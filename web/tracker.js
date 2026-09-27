@@ -27,7 +27,7 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.1.10";
+const VERSION = "2.1.11";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
 const NODE_NAME = "ANTsNastyBastardsTracker";
 
@@ -326,6 +326,7 @@ const S = {
   frameAttr: newSeries(1024), // (t, hook ms attributed inside that frame)
   frameNodeStage: newSeries(512), // (t, sum of drawNode ms inside that frame)
   frameConnStage: newSeries(512), // (t, sum of drawConnections ms inside that frame)
+  frameLinkStage: newSeries(512), // (t, sum of renderLink ms inside that frame)
   raf: newSeries(512), // (t, ms since previous rAF callback)
   invalidations: newSeries(2048), // (t, 1) per canvas.setDirty() call
   stalls: newSeries(512), // (t, blocking ms of a stall)
@@ -347,6 +348,7 @@ let hookDepth = 0; // >0 while inside a wrapped hook, so nested hooks count once
 let curAttrMs = 0;
 let curNodeStageMs = 0;
 let curConnStageMs = 0;
+let curLinkStageMs = 0;
 
 let drawThrottleMs = 0; // Testing tab: redraw rate cap (0 = off)
 let capTrailingTimer = null;
@@ -385,7 +387,7 @@ function trimIfLive(ring, cutoff) {
 function frameMetrics() {
   const now = nowMs();
   // trim to the keep-horizon so a long idle doesn't leave stale frames around
-  for (const ring of [S.frames, S.frameAttr, S.frameNodeStage, S.frameConnStage]) trimIfLive(ring, now - FRAME_KEEP_MS);
+  for (const ring of [S.frames, S.frameAttr, S.frameNodeStage, S.frameConnStage, S.frameLinkStage]) trimIfLive(ring, now - FRAME_KEEP_MS);
 
   let win = FRAME_WINDOW_MS;
   let agg = S.frames.aggregate(now - win);
@@ -403,6 +405,7 @@ function frameMetrics() {
   const attr = S.frameAttr.aggregate(now - win);
   const nodeStage = S.frameNodeStage.aggregate(now - win);
   const connStage = S.frameConnStage.aggregate(now - win);
+  const linkStage = S.frameLinkStage.aggregate(now - win);
 
   const mean = a.n ? a.sum / a.n : 0;
   // Rate over the observed span. (n-1) intervals for n samples.
@@ -645,7 +648,7 @@ function selfCostMetrics() {
     ringBytes += b.series.bytes;
   }
   ringBytes +=
-    S.frames.bytes + S.frameAttr.bytes + S.frameNodeStage.bytes + S.frameConnStage.bytes + S.raf.bytes + S.invalidations.bytes + S.stalls.bytes + S.mem.bytes;
+    S.frames.bytes + S.frameAttr.bytes + S.frameNodeStage.bytes + S.frameConnStage.bytes + S.frameLinkStage.bytes + S.raf.bytes + S.invalidations.bytes + S.stalls.bytes + S.mem.bytes;
   return {
     uptime,
     buckets,
@@ -889,14 +892,21 @@ const LOD = {
   // it was flattening nodes on its own.
   linkStyle: "spline",
   thinLinks: 0, // link segments stroked thin so far
+  linkMs: 0, // time inside renderLink calls (the ink itself)
+  linkCalls: 0, // renderLink calls made (links actually drawn)
   domMarked: null, // Set of elements we are hiding right now
+  domLayer: 0, // wrappers hidden through the DOM widget layer
+  domMarkedWidgets: 0, // widgets carrying our hideOnZoom flag
   domWidgets: null, // Map<widget, original hideOnZoom> for the ones we flipped
   domHidden: 0, // elements hidden because their node is a box
   domNodes: 0, // nodes whose DOM content is hidden
-  domStilled: 0, // widgets also taken out of the per-frame layout pass
+  domStilled: 0, // widgets the frontend will actually honour hideOnZoom for
   sweptZoom: NaN, // the zoom the DOM was last swept at
   sweptKey: "", // and the flat decision it was swept for
   autoLinkCarried: false, // a v2.1.9 "auto" link setting was carried over
+  // A measured answer to "does this setting do anything on my page": the two
+  // states are alternated, one second each, and the frame budget is compared.
+  ab: null, // { phase, rounds, saved, s0, s1, text }
 };
 
 // The zoom below which every node is painted as a rectangle. A zoom, not a node
@@ -923,6 +933,11 @@ const LOD_DETAIL_ZOOMS = [0, 1, 0.8, 0.6, 0.4, 0.2];
 const LOD_LINK_WIDTH = 1; // graph units; LiteGraph's own default is 3
 const LOD_FULL_LINK_WIDTH = 3; // what ComfyUI draws when nothing is thinned
 const LOD_DOM_CLASS = "ants-lod-box"; // elements hidden while their node is a box
+// The frontend renders every DOM widget — image previews, curve editors, and the
+// Vue components behind the core 3D nodes — in this layer, one wrapper per
+// widget. A wrapper is what is on screen; the widget object behind it may have no
+// element to reach for at all.
+const LOD_DOM_LAYER = '[data-testid="dom-widgets"]';
 const LOD_DOM_SWEEP_MS = 1000; // how often newly added nodes/widgets are picked up
 // Link drawing, as a setting rather than a side effect of the node threshold.
 const LOD_LINK_STYLES = ["spline", "straight"];
@@ -1394,6 +1409,81 @@ function lodNodeById(canvas, id) {
   return null;
 }
 
+// Every wrapper in the DOM widget layer, and the node it belongs to. O(wrappers
+// x nodes) comparisons in plain numbers, run on a zoom change and once a second,
+// not per frame. The wrapper
+// is positioned at its node's origin plus the widget's offset, in client pixels
+// (see the frontend's useAbsolutePosition), so the node can be found by a
+// containment test in graph coordinates — no layout read per widget, and it works
+// for component widgets, which have no element of their own to key on.
+function lodDomLayerSweep(canvas, keep) {
+  let layer = null;
+  try {
+    if (typeof document === "undefined" || typeof document.querySelectorAll !== "function") return 0;
+    layer = document.querySelectorAll(LOD_DOM_LAYER)[0] || null;
+  } catch (e) {
+    return 0;
+  }
+  if (!layer || !layer.children || !layer.children.length) return 0;
+  const ds = (canvas && canvas.ds) || null;
+  const scale = ds ? Number(ds.scale) || 1 : 1;
+  const offset = ds && ds.offset ? ds.offset : [0, 0];
+  const canvasEl = canvas && canvas.canvas;
+  let originX = 0;
+  let originY = 0;
+  if (canvasEl && typeof canvasEl.getBoundingClientRect === "function") {
+    // One layout read for the whole sweep, not one per widget.
+    try {
+      const rect = canvasEl.getBoundingClientRect();
+      originX = rect.left || 0;
+      originY = rect.top || 0;
+    } catch (e) {
+      /* fall back to the style offsets below, which are already client pixels */
+    }
+  }
+  const nodes = lodGraphNodes(canvas) || [];
+  if (!nodes.length) return 0;
+  let hidden = 0;
+  for (const el of layer.children) {
+    if (!el || !el.classList) continue;
+    let clientX = parseFloat(el.style && el.style.left);
+    let clientY = parseFloat(el.style && el.style.top);
+    if (!Number.isFinite(clientX) || !Number.isFinite(clientY)) {
+      if (typeof el.getBoundingClientRect !== "function") continue;
+      try {
+        const r = el.getBoundingClientRect();
+        clientX = r.left;
+        clientY = r.top;
+      } catch (e) {
+        continue;
+      }
+    }
+    const gx = (clientX - originX) / scale - (Number(offset[0]) || 0);
+    const gy = (clientY - originY) / scale - (Number(offset[1]) || 0);
+    // Topmost node wins: the last one in the draw order whose rectangle
+    // contains the point, which is the node this wrapper is drawn on top of.
+    let owner = null;
+    for (const node of nodes) {
+      if (!lodFlatNode(node, canvas)) continue;
+      const size = node.size || node.renderingSize;
+      if (!size) continue;
+      const w = Math.abs(Number(size[0])) || 0;
+      const h = Math.abs(Number(size[1])) || 0;
+      const x = Number(node.pos && node.pos[0]) || 0;
+      const y = Number(node.pos && node.pos[1]) || 0;
+      if (gx >= x && gx <= x + w && gy >= y && gy <= y + h) owner = node;
+    }
+    if (!owner) continue;
+    // A widget with an element of its own was already hidden through its node;
+    // this pass is for the wrappers nothing else can reach.
+    if (keep.has(el)) continue;
+    el.classList.add(LOD_DOM_CLASS);
+    keep.add(el);
+    hidden++;
+  }
+  return hidden;
+}
+
 function lodSweepDom(canvas) {
   const marked = LOD.domMarked || (LOD.domMarked = new Set());
   const keep = new Set();
@@ -1428,6 +1518,15 @@ function lodSweepDom(canvas) {
   } catch (e) {
     /* hiding DOM is a courtesy: if the page's DOM is not what we expect, skip it */
   }
+  // The DOM widget layer: the wrappers behind every DOM widget, including the
+  // Vue-component widgets the core 3D nodes are built from, which have no
+  // element of their own for the loop above to find.
+  let layerHidden = 0;
+  try {
+    if (canvas && lodFlatOn(canvas)) layerHidden = lodDomLayerSweep(canvas, keep);
+  } catch (e) {
+    /* never fatal */
+  }
   // The way back: while the zoom is below the setting every node is a box, so
   // every widget we touched is still one and stays touched. Above it, all of
   // them go back to asking for their own placement on the next drawn frame.
@@ -1451,7 +1550,13 @@ function lodSweepDom(canvas) {
   LOD.domMarked = keep;
   LOD.domHidden = keep.size;
   LOD.domNodes = nodes;
-  LOD.domStilled = LOD.domWidgets ? LOD.domWidgets.size : 0;
+  LOD.domLayer = layerHidden;
+  LOD.domMarkedWidgets = LOD.domWidgets ? LOD.domWidgets.size : 0;
+  // The flag only hides anything while the frontend is drawing in its own
+  // low-quality mode (its DOM widget layer checks `hideOnZoom && lowQuality`),
+  // so that — and not the count of widgets we flagged — is what is out of the
+  // per-frame widget pass.
+  LOD.domStilled = lodFrontendLowQuality(canvas) ? LOD.domMarkedWidgets : 0;
   LOD.sweptZoom = LOD.zoom;
   LOD.sweptKey = lodFlatOn(canvas) ? "flat" : "full";
   return changed;
@@ -1552,6 +1657,7 @@ function lodSinceSwitch() {
     n,
     nodeMsPerFrame: S.frameNodeStage.aggregate(from).sum / n,
     connMsPerFrame: S.frameConnStage.aggregate(from).sum / n,
+    linkMsPerFrame: S.frameLinkStage.aggregate(from).sum / n,
     meanFrameMs: S.frames.aggregate(from).sum / n,
   };
 }
@@ -1569,6 +1675,79 @@ function lodCaptureBaseline() {
   } catch (e) {
     LOD.baseline = null;
   }
+}
+
+// Does the link setting actually buy anything on this page? Ink is only part of
+// what the connections stage costs — the frontend walks every input slot of
+// every node before it decides which links are on screen — so the honest way to
+// answer it is to alternate the setting and compare the same page against
+// itself, rather than to guess from a before/after pair taken minutes apart.
+const LOD_AB_ROUNDS = 3; // on/off pairs
+const LOD_AB_PHASE_MS = 1200;
+const LOD_AB_MIN_FRAMES = 3; // below this the comparison is not worth printing
+
+function lodAbStart() {
+  LOD.ab = {
+    phase: 0, // 0 = thinning on, 1 = thinning off
+    rounds: LOD_AB_ROUNDS,
+    last: nowMs(),
+    on: { ms: 0, frames: 0 },
+    off: { ms: 0, frames: 0 },
+    saved: LOD.detailZoom,
+    text: `measuring: ${LOD_AB_ROUNDS} second(s) of each, one after the other\u2026`,
+  };
+  lodAbApply();
+  return LOD.ab;
+}
+
+function lodAbApply() {
+  // The setting is moved directly, not through lodSet: nothing here should be
+  // saved to storage or count as a user change. The "on" half is thinning below
+  // every zoom, so the comparison is the setting at its strongest — a threshold
+  // the user's own zoom happens to sit above would measure nothing.
+  LOD.detailZoom = LOD.ab.phase === 0 ? 1 : 0;
+}
+
+function lodAbStop(text) {
+  const ab = LOD.ab;
+  if (!ab) return;
+  LOD.detailZoom = ab.saved;
+  ab.text = text;
+  ab.done = true;
+  lodSaveSettings();
+}
+
+// One call per drawn frame, with that frame's own connections time: the two
+// phases are measured from the same code path, on the same page, seconds apart.
+function lodAbFrame(connMs) {
+  const ab = LOD.ab;
+  if (!ab || ab.done) return;
+  const t = nowMs();
+  const bucket = ab.phase === 0 ? ab.on : ab.off;
+  bucket.ms += Math.max(0, Number(connMs) || 0);
+  bucket.frames++;
+  if (t - ab.last < LOD_AB_PHASE_MS) return;
+  ab.last = t;
+  ab.phase = (ab.phase + 1) % 2;
+  if (ab.phase === 0) {
+    ab.rounds--;
+    if (ab.rounds <= 0) {
+      const onAvg = ab.on.frames ? ab.on.ms / ab.on.frames : 0;
+      const offAvg = ab.off.frames ? ab.off.ms / ab.off.frames : 0;
+      const delta = offAvg - onAvg;
+      const pct = offAvg > 0 ? (delta / offAvg) * 100 : 0;
+      const enough = ab.on.frames >= LOD_AB_MIN_FRAMES && ab.off.frames >= LOD_AB_MIN_FRAMES;
+      lodAbStop(
+        enough
+          ? `thinning measured on this page: links ${fmtMs(onAvg, 1)} ms/frame thinned below 100% vs ${fmtMs(offAvg, 1)} ms/frame in full ink ` +
+            `(${ab.on.frames}/${ab.off.frames} frames) \u2014 ${delta >= 0 ? "saves" : "costs"} ${fmtMs(Math.abs(delta), 1)} ms/frame ` +
+            `(${Math.abs(pct).toFixed(0)}% of the connections stage)`
+          : `not enough frames to compare (${ab.on.frames} thinned, ${ab.off.frames} full) \u2014 draw or pan the graph for a moment and try again`
+      );
+      return;
+    }
+  }
+  lodAbApply();
 }
 
 function lodSet(opts) {
@@ -1642,6 +1821,15 @@ function lodSet(opts) {
 // shadows and rounded corners. Worth showing next to ours, because "my frames are
 // still slow with LOD on" is a fair question and the answer is that this LOD
 // changes shapes, not how many nodes get drawn.
+function lodFrontendLowQuality(canvas) {
+  try {
+    const c = canvas || (typeof app !== "undefined" && app && app.canvas) || null;
+    return !!(c && (c.low_quality || c._isLowQuality));
+  } catch (e) {
+    return false;
+  }
+}
+
 function lodFrontendLod(canvas) {
   try {
     const c = canvas || (typeof app !== "undefined" && app && app.canvas) || null;
@@ -1754,6 +1942,7 @@ function patchCanvasDraw() {
       S.counters.draws++;
       curNodeStageMs = 0;
       curConnStageMs = 0;
+      curLinkStageMs = 0;
       curAttrMs = 0;
       // Whoever is inside this draw is on the display lane: a source that draws
       // is a source whose skipped ticks the user can see (see GOV_DISPLAY_FLOOR_MS).
@@ -1778,6 +1967,8 @@ function patchCanvasDraw() {
           S.frameAttr.push(t0, curAttrMs);
           S.frameNodeStage.push(t0, curNodeStageMs);
           S.frameConnStage.push(t0, curConnStageMs);
+          S.frameLinkStage.push(t0, curLinkStageMs);
+          lodAbFrame(curConnStageMs);
           S.counters.frames++;
         }
       }
@@ -1862,44 +2053,53 @@ function patchCanvasDraw() {
       const a = args[1];
       const b = args[2];
       const link = args[3];
-      if (ctx && a && b && lodLinksStraight()) {
-        const lt0 = performance.now();
-        try {
+      if (!ctx || !a || !b) return originalRenderLink.apply(this, args);
+      // Every call is timed, whichever path it takes. The difference between
+      // this total and the whole connections stage is the part of the link cost
+      // no ink setting can reach: the frontend walking every input slot of every
+      // node in the graph before it decides a link is even on screen.
+      const lr0 = performance.now();
+      let ret;
+      try {
+        if (lodLinksStraight()) {
           lodPaintLink(ctx, a, b, args[6] || (link && link.color) || null);
-        } catch (err) {
-          lodAbort(err);
-          return originalRenderLink.apply(this, args);
+          LOD.links++;
+          return undefined;
         }
-        LOD.links++;
-        LOD.ms += performance.now() - lt0;
-        return undefined;
-      }
-      // Told to keep the curves but draw them cheaply. What costs the pixels is
-      // the width of the stroke and the dark outline drawn under it (a second
-      // stroke 4 units wider, so on a long link the outline is most of the ink).
-      // Both live on the canvas object, so they are set for this one call and
-      // put straight back — hit-testing, dragging and the panel never see them.
-      if (ctx && a && b && lodDetailOn(this) && LOD.linkStyle !== "straight") {
-        let restore = null;
-        try {
-          const width = this.connections_width;
-          const border = this.render_connections_border;
-          this.connections_width = LOD_LINK_WIDTH;
-          this.render_connections_border = false;
-          restore = () => {
-            this.connections_width = width;
-            this.render_connections_border = border;
-          };
-          const ret = originalRenderLink.apply(this, args);
-          LOD.thinLinks++;
-          return ret;
-        } catch (err) {
-          lodAbort(err);
-        } finally {
-          if (restore) restore();
+        // Told to keep the curves but draw them cheaply. What costs pixels is
+        // the width of the stroke and the dark outline drawn under it (a second
+        // stroke 4 units wider, so on a long link the outline is most of the
+        // ink). Both live on the canvas object, so they are set for this one
+        // call and put straight back — hit-testing, dragging and the panel never
+        // see them.
+        if (lodDetailOn(this) && LOD.linkStyle !== "straight") {
+          let restore = null;
+          try {
+            const width = this.connections_width;
+            const border = this.render_connections_border;
+            this.connections_width = LOD_LINK_WIDTH;
+            this.render_connections_border = false;
+            restore = () => {
+              this.connections_width = width;
+              this.render_connections_border = border;
+            };
+            ret = originalRenderLink.apply(this, args);
+            LOD.thinLinks++;
+            return ret;
+          } finally {
+            if (restore) restore();
+          }
         }
+        return originalRenderLink.apply(this, args);
+      } catch (err) {
+        lodAbort(err);
+        return originalRenderLink.apply(this, args);
+      } finally {
+        const dt = performance.now() - lr0;
+        LOD.linkMs += dt;
+        LOD.linkCalls++;
+        if (!S.paused) curLinkStageMs += dt;
       }
-      return originalRenderLink.apply(this, args);
     };
     wrappedRenderLink.__antsWrapped = true;
     proto.renderLink = wrappedRenderLink;
@@ -4884,6 +5084,17 @@ function buildTweaksTab(container) {
     lodUpdate();
   });
 
+  const lodAbBtn = el("button", { class: "ants-btn", text: "Measure link thinning" });
+  lodAbBtn.title =
+    "Answers \"is this setting doing anything on my page\" by measuring instead of arguing: the thinning is alternated on and off, one second each, " +
+    "three times over, and the two halves are compared on the connections stage of the frame budget. Nothing is saved, nothing else changes, and the " +
+    "setting is put back at the end.";
+  lodAbBtn.addEventListener("click", () => {
+    if (LOD.ab && !LOD.ab.done) return;
+    lodAbStart();
+    lodUpdate();
+  });
+
   const lodOffBtn = el("button", { class: "ants-btn", text: "Back to full drawing" });
   lodOffBtn.title =
     "Turn all of them off \u2014 flattening, link thinning, thumbnails and the redraw cap \u2014 and let ComfyUI draw the canvas " +
@@ -4904,6 +5115,7 @@ function buildTweaksTab(container) {
   lodRow.appendChild(lodDetailSel);
   lodRow.appendChild(lodThumbSel);
   lodRow.appendChild(lodIdleSel);
+  lodRow.appendChild(lodAbBtn);
   lodRow.appendChild(lodOffBtn);
   container.appendChild(lodRow);
   const lodLine = el("div", { class: "ants-note", style: { whiteSpace: "pre-wrap" } });
@@ -4930,7 +5142,10 @@ function buildTweaksTab(container) {
         "the shape of a link: ComfyUI's curves, or straight lines. The thinning setting decides how much ink a curve uses \u2014 below " +
         "its zoom links are stroked 1px wide instead of 3 and lose the dark outline drawn under them, which on a long link is most of " +
         "the pixels, and the curves stay exactly where they were \u2014 link ink and nothing else, so a link setting never paints a node. " +
-        "Everything here is remembered across sessions and handed back by \"Back to full drawing\".",
+        "How much that is worth depends on the page, and the readout measures it rather than claiming it: the connections stage also contains " +
+        "the frontend walking every input slot of every node before it decides which links are even on screen, and \"Measure link thinning\" " +
+        "compares the setting against itself so the two parts are told apart. Everything here is remembered across sessions and handed back by " +
+        "\"Back to full drawing\".",
     })
   );
 
@@ -5017,6 +5232,26 @@ function buildTweaksTab(container) {
           );
         }
       }
+      // Where the connections stage actually goes. The ink is what a link
+      // setting can change; the rest of the stage is the frontend walking every
+      // input slot of every node in the graph, which no setting here can shrink.
+      if (since && since.n >= 3 && since.linkMsPerFrame > 0) {
+        const connPer = since.connMsPerFrame;
+        const ink = Math.min(connPer, since.linkMsPerFrame);
+        if (connPer > 0.5) {
+          const drawn = LOD.linkCalls / since.n;
+          const perLink = drawn > 0 ? since.linkMsPerFrame / drawn : 0;
+          bits2.push(
+            `connections ${fmtMs(connPer, 1)} ms/frame: the strokes themselves are ${fmtMs(ink, 1)} ms ` +
+              `(${drawn.toFixed(1)} link draw(s)/frame at ${fmtMs(perLink, 3)} ms each), and the other ` +
+              `${fmtMs(Math.max(0, connPer - ink), 1)} ms is the frontend walking every input slot of every node before it decides which links ` +
+              `are on screen \u2014 a link ink setting can only reach the first part`
+          );
+        }
+      }
+      if (LOD.ab) {
+        bits2.push(LOD.ab.text);
+      }
       if (LOD.detailZoom > 0) {
         const frames = Math.max(1, since ? since.n : 1);
         if (lodLinksStraight()) {
@@ -5038,11 +5273,15 @@ function buildTweaksTab(container) {
         if (LOD.domHidden) {
           bits2.push(
             `${LOD.domHidden} DOM element(s) of ${LOD.domNodes} boxed node(s) hidden ` +
-              `(image and video previews, curve editors, custom node UIs)` +
+              `(image and video previews, curve editors, 3D viewports, custom node UIs)` +
+              (LOD.domLayer ? `, ${LOD.domLayer} of them through the frontend's DOM widget layer` : "") +
+              ` \u2014 they come back the moment the node does` +
               (LOD.domStilled
-                ? `, ${LOD.domStilled} widget(s) also out of the per-frame layout pass`
-                : "") +
-              ` \u2014 they come back the moment the node does`
+                ? ` \u00b7 ${LOD.domStilled} widget(s) also carrying a hide-on-zoom flag the frontend is honouring right now`
+                : LOD.domMarkedWidgets
+                  ? ` \u00b7 ${LOD.domMarkedWidgets} widget(s) carry a hide-on-zoom flag as well, which the frontend only consults in its own ` +
+                    `low-quality mode (off at this setting) \u2014 the class above is what is doing the hiding`
+                  : "")
           );
         } else if (lodFlatOn() && LOD.plan.flat > 0) {
           bits2.push("the nodes painted flat at this zoom have no DOM content to hide (their visuals are canvas-drawn)");
@@ -5092,7 +5331,12 @@ function buildTweaksTab(container) {
     lodLine.textContent = bits.join("\n");
   }
 
-  ui.state.tweaks = { update: lodUpdate };
+  ui.state.tweaks = {
+    update: () => {
+      if (lodAbBtn) lodAbBtn.textContent = LOD.ab && !LOD.ab.done ? "Measuring\u2026" : "Measure link thinning";
+      lodUpdate();
+    },
+  };
 }
 
 // --- Nodes ------------------------------------------------------------------
@@ -7148,6 +7392,10 @@ function buildTelemetryReport() {
         lodOn()
           ? `on (every node a rectangle below ${Math.round(LOD.flatBelow * 100)}% zoom${LOD.legacyPx ? `, carried over from "nodes under ${LOD.legacyPx}px"` : ""}, links ${lodLinksStraight() ? "straight (link setting)" : "as drawn"}, idle redraw cap ${LOD.idleCapMs || "off"}ms) ` +
             `— ${LOD.nodes} node draw(s) and ${LOD.links} link draw(s) simplified, ${LOD.capped} redraw(s) merged` +
+            (LOD.linkCalls > 0 && LOD.linkMs > 0
+              ? `, link strokes ${fmtMs((LOD.linkMs / Math.max(1, LOD.linkCalls)) * 1000, 0)}\u00b5s each over ${LOD.linkCalls} call(s) ` +
+                `(the rest of the connections stage is the frontend's own per-slot walk)`
+              : "") +
             (LOD.thumbZoom > 0
               ? `, previews ${LOD.imgThumb}/${LOD.imgSeen} served from thumbnails (${LOD.thumbsBuilt} cached, ${fmtBytes(LOD.thumbBytes)}) below ${Math.round(LOD.thumbZoom * 100)}% zoom`
               : "") +
@@ -7432,6 +7680,9 @@ function installDebugApi() {
         get detail() {
           return {
             on: lodDetailOn(),
+            linkMs: LOD.linkMs,
+            linkCalls: LOD.linkCalls,
+            ab: LOD.ab,
             belowZoom: LOD.detailZoom,
             thinLinks: LOD.thinLinks,
             linkWidth: LOD_LINK_WIDTH,
@@ -7447,6 +7698,15 @@ function installDebugApi() {
             nodes: LOD.domNodes,
             marked: LOD.domMarked ? LOD.domMarked.size : 0,
             stilled: LOD.domStilled,
+            // Hidden through the frontend's DOM widget layer (component widgets
+            // with no element of their own, like the core 3D viewports).
+            layer: LOD.domLayer,
+            // Widgets carrying our hideOnZoom flag. The frontend honours that
+            // flag only in its own low-quality mode, which is what `stilled`
+            // counts; this is the flag itself, so a panel can say which of the
+            // two is doing the hiding.
+            markedWidgets: LOD.domMarkedWidgets,
+            frontendLowQuality: lodFrontendLowQuality(app.canvas),
             // The widgets themselves, for anyone who wants to see what was
             // touched rather than take the count on faith.
             widgets: LOD.domWidgets ? [...LOD.domWidgets.keys()] : [],
@@ -7484,6 +7744,18 @@ function installDebugApi() {
           };
         },
         set: (opts) => lodSet(opts),
+        // Starts the on/off measurement of the link setting and returns its
+        // state; the verdict lands in `state.ab.text` when it finishes.
+        measureLinks: () => lodAbStart(),
+        // Re-runs the DOM sweep. The tracker does this itself on a zoom or a
+        // setting change; this is here so a test (or a script) can ask for it.
+        sweep: () => {
+          try {
+            return lodSweepDom(app.canvas);
+          } catch (e) {
+            return false;
+          }
+        },
         off: () => lodSet({ flatBelow: 0, idleCapMs: 0, thumbZoom: 0, detailZoom: 0, linkStyle: "spline" }),
       },
       setSyntheticTick,

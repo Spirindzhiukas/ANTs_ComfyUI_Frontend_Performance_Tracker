@@ -289,6 +289,23 @@ h.canvas.nodes[3].widgets = [
   { name: "curve", element: demoWidget.children[0], options: { hideOnZoom: false } },
   { name: "model_file", type: "load3D", component: {}, options: {} },
 ];
+// The third shape: what a core 3D node actually puts on screen — a wrapper in the
+// frontend's DOM widget layer, positioned at its node's origin, with the widget
+// object holding no reference to it at all.
+const demoLayer = h.document.createElement("div");
+demoLayer._attrs["data-testid"] = "dom-widgets";
+const demoViewport = h.document.createElement("div");
+demoViewport.className = "dom-widget size-full";
+demoViewport._cls = demoViewport._cls || new Set();
+demoLayer.appendChild(demoViewport);
+h.document.body.appendChild(demoLayer);
+const placeViewport = () => {
+  const pos = h.canvas.nodes[3].pos;
+  const scale = h.canvas.ds.scale;
+  demoViewport.style.left = `${(pos[0] + h.canvas.ds.offset[0]) * scale}px`;
+  demoViewport.style.top = `${(pos[1] + h.canvas.ds.offset[1]) * scale}px`;
+};
+placeViewport();
 
 h.tracker.lowZoom.set({ flatBelow: 0.2, idleCapMs: 500, thumbZoom: 0.6, detailZoom: 0.6, linkStyle: "spline" });
 
@@ -350,9 +367,13 @@ console.log(
     `(${h.canvas.ctx.ops.filter((o) => o[0] === "bezierCurveTo").length} bezier segment(s)) — the node setting does not touch links`
 );
 console.log(
-  `  DOM content of a boxed node hidden: ${lodBoxed()} (${h.tracker.lowZoom.dom.hidden} element(s) of ${h.tracker.lowZoom.dom.nodes} boxed node(s),` +
-    ` ${h.tracker.lowZoom.dom.stilled} widget(s) — an element widget and a Vue-component widget — out of the per-frame layout pass)` +
+  `  DOM content of a boxed node hidden: ${lodBoxed()} (${h.tracker.lowZoom.dom.hidden} element(s) of ${h.tracker.lowZoom.dom.nodes} boxed node(s);` +
+    ` ${h.tracker.lowZoom.dom.layer} of them through the frontend's DOM widget layer — the 3D viewport wrappers nothing else can reach;` +
+    ` ${h.tracker.lowZoom.dom.markedWidgets} widget(s) carry a hide-on-zoom flag, which the frontend only honours in its own low-quality mode)` +
     ` | frame quality flag touched: ${h.canvas._isLowQuality === false ? "no" : "yes"}`
+);
+console.log(
+  `  the 3D viewport wrapper: hidden ${demoViewport._cls.has("ants-lod-box")} (class added by the layer sweep, no element handle anywhere)`
 );
 
 // Link ink on its own: curves kept, stroke paid for once. Nothing else changes —
@@ -385,11 +406,27 @@ console.log(
 );
 h.tracker.lowZoom.set({ linkStyle: "spline" });
 
+// The measured answer to "does thinning do anything on this page": the panel
+// button runs exactly this, alternating the setting and comparing.
+h.canvas.costs.link = 1.5; // make the ink expensive enough to measure in a demo
+h.tracker.lowZoom.set({ detailZoom: 1 });
+h.canvas.ds.scale = 0.1;
+placeViewport();
+h.advance(1500);
+h.tracker.lowZoom.measureLinks();
+for (let i = 0; i < 30; i++) {
+  h.advance(400);
+  h.canvas.setDirty(true, true);
+  h.canvas.draw();
+}
+console.log(`  ${h.tracker.lowZoom.state.ab.text}`);
+
 // And the same moment one zoom level up: nothing is degraded, the DOM element is
 // back on screen, the canvas object is exactly as ComfyUI left it. This is the
 // check that matters — the mode has to give the page back as it found it.
 h.tracker.lowZoom.set({ flatBelow: 0.2 });
 h.canvas.ds.scale = 0.9;
+placeViewport();
 const thinBefore2 = h.tracker.lowZoom.detail.thinLinks;
 frame(2);
 run(500);

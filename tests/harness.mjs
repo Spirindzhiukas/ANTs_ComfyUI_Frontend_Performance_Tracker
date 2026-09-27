@@ -248,7 +248,13 @@ export function createHarness(options = {}) {
         border: this.render_connections_border,
         lowQuality: this._isLowQuality,
       });
-      busy(this.costs.link || 0);
+      // Ink costs pixels, and pixels cost time: a 1px stroke is cheaper than the
+      // 3px one, and a link drawn with its dark outline under it is a second,
+      // wider stroke again. Without this the simulation would say every link
+      // setting is free, which is the thing the panel exists to measure.
+      const widths = 1;
+      const ink = this.render_connections_border ? 2.6 : 1;
+      busy((this.costs.link || 0) * widths * ink * (this.connections_width / 3));
       ctx.beginPath();
       ctx.moveTo(a[0], a[1]);
       ctx.bezierCurveTo(a[0] + 40, a[1], b[0] - 40, b[1], b[0], b[1]);

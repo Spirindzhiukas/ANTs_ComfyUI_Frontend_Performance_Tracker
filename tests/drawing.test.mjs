@@ -453,6 +453,69 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     assert(!text.includes("straight-line path"), "and never mentions a path the node setting used to be able to switch on");
   });
 
+  test("the panel separates link ink from the frontend's own per-link bookkeeping", async () => {
+    const h = await boot();
+    h.window.devicePixelRatio = 1;
+    // A connections stage that costs far more than the strokes inside it: this
+    // is the shape of the real page (the frontend walks every input slot of
+    // every node, whichever links are on screen).
+    h.canvas.costs = { background: 0.1, connections: 6, chrome: 0.2, link: 0.5 };
+    bigGraph(h, 12, 0.1);
+    h.tracker.lowZoom.set({ detailZoom: 1, flatBelow: 0 }); // thin the ink, keep the curves
+    drawLoop(h, 1.2);
+    assertGreater(h.tracker.lowZoom.state.linkCalls, 0, "links were drawn");
+    assertGreater(h.tracker.lowZoom.state.linkMs, 0, "and the ink was timed");
+
+    await openTweaksTab(h);
+    h.advance(600);
+    await h.flush();
+    const text = panelText(h);
+    assertIncludes(text, "the strokes themselves are", "the panel splits the connections stage");
+    assertIncludes(
+      text,
+      "walking every input slot of every node",
+      "and names what the rest of it is, so no ink setting is credited with it"
+    );
+    assertIncludes(text, "a link ink setting can only reach the first part", "stated as a limit, not a promise");
+  });
+
+  test("the measure button compares the link setting against itself, on this page", async () => {
+    const h = await boot();
+    h.window.devicePixelRatio = 1;
+    // Thinned frames are cheap; full-ink frames are not. The measurement has to
+    // find that difference without being told about it.
+    bigGraph(h, 8, 0.1);
+    // The canvas charges for ink by the stroke: 3px with a dark outline under it
+    // costs several times what a 1px outline-free stroke does (see tests/harness).
+    h.canvas.costs = { background: 0, connections: 0, chrome: 0, link: 0.5 };
+    h.tracker.lowZoom.set({ detailZoom: 1, flatBelow: 0 });
+    h.advance(2200); // the baseline window the readout compares against
+    h.advance(2200);
+    const ab = h.tracker.lowZoom.measureLinks();
+    assertEqual(ab.on.frames, 0, "the measurement starts with nothing counted");
+    // Three on/off pairs, one second each. The harness clock only moves when a
+    // test moves it, so frames are drawn by hand.
+    for (let i = 0; i < 24; i++) {
+      h.advance(650);
+      h.canvas.setDirty(true, true);
+      h.canvas.draw();
+    }
+    assert(h.tracker.lowZoom.state.ab.done, "the measurement finishes on its own");
+    assertGreater(h.tracker.lowZoom.state.ab.on.frames, 0, "thinned frames were counted");
+    assertGreater(h.tracker.lowZoom.state.ab.off.frames, 0, "and full-ink frames too");
+    assertEqual(h.tracker.lowZoom.state.detailZoom, 1, "the setting is put back exactly as it was");
+    await openTweaksTab(h);
+    h.advance(600);
+    await h.flush();
+    assertIncludes(panelText(h), "thinning measured on this page", "and the panel reports the verdict");
+    assertIncludes(panelText(h), "ms/frame", "with numbers");
+    const done = h.tracker.lowZoom.state.ab;
+    assert(
+      done.on.ms / Math.max(1, done.on.frames) < done.off.ms / Math.max(1, done.off.frames),
+      "and the cheaper half is the thinned one, which is what it was asked to find out"
+    );
+  });
+
   test("link thinning changes link ink and nothing else about the frame", async () => {
     const h = await boot();
     h.window.devicePixelRatio = 1;
@@ -549,8 +612,17 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
 
     h.tracker.lowZoom.set({ flatBelow: 0.2 });
     assertEqual(widget.options.hideOnZoom, true, "the store is told to skip it while its node is a rectangle");
-    assertEqual(h.tracker.lowZoom.dom.stilled, 1, "and the panel counts it");
     assertEqual(h.tracker.lowZoom.dom.widgets.length, 1, "the widget itself is exposed, not just a count");
+    assertEqual(h.tracker.lowZoom.dom.markedWidgets, 1, "and it is counted as flagged");
+    // The frontend only honours that flag in its own low-quality mode — which is
+    // exactly what this tracker must not switch on to hide a widget, so the
+    // panel must not claim the widget is out of the per-frame pass when it is
+    // not.
+    assertEqual(h.tracker.lowZoom.dom.stilled, 0, "but nothing is claimed while the frontend's own low-quality mode is off");
+    h.canvas._isLowQuality = true; // the frontend's own LOD, switched on by the user
+    h.tracker.lowZoom.sweep();
+    assertEqual(h.tracker.lowZoom.dom.stilled, 1, "with the frontend's LOD on, the flag is what is doing the hiding");
+    h.canvas._isLowQuality = false;
 
     // Zoom in: the widget is the frontend's business again.
     h.canvas.ds.scale = 0.5;
@@ -638,6 +710,43 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     assertGreater(h.canvas.ctx.ops.filter((o) => o[0] === "bezierCurveTo").length, 0, "curves with the node setting off");
   });
 
+  test("a component widget with no element at all is hidden through the frontend's DOM widget layer", async () => {
+    const h = await boot();
+    h.window.devicePixelRatio = 1;
+    bigGraph(h, 2, 0.1);
+    h.canvas.ds.offset[0] = 0;
+    h.canvas.ds.offset[1] = 0;
+    // What the core 3D nodes put on screen: a wrapper in the DOM widget layer,
+    // positioned at its node's origin (client pixels: the canvas is at 0,0 in
+    // this harness), holding the Vue component. Nothing on the widget object
+    // points at it.
+    const layer = h.document.createElement("div");
+    const wrapper = h.document.createElement("div");
+    wrapper.className = "dom-widget size-full";
+    const { left, top } = (() => {
+      const pos = h.canvas.nodes[1].pos;
+      const scale = h.canvas.ds.scale;
+      return { left: (pos[0] + h.canvas.ds.offset[0]) * scale, top: (pos[1] + h.canvas.ds.offset[1]) * scale };
+    })();
+    wrapper.style.left = `${left}px`;
+    wrapper.style.top = `${top}px`;
+    layer.appendChild(wrapper);
+    h.document.body.appendChild(layer);
+    // The tracker finds it by the attribute the frontend puts on that layer.
+    layer._attrs = { "data-testid": "dom-widgets" };
+
+    h.tracker.lowZoom.set({ flatBelow: 0.2 });
+    assert(wrapper._cls.has("ants-lod-box"), "the wrapper is hidden with the same class as any other DOM content");
+    assertEqual(h.tracker.lowZoom.dom.layer, 1, "and it is counted separately from the element-backed widgets");
+    assertEqual(h.tracker.lowZoom.dom.hidden, 1, "it is part of the total hidden count");
+
+    // Zoom back in: the wrapper comes back, because the node is drawn in full.
+    h.canvas.ds.scale = 0.5;
+    h.tracker.lowZoom.sweep();
+    assert(!wrapper._cls.has("ants-lod-box"), "and it is handed back the moment the node is");
+    assertEqual(h.tracker.lowZoom.dom.layer, 0);
+  });
+
   test("a Vue-component widget (a 3D viewport) is boxed too, without needing an element handle", async () => {
     const h = await boot();
     h.window.devicePixelRatio = 1;
@@ -649,12 +758,12 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
 
     h.tracker.lowZoom.set({ flatBelow: 0.2 });
     assertEqual(viewer.options.hideOnZoom, true, "the widget is told to stand down while its node is a rectangle");
-    assertEqual(h.tracker.lowZoom.dom.stilled, 1, "and it is counted, element or no element");
+    assertEqual(h.tracker.lowZoom.dom.markedWidgets, 1, "and it is counted, element or no element");
 
     h.canvas.ds.scale = 0.5;
     drawLoop(h, 0.1);
     assertEqual(viewer.options.hideOnZoom, undefined, "the option it never had is removed again, not set to false");
-    assertEqual(h.tracker.lowZoom.dom.stilled, 0);
+    assertEqual(h.tracker.lowZoom.dom.markedWidgets, 0);
   });
 
   test("the drawing settings are the user's, and survive a reload", async () => {

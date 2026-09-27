@@ -496,7 +496,7 @@ logged for DevTools.
 ## Development
 
 ```
-node tests/run-tests.mjs          # 113 tests, no dependencies, no browser
+node tests/run-tests.mjs          # 116 tests, no dependencies, no browser
 node tests/run-tests.mjs timing   # filter by name fragment
 python3 tests/test_init.py        # backend route parsing + graceful fallbacks
 node tests/demo.mjs               # print what the panel says, with no ComfyUI
@@ -535,6 +535,41 @@ installed as the sandbox's `CanvasRenderingContext2D` (the preview ladder
 patches `drawImage` there, the same way a browser exposes it), and
 `createImageBitmap` records the resize it was asked to perform instead of
 resizing anything.
+
+## What changed in v2.1.11
+
+- **Component widgets are hidden through the frontend's DOM widget layer.** The
+  core 3D nodes (`Save 3D (Advanced)`, `Save 3D Model`, `Preview 3D`, point
+  clouds) build their viewport as a `ComponentWidgetImpl`, and the frontend
+  renders it in a separate layer — one wrapper per widget, positioned at its
+  node's origin, with nothing on the widget object pointing at it. v2.1.10
+  stopped setting the canvas's low-quality flag, and that flag turned out to be
+  the *only* thing that made `hideOnZoom` hide anything (`DomWidgets.vue` reads
+  `hideOnZoom && lowQuality`), so those viewports went back to floating over
+  their own flattened rectangles. The sweep now finds the wrappers directly:
+  each one is positioned at its node's origin in client pixels, so the owning
+  node is found by containment in graph coordinates, and the same
+  `.ants-lod-box` class that hides every other DOM widget is applied. No element
+  handle, no per-widget layout read, and it is handed back on the same sweep
+  that unboxes the node.
+- **The panel stops claiming work it is not doing.** `hideOnZoom` only takes
+  effect in the frontend's low-quality mode, which this tool deliberately no
+  longer switches on, so the readout now separates the two: elements hidden by
+  class (real, now including the 3D viewports), and widgets carrying the
+  hide-on-zoom flag (real only when the frontend's own LOD is on).
+- **The links line tells you where the connections stage actually goes.** Every
+  `renderLink` call is now timed, so the panel can split the stage in two: the
+  strokes themselves (what a link setting can change) and the rest — the
+  frontend walking every input slot of every node in the graph before it decides
+  which links are on screen, which no ink setting can reach. On a graph with a
+  thousand nodes that second part is the larger one, and pretending otherwise
+  would be the dishonest part of a performance panel.
+- **"Measure link thinning" — the panel answers "does this actually help?" with
+  a measurement instead of a claim.** It alternates the setting on and off,
+  1.2 s each, three times over, and compares the connections stage of the same
+  page against itself, then reports the delta in ms/frame with the frame counts.
+  Nothing is saved, nothing else changes, and the setting is put back when it
+  finishes. If the difference is inside the noise it says so.
 
 ## What changed in v2.1.10
 
