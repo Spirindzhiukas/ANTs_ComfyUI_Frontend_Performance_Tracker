@@ -26,7 +26,7 @@ function byClass(h, cls) {
 // Testing tabs have several tables, so the index matters).
 function tableRows(h, tab, which = 0) {
   const body = byId(h, "ants-tracker-body");
-  const idx = { timing: 0, nodes: 1, stalls: 2, governor: 3, load: 4, memory: 5, gpu: 6, testing: 7 }[tab];
+  const idx = tabIndexOf(h, tab);
   const tables = body.children[idx].descendants().filter((n) => n.tagName === "TABLE" && n._cls && n._cls.has("ants-table"));
   const table = tables[which];
   if (!table) return [];
@@ -38,7 +38,7 @@ function tableRows(h, tab, which = 0) {
 
 function headersOf(h, tab, which = 0) {
   const body = byId(h, "ants-tracker-body");
-  const idx = { timing: 0, nodes: 1, stalls: 2 }[tab];
+  const idx = tabIndexOf(h, tab);
   const tables = body.children[idx].descendants().filter((n) => n.tagName === "TABLE" && n._cls && n._cls.has("ants-table"));
   const thead = tables[which].children.find((c) => c.tagName === "THEAD");
   return thead.children[0].children;
@@ -94,8 +94,17 @@ function tabButtons(h) {
   return bar ? bar.children.filter((c) => c.tagName === "BUTTON") : [];
 }
 function clickTab(h, name) {
-  const labels = { timing: 0, nodes: 1, stalls: 2, governor: 3, load: 4, memory: 5, gpu: 6, testing: 7 };
-  tabButtons(h)[labels[name]].click();
+  // By label, not by index: the tab row changes, and a test that silently clicks
+  // the wrong tab is worse than one that fails.
+  const want = { tweaks: "tweaks", timing: "timing", nodes: "nodes", stalls: "stalls", governor: "governor", load: "load", memory: "memory", gpu: "gpu", testing: "testing" }[name] || name;
+  const btn = tabButtons(h).find((b) => String(b.textContent).toLowerCase().includes(want));
+  if (!btn) throw new Error(`no tab labelled ${name} in the panel`);
+  btn.click();
+}
+
+function tabIndexOf(h, tab) {
+  const want = { tweaks: "tweaks", timing: "timing", nodes: "nodes", stalls: "stalls", governor: "governor", load: "load", memory: "memory", gpu: "gpu", testing: "testing" }[tab] || tab;
+  return tabButtons(h).findIndex((b) => String(b.textContent).toLowerCase().includes(want));
 }
 function drawLoop(h, seconds, intervalMs = FRAME_MS) {
   const steps = Math.max(1, Math.round((seconds * 1000) / intervalMs));

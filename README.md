@@ -316,7 +316,7 @@ render, the DOM and canvas drawing cannot leave the main thread — no
 scheduler can move them, and `OffscreenCanvas` only helps an application
 that created its canvas that way (ComfyUI does not). That is why the
 answer to a 280ms redraw is not a thread but *less drawing*: see
-**low-zoom drawing** in the Nodes tab, which paints nodes that are too
+**low-zoom drawing** in the Tweaks tab, which paints nodes that are too
 small to read as one rectangle, thins links instead of straightening
 them, hides the DOM content of the nodes it boxed, and rate-limits
 redraws while nobody is touching the page. What a scheduler
@@ -494,7 +494,7 @@ logged for DevTools.
 ## Development
 
 ```
-node tests/run-tests.mjs          # 108 tests, no dependencies, no browser
+node tests/run-tests.mjs          # 111 tests, no dependencies, no browser
 node tests/run-tests.mjs timing   # filter by name fragment
 python3 tests/test_init.py        # backend route parsing + graceful fallbacks
 node tests/demo.mjs               # print what the panel says, with no ComfyUI
@@ -533,6 +533,45 @@ installed as the sandbox's `CanvasRenderingContext2D` (the preview ladder
 patches `drawImage` there, the same way a browser exposes it), and
 `createImageBitmap` records the resize it was asked to perform instead of
 resizing anything.
+
+## What changed in v2.1.8
+
+- **A tab of its own, first in the row: Tweaks.** The drawing settings used to
+  live halfway down the Nodes tab, under a budget table they have nothing to do
+  with. They are now the first tab — the one place a person goes to *change*
+  something, with the other tabs answering questions — and the Nodes tab keeps
+  what it is for: where the frame went, per node type, and who asks for redraws.
+- **Link drawing is its own setting.** v2.1.4 tied straight links to the node
+  threshold: flatten most of the graph and the links went straight with it, which
+  is exactly the shape a workflow built out of curves cannot survive. There is
+  now a link-style dropdown — **straight while the graph is rectangles** (the old
+  behaviour, and still the default), **keep every curve**, or **always straight
+  lines** — independent of the node threshold and of the thinning setting. The
+  three are meant to be combined: flattening decides what a node costs, the link
+  style decides a link's shape, thinning decides how much ink that shape uses.
+  "Keep every curve" with thinning on is the combination the old design made
+  impossible.
+- **Vue-component widgets are boxed with their node.** The core 3D nodes
+  (`Save 3D (Advanced)`, `Save 3D Model`, `Preview 3D`, point clouds) build their
+  viewport as a `ComponentWidgetImpl`, which — unlike an image or a curve editor
+  — has **no `element` of its own**: the frontend renders the wrapper in its DOM
+  widget layer. So v2.1.6's element hook never saw them, and a boxed node kept a
+  live 3D viewport on top of its rectangle. The sweep now recognises component
+  widgets by their `component` and stands them down through the same
+  `hideOnZoom` flag, which is what the widget store consults before positioning
+  anything. Nodes whose visuals are canvas-drawn (not DOM) are untouched, and
+  everything is restored when the node is drawn properly again.
+- **The settings are remembered across sessions.** The five drawing settings are
+  written to `localStorage` (`ants.lowZoom.v1`) as you change them and restored
+  on the next page load, before the first frame draws, so the panel's controls
+  and the canvas agree from the start. An install nobody has configured has
+  nothing saved and behaves exactly as before; "Back to full drawing" clears the
+  saved state along with the settings.
+- **Stalls that are the canvas repaint say so.** The Stalls tab is titled
+  "main-thread blocking that is NOT canvas drawing", and on a page with the
+  drawing optimised the biggest row is often the repaint itself — a display-lane
+  source, tagged **canvas repaint** in the table, so drawing time and genuine
+  stalls are not read as the same thing.
 
 ## What changed in v2.1.7
 

@@ -12,8 +12,10 @@
 import { createHarness, FRAME_MS } from "./harness.mjs";
 import { suite, test, assert, assertEqual, assertClose, assertGreater, assertLess, assertIncludes } from "./framework.mjs";
 
-async function boot() {
-  const h = createHarness();
+async function boot(options) {
+  // `options.storage` is how a test says "this is a second page load": the same
+  // browser storage, a fresh tracker.
+  const h = createHarness(options);
   for (const ext of h.app.extensions) if (ext.setup) await ext.setup();
   await h.flush();
   return h;
@@ -58,15 +60,19 @@ function panelText(h) {
     .join(" ");
 }
 
-// The panel is built lazily: open it from the corner button, then the Nodes tab.
-async function openNodesTab(h) {
+// The panel is built lazily: open it from the corner button, then the tab that
+// owns the drawing settings (v2.1.8 moved them out of the Nodes tab and to the
+// front of the tab row).
+async function openTweaksTab(h) {
   const corner = h.document.getElementById("ants-corner-btn");
   if (corner) corner.click();
   await h.flush();
   const bar = h.document.getElementById("ants-tracker-tabs");
   if (bar) {
     const buttons = bar.children.filter((c) => c.tagName === "BUTTON");
-    if (buttons[1]) buttons[1].click();
+    const tweaks = buttons.find((b) => String(b.textContent).toLowerCase().includes("tweaks"));
+    if (tweaks) tweaks.click();
+    else if (buttons[0]) buttons[0].click();
   }
   await h.flush();
   return h.panel();
@@ -217,7 +223,7 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     h.advance(FRAME_MS);
     h.canvas.setDirty(true, true);
     h.canvas.draw();
-    await openNodesTab(h);
+    await openTweaksTab(h);
     assertIncludes(panelText(h), "the typical node is 120px wide on screen", "the panel points at the setting that would catch it");
   });
 
@@ -352,10 +358,10 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     h.tracker.lowZoom.set({ minPx: 32 });
     drawLoop(h, 0.1);
     drawLoop(h, 0.1);
-    await openNodesTab(h);
+    await openTweaksTab(h);
     const text = panelText(h);
     assertIncludes(text, "straight-line path", "the panel names the path links are actually on");
-    assertIncludes(text, "the link-thinning setting applies", "and says how to see the thinning instead");
+    assertIncludes(text, "the thinning setting applies", "and says how to see the thinning instead");
   });
 
   test("the frontend's own low-quality rendering is borrowed for the frame, then handed back", async () => {
@@ -469,6 +475,93 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     assertEqual(widget.options.hideOnZoom, false, "nothing of somebody else's widget options is left changed");
   });
 
+
+  test("link style is its own setting: curves can be kept while the graph is flattened", async () => {
+    const h = await boot();
+    h.window.devicePixelRatio = 1;
+    bigGraph(h, 6, 0.1); // 20px nodes at zoom 0.1: everything is a rectangle
+    h.tracker.lowZoom.set({ minPx: 32, detailZoom: 0.6, linkStyle: "spline" });
+    h.canvas.ctx.ops.length = 0;
+    h.canvas.linkSettings.length = 0;
+    drawLoop(h, 0.1);
+
+    assertGreater(h.canvas.linkSettings.length, 0, "links were rendered");
+    assert(
+      h.canvas.linkSettings.every((s) => s.width === 1 && s.border === false),
+      "thinned, because the link setting asks for curves"
+    );
+    assertGreater(
+      h.canvas.ctx.ops.filter((o) => o[0] === "bezierCurveTo").length,
+      0,
+      "and drawn as curves even though the whole graph is rectangles"
+    );
+    assertEqual(h.tracker.lowZoom.state.links, 0, "nothing took the straight-line path");
+    assertEqual(h.tracker.lowZoom.state.linkStyle, "spline");
+
+    // "straight" is the explicit opt-in, and it wins over thinning.
+    h.tracker.lowZoom.set({ linkStyle: "straight" });
+    h.canvas.ctx.ops.length = 0;
+    drawLoop(h, 0.1);
+    assertEqual(h.canvas.ctx.ops.filter((o) => o[0] === "bezierCurveTo").length, 0, "no curves when straight is asked for");
+    assertGreater(h.tracker.lowZoom.state.links, 0, "the straight path did the drawing");
+
+    // "auto" is the old behaviour: straight only because most of the graph is flat.
+    h.tracker.lowZoom.set({ linkStyle: "auto" });
+    h.canvas.ctx.ops.length = 0;
+    drawLoop(h, 0.1);
+    assertEqual(h.canvas.ctx.ops.filter((o) => o[0] === "bezierCurveTo").length, 0, "auto goes straight while the graph is rectangles");
+    // With flattening off there is nothing to be straightened for.
+    h.tracker.lowZoom.set({ minPx: 0 });
+    h.canvas.ctx.ops.length = 0;
+    h.canvas.linkSettings.length = 0;
+    drawLoop(h, 0.1);
+    assertGreater(h.canvas.ctx.ops.filter((o) => o[0] === "bezierCurveTo").length, 0, "and curves come back with the threshold at 0");
+  });
+
+  test("a Vue-component widget (a 3D viewport) is boxed too, without needing an element handle", async () => {
+    const h = await boot();
+    h.window.devicePixelRatio = 1;
+    bigGraph(h, 2, 0.1);
+    // The shape the core 3D nodes use: a ComponentWidgetImpl has no `element` —
+    // the frontend renders its wrapper — so the only handle is the widget.
+    const viewer = { name: "model_file", type: "load3D", component: {}, options: {} };
+    h.canvas.nodes[0].widgets = [viewer];
+
+    h.tracker.lowZoom.set({ minPx: 32 });
+    assertEqual(viewer.options.hideOnZoom, true, "the widget is told to stand down while its node is a rectangle");
+    assertEqual(h.tracker.lowZoom.dom.stilled, 1, "and it is counted, element or no element");
+
+    h.canvas.ds.scale = 0.5;
+    drawLoop(h, 0.1);
+    assertEqual(viewer.options.hideOnZoom, undefined, "the option it never had is removed again, not set to false");
+    assertEqual(h.tracker.lowZoom.dom.stilled, 0);
+  });
+
+  test("the drawing settings are the user's, and survive a reload", async () => {
+    const h = await boot();
+    h.tracker.lowZoom.set({ minPx: 128, detailZoom: 0.4, thumbZoom: 0.8, idleCapMs: 500, linkStyle: "spline" });
+    const saved = h.localStorage.getItem("ants.lowZoom.v1");
+    assert(saved, "the choice is written down");
+    assertIncludes(saved, "\"spline\"");
+
+    // A second page load with the same storage: the same settings are in effect
+    // before anything draws, and the panel's controls show them.
+    const h2 = await boot({ storage: h.localStorage });
+    assertEqual(h2.tracker.lowZoom.state.minPx, 128, "the node threshold came back");
+    assertEqual(h2.tracker.lowZoom.state.detailZoom, 0.4, "so did the link thinning");
+    assertEqual(h2.tracker.lowZoom.state.thumbZoom, 0.8, "and the previews");
+    assertEqual(h2.tracker.lowZoom.state.idleCapMs, 500, "and the idle cap");
+    assertEqual(h2.tracker.lowZoom.state.linkStyle, "spline", "and the link style");
+    await openTweaksTab(h2);
+    assertIncludes(panelText(h2), "links: keep every curve", "the control reflects it, so the panel is not lying about the state");
+
+    // "Back to full drawing" is the way back to an untouched page.
+    h2.tracker.lowZoom.off();
+    const h3 = await boot({ storage: h2.localStorage });
+    assertEqual(h3.tracker.lowZoom.state.minPx, 0, "nothing is re-enabled after a reset");
+    assertEqual(h3.tracker.lowZoom.state.thumbZoom, 0, "including the previews");
+  });
+
   test("the panel says whether culling could help at this zoom, and what the mode is doing", async () => {
     const h = await boot();
     h.window.devicePixelRatio = 1;
@@ -489,7 +582,7 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     drawLoop(h, 0.2);
     h.canvas.min_font_size_for_lod = 0; // the frontend's own LOD is switched off
     h.canvas.low_quality = false;
-    await openNodesTab(h); // the tab is built when it is opened, so this reads the current state
+    await openTweaksTab(h); // the tab is built when it is opened, so this reads the current state
     const text = panelText(h);
     assertIncludes(text, "culling cannot save anything here", "the panel draws the conclusion, not just the number");
     assertIncludes(text, "frontend LOD is switched off", "and names the frontend's own LOD switch instead of leaving it hidden");

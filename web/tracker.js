@@ -27,7 +27,7 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.1.7";
+const VERSION = "2.1.8";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
 const NODE_NAME = "ANTsNastyBastardsTracker";
 
@@ -879,6 +879,14 @@ const LOD = {
   // zoomed out stay hidden). Curves are kept: what changes is how much ink is
   // laid down, not the shape of the link.
   detailZoom: 0.6, // below this zoom detail is reduced (0 = full detail)
+  // How links are drawn when the graph is being flattened.
+  //   "auto"     — straight lines while most of the graph is rectangles (the
+  //                v2.1.4 behaviour, kept as the default so nothing changes for
+  //                anyone who never touches it);
+  //   "spline"   — never straighten; keep every curve and let the thinning
+  //                setting above decide how much ink they use;
+  //   "straight" — always straight, for graphs drawn with straight links.
+  linkStyle: "auto",
   thinLinks: 0, // link segments stroked thin so far
   lqMissing: false, // the frontend does not expose its low-quality flag
   domMarked: null, // Set of elements we are hiding right now
@@ -908,6 +916,11 @@ const LOD_DETAIL_ZOOMS = [0, 1, 0.8, 0.6, 0.4, 0.2];
 const LOD_LINK_WIDTH = 1; // graph units; LiteGraph's own default is 3
 const LOD_DOM_CLASS = "ants-lod-box"; // elements hidden while their node is a box
 const LOD_DOM_SWEEP_MS = 1000; // how often newly added nodes/widgets are picked up
+// Link drawing, as a setting rather than a side effect of the node threshold.
+const LOD_LINK_STYLES = ["auto", "spline", "straight"];
+// Settings survive a reload: they are the user's choice about their own page,
+// and re-picking four dropdowns after every ComfyUI restart is not a feature.
+const LOD_STORE_KEY = "ants.lowZoom.v1";
 
 function lodOn() {
   return LOD.minPx > 0 || LOD.idleCapMs > 0 || LOD.thumbZoom > 0 || LOD.detailZoom > 0;
@@ -920,6 +933,16 @@ function lodDetailOn() {
 // Something on screen is being drawn as a rectangle this frame. The plan is
 // sampled at the top of the frame, so this is the current frame's answer, not
 // last frame's.
+// Straight links are a *drawing* choice, and v2.1.4 tied it to the node
+// threshold: flatten most of the graph and links went straight with it. That is
+// wrong for a workflow built out of curves, so it is now its own setting, with
+// the old behaviour available as "auto".
+function lodLinksStraight() {
+  if (LOD.linkStyle === "straight") return true;
+  if (LOD.linkStyle === "spline") return false;
+  return LOD.minPx > 0 && LOD.plan.links;
+}
+
 function lodBoxifyOn() {
   return LOD.minPx > 0 && LOD.plan.tiny > 0;
 }
@@ -1279,10 +1302,17 @@ function lodDomTargets(node) {
     const widgets = node && node.widgets;
     if (!widgets || !widgets.length) return out;
     for (const w of widgets) {
-      const el = w && (w.element || w.inputEl);
-      if (!el || typeof el !== "object" || typeof el.classList !== "object") continue;
-      const target = (typeof el.closest === "function" && el.closest(".dom-widget")) || el;
-      if (target && target.classList) out.push({ el: target, widget: w });
+      if (!w) continue;
+      const el = w.element || w.inputEl;
+      const hasEl = el && typeof el === "object" && typeof el.classList === "object";
+      // `component` is how the frontend's ComponentWidgetImpl carries the Vue
+      // component it renders (3D viewers, camera info, anything added through
+      // addWidget). No element to reach for, but the widget is in the store and
+      // its wrapper is positioned on every draw — the flag is the handle.
+      const isComponent = !hasEl && typeof w.component !== "undefined";
+      if (!hasEl && !isComponent) continue;
+      const target = hasEl ? (typeof el.closest === "function" && el.closest(".dom-widget")) || el : null;
+      out.push({ el: target && target.classList ? target : null, widget: w });
     }
   } catch (e) {
     /* a widget with a hostile element getter is simply not hidden */
@@ -1361,8 +1391,10 @@ function lodSweepDom(canvas) {
         if (!node || !(lodNodePx(node, canvas) < LOD.minPx)) continue;
         let any = false;
         for (const t of lodDomTargets(node)) {
-          t.el.classList.add(LOD_DOM_CLASS);
-          keep.add(t.el);
+          if (t.el) {
+            t.el.classList.add(LOD_DOM_CLASS);
+            keep.add(t.el);
+          }
           lodStillWidget(t.widget, true); // returns true only when it changed something
           any = true;
         }
@@ -1418,6 +1450,47 @@ function lodSweepDom(canvas) {
 function lodDrawCapMs(t) {
   if (LOD.idleCapMs > 0 && !govInputRecently(t, LOD_IDLE_INPUT_MS)) return LOD.idleCapMs;
   return drawThrottleMs > 0 ? drawThrottleMs : 0;
+}
+
+function lodSaveSettings() {
+  try {
+    if (typeof localStorage === "undefined" || !localStorage) return;
+    localStorage.setItem(
+      LOD_STORE_KEY,
+      JSON.stringify({
+        minPx: LOD.minPx,
+        detailZoom: LOD.detailZoom,
+        thumbZoom: LOD.thumbZoom,
+        idleCapMs: LOD.idleCapMs,
+        linkStyle: LOD.linkStyle,
+      })
+    );
+  } catch (e) {
+    /* a browser with storage switched off just does not remember */
+  }
+}
+
+// Called once at startup, before the panel is built, so the selects show what is
+// actually in effect. Nothing is enabled that the user did not enable: this
+// restores their own last choice, and an untouched install has nothing saved.
+function lodLoadSettings() {
+  try {
+    if (typeof localStorage === "undefined" || !localStorage) return false;
+    const raw = localStorage.getItem(LOD_STORE_KEY);
+    if (!raw) return false;
+    const saved = JSON.parse(raw);
+    if (!saved || typeof saved !== "object") return false;
+    lodSet({
+      minPx: Number(saved.minPx) || 0,
+      detailZoom: saved.detailZoom === undefined ? 0 : Number(saved.detailZoom) || 0,
+      thumbZoom: saved.thumbZoom === undefined ? 0.6 : Number(saved.thumbZoom) || 0,
+      idleCapMs: Number(saved.idleCapMs) || 0,
+      linkStyle: saved.linkStyle || "auto",
+    });
+    return true;
+  } catch (e) {
+    return false;
+  }
 }
 
 function lodAbort(err) {
@@ -1479,6 +1552,10 @@ function lodSet(opts) {
     if (LOD.thumbZoom > 0) lodInstallDrawImage();
   }
   if ("detailZoom" in o) LOD.detailZoom = Math.max(0, Math.min(1, Number(o.detailZoom) || 0));
+  if ("linkStyle" in o) {
+    const style = String(o.linkStyle);
+    LOD.linkStyle = LOD_LINK_STYLES.includes(style) ? style : "auto";
+  }
   if (LOD.minPx > 0) lodInstallDomSweep();
   const now = lodOn();
   if (now) LOD.error = "";
@@ -1494,6 +1571,9 @@ function lodSet(opts) {
   } catch (e) {
     /* the sweep never throws, but setup is not worth a broken toggle */
   }
+  // Remembered across sessions (see LOD_STORE_KEY). The change is already in
+  // effect by now, so a storage that refuses to save cannot take it back.
+  lodSaveSettings();
   return now;
 }
 
@@ -1729,7 +1809,7 @@ function patchCanvasDraw() {
       const a = args[1];
       const b = args[2];
       const link = args[3];
-      if (ctx && a && b && LOD.minPx > 0 && LOD.plan.links) {
+      if (ctx && a && b && lodLinksStraight()) {
         const lt0 = performance.now();
         try {
           lodPaintLink(ctx, a, b, args[6] || (link && link.color) || null);
@@ -1746,7 +1826,7 @@ function patchCanvasDraw() {
       // stroke 4 units wider, so on a long link the outline is most of the ink).
       // Both live on the canvas object, so they are set for this one call and
       // put straight back — hit-testing, dragging and the panel never see them.
-      if (ctx && a && b && lodDetailOn()) {
+      if (ctx && a && b && lodDetailOn() && LOD.linkStyle !== "straight") {
         let restore = null;
         try {
           const width = this.connections_width;
@@ -2036,6 +2116,10 @@ function recordStall(entry, kind) {
           fn: blame.src.name,
           url: "",
           ours: !!blame.src.ours,
+          // The frame's cost belongs to the canvas repaint this source drives,
+          // which is drawing, not a stall in the tab's "not canvas drawing"
+          // sense. Tagged so the two are not read as the same thing.
+          display: !!blame.src.display,
         },
         cost,
         cost,
@@ -4210,6 +4294,7 @@ function buildPanel() {
   const tabsBar = el("div", { id: "ants-tracker-tabs" });
   const tabsBody = el("div", { id: "ants-tracker-body" });
   for (const [name, label] of [
+    ["tweaks", "Tweaks"],
     ["timing", "Timing"],
     ["nodes", "Nodes"],
     ["stalls", "Stalls"],
@@ -4623,57 +4708,13 @@ function buildTimingTab(container) {
 
 // --- Nodes -----------------------------------------------------------------
 
-function buildNodesTab(container) {
-  const budgetCallout = el("div", { class: "ants-callout" });
-  const budgetTable = el("table", { class: "ants-kv" });
-  const budgetRows = {};
-  for (const [key, label] of [
-    ["total", "Whole frame (canvas.draw)"],
-    ["nodeDraw", "↳ drawNode() — all node rendering"],
-    ["hooks", "↳ wrapped draw hooks (subset of drawNode)"],
-    ["chrome", "↳ LiteGraph chrome / widgets / bitmaps"],
-    ["conns", "↳ drawConnections()"],
-    ["other", "↳ everything else (grid, groups, overlays)"],
-    ["pcts", "frame time p50 / p95 / p99"],
-  ]) {
-    const tr = el("tr");
-    tr.appendChild(td({ class: "ants-kv-label", text: label }));
-    const v = td({ class: "ants-kv-value" });
-    tr.appendChild(v);
-    budgetTable.appendChild(tr);
-    budgetRows[key] = v;
-  }
-  const rateLine = el("div", { class: "ants-note" });
-  budgetCallout.appendChild(budgetTable);
-  budgetCallout.appendChild(rateLine);
+// --- Tweaks -----------------------------------------------------------------
+// The canvas-rendering settings, on their own tab and at the front of the row:
+// they are the part of this tool a person comes to *change*, where the other
+// tabs answer questions. Kept in one block so the settings and the numbers they
+// moved are read together.
 
-  const invLine = el("div", { class: "ants-note" });
-  const invTable = makeTable([
-    { label: "Redraw request caller (sampled)" },
-    { label: "pack" },
-    { label: "est. /s", right: true },
-    { label: "share", right: true },
-    { label: "samples", right: true },
-  ]);
-
-  const types = makeTable([
-    { label: "Node type", key: "type", text: true },
-    { label: "ms/frame", right: true, key: "ms" },
-    { label: "% of frame", right: true, key: "share" },
-    { label: "calls/frame", right: true, key: "calls" },
-    { label: "ms/call", right: true, key: "perCall" },
-    { label: "p95 call", right: true, key: "p95" },
-  ]);
-  const typeNote = el("p", { class: "ants-note" });
-  typeNote.textContent =
-    "Click any column header to sort by it (again to reverse, a third time for the default: most expensive first). " +
-    "drawNode() time includes every wrapped hook as a subset, so do not add this table to the Timing tab. " +
-    "\"calls/frame\" is calls per redraw of the canvas, so for a type that is painted every frame it is close to the number of " +
-    "instances on screen; a value well below 1 means most of this type is off-screen or culled on a given redraw, which is cheap " +
-    "by definition. Use \"% of frame\" and \"ms/call\" to find the expensive ones: a high ms/call with a low calls/frame is one " +
-    "heavy node, a low ms/call with a high calls/frame is many cheap nodes.";
-
-  container.appendChild(budgetCallout);
+function buildTweaksTab(container) {
   // ------------------------------------------------------ low-zoom drawing ---
   // Opt-in, because it changes what the canvas paints. It exists because the
   // budget above is usually not a scheduling problem: on a big graph at low
@@ -4708,6 +4749,29 @@ function buildNodesTab(container) {
     "data loss: the last request of a burst still gets one trailing redraw. Touch the page and the cap is lifted instantly.";
   lodIdleSel.addEventListener("change", () => {
     lodSet({ idleCapMs: Number(lodIdleSel.value) });
+    lodUpdate();
+  });
+
+  const lodLinkSel = el("select", { class: "ants-select", style: { width: "auto", maxWidth: "260px" } });
+  for (const [id, text] of [
+    ["auto", "links: straight while the graph is rectangles"],
+    ["spline", "links: keep every curve"],
+    ["straight", "links: always straight lines"],
+  ]) {
+    const opt = el("option", { text });
+    opt.value = id;
+    lodLinkSel.appendChild(opt);
+  }
+  lodLinkSel.value = LOD.linkStyle;
+  lodLinkSel.title =
+    "What links are drawn as while the node setting above is flattening the graph. \"Straight while the graph is rectangles\" is how " +
+    "this worked from v2.1.4: once most of the sample is flat, links are replaced by straight lines, which is cheap but destroys the " +
+    "shape of a workflow drawn with curves. \"Keep every curve\" never straightens a link \u2014 combine it with the thinning setting " +
+    "below to pay less for the curves instead. \"Always straight lines\" is for graphs that were drawn with straight links to begin " +
+    "with. The three settings are independent: flattening decides what a node costs, this decides the shape of a link, and thinning " +
+    "decides how much ink that shape uses.";
+  lodLinkSel.addEventListener("change", () => {
+    lodSet({ linkStyle: lodLinkSel.value });
     lodUpdate();
   });
 
@@ -4755,8 +4819,9 @@ function buildNodesTab(container) {
     "Turn all of them off \u2014 flattening, link thinning, thumbnails and the redraw cap \u2014 and let ComfyUI draw the canvas " +
     "exactly as it wants, including any DOM content this tool was hiding.";
   lodOffBtn.addEventListener("click", () => {
-    lodSet({ minPx: 0, idleCapMs: 0, thumbZoom: 0, detailZoom: 0 });
+    lodSet({ minPx: 0, idleCapMs: 0, thumbZoom: 0, detailZoom: 0, linkStyle: "auto" });
     lodPxSel.value = "0";
+    lodLinkSel.value = "auto";
     lodDetailSel.value = "0";
     lodThumbSel.value = "0";
     lodIdleSel.value = "0";
@@ -4765,6 +4830,7 @@ function buildNodesTab(container) {
 
   const lodRow = el("div", { style: { display: "flex", flexWrap: "wrap", gap: "10px", alignItems: "center", margin: "4px 0" } });
   lodRow.appendChild(lodPxSel);
+  lodRow.appendChild(lodLinkSel);
   lodRow.appendChild(lodDetailSel);
   lodRow.appendChild(lodThumbSel);
   lodRow.appendChild(lodIdleSel);
@@ -4786,12 +4852,14 @@ function buildNodesTab(container) {
         "into whatever box the node occupies, and at low zoom that box is a few dozen pixels \u2014 the thumbnail ladder follows the " +
         "screen (about 512px around 60% zoom down to 64px around 10%), so what changes is how much image data is uploaded per " +
         "redraw, not what the node shows. " +
-        "The link setting is the third: below the zoom you pick, links are stroked 1px wide instead of 3 and lose the dark outline " +
-        "drawn under them, while keeping the curves \u2014 straight lines destroy the shape of a workflow built out of splines, so " +
-        "that stays a separate option and is only used when most of the graph is already rectangles. Those frames are drawn with the " +
-        "frontend's own low-quality mode on as well (no node shadows, no rounded corners). Every element of a " +
-        "node that is currently a rectangle \u2014 image and video previews, curve editors, custom Vue or JS node UIs \u2014 is hidden " +
-        "with one class while its node is a box, and unhidden the moment the node is drawn properly again.",
+        "The three settings are independent and meant to be used together. The node setting decides what a node costs \u2014 below it, " +
+        "a node is one flat rectangle, and everything that lives on top of that node (image and video previews, curve editors, 3D " +
+        "viewports, custom Vue or JS node UIs) is hidden with it and taken out of the per-frame layout pass. The link setting decides " +
+        "the shape of a link: ComfyUI's curves, or straight lines. The thinning setting decides how much ink a curve uses \u2014 below " +
+        "its zoom links are stroked 1px wide instead of 3 and lose the dark outline drawn under them, which on a long link is most of " +
+        "the pixels, and the curves stay exactly where they were. Those frames are drawn with the frontend's own low-quality mode on as " +
+        "well (no node shadows, no rounded corners). Everything here is remembered across sessions and handed back by \"Back to full " +
+        "drawing\".",
     })
   );
 
@@ -4866,14 +4934,15 @@ function buildNodesTab(container) {
       if (LOD.detailZoom > 0) {
         if (lodDetailOn()) {
           const frames = Math.max(1, since ? since.n : 1);
-          if (LOD.plan.links) {
-            // Most of the graph is rectangles, and that path straightens links.
-            // Saying so is the difference between "this setting does nothing"
-            // and "this setting is not the one in charge right now".
+          if (lodLinksStraight()) {
+            // Straight links used to be a side effect of the node threshold, so
+            // a panel that only said "most of the graph is rectangles" left the
+            // user guessing which setting to change. Name it.
             bits2.push(
-              `zoomed out: ${LOD.links} link draw(s) on the straight-line path (most of the graph is rectangles, per the node ` +
-                `setting above) \u2014 the link-thinning setting applies to links ComfyUI draws as splines, so set the node ` +
-                `threshold to 0 to compare`
+              `zoomed out: ${LOD.links} link draw(s) on the straight-line path, because the link setting is ` +
+                (LOD.linkStyle === "straight" ? "\"always straight lines\"" : "\"straight while the graph is rectangles\"") +
+                ` \u2014 the thinning setting applies to links ComfyUI draws as curves, so switch the link setting to "keep every ` +
+                `curve" to pay less for the curves instead of losing their shape`
             );
           } else {
             bits2.push(
@@ -4933,6 +5002,62 @@ function buildNodesTab(container) {
     lodLine.textContent = bits.join("\n");
   }
 
+  ui.state.tweaks = { update: lodUpdate };
+}
+
+// --- Nodes ------------------------------------------------------------------
+
+function buildNodesTab(container) {
+  const budgetCallout = el("div", { class: "ants-callout" });
+  const budgetTable = el("table", { class: "ants-kv" });
+  const budgetRows = {};
+  for (const [key, label] of [
+    ["total", "Whole frame (canvas.draw)"],
+    ["nodeDraw", "↳ drawNode() — all node rendering"],
+    ["hooks", "↳ wrapped draw hooks (subset of drawNode)"],
+    ["chrome", "↳ LiteGraph chrome / widgets / bitmaps"],
+    ["conns", "↳ drawConnections()"],
+    ["other", "↳ everything else (grid, groups, overlays)"],
+    ["pcts", "frame time p50 / p95 / p99"],
+  ]) {
+    const tr = el("tr");
+    tr.appendChild(td({ class: "ants-kv-label", text: label }));
+    const v = td({ class: "ants-kv-value" });
+    tr.appendChild(v);
+    budgetTable.appendChild(tr);
+    budgetRows[key] = v;
+  }
+  const rateLine = el("div", { class: "ants-note" });
+  budgetCallout.appendChild(budgetTable);
+  budgetCallout.appendChild(rateLine);
+
+  const invLine = el("div", { class: "ants-note" });
+  const invTable = makeTable([
+    { label: "Redraw request caller (sampled)" },
+    { label: "pack" },
+    { label: "est. /s", right: true },
+    { label: "share", right: true },
+    { label: "samples", right: true },
+  ]);
+
+  const types = makeTable([
+    { label: "Node type", key: "type", text: true },
+    { label: "ms/frame", right: true, key: "ms" },
+    { label: "% of frame", right: true, key: "share" },
+    { label: "calls/frame", right: true, key: "calls" },
+    { label: "ms/call", right: true, key: "perCall" },
+    { label: "p95 call", right: true, key: "p95" },
+  ]);
+  const typeNote = el("p", { class: "ants-note" });
+  typeNote.textContent =
+    "Click any column header to sort by it (again to reverse, a third time for the default: most expensive first). " +
+    "drawNode() time includes every wrapped hook as a subset, so do not add this table to the Timing tab. " +
+    "\"calls/frame\" is calls per redraw of the canvas, so for a type that is painted every frame it is close to the number of " +
+    "instances on screen; a value well below 1 means most of this type is off-screen or culled on a given redraw, which is cheap " +
+    "by definition. Use \"% of frame\" and \"ms/call\" to find the expensive ones: a high ms/call with a low calls/frame is one " +
+    "heavy node, a low ms/call with a high calls/frame is many cheap nodes.";
+
+  container.appendChild(budgetCallout);
   container.appendChild(el("div", { class: "ants-section-title", text: "Who is asking for redraws" }));
   container.appendChild(invLine);
   container.appendChild(invTable.table);
@@ -5041,7 +5166,6 @@ function buildNodesTab(container) {
       }
       rateLine.textContent = bits.join(" · ");
     }
-    lodUpdate();
 
     const inv = invalidationMetrics();
     const invBits = [`${fmtRate(inv.perSec)} redraw requests/s`];
@@ -5194,7 +5318,16 @@ function buildStallsTab(container) {
       (s) => s.sig,
       (row, s) => {
         const c = row.nodes[0].children;
-        setText(c[0], s.sig);
+        setText(c[0], "");
+        c[0].appendChild(document.createTextNode(s.sig));
+        if (s.display) {
+          const tag = el("span", { class: "ants-tag", text: "canvas repaint" });
+          tag.title =
+            "This is the source that draws the canvas, so the blocking time here is drawing time that the frame budget also counts \u2014 " +
+            "not a stall in the \"something other than drawing blocked the thread\" sense. The Governor's display lane keeps it " +
+            "uncapped while you interact.";
+          c[0].appendChild(tag);
+        }
         setText(c[1], s.pack || "—");
         setText(c[2], s.invoker || "—");
         setText(c[3], s.count);
@@ -6543,6 +6676,7 @@ function buildGovernorTab(container) {
 
 function buildTabContents() {
   if (ui.state.timing) return;
+  buildTweaksTab(ui.tabs.tweaks);
   buildTimingTab(ui.tabs.timing);
   buildNodesTab(ui.tabs.nodes);
   buildStallsTab(ui.tabs.stalls);
@@ -6930,8 +7064,8 @@ function buildTelemetryReport() {
             (LOD.detailZoom > 0
               ? LOD.thinLinks > 0
                 ? `, links ${LOD.thinLinks} segment(s) drawn 1px without outlines below ${Math.round(LOD.detailZoom * 100)}% zoom`
-                : LOD.plan.links
-                  ? `, links drawn straight (most of the graph is rectangles) while ${LOD.detailZoom > 0 ? Math.round(LOD.detailZoom * 100) : 0}% link thinning is available for the spline path`
+                : lodLinksStraight()
+                  ? `, links drawn straight (${LOD.linkStyle === "straight" ? "link setting: always straight" : "link setting: straight while the graph is rectangles"})`
                   : ""
               : "") +
             (LOD.domHidden
@@ -7311,6 +7445,7 @@ app.registerExtension({
 
   async setup() {
     ensureCanvasPatched();
+    lodLoadSettings();
     buildCornerButton();
     installStallObserver();
     installRafMonitor();

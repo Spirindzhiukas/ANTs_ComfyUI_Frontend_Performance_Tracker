@@ -282,9 +282,15 @@ const demoWidget = h.document.createElement("div");
 demoWidget.className = "dom-widget";
 demoWidget.appendChild(h.document.createElement("canvas"));
 h.document.body.appendChild(demoWidget);
-h.canvas.nodes[3].widgets = [{ name: "curve", element: demoWidget.children[0], options: { hideOnZoom: false } }];
+// Two shapes of DOM content on one node: a widget with an element (a curve
+// editor) and a Vue-component widget (how the core 3D viewer nodes are built —
+// no element of its own, the frontend renders the wrapper).
+h.canvas.nodes[3].widgets = [
+  { name: "curve", element: demoWidget.children[0], options: { hideOnZoom: false } },
+  { name: "model_file", type: "load3D", component: {}, options: {} },
+];
 
-h.tracker.lowZoom.set({ minPx: 24, idleCapMs: 500, thumbZoom: 0.6, detailZoom: 0.6 });
+h.tracker.lowZoom.set({ minPx: 24, idleCapMs: 500, thumbZoom: 0.6, detailZoom: 0.6, linkStyle: "auto" });
 
 // One node with a 4096px image in it, drawn the way a preview/load/compare node
 // draws: the first frame paints the full bitmap, the next one is served from the
@@ -323,18 +329,21 @@ await pump();
 const s = h.tracker.lowZoom.state;
 console.log(
   `  zoom 10%, everything on: ${s.plan.tiny}/${s.plan.total} nodes painted as rectangles, ` +
-    `links taken over by the straight-line path (${s.links} of them — that path needs most of the graph to be rectangles)`
+    `links taken over by the straight-line path (${s.links} of them — link setting "auto" straightens links while most of the ` +
+    `graph is rectangles)`
 );
 console.log(
-  `  DOM widget of a boxed node hidden: ${lodBoxed()} (${h.tracker.lowZoom.dom.hidden} element(s) of ${h.tracker.lowZoom.dom.nodes} boxed node(s),` +
-    ` ${h.tracker.lowZoom.dom.stilled} also out of the per-frame layout pass)` +
+  `  DOM content of a boxed node hidden: ${lodBoxed()} (${h.tracker.lowZoom.dom.hidden} element(s) of ${h.tracker.lowZoom.dom.nodes} boxed node(s),` +
+    ` ${h.tracker.lowZoom.dom.stilled} widget(s) — an element widget and a Vue-component widget — out of the per-frame layout pass)` +
     ` | low-quality frame handed to the frontend: ${h.tracker.lowZoom.detail.lowQualityForced}` +
     ` | previews served from thumbnails: ${h.tracker.lowZoom.previews.served}/${h.tracker.lowZoom.previews.seen}`
 );
 
 // The link setting on its own, with the nodes left alone: the curves are kept,
 // the ink is not. This is the shape of a workflow the user actually zooms out of.
-h.tracker.lowZoom.set({ minPx: 0 });
+// The link setting on its own: keep the curves, pay less for them. This is the
+// combination the node threshold alone used to make impossible.
+h.tracker.lowZoom.set({ minPx: 0, linkStyle: "spline" });
 h.canvas.linkSettings.length = 0;
 h.canvas.ctx.ops.length = 0;
 const thinBefore = h.tracker.lowZoom.detail.thinLinks;
@@ -369,12 +378,12 @@ await pump();
 bullets("SUMMARY BAR (always visible)");
 dump(h.document.getElementById("ants-tracker-summary"));
 
-const TABS = ["timing", "nodes", "stalls", "governor", "load", "memory", "gpu", "testing"];
+const TABS = ["tweaks", "timing", "nodes", "stalls", "governor", "load", "memory", "gpu", "testing"];
 const tabBar = h.document.getElementById("ants-tracker-tabs");
 const body = h.document.getElementById("ants-tracker-body");
 for (let i = 0; i < TABS.length; i++) {
   tabBar.children[i].click();
-  run(i === 6 ? 2600 : 700); // the GPU tab polls /system_stats every 2.5s while open
+  run(TABS[i] === "gpu" ? 2600 : 700); // the GPU tab polls /system_stats every 2.5s while open
   await pump();
   if (TABS[i] === "governor") {
     // Collapsed detail rows are skipped by the printer, and the trace detail
