@@ -27,7 +27,7 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.1.2";
+const VERSION = "2.1.3";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
 const NODE_NAME = "ANTsNastyBastardsTracker";
 
@@ -1399,7 +1399,8 @@ const GOV = {
   savedPolicies: null, // from localStorage, applied as sources appear
   attrTokens: 0,
   lastAttrAt: 0,
-  counters: { skipped: 0, deferred: 0, coalesced: 0, redrawReqs: 0, forced: 0, errors: 0 },
+  counters: { skipped: 0, deferred: 0, coalesced: 0, redrawReqs: 0, forced: 0, errors: 0, autolimited: 0 },
+  auto: { measuredMsPerSec: 0, reachableMsPerSec: 0, note: "", lastAt: 0, actions: [], mine: [] },
   disabled: false,
   offReason: "",
   runningReg: null,
@@ -1427,6 +1428,13 @@ const GOV = {
     adaptiveSkipMax: 3,
     traceMinMs: 50,
     traceCap: 40,
+    // Autopilot: off by default. When on, the layer itself caps the worst
+    // offender every few seconds until the sources it can reach stop burning
+    // more than autoTargetMsPerSec between them. It is the answer to "I opened
+    // the panel, saw a 646 ms/s row, and did not want to pick a policy by hand".
+    autoLimit: false,
+    autoTargetMsPerSec: 250,
+    autoMinMsPerSec: 30,
   },
   worker: { available: false, why: "not probed", jobs: 0, mainMs: 0, offThreadMs: 0, lastError: null },
 };
@@ -1452,6 +1460,75 @@ function govMinGap(src) {
   if (pol.gap) return pol.gap;
   const requested = src.requestedMs > 0 ? src.requestedMs : GOV_RAF_REQUESTED_MS;
   return Math.max(requested * (pol.factor || 1), pol.floorMs || 0);
+}
+
+// How far apart this source's runs actually land. A timer that asks for 10ms
+// but takes 300ms of work runs every ~300ms, and a limit has to be wider than
+// that to change anything - which is exactly why "half speed" (33ms here) is a
+// no-op on a runaway chain, and why the suggestion used to look useless.
+function govObservedPeriodMs(src) {
+  const ring = src.ring;
+  if (!ring || ring.n < 2) return 0;
+  const span = ring.lastT() - ring.firstT();
+  if (!(span > 0)) return 0;
+  return span / (ring.n - 1);
+}
+
+// The gap a policy would impose on this source, without applying it.
+function govGapForPolicy(src, pol) {
+  if (!pol || pol.untouched) return 0;
+  if (pol.pause) return Infinity;
+  if (pol.gap) return pol.gap;
+  const requested = src.requestedMs > 0 ? src.requestedMs : GOV_RAF_REQUESTED_MS;
+  return Math.max(requested * (pol.factor || 1), pol.floorMs || 0);
+}
+
+const GOV_AUTO_LADDER = ["half", "quarter", "hz2", "hz1"];
+
+// Cost per second a policy would leave a source at: its measured cost per run at
+// the new rate, capped by the rate it has right now (a limit can only slow a
+// source down, never speed it up, so the current rate is a safe ceiling).
+function govPredictedMsPerSec(perRunMs, gapMs, currentRatePerSec) {
+  if (!(perRunMs > 0) || !(gapMs > 0) || !Number.isFinite(gapMs)) return 0;
+  const rate = currentRatePerSec > 0 ? Math.min(1000 / gapMs, currentRatePerSec) : 1000 / gapMs;
+  return rate * perRunMs;
+}
+
+// The limit to hand a source, walking the ladder from the mild end. A candidate
+// has to do two things, and both rules come from the same real page:
+//   * it has to *bite* — a 33ms cap cannot slow anything that already runs once
+//     every 300ms, so multipliers are skipped for a runaway chain;
+//   * it has to *pay* — a cap that bites but leaves the source at 97% of what it
+//     was costing (a 316ms-per-run chain capped at 2/s) is a sticker, not a
+//     limit. With a goal the walk continues past such a candidate; without one
+//     the first candidate that bites is enough.
+// `opts.current` is the policy already in place: the walk then only accepts a
+// real step up from it, so a row is never re-tightened to where it already is.
+function govPickPolicy(src, opts) {
+  const o = opts || {};
+  const cur = o.current ? GOV_POLICY_BY_ID.get(o.current) : null;
+  const curGap = cur ? govGapForPolicy(src, cur) : 0;
+  const period = o.periodMs > 0 ? o.periodMs : govObservedPeriodMs(src);
+  const goal = o.goalMsPerSec > 0 ? o.goalMsPerSec : 0;
+  let mildest = null;
+  for (const id of GOV_AUTO_LADDER) {
+    const gap = govGapForPolicy(src, GOV_POLICY_BY_ID.get(id));
+    if (!Number.isFinite(gap)) continue;
+    if (curGap && !(gap > curGap * 1.15)) continue; // not a step up from what is there
+    if (period > 0 && gap < period * 1.15) continue; // would not slow it down
+    if (!mildest) mildest = id;
+    if (!goal) return id;
+    if (govPredictedMsPerSec(o.perRunMs, gap, o.ratePerSec) <= goal) return id;
+  }
+  return mildest; // nothing on the ladder reaches the goal: the mildest bite will do
+}
+
+// Would this row's current limit actually change anything? Used by the table so
+// a limit that cannot bite says so instead of looking like a working limit.
+function govLimitIsNoop(row) {
+  if (row.ours || row.policy === "full" || row.kind === "raf") return false;
+  if (!(row.perRunMs > 0) || !(row.effectiveMs > 0)) return false;
+  return row.effectiveMs < row.perRunMs * 1.15;
 }
 
 function govEffectiveMs(src) {
@@ -1701,6 +1778,9 @@ function govInstall() {
     govInstallInputGuard();
     govProbeWorker();
     govLoad();
+    // The autopilot runs on its own exempt timer: it has to work with the panel
+    // closed, and it must never be slowed by the thing it is tuning.
+    govOwn(() => setInterval(() => govAutoPilot(), GOV_AUTO_INTERVAL_MS));
     GOV.installed = true;
   } catch (e) {
     GOV.installError = e && e.message ? e.message : String(e);
@@ -2068,21 +2148,146 @@ function govSetControl(key, value) {
 }
 
 // Suggested limits: derived from what this session actually measured, and only
-// applied to a source the panel can see burning real milliseconds. A starting
-// point for tuning, not an autopilot.
+// applied to a source the panel can see burning real milliseconds.
+//
+// Two rules, both learned from a real page. The ranking is by measured cost per
+// second, NOT by run rate: the worst offenders on that page ran 1-3 times a
+// second because each run took 300-470ms, and the old "at least 4 runs/s" guard
+// skipped both of them while offering limits to a dozen 0.1 ms/s heartbeats. And
+// the policy has to be one that can bite: for a source whose runs are 300ms
+// apart, "half speed" (33ms) is a no-op, so the ladder skips to a real cap.
 function govSuggest() {
   const rows = govRows();
   const applied = [];
   for (const r of rows) {
-    if (r.ours || r.msPerSec < 1 || r.runsPerSec < 4) continue;
-    let id = "half";
-    if (r.msPerSec >= 50) id = "hz1";
-    else if (r.msPerSec >= 15) id = "hz2";
-    else if (r.msPerSec >= 5) id = "quarter";
-    if (r.policy === id) continue;
-    if (govSetPolicy(r.key, id)) applied.push(`${r.name} → ${GOV_POLICY_BY_ID.get(id).label}`);
+    if (r.ours || r.kind === "raf") continue;
+    if (r.msPerSec < 5) continue; // it has to be costing something real
+    const src = govHeaviestSource(r);
+    if (!src) continue;
+    // Aim to at least halve what this row costs, and never below the floor (a
+    // source that is already cheap gets the mildest limit that bites).
+    const goal = Math.max(GOV.controls.autoMinMsPerSec, r.msPerSec / 2);
+    const wasNoop = r.policy !== "full" && govLimitIsNoop(r);
+    const id = govPickPolicy(src, {
+      current: r.policy === "full" ? null : r.policy,
+      goalMsPerSec: goal,
+      perRunMs: r.perRunMs,
+      ratePerSec: r.runsPerSec,
+    });
+    if (!id) continue; // already at the tightest limit that would change anything
+    const gap = govGapForPolicy(src, GOV_POLICY_BY_ID.get(id));
+    const predicted = Math.round(govPredictedMsPerSec(r.perRunMs, gap, r.runsPerSec));
+    if (!govSetPolicy(r.key, id)) continue;
+    applied.push(
+      `${r.name} → ${GOV_POLICY_BY_ID.get(id).label} ` +
+        `(was ${Math.round(r.msPerSec)} ms/s, ≈${predicted} after` +
+        `${wasNoop ? "; the limit that was there could not bite" : ""})`
+    );
   }
   return applied;
+}
+
+// The member of a grouped row that has actually run the most, for reading a
+// live ring (the row itself is only a snapshot).
+function govHeaviestSource(row) {
+  const members = row.sources;
+  if (!members || !members.length) return null;
+  let best = null;
+  for (const s of members) if (!best || s.fires > best.fires) best = s;
+  return best;
+}
+
+// ------------------------------------------------------------- autopilot ----
+// Opt-in. Every GOV_AUTO_INTERVAL_MS it looks at the sources it is allowed to
+// touch (not ours, not rAF - those have their own governor - and not anything
+// already limited), and if they are burning more than autoTargetMsPerSec it
+// caps the worst one with the mildest policy that actually bites. One row per
+// round, never re-tightening a row it already moved, and it says what it did in
+// the panel and in the copied report. "Reset to untouched" turns it off.
+const GOV_AUTO_INTERVAL_MS = 5000;
+
+function govAutoPilot() {
+  if (GOV.disabled || !GOV.controls.autoLimit || S.paused) return GOV.auto.note;
+  GOV.auto.lastAt = nowMs();
+  const rows = govRows();
+  const candidates = [];
+  let measured = 0;
+  let reachable = 0;
+  for (const r of rows) {
+    if (r.ours || r.kind === "raf") continue;
+    measured += r.msPerSec;
+    // Rows the pilot limited itself stay in play: the first cap that bites
+    // usually is not the last one needed, and a chain whose *work* is longer
+    // than the gap between its runs (a 316ms render at 2/s) has to be walked
+    // up the ladder until it is actually cheaper. Limits set by hand are left
+    // alone — the pilot does not touch other people's work.
+    const mine = r.policy !== "full" && GOV.auto.mine.indexOf(r.key) >= 0;
+    if (r.policy === "full") reachable += r.msPerSec;
+    else if (!mine) continue;
+    if (r.msPerSec < GOV.controls.autoMinMsPerSec) continue;
+    candidates.push(r);
+  }
+  GOV.auto.measuredMsPerSec = measured;
+  GOV.auto.reachableMsPerSec = reachable;
+  const target = Math.max(1, Number(GOV.controls.autoTargetMsPerSec) || 250);
+  if (measured <= target) {
+    GOV.auto.note = `under target (${Math.round(measured)} of ${target} ms/s)`;
+    return GOV.auto.note;
+  }
+  // The worst row the pilot may still act on, and the next limit up for it.
+  let worst = null;
+  let id = null;
+  let blocked = null;
+  for (const r of candidates) {
+    const src = govHeaviestSource(r);
+    if (!src) continue;
+    // What this row would have to cost for the *page* to be at target: no point
+    // capping it harder than that (the mildest cap that reaches the goal wins).
+    const goal = Math.max(GOV.controls.autoMinMsPerSec, target - (measured - r.msPerSec));
+    const next = govPickPolicy(src, {
+      current: r.policy === "full" ? null : r.policy,
+      goalMsPerSec: goal,
+      perRunMs: r.perRunMs,
+      ratePerSec: r.runsPerSec,
+    });
+    if (next) {
+      worst = r;
+      id = next;
+      break;
+    }
+    if (!blocked) blocked = r;
+  }
+  if (!worst) {
+    GOV.auto.note = blocked
+      ? `over target (${Math.round(measured)} of ${target} ms/s); ${blocked.name} is at the tightest cap a limit can use ` +
+        `(${Math.round(blocked.msPerSec)} ms/s left) — that loop needs fixing at its source`
+      : `over target (${Math.round(measured)} of ${target} ms/s) but nothing left to limit`;
+    return GOV.auto.note;
+  }
+  const src = govHeaviestSource(worst);
+  if (!govSetPolicy(worst.key, id)) {
+    GOV.auto.note = `could not limit ${worst.name}`;
+    return GOV.auto.note;
+  }
+  GOV.counters.autolimited++;
+  if (GOV.auto.mine.indexOf(worst.key) < 0) GOV.auto.mine.push(worst.key);
+  const gapMs = govGapForPolicy(src, GOV_POLICY_BY_ID.get(id));
+  const action = {
+    at: GOV.auto.lastAt,
+    key: worst.key,
+    label: worst.label,
+    to: id,
+    label2: (GOV_POLICY_BY_ID.get(id) || {}).label || id,
+    measuredMsPerSec: Math.round(worst.msPerSec),
+    gapMs: Math.round(gapMs),
+    predictedMsPerSec: Math.round(govPredictedMsPerSec(worst.perRunMs, gapMs, worst.runsPerSec)),
+  };
+  GOV.auto.actions.unshift(action);
+  if (GOV.auto.actions.length > 12) GOV.auto.actions.length = 12;
+  GOV.auto.note =
+    `limited ${worst.name} to ${action.label2} (it was burning ${action.measuredMsPerSec} ms/s, ` +
+    `≈${action.predictedMsPerSec} after — still ${Math.round(Math.max(0, measured - worst.msPerSec + action.predictedMsPerSec))} ms/s in total)`;
+  return GOV.auto.note;
 }
 
 function govReset() {
@@ -2100,7 +2305,13 @@ function govReset() {
     adaptiveSkipMax: 3,
     traceMinMs: 50,
     traceCap: 40,
+    autoLimit: false,
+    autoTargetMsPerSec: 250,
+    autoMinMsPerSec: 30,
   });
+  GOV.auto.actions.length = 0;
+  GOV.auto.mine.length = 0;
+  GOV.auto.note = "";
   GOV.rafSkippedInARow = 0;
   GOV.redraw = null;
   govSave();
@@ -2233,6 +2444,9 @@ function govRows() {
       sourceRateBefore: NaN,
       sourceRateAfter: NaN,
     };
+    // Non-enumerable: the panel and the autopilot need the live sources behind a
+    // grouped row, but the snapshot must not serialize rings into the report.
+    Object.defineProperty(row, "sources", { value: g.sink, enumerable: false });
     if (pol.id !== "full" && !g.ours && g.fires > 0) {
       // Estimate only: the ticks that did not run cannot be timed, so this is
       // the skipped rate times the mean cost of the ticks that did run.
@@ -2258,8 +2472,20 @@ function govMetrics() {
   const coalesced = GOV.coalescedRing.aggregate(now - WINDOW_MS).sum;
   let throttled = 0;
   let savedMsPerSec = 0;
+  let inertCount = 0;
+  let inertMsPerSec = 0;
   for (const r of rows) {
-    if (r.policy !== "full" && !r.ours) throttled++;
+    if (r.policy !== "full" && !r.ours) {
+      throttled++;
+      // A limit that is narrower than the source's own period does nothing at
+      // all: it never skips a tick, and the "estimated savings" for that row
+      // would be fiction. Reported as a whole-row property, because that is what
+      // it is.
+      if (govLimitIsNoop(r)) {
+        inertCount++;
+        inertMsPerSec += r.msPerSec;
+      }
+    }
     savedMsPerSec += r.savedMsPerSec;
   }
   return {
@@ -2270,6 +2496,7 @@ function govMetrics() {
     sources: rows,
     sourceCount: rows.length,
     throttled,
+    inert: { count: inertCount, msPerSec: inertMsPerSec },
     registered: GOV.sources.size,
     ours: rows.filter((r) => r.ours).length,
     counters: { ...GOV.counters },
@@ -2283,6 +2510,18 @@ function govMetrics() {
     worker: { ...GOV.worker },
     traceCount: GOV.traces.length,
     traceVersion: GOV.traceVersion,
+    auto: {
+      on: !!GOV.controls.autoLimit,
+      targetMsPerSec: GOV.controls.autoTargetMsPerSec,
+      minMsPerSec: GOV.controls.autoMinMsPerSec,
+      measuredMsPerSec: GOV.auto.measuredMsPerSec,
+      reachableMsPerSec: GOV.auto.reachableMsPerSec,
+      mine: GOV.auto.mine.length,
+      note: GOV.auto.note,
+      actions: GOV.auto.actions.slice(0, 6),
+      count: GOV.counters.autolimited,
+      inert: inertCount,
+    },
     selfTest: GOV.selfTest,
     policies: GOV_POLICIES,
   };
@@ -4538,6 +4777,17 @@ function graphNodeCount() {
 
 const GOV_BUDGET_PRESETS = [8, 12, 16, 24];
 const GOV_RAF_MIN_HZ = [60, 30, 20, 10];
+const GOV_AUTO_TARGETS = [
+  { ms: 150, label: "150 ms/s (strict)" },
+  { ms: 250, label: "250 ms/s (default)" },
+  { ms: 400, label: "400 ms/s" },
+  { ms: 600, label: "600 ms/s (gentle)" },
+];
+const GOV_AUTO_MIN = [
+  { ms: 15, label: "15 ms/s (touch almost anything)" },
+  { ms: 30, label: "30 ms/s (default)" },
+  { ms: 60, label: "60 ms/s (only the worst)" },
+];
 const GOV_TRACE_PRESETS = [
   { ms: 30, label: "capture frames over 30 ms" },
   { ms: 50, label: "capture frames over 50 ms (default)" },
@@ -4642,6 +4892,30 @@ function buildGovernorTab(container) {
     () => (GOV.controls.inputGuard ? "on" : "off"),
     (v) => govSetControl("inputGuard", v === "on")
   );
+  const selAuto = selectControl(
+    "autopilot",
+    [
+      { value: "off", label: "off (you pick the limits)" },
+      { value: "on", label: "on (cap the worst source every 5s)" },
+    ],
+    () => (GOV.controls.autoLimit ? "on" : "off"),
+    (v) => {
+      govSetControl("autoLimit", v === "on");
+      if (v === "on") govAutoPilot();
+    }
+  );
+  const selAutoTarget = selectControl(
+    "autopilot target",
+    GOV_AUTO_TARGETS.map((p) => ({ value: p.ms, label: p.label })),
+    () => GOV.controls.autoTargetMsPerSec,
+    (v) => govSetControl("autoTargetMsPerSec", Number(v))
+  );
+  const selAutoMin = selectControl(
+    "autopilot floor",
+    GOV_AUTO_MIN.map((p) => ({ value: p.ms, label: p.label })),
+    () => GOV.controls.autoMinMsPerSec,
+    (v) => govSetControl("autoMinMsPerSec", Number(v))
+  );
   const selTrace = selectControl(
     "frame traces",
     GOV_TRACE_PRESETS.map((p) => ({ value: p.ms, label: p.label })),
@@ -4656,22 +4930,29 @@ function buildGovernorTab(container) {
     text: "Suggest limits from this session",
     title: "Limit the sources this session actually measured burning milliseconds. Everything else is left alone, and nothing is applied twice.",
   });
-  const resetBtn = el("button", { class: "ants-btn", text: "Reset to untouched", title: "Every policy back to normal, every control back to its default" });
+  const resetBtn = el("button", { class: "ants-btn", text: "Reset to untouched", title: "Every policy back to normal, every control back to its default (turns the autopilot off too)" });
   const offBtn = el("button", {
     class: "ants-btn",
     text: "Turn the layer off",
     title: "Restore the browser's own setTimeout / setInterval / requestAnimationFrame and stop governing anything, now and for this page load",
   });
   const result = el("span", { class: "ants-note", style: { margin: "0" } });
+  const autoLine = el("div", { class: "ants-note", style: { marginTop: "4px" } });
   btnRow.appendChild(suggestBtn);
   btnRow.appendChild(resetBtn);
   btnRow.appendChild(offBtn);
   btnRow.appendChild(result);
   container.appendChild(btnRow);
+  container.appendChild(autoLine);
 
   suggestBtn.addEventListener("click", () => {
     const applied = govSuggest();
-    setText(result, applied.length ? `applied: ${applied.join(", ")}` : "nothing worth limiting right now (nothing is burning real time)");
+    setText(
+      result,
+      applied.length
+        ? `applied: ${applied.join(", ")}`
+        : "nothing worth limiting right now (nothing is burning real time that a limit could slow down)"
+    );
     update();
   });
   resetBtn.addEventListener("click", () => {
@@ -4696,7 +4977,7 @@ function buildGovernorTab(container) {
     { label: "Source", key: "label", text: true },
     { label: "kind", key: "kind", text: true },
     { label: "asked", right: true, key: "requested" },
-    { label: "allowed", right: true, key: "effective" },
+    { label: "allowed", right: true, key: "effective", text: true },
     { label: "runs/s", right: true, key: "runs" },
     { label: "ms/s", right: true, key: "ms" },
     { label: "ms/run", right: true, key: "perRun" },
@@ -4966,6 +5247,28 @@ function buildGovernorTab(container) {
           : "not installed"
     );
     if (m.disabled) callout.className = "ants-callout warn";
+    const au = m.auto;
+    if (au.on) {
+      autoLine.textContent =
+        `autopilot: target ${au.targetMsPerSec} ms/s of limitable cost, measured ${Math.round(au.measuredMsPerSec)} ms/s, ` +
+        `floor ${au.minMsPerSec} ms/s` +
+        `${au.note ? ` — ${au.note}` : ""}` +
+        (au.actions.length
+          ? `\n${au.actions.map((a) => `${a.label} → ${a.label2} (was ${a.measuredMsPerSec} ms/s, cap ${a.gapMs}ms, ≈${a.predictedMsPerSec} after)`).join("\n")}`
+          : "");
+      autoLine.style.whiteSpace = "pre-wrap";
+    } else {
+      autoLine.textContent = au.count
+        ? `autopilot is off; it applied ${au.count} limit(s) before you turned it off (Reset clears them)`
+        : "";
+    }
+    if (m.inert && m.inert.count) {
+      autoLine.textContent +=
+        `${autoLine.textContent ? "\n" : ""}` +
+        `${m.inert.count} limited source(s) are unaffected by their own limit — it is narrower than the gap between their runs already ` +
+        `(${fmtRate(m.inert.msPerSec)} ms/s still burning). Pick 2/s or 1/s for a chain that slow.`;
+      autoLine.style.whiteSpace = "pre-wrap";
+    }
     setText(vals.sources, `${m.sourceCount}${m.registered > m.sourceCount ? ` rows (${m.registered} registrations)` : ""}`);
     setText(vals.limited, m.throttled ? `${m.throttled}` : "none");
     setText(vals.skipped, `${m.counters.skipped} (${fmtRate(m.skippedPerSec)}/s)`);
@@ -4997,7 +5300,18 @@ function buildGovernorTab(container) {
           : `${r.kindLabel}${r.registrations > 1 ? `, ${r.registrations} registrations` : ""}${r.provisional ? "; attribution is sampled, so the file may appear shortly" : ""}`;
         setText(c[1], r.kindLabel);
         setText(c[2], `${fmtMs(r.requestedMs || GOV_RAF_REQUESTED_MS, r.requestedMs && r.requestedMs < 100 ? 1 : 0)}ms`);
-        setText(c[3], Number.isFinite(r.effectiveMs) ? `${fmtMs(r.effectiveMs, 0)}ms` : "never");
+        const noop = govLimitIsNoop(r);
+        setText(
+          c[3],
+          !Number.isFinite(r.effectiveMs)
+            ? "paused"
+            : noop
+              ? `${fmtMs(r.effectiveMs, 0)}ms — no effect`
+              : `${fmtMs(r.effectiveMs, 0)}ms`
+        );
+        c[3].title = noop
+          ? `This limit cannot bite: the source's runs are ~${fmtMs(r.perRunMs, 0)}ms apart already, so a ${fmtMs(r.effectiveMs, 0)}ms minimum gap changes nothing. Use 2/s or 1/s for a chain that is this slow.`
+          : "The shortest gap the current limit permits. If it is wider than the source's own period, the limit starts to bite.";
         setText(c[4], r.runsPerSec ? fmtRate(r.runsPerSec) : "—");
         setText(c[5], r.msPerSec ? fmtMs(r.msPerSec) : "—");
         setText(c[6], Number.isFinite(r.perRunMs) ? fmtMs(r.perRunMs, 3) : "—");
@@ -5540,6 +5854,24 @@ function buildTelemetryReport() {
     }
   }
 
+  {
+    const au = gv.auto || {};
+    if (au.on) {
+      lines.push(
+        `  autopilot: ON, target ${au.targetMsPerSec} ms/s of limited-source cost | measured ${Math.round(au.measuredMsPerSec || 0)} ms/s | ` +
+          `${au.count || 0} limit(s) applied${au.note ? ` | ${au.note}` : ""}`
+      );
+      for (const a of au.actions || [])
+        lines.push(`    it limited ${a.label} to ${a.label2} (was burning ${a.measuredMsPerSec} ms/s, cap ${a.gapMs}ms, ≈${a.predictedMsPerSec} ms/s after)`);
+    }
+    if (gv.inert && gv.inert.count) {
+      lines.push(
+        `  ${gv.inert.count} limited source(s) are not affected by their own limit: it is narrower than how far apart their runs already are ` +
+          `(${Math.round(gv.inert.msPerSec)} ms/s still on the main thread). Use 2/s or 1/s for a chain that slow.`
+      );
+    }
+  }
+
   lines.push("");
   lines.push("-- BENCHMARK (scripted pan) --");
   const A = s.settings.benchmark && s.settings.benchmark.A;
@@ -5679,6 +6011,12 @@ function installDebugApi() {
         policy: (key, id) => govSetPolicy(key, id),
         control: (key, value) => govSetControl(key, value),
         suggest: () => govSuggest(),
+        autoPilot: () => govAutoPilot(),
+        pickPolicy: (key) => {
+          const row = govRows().find((r) => r.key === key || r.label.includes(key));
+          const s = row ? govHeaviestSource(row) : null;
+          return s ? govPickPolicy(s) : null;
+        },
         reset: () => govReset(),
         off: (reason) => govUninstall(reason),
         probeWorker: () => govProbeWorker(),

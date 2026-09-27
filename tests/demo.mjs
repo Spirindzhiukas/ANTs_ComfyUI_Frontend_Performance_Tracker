@@ -181,7 +181,21 @@ const gov = h.tracker.governor;
 const clampSource = gov.sources.find((r) => r.name === "clamp");
 if (clampSource) gov.policy(clampSource.key, "quarter");
 gov.control("coalesce", true);
+
+// A repaint timer of the kind the autopilot exists for: it asks for every 100ms
+// but each run costs 20ms, so it is a real 167 ms/s of main thread. The autopilot
+// is pointed at the same 150 ms/s target a user would pick, and gets one interval
+// to notice and cap it.
+vm.runInContext(
+  `setInterval(function checkAndRepaint() { __antsCost(20); }, 100);`,
+  h.sandbox,
+  { filename: "http://localhost:8188/assets/vendor-vueuse-gYZjo854.js" }
+);
+gov.control("autoLimit", true);
+gov.control("autoTargetMsPerSec", 150);
 run(2000);
+await pump();
+run(6000); // one autopilot round, plus room for the table to re-measure
 await pump();
 // ------------------------------------------------------------------- print ---
 const WIDTH = 100;
@@ -274,9 +288,10 @@ bullets("TEXT REPORT (Copy button)");
 console.log(h.clipboardWrites[h.clipboardWrites.length - 1] || "(clipboard empty)");
 
 console.log(
-  "\nnote: the last two seconds of the run above have one limit applied (the extension's `clamp`" +
-    "\n      heartbeat at quarter speed) and redraw merging on, so the GOVERNOR TAB above shows a" +
-    "\n      source that was measured, then limited, with its skipped ticks counted." +
+  "\nnote: the tail of the run above has limits applied — the extension's `clamp` heartbeat capped by" +
+    "\n      hand at quarter speed, and the repaint timer capped by the AUTOPILOT (target 150 ms/s, one" +
+    "\n      round every 5s) — so the GOVERNOR TAB above shows both: a source limited by hand, and the" +
+    "\n      autopilot's own line saying which source it capped, at what gap, and what it was costing." +
     "\nnote: in this simulation the clock only advances with h.advance(), so the tracker's own" +
     "\n      per-render cost reads 0 — a real browser spends real time rendering the panel." +
     "\n      Everything else above is what web/tracker.js computes from the synthetic traffic."

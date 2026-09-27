@@ -240,6 +240,49 @@ a reload; **Reset to untouched** clears them, and **Suggest limits from
 this session** proposes a limit per source from its measured cost —
 nothing is applied until you pick it.
 
+**Autopilot** (off by default) is for the case this tab was built
+around: you open it, see one row burning 646 ms/s with 0 skipped, and the
+question is which policy to pick. With the autopilot on, the layer caps
+the worst source it is allowed to touch every five seconds until the
+limitable sources are under the target you set (150/250/400/600 ms/s),
+then stops and prints what it did — *"limited renderFrame to 2/s (it was
+burning 646 ms/s, ≈600 after — still 1208 ms/s in total)"*. When the row
+it just capped is still the worst thing on the page it steps the same row
+up the ladder next round, so a 316ms-per-run chain ends at 1/s rather
+than sitting at a 2/s cap that changed nothing; when a row reaches 1/s
+and is *still* too expensive, it says so — *"renderFrame is at the
+tightest cap a limit can use (300 ms/s left) — that loop needs fixing at
+its source"* — instead of pretending the problem is handled. It never
+touches the tracker's own timers, never touches rAF loops (those have
+their own governor), never touches a limit you set by hand, and **Reset
+to untouched** turns it off and lifts everything.
+
+Two rules make the difference between a limit that works and one that
+only looks like it does, and both came out of a real CPU-rendered page:
+
+- **A limit has to be wider than the source's own period to bite.** A
+  timer that asks for 10ms but takes 300ms of work runs every ~300ms, so
+  "half speed" (33ms) and "quarter speed" (66ms) change *nothing* for it —
+  only `2/s` or `1/s` do. The table now says so on the row's `allowed`
+  cell (`33ms — no effect`), and the autopilot and **Suggest limits**
+  both skip the multipliers and go straight to a cap for a source like
+  that (measured against its own runs, not against the delay it asked
+  for).
+- **The ranking is by cost, not by rate.** Both real offenders on that
+  page ran 1.3–3 times a second, so anything that filtered on "runs
+  often" missed them entirely and offered limits to a dozen 0.1 ms/s
+  heartbeats instead.
+- **A limit that bites but does not help is a sticker.** A cap that
+  leaves a source at 97% of what it cost before (a 316ms-per-run chain
+  capped at 2/s) looks like a working limit in every table. So both the
+  suggestion engine and the autopilot aim at a *cost* instead of at a
+  gap: the suggestion engine at half of what the row is burning, the
+  autopilot at whatever brings the page to the target you set. The
+  mildest limit that reaches that cost wins, and neither goes below the
+  floor (30 ms/s by default) — a 20ms heartbeat still gets half speed,
+  while a runaway chain gets 1/s, because nothing milder is worth the
+  behaviour change it costs a page whose extension owns that loop.
+
 **Redraw merging** is the other half of the same idea. `setDirty`
 requests were already counted exactly (and the Testing tab's cap can
 delay them); with merging on, requests inside one frame are combined:
@@ -437,7 +480,7 @@ logged for DevTools.
 ## Development
 
 ```
-node tests/run-tests.mjs          # 82 tests, no dependencies, no browser
+node tests/run-tests.mjs          # 91 tests, no dependencies, no browser
 node tests/run-tests.mjs timing   # filter by name fragment
 python3 tests/test_init.py        # backend route parsing + graceful fallbacks
 node tests/demo.mjs               # print what the panel says, with no ComfyUI
@@ -466,7 +509,36 @@ row do not starve each other, and internal errors fail open and end in
 the layer turning itself off — and a suite that keeps it from becoming
 the scapegoat: relayed frames are attributed to the source measured
 inside them, and the saved timer functions are called with a receiver
-Chrome accepts (the fake timers can be made Chrome-strict for that).
+Chrome accepts (the fake timers can be made Chrome-strict for that) — and
+a suite for the parts that have to target the *right* source: a
+suggestion for a slow, expensive chain has to be a cap that can bite it,
+a cheap heartbeat still gets the mildest limit, and the autopilot has to
+leave rAF loops and the tracker's own timers alone.
+
+## What changed in v2.1.3
+
+- **Fixed: limits that could not bite looked like they worked, and the
+  ones that mattered were never suggested.** A source whose runs are
+  300ms apart is unaffected by "half speed" (33ms) — and on a real
+  CPU-rendered page the two worst offenders (a Vue render chain at
+  646 ms/s and a culling scan at 474 ms per run) were exactly that shape.
+  Both were also invisible to **Suggest limits**, which required 4 runs/s
+  and so offered limits to a dozen 0.1 ms/s heartbeats instead. The
+  suggestion engine now ranks by measured cost per second, picks the
+  mildest policy whose gap is actually wider than the source's observed
+  period (skipping the multipliers when they cannot bite), and the table
+  marks such a limit as `no effect`, with the panel and the report
+  saying how many limited sources are in that state and how much they
+  still cost.
+- **New: autopilot** (off by default) — cap the worst source it may
+  touch every five seconds until the limitable sources are under a
+  target you set (150–600 ms/s), then stop. A row it capped that is
+  still the worst stays in play and is stepped up the ladder (2/s → 1/s)
+  until it is cheaper or the ladder runs out; a row that reaches the
+  tightest cap and is still expensive is reported as needing a fix at
+  its source, with what it still costs. Limits set by hand are never
+  touched, and every action is logged in the panel and in the copied
+  report — with the cost it measured and the cost the cap should leave.
 
 ## What changed in v2.1.2
 

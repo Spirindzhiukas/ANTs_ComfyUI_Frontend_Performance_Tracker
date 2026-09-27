@@ -851,3 +851,202 @@ suite("governor: relays, not a scapegoat", () => {
     assertEqual(row0.blockingMs, 200, "while still carrying the blocking time it caused");
   });
 });
+
+// ---------------------------------------------------------------------------
+// The real page this was written against had two offenders running 1.3 and 3
+// times a second because each run cost 300-470 ms. The old suggestion skipped
+// both (it required 4 runs/s) and the half/quarter policies are no-ops for a
+// chain like that, so the panel offered limits for a dozen 0.1 ms/s heartbeats
+// and nothing happened where it mattered. These tests pin the new behaviour.
+suite("governor: suggestions and the autopilot target what actually costs time", () => {
+  // A runaway chain: asks for 10ms, blocks the thread for `work` ms per run, so
+  // its real period is ~work ms and no multiplier of 10ms can slow it down.
+  function registerRunaway(h, work, asked) {
+    h.sandbox.__antsCost = (ms) => h.busy(ms);
+    vm.runInContext(
+      `(function chain() { __antsCost(${work}); setTimeout(chain, ${asked}); })();`,
+      h.sandbox,
+      { filename: "http://localhost:8188/assets/settingStore-DDHzGrHr.js" }
+    );
+  }
+
+  test("a slow, expensive chain is suggested a cap that makes it cheaper, not a sticker", async () => {
+    const h = await boot();
+    registerRunaway(h, 300, 10); // ~310ms per run: the real page's shape
+    h.advance(3000);
+    const r = row(h, "chain");
+    assertLess(r.runsPerSec, 4, `it runs fewer than 4 times a second (${fmt(r.runsPerSec)})`);
+    assertGreater(r.msPerSec, 30, `but costs real time (${fmt(r.msPerSec)} ms/s)`);
+    const costBefore = r.msPerSec;
+
+    const applied = h.tracker.governor.suggest();
+    assert(applied.length, `the suggestion engine did something (${JSON.stringify(applied)})`);
+    const after = row(h, "chain");
+    // The milder 2/s cap bites but would leave a 300ms-per-run chain at ~2/3 of
+    // its old cost; the suggestion has to reach for what actually helps.
+    assertEqual(after.policy, "hz1", "a 300ms-per-run chain is capped at 1/s, not at a 2/s sticker");
+    assertIncludes(applied[0], "after)", "and the suggestion says what it expects the cost to become");
+
+    const before = after.fires;
+    h.advance(3000);
+    const rate = ((row(h, "chain").fires - before) / 3000) * 1000;
+    assertLess(rate, 1.5, `and the chain really did slow down (${fmt(rate)}/s)`);
+    assertGreater(rate, 0.4, "without being silenced");
+    const costAfter = ((row(h, "chain").ms || 0) / 3000) * 1000;
+    assertLess(costAfter, costBefore * 0.8, `and it costs less per second (${fmt(costBefore)} → ${fmt(costAfter)} ms/s)`);
+  });
+
+  test("suggesting again does not re-tighten what is already tight enough", async () => {
+    const h = await boot();
+    registerRunaway(h, 300, 10);
+    h.advance(3000);
+    h.tracker.governor.suggest();
+    assertEqual(row(h, "chain").policy, "hz1", "the first suggestion caps it at 1/s");
+    const again = h.tracker.governor.suggest().filter((line) => line.includes("chain"));
+    assertEqual(again.length, 0, `a second suggestion leaves the row alone (${JSON.stringify(again)})`);
+    assertEqual(row(h, "chain").policy, "hz1", "and its policy is unchanged");
+  });
+
+  test("a fast cheap heartbeat still gets the mildest limit that bites it", async () => {
+    const h = await boot();
+    h.sandbox.__antsCost = (ms) => h.busy(ms);
+    vm.runInContext(`setInterval(function beat() { __antsCost(6); }, 20);`, h.sandbox, {
+      filename: "http://localhost:8188/extensions/SomePack/js/main.js",
+    });
+    h.advance(1000);
+    h.tracker.governor.suggest();
+    assertEqual(row(h, "beat").policy, "half", "half speed is the mildest option for a 20ms heartbeat");
+  });
+
+  test("nothing is suggested for sources that cost nothing, and the tracker is never limited", async () => {
+    const h = await boot();
+    h.sandbox.setInterval(function trivial() {}, 500);
+    h.advance(3000);
+    assertEqual(h.tracker.governor.suggest().length, 0, "a 500ms no-op heartbeat is left alone");
+    for (const r of h.tracker.governor.sources) {
+      if (!r.ours) continue;
+      assertEqual(r.policy, "full", `${r.name} (the tracker's own) was left alone`);
+    }
+  });
+
+  test("the autopilot is off by default and caps the worst source when switched on", async () => {
+    const h = await boot();
+    registerRunaway(h, 60, 10);
+    h.sandbox.setInterval(function quietPoll() { h.busy(0.2); }, 40);
+    h.advance(1500);
+    assertEqual(h.tracker.governor.policy(row(h, "chain").key, "full"), false, "the runaway starts unlimited");
+    h.advance(12000);
+    assertEqual(h.tracker.governor.metrics.auto.on, false, "the autopilot is off by default");
+    assertEqual(row(h, "chain").policy, "full", "and nothing was limited on its own");
+    assertEqual(h.tracker.governor.metrics.auto.count, 0);
+
+    h.tracker.governor.control("autoLimit", true);
+    h.advance(6000); // one pilot interval, plus room for the row to re-measure
+    const autopilotRow = row(h, "chain");
+    assert(autopilotRow.policy !== "full", `the pilot limited the worst source (${autopilotRow.policy})`);
+    assertEqual(autopilotRow.policy, "hz2", "with a cap that can bite its ~60ms period");
+    assertEqual(row(h, "quietPoll").policy, "full", "the cheap heartbeat was left alone");
+    const actions = h.tracker.governor.metrics.auto.actions;
+    assertGreater(actions.length, 0, "and it recorded what it did");
+    assertIncludes(actions[0].label, "settingStore", "naming the source it limited");
+    assertGreater(actions[0].gapMs, 100, "with the gap it applied");
+    assertGreater(actions[0].predictedMsPerSec, 0, "and what the cap should leave it costing");
+    assertEqual(h.tracker.governor.metrics.auto.mine, 1, "the pilot remembers which limits are its own");
+  });
+
+  test("the pilot walks its own cap up the ladder while the row is still the worst", async () => {
+    const h = await boot();
+    registerRunaway(h, 300, 10);
+    h.advance(4000);
+    h.tracker.governor.control("autoLimit", true);
+    h.tracker.governor.control("autoTargetMsPerSec", 100); // below what one cap can reach
+
+    const costBefore = row(h, "chain").msPerSec;
+    h.advance(6000);
+    const first = h.tracker.governor.metrics.auto.actions;
+    assert(first.length, "the pilot acted on the worst row");
+    const oldest = first[first.length - 1];
+    assertEqual(oldest.to, "hz2", "its first cap is the mildest one that bites");
+    assertEqual(oldest.predictedMsPerSec, 600, "which it already knows will not be enough");
+
+    h.advance(12000);
+    const later = h.tracker.governor.metrics.auto.actions;
+    assertEqual(later[0].to, "hz1", "the next rounds walk the same row up the ladder");
+    assertGreater(later[0].gapMs, oldest.gapMs, `each step is a wider gap (${oldest.gapMs}ms → ${later[0].gapMs}ms)`);
+    assertEqual(later[0].predictedMsPerSec, 300, "until the row costs what 1/s allows");
+    h.advance(3000);
+    const now = row(h, "chain").msPerSec;
+    assertLess(now, costBefore * 0.6, `and the row really is cheaper (${fmt(costBefore)} → ${fmt(now)} ms/s)`);
+    assertEqual(row(h, "chain").policy, "hz1", "1/s is the end of the ladder: it is not tightened further");
+    const note = h.tracker.governor.metrics.auto.note;
+    assertIncludes(note, "tightest cap", `and the panel says why it stopped (${note})`);
+    assertIncludes(note, "fixing at its source", "pointing at the loop instead of pretending it is fixed");
+  });
+
+  test("the pilot leaves a limit that was set by hand alone", async () => {
+    const h = await boot();
+    h.sandbox.__antsCost = (ms) => h.busy(ms);
+    vm.runInContext(`setInterval(function mine() { __antsCost(40); }, 50);`, h.sandbox, {
+      filename: "http://localhost:8188/extensions/SomePack/js/main.js",
+    });
+    registerRunaway(h, 120, 10);
+    h.advance(2000);
+    const mineKey = row(h, "mine").key;
+    h.tracker.governor.policy(mineKey, "quarter");
+    h.advance(2000);
+    h.tracker.governor.control("autoLimit", true);
+    h.tracker.governor.control("autoTargetMsPerSec", 60);
+    h.advance(20000);
+    assertEqual(row(h, "mine").policy, "quarter", "a hand-set limit is never raised by the pilot");
+    assert(row(h, "chain").policy !== "full", `while the row nobody has touched does get capped (${row(h, "chain").policy})`);
+  });
+
+  test("the autopilot never touches the tracker's own timers or a rAF loop", async () => {
+    const h = await boot();
+    h.sandbox.__antsCost = (ms) => h.busy(ms);
+    vm.runInContext(`(function loop() { __antsCost(40); requestAnimationFrame(loop); })();`, h.sandbox, {
+      filename: "http://localhost:8188/extensions/SomePack/js/main.js",
+    });
+    h.advance(1500);
+    h.tracker.governor.control("autoLimit", true);
+    h.advance(12000);
+    const r = row(h, "loop");
+    assertEqual(r.policy, "full", "a rAF loop keeps its own governor and is not capped by the autopilot");
+    for (const own of h.tracker.governor.sources) {
+      if (own.ours) assertEqual(own.policy, "full", "the tracker's own timers stay exempt");
+    }
+  });
+
+  test("a limit that cannot bite says so instead of looking like it works", async () => {
+    const h = await boot();
+    registerRunaway(h, 80, 10);
+    h.advance(1200);
+    const r = row(h, "chain");
+    h.tracker.governor.policy(r.key, "half"); // 33ms against an ~80ms chain: decoration
+    h.advance(1200);
+    const after = row(h, "chain");
+    assertGreater(
+      h.tracker.governor.metrics.inert.count,
+      0,
+      "the row is reported as unaffected by its own limit instead of claiming savings"
+    );
+    assertGreater(h.tracker.governor.metrics.inert.msPerSec, 20, "with how much it still costs per second");
+    h.tracker.open();
+    h.advance(1200);
+    await h.flush();
+    const text = h.document
+      .getElementById("ants-tracker-tabs")
+      .children.find((n) => n.textContent.includes("Governor")).click();
+    h.advance(1200);
+    await h.flush();
+    assertIncludes(
+      h.document.body.descendants().map((n) => n._text || "").join(" "),
+      "no effect",
+      "and the table marks the row's limit as having no effect"
+    );
+  });
+});
+
+function fmt(n) {
+  return Number.isFinite(n) ? n.toFixed(2) : String(n);
+}
