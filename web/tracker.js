@@ -27,7 +27,7 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.1.0";
+const VERSION = "2.1.1";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
 const NODE_NAME = "ANTsNastyBastardsTracker";
 
@@ -1313,7 +1313,7 @@ const GOV_IDLE_MS = 150; // no input for this long counts as "nobody is interact
 // A policy turns "how often the source wants to run" into "how often it may".
 // The gap is a minimum spacing between runs; "normal" imposes none at all.
 const GOV_POLICIES = [
-  { id: "full", label: "normal", gap: 0 },
+  { id: "full", label: "normal", gap: 0, untouched: true },
   { id: "half", label: "½ speed", factor: 2, floorMs: 33 },
   { id: "quarter", label: "¼ speed", factor: 4, floorMs: 66 },
   { id: "hz2", label: "2 /s", gap: 500 },
@@ -1336,7 +1336,10 @@ const GOV = {
   savedPolicies: null, // from localStorage, applied as sources appear
   attrTokens: 0,
   lastAttrAt: 0,
-  counters: { skipped: 0, deferred: 0, coalesced: 0, redrawReqs: 0, forced: 0 },
+  counters: { skipped: 0, deferred: 0, coalesced: 0, redrawReqs: 0, forced: 0, errors: 0 },
+  disabled: false,
+  offReason: "",
+  runningReg: null,
   skipRing: new Ring(256),
   coalescedRing: new Ring(256),
   overheadMs: 0,
@@ -1376,6 +1379,12 @@ function govPolicy(src) {
 function govMinGap(src) {
   if (src.ours) return 0;
   const pol = govPolicy(src);
+  // "normal" has to mean exactly what the tab says: measured, otherwise
+  // untouched. Gating a source at its own asked-for delay looks harmless and is
+  // not - the browser fires "100ms" timers a millisecond early sometimes, and a
+  // repaint interval that loses those ticks stops repainting (see the note on
+  // registrations in govNewReg).
+  if (pol.untouched) return 0;
   if (pol.pause) return Infinity;
   if (pol.gap) return pol.gap;
   const requested = src.requestedMs > 0 ? src.requestedMs : GOV_RAF_REQUESTED_MS;
@@ -1437,6 +1446,15 @@ function govTrack(kind, fn, requestedMs) {
   return src;
 }
 
+// One registration is one timer, or one rAF chain. The *limit* belongs to the
+// row (a user tunes "checkAndRepaint" and expects that row's runs/s to fall, and
+// one heavy function used by three graph views is one offender, not three), but
+// the *deferred copy* is per registration: a row can hold several chains, and a
+// single shared deferral slot let one chain's pending copy starve the others.
+function govNewReg(src) {
+  return { src, pending: null, pendingId: null, pendingFn: null, reRegistered: false };
+}
+
 function govNewSource(key, kind, name, requestedMs) {
   return {
     key,
@@ -1459,11 +1477,7 @@ function govNewSource(key, kind, name, requestedMs) {
     firstSeen: nowMs(),
     lastRunAt: -1e9,
     lastFnMs: 0,
-    pending: null, // outstanding deferred run (one per source, never a storm)
-    pendingId: null, // the registration id that deferral belongs to
-    pendingFn: null, // the callback it will run, so a forced run can drop it
     samples: 0,
-    reRegisteredDuringRun: false,
     policySetAt: 0,
     firesAtPolicySet: 0,
   };
@@ -1516,6 +1530,71 @@ function govApplySaved(src, provisionalKey) {
   src.firesAtPolicySet = src.fires;
 }
 
+// Fail open, then get out of the way. This layer replaces setTimeout,
+// setInterval and requestAnimationFrame inside somebody else's application: an
+// exception in here must never stop a callback from running, and after a few
+// internal errors the layer has to remove itself rather than keep gambling with
+// a UI it cannot see. The panel and the report both say when that happened, and
+// the panel has the same button for when the user decides it, not the counter.
+const GOV_FAIL_OPEN_AFTER = 3;
+
+function govFailOpen(where, err) {
+  GOV.counters.errors++;
+  const msg = (err && err.message) || String(err);
+  warnOnce(`gov-error-${where}`, `Scheduler layer error in ${where}: ${msg}`);
+  if (GOV.counters.errors >= GOV_FAIL_OPEN_AFTER) {
+    govUninstall(`its own ${GOV.counters.errors} errors (last: ${where} — ${msg})`);
+  }
+}
+
+function govUninstall(reason) {
+  if (GOV.disabled) return false;
+  GOV.disabled = true;
+  GOV.offReason = reason || "turned off";
+  try {
+    const g = typeof globalThis !== "undefined" && globalThis ? globalThis : null;
+    const targets = [];
+    if (g) targets.push(g);
+    try {
+      if (typeof window !== "undefined" && window && window !== g) targets.push(window);
+    } catch (e) {
+      /* an embedder with a hostile window proxy */
+    }
+    const keys = ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "requestAnimationFrame", "cancelAnimationFrame"];
+    for (const target of targets) {
+      for (const k of keys) {
+        if (GOV.orig && typeof GOV.orig[k] === "function") {
+          try {
+            target[k] = GOV.orig[k];
+          } catch (e) {
+            /* read-only host object: the pass-through in govRun still applies */
+          }
+        }
+      }
+    }
+    // Anything the page still has registered goes through the wrapper, which is
+    // now a straight call to the real callback; drop the deferrals we queued.
+    for (const reg of GOV.live.values()) {
+      if (reg && reg.pending !== null) {
+        try {
+          if (GOV.orig && GOV.orig.clearTimeout) GOV.orig.clearTimeout(reg.pending);
+        } catch (e) {
+          /* already fired */
+        }
+        reg.pending = null;
+      }
+    }
+    GOV.live.clear();
+    if (GOV.pendingByRegistration) GOV.pendingByRegistration.clear();
+    GOV.overBudget = false;
+    GOV.adaptiveForced = false;
+    warnOnce("gov-off", `Scheduler layer turned off: ${GOV.offReason}. The page's own timers are back to untouched.`);
+  } catch (e) {
+    /* nothing left to restore */
+  }
+  return true;
+}
+
 function govInstall() {
   if (GOV.installed || GOV.installError) return;
   try {
@@ -1562,19 +1641,30 @@ function govWrapRegister(orig, kind) {
   if (orig.__antsGovWrapped) return orig;
   const wrapped = function govWrapperFrame(fn, ms, ...rest) {
     if (typeof fn !== "function") return orig.apply(this, [fn, ms, ...rest]);
-    const src = govTrack(kind, fn, ms);
-    if (src.ours) return orig.call(this, fn, ms, ...rest);
+    let src = null;
+    let reg = null;
+    try {
+      src = govTrack(kind, fn, ms);
+      if (src.ours) return orig.call(this, fn, ms, ...rest);
+      reg = govNewReg(src);
+      if (GOV.runningReg) GOV.runningReg.reRegistered = true;
+    } catch (e) {
+      // Fail open: this is somebody else's application, and a profiler that
+      // cannot measure a timer must still let it be registered.
+      govFailOpen("timer registration", e);
+      return orig.call(this, fn, ms, ...rest);
+    }
     const real = orig.call(
       this,
       function () {
         GOV.live.delete(real);
-        return govRun(src, fn, this, arguments, real);
+        return govRun(src, reg, fn, this, arguments, real);
       },
       ms,
       ...rest
     );
     src.registrations++;
-    if (real !== undefined && real !== null) GOV.live.set(real, src);
+    if (real !== undefined && real !== null) GOV.live.set(real, reg);
     return real;
   };
   wrapped.__antsGovWrapped = true;
@@ -1584,20 +1674,20 @@ function govWrapRegister(orig, kind) {
 function govWrapClear(orig) {
   if (orig.__antsGovWrapped) return orig;
   const wrapped = function (id) {
-    govCancelDeferral(id);
-    const src = GOV.live.get(id);
-    if (src) {
-      GOV.live.delete(id);
-      // A skipped one-shot callback is sitting in this source's deferred slot:
-      // if the caller cancels the timer, the deferred run has to go with it.
-      if (src.pending !== null) {
-        try {
-          if (GOV.orig && GOV.orig.clearTimeout) GOV.orig.clearTimeout(src.pending);
-        } catch (e) {
-          /* the deferred run already fired */
+    try {
+      govCancelDeferral(id);
+      const reg = GOV.live.get(id);
+      if (reg) {
+        GOV.live.delete(id);
+        // A skipped one-shot callback is sitting in this registration's deferred
+        // slot: if the caller cancels the timer, the deferred run goes with it.
+        if (reg.pending !== null) {
+          if (GOV.orig && GOV.orig.clearTimeout) GOV.orig.clearTimeout(reg.pending);
+          reg.pending = null;
         }
-        src.pending = null;
       }
+    } catch (e) {
+      govFailOpen("clear", e);
     }
     return orig.call(this, id);
   };
@@ -1608,8 +1698,12 @@ function govWrapClear(orig) {
 function govWrapCancel(orig) {
   if (orig.__antsGovWrapped) return orig;
   const wrapped = function (id) {
-    govCancelDeferral(id);
-    GOV.live.delete(id);
+    try {
+      govCancelDeferral(id);
+      GOV.live.delete(id);
+    } catch (e) {
+      govFailOpen("cancelAnimationFrame", e);
+    }
     return orig.call(this, id);
   };
   wrapped.__antsGovWrapped = true;
@@ -1625,15 +1719,23 @@ function govWrapRaf(orig) {
   if (orig.__antsGovWrapped) return orig;
   const wrapped = function govWrapperFrame(cb) {
     if (typeof cb !== "function") return orig.call(this, cb);
-    const src = govTrack("raf", cb, 0);
-    if (GOV.running) GOV.running.reRegisteredDuringRun = true;
-    if (src.ours) return orig.call(this, cb);
+    let src = null;
+    let reg = null;
+    try {
+      src = govTrack("raf", cb, 0);
+      if (src.ours) return orig.call(this, cb);
+      reg = govNewReg(src);
+      if (GOV.runningReg) GOV.runningReg.reRegistered = true;
+    } catch (e) {
+      govFailOpen("rAF registration", e);
+      return orig.call(this, cb);
+    }
     const handle = orig.call(this, function (ts) {
       GOV.live.delete(handle);
-      return govRun(src, cb, this, [ts]);
+      return govRun(src, reg, cb, this, [ts], handle);
     });
     src.registrations++;
-    if (handle !== undefined && handle !== null) GOV.live.set(handle, src);
+    if (handle !== undefined && handle !== null) GOV.live.set(handle, reg);
     return handle;
   };
   wrapped.__antsGovWrapped = true;
@@ -1642,7 +1744,11 @@ function govWrapRaf(orig) {
 
 // ------------------------------------------------------------- dispatch ----
 
-function govRun(src, fn, thisArg, args, registrationId) {
+function govRun(src, reg, fn, thisArg, args, registrationId) {
+  // Once this layer has taken itself out (or been switched off from the panel)
+  // it must be nothing but a pass-through: these wrappers stay installed on
+  // timers the page registered before it gave up.
+  if (GOV.disabled || !reg) return fn.apply(thisArg, args);
   const tEnter = performance.now();
   let gap = govMinGap(src);
   let adaptive = false;
@@ -1654,26 +1760,38 @@ function govRun(src, fn, thisArg, args, registrationId) {
       adaptive = true;
     }
   }
-  if (gap > 0 && tEnter - src.lastRunAt < gap) {
-    src.skipped++;
-    GOV.counters.skipped++;
-    if (adaptive) GOV.rafSkippedInARow++;
-    if (!S.paused) GOV.skipRing.push(tEnter, 1);
-    if (src.kind === "timeout" || src.kind === "raf") {
-      govDefer(src, fn, thisArg, args, Math.max(1, gap - (tEnter - src.lastRunAt)), registrationId);
+  try {
+    if (gap > 0 && tEnter - src.lastRunAt < gap) {
+      const late = tEnter - src.lastRunAt;
+      src.skipped++;
+      GOV.counters.skipped++;
+      if (adaptive) GOV.rafSkippedInARow++;
+      if (!S.paused) GOV.skipRing.push(tEnter, 1);
+      // A paused source is dropped, never deferred: "wait forever" handed to
+      // setTimeout() comes back as a 1ms timer, which is the opposite of pause.
+      const waivable = adaptive || Number.isFinite(gap);
+      if (waivable && (src.kind === "timeout" || src.kind === "raf")) {
+        govDefer(reg, src, fn, thisArg, args, Math.max(1, gap - late), registrationId);
+      }
+      GOV.overheadMs += Math.max(0, performance.now() - tEnter);
+      return undefined;
     }
-    GOV.overheadMs += Math.max(0, performance.now() - tEnter);
-    return undefined;
+    if (adaptive) GOV.rafSkippedInARow = 0;
+    if (GOV.adaptiveForced && reg.pending !== null && reg.pendingFn === fn && reg.pendingId !== null) {
+      // The progress guarantee is about to run this exact callback, so the copy
+      // deferred earlier would be a second run of it. One callback, one run.
+      govCancelDeferral(reg.pendingId);
+    }
+  } catch (e) {
+    govFailOpen("dispatch", e);
   }
-  if (adaptive) GOV.rafSkippedInARow = 0;
-  if (GOV.adaptiveForced && src.pending !== null && src.pendingFn === fn && src.pendingId !== null) {
-    // The progress guarantee is about to run this exact callback, so the copy
-    // deferred earlier would be a second run of it. One callback, one run.
-    govCancelDeferral(src.pendingId);
+  const out = govExecute(src, reg, fn, thisArg, args);
+  try {
+    // The callback's own time is counted as the callback's, not as this layer's.
+    GOV.overheadMs += Math.max(0, performance.now() - tEnter - (src.lastFnMs || 0));
+  } catch (e) {
+    /* accounting only */
   }
-  const out = govExecute(src, fn, thisArg, args);
-  // The callback's own time is counted as the callback's, not as this layer's.
-  GOV.overheadMs += Math.max(0, performance.now() - tEnter - (src.lastFnMs || 0));
   return out;
 }
 
@@ -1713,33 +1831,38 @@ function govBehindBudget() {
   return behind;
 }
 
-function govExecute(src, fn, thisArg, args) {
+function govExecute(src, reg, fn, thisArg, args) {
   const t0 = performance.now();
+  if (reg) reg.reRegistered = false;
   src.lastRunAt = t0; // also for a deferred run: it is still a run
   const prev = GOV.running;
+  const prevReg = GOV.runningReg;
   GOV.running = src;
-  src.reRegisteredDuringRun = false;
+  GOV.runningReg = reg;
   let ret;
   try {
     ret = fn.apply(thisArg, args);
   } finally {
     GOV.running = prev;
-    const dt = performance.now() - t0;
-    src.lastFnMs = dt;
-    src.fires++;
-    src.ms += dt;
-    if (dt > src.worst) src.worst = dt;
-    if (!S.paused) src.ring.push(t0, dt);
-    if (src.pending !== null && src.reRegisteredDuringRun) {
-      // The callback keeps itself alive, so our deferred copy would become a
-      // second chain for the same loop: cancel it and let the loop's own
-      // registration win.
-      try {
-        if (GOV.orig && GOV.orig.clearTimeout) GOV.orig.clearTimeout(src.pending);
-      } catch (e) {
-        /* already fired */
+    GOV.runningReg = prevReg;
+    try {
+      const dt = performance.now() - t0;
+      src.lastFnMs = dt;
+      src.fires++;
+      src.ms += dt;
+      if (dt > src.worst) src.worst = dt;
+      if (!S.paused) src.ring.push(t0, dt);
+      if (reg && reg.pending !== null && reg.reRegistered) {
+        // The callback keeps itself alive, so our deferred copy would become a
+        // second chain for the same loop: cancel it and let the loop's own
+        // registration win.
+        if (GOV.orig && GOV.orig.clearTimeout) GOV.orig.clearTimeout(reg.pending);
+        reg.pending = null;
+        reg.pendingId = null;
+        reg.pendingFn = null;
       }
-      src.pending = null;
+    } catch (e) {
+      govFailOpen("bookkeeping", e);
     }
   }
   return ret;
@@ -1747,23 +1870,25 @@ function govExecute(src, fn, thisArg, args) {
 
 // Deferral uses the *original* timer functions, so a re-scheduled callback is
 // never counted twice and never governed twice.
-function govDefer(src, fn, thisArg, args, delayMs, registrationId) {
-  if (src.pending !== null || !GOV.orig || !GOV.orig.setTimeout) return;
+function govDefer(reg, src, fn, thisArg, args, delayMs, registrationId) {
+  // One deferred copy per registration: a limited source can be late, but it can
+  // never queue up work faster than the thing it is replacing did.
+  if (!reg || reg.pending !== null || !Number.isFinite(delayMs) || !GOV.orig || !GOV.orig.setTimeout) return;
   GOV.counters.deferred++;
   src.deferred++;
   const handle = GOV.orig.setTimeout(() => {
     if (registrationId !== undefined && registrationId !== null) GOV.pendingByRegistration.delete(registrationId);
-    src.pending = null;
-    src.pendingId = null;
-    src.pendingFn = null;
-    govExecute(src, fn, thisArg, args);
+    reg.pending = null;
+    reg.pendingId = null;
+    reg.pendingFn = null;
+    govExecute(src, reg, fn, thisArg, args);
   }, Math.max(1, Math.ceil(delayMs)));
-  src.pending = handle;
-  src.pendingId = registrationId === undefined ? null : registrationId;
-  src.pendingFn = fn;
+  reg.pending = handle;
+  reg.pendingId = registrationId === undefined ? null : registrationId;
+  reg.pendingFn = fn;
   if (registrationId !== undefined && registrationId !== null) {
     if (!GOV.pendingByRegistration) GOV.pendingByRegistration = new Map();
-    GOV.pendingByRegistration.set(registrationId, { handle, src });
+    GOV.pendingByRegistration.set(registrationId, { handle, reg, src });
   }
 }
 
@@ -1780,10 +1905,10 @@ function govCancelDeferral(id) {
   } catch (e) {
     /* it already fired */
   }
-  if (rec.src && rec.src.pending === rec.handle) {
-    rec.src.pending = null;
-    rec.src.pendingId = null;
-    rec.src.pendingFn = null;
+  if (rec.reg && rec.reg.pending === rec.handle) {
+    rec.reg.pending = null;
+    rec.reg.pendingId = null;
+    rec.reg.pendingFn = null;
   }
   return true;
 }
@@ -2069,6 +2194,8 @@ function govMetrics() {
   return {
     installed: GOV.installed,
     installError: GOV.installError,
+    disabled: GOV.disabled,
+    offReason: GOV.offReason,
     sources: rows,
     sourceCount: rows.length,
     throttled,
@@ -4439,9 +4566,15 @@ function buildGovernorTab(container) {
     title: "Limit the sources this session actually measured burning milliseconds. Everything else is left alone, and nothing is applied twice.",
   });
   const resetBtn = el("button", { class: "ants-btn", text: "Reset to untouched", title: "Every policy back to normal, every control back to its default" });
+  const offBtn = el("button", {
+    class: "ants-btn",
+    text: "Turn the layer off",
+    title: "Restore the browser's own setTimeout / setInterval / requestAnimationFrame and stop governing anything, now and for this page load",
+  });
   const result = el("span", { class: "ants-note", style: { margin: "0" } });
   btnRow.appendChild(suggestBtn);
   btnRow.appendChild(resetBtn);
+  btnRow.appendChild(offBtn);
   btnRow.appendChild(result);
   container.appendChild(btnRow);
 
@@ -4453,6 +4586,16 @@ function buildGovernorTab(container) {
   resetBtn.addEventListener("click", () => {
     govReset();
     setText(result, "all limits lifted; the page is back to untouched");
+    update();
+  });
+  offBtn.addEventListener("click", () => {
+    const did = govUninstall("turned off from the panel");
+    setText(
+      result,
+      did
+        ? "the layer is off: the browser's own timers are back and nothing here is governed any more (reload to bring it back)"
+        : `already off (${GOV.offReason})`
+    );
     update();
   });
 
@@ -4721,7 +4864,17 @@ function buildGovernorTab(container) {
     syncSelect(selCoalesce, GOV.controls.coalesce ? "on" : "off");
     syncSelect(selInputGuard, GOV.controls.inputGuard ? "on" : "off");
     syncSelect(selTrace, GOV.controls.traceMinMs);
-    setText(vals.state, m.installed ? (m.installError ? `not installed: ${m.installError}` : "installed") : "not installed");
+    setText(
+      vals.state,
+      m.disabled
+        ? `TURNED OFF — ${m.offReason}`
+        : m.installed
+          ? m.installError
+            ? `not installed: ${m.installError}`
+            : `installed${m.counters.errors ? ` (${m.counters.errors} internal error(s), fail-open after 3)` : ""}`
+          : "not installed"
+    );
+    if (m.disabled) callout.className = "ants-callout warn";
     setText(vals.sources, `${m.sourceCount}${m.registered > m.sourceCount ? ` rows (${m.registered} registrations)` : ""}`);
     setText(vals.limited, m.throttled ? `${m.throttled}` : "none");
     setText(vals.skipped, `${m.counters.skipped} (${fmtRate(m.skippedPerSec)}/s)`);
@@ -5256,6 +5409,9 @@ function buildTelemetryReport() {
   const gv = s.governor;
   if (!gv || !gv.installed) {
     lines.push(gv && gv.installError ? `(not installed: ${gv.installError})` : "(not installed)");
+  } else if (gv.disabled) {
+    lines.push(`TURNED OFF — ${gv.offReason}. Nothing is being limited; the page's own timers are untouched.`);
+    lines.push(`  ${gv.sourceCount} source(s) had been seen, ${gv.counters.skipped} tick(s) skipped, ${gv.counters.deferred} deferred before it stopped.`);
   } else {
     lines.push(
       `${gv.sourceCount} source(s), ${gv.throttled} limited | ${gv.counters.skipped} ticks skipped (${fmtRate(gv.skippedPerSec)}/s) | ` +
@@ -5433,6 +5589,7 @@ function installDebugApi() {
         control: (key, value) => govSetControl(key, value),
         suggest: () => govSuggest(),
         reset: () => govReset(),
+        off: (reason) => govUninstall(reason),
         probeWorker: () => govProbeWorker(),
         selfTest: () => govRunSelfTest(),
         selfTestMain: (arg) => govSelfTestMainThread(arg),

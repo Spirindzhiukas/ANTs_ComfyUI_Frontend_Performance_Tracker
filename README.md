@@ -266,10 +266,26 @@ that created its canvas that way (ComfyUI does not). What a scheduler
 layer *can* do is serialise and rate-limit the main thread's competing
 tick sources, which is what this tab is for.
 
-The Governor measures and reports its own bookkeeping cost, and the
-tracker's own timers are exempt from limits (marked as such in the
-table). Without `Worker`/`Blob` support the lane says so and answers on
-the main thread instead of pretending.
+**"normal" means no gate at all.** A source on `normal` is not rate
+checked even against the delay it asked for: the browser fires "100ms"
+timers a millisecond or two early under load, and a repaint interval
+that loses those ticks stops repainting. Limits are per *row* (tuning a
+row is how you tell this tracker that one heavy function used by three
+graph views is one offender), while the deferred copy that a skipped
+tick needs is per *chain*, so one chain's pending copy can never starve
+another's.
+
+**It fails open, and it can be switched off.** A profiler that replaces
+`setTimeout` is patch-level surgery on somebody else's application, so
+every wrapper catches its own errors, a callback that could not be
+measured is still registered and still runs, and after three internal
+errors the layer restores the browser's own timer functions and stops
+governing anything — the panel and the copied report both say so, and
+**Turn the layer off** does the same on demand. The Governor also
+measures and reports its own bookkeeping cost, and the tracker's own
+timers are exempt from limits (marked as such in the table). Without
+`Worker`/`Blob` support the lane says so and answers on the main thread
+instead of pretending.
 
 ### Load tab
 
@@ -421,7 +437,7 @@ logged for DevTools.
 ## Development
 
 ```
-node tests/run-tests.mjs          # 72 tests, no dependencies, no browser
+node tests/run-tests.mjs          # 79 tests, no dependencies, no browser
 node tests/run-tests.mjs timing   # filter by name fragment
 python3 tests/test_init.py        # backend route parsing + graceful fallbacks
 node tests/demo.mjs               # print what the panel says, with no ComfyUI
@@ -443,7 +459,31 @@ suite: limits applied to a real foreign heartbeat, the "slowed, never
 silenced" guarantees (a deferred callback still runs; a source that
 re-registers itself is not duplicated), adaptive rAF with the input
 guard, merging semantics, persistence, the trace contents, and the
-worker lane's fallback when there is no `Worker`.
+worker lane's fallback when there is no `Worker` — plus a suite that
+exists to keep the layer from breaking the page it measures: nothing is
+skipped or deferred while nothing is limited, several chains sharing one
+row do not starve each other, and internal errors fail open and end in
+the layer turning itself off.
+
+## What changed in v2.1.1
+
+- **Fixed: the scheduler layer could stop the workspace from drawing.**
+  A source on `normal` was still gated at the delay it asked for, so a
+  100ms repaint interval that fires a millisecond early lost those ticks
+  — and when several chains share one row (the same function registered
+  by more than one graph view), the shared gate starved them outright:
+  measured on a real page, 21,699 ticks skipped, 12,752 deferred, and a
+  graph canvas that never repainted. `normal` now means no gate at all,
+  and the deferred copy that a skipped tick needs is per chain instead of
+  one shared slot. Regression tests cover all three scheduling styles
+  (interval, chained timeout, self-scheduling rAF) and assert that
+  nothing is skipped or deferred while nothing is limited.
+- **Fail open, and a way out.** Every wrapper now catches its own
+  errors: an internal failure never stops a callback from running or a
+  timer from being registered, and after three errors the layer restores
+  the browser's own timer functions and turns itself off. The panel
+  reports when that happened, the report leads with `TURNED OFF`, and a
+  new **Turn the layer off** button does it on demand.
 
 ## What changed in v2.1
 

@@ -592,3 +592,171 @@ suite("governor: it stays out of the way", () => {
     h.tracker.resume();
   });
 });
+
+// ---------------------------------------------------------------------------
+// The suite below exists because of a real regression: gating every source at
+// its own asked-for delay, even with no limit requested, starved ComfyUI's
+// repaint timer until the graph canvas went blank and unresponsive. Whatever
+// else changes, "normal" has to keep meaning "measured, otherwise untouched".
+suite("governor: it does not break the page", () => {
+  test("with the defaults, nothing is skipped or deferred, however the page schedules its work", async () => {
+    const h = await boot();
+    let intervalRuns = 0;
+    let chainRuns = 0;
+    let rafRuns = 0;
+    h.sandbox.setInterval(function repaintCheck() {
+      intervalRuns++;
+      h.busy(1);
+    }, 100);
+    const chain = () => {
+      chainRuns++;
+      h.busy(0.5);
+      h.sandbox.setTimeout(chain, 50);
+    };
+    h.sandbox.setTimeout(chain, 50);
+    const frame = () => {
+      rafRuns++;
+      h.sandbox.requestAnimationFrame(frame);
+    };
+    h.sandbox.requestAnimationFrame(frame);
+
+    h.advance(2000);
+    const c = h.tracker.governor.state.counters;
+    assertEqual(c.skipped, 0, "nothing was skipped: the default policy is not a limit");
+    assertEqual(c.deferred, 0, "and nothing was pushed through a deferred copy");
+    assertGreater(intervalRuns, 17, "the interval runs at its own rate");
+    assertLess(intervalRuns, 23, "which is 100ms, not slower");
+    assertGreater(chainRuns, 34, "the chained timer keeps its own pace");
+    assertLess(chainRuns, 44, "which is 50ms per link");
+    assertGreater(rafRuns, 100, "the rAF loop still runs every frame");
+  });
+
+  test("two chains that share a name and a delay do not starve each other", async () => {
+    const h = await boot();
+    h.sandbox.__counts = { a: 0, b: 0 };
+    h.sandbox.__antsCost = (ms) => h.busy(ms);
+    vm.runInContext(
+      `setInterval(function repaintCheck() { __counts.a++; __antsCost(1); }, 100);`,
+      h.sandbox,
+      { filename: "http://localhost:8188/assets/GraphView-one.js" }
+    );
+    vm.runInContext(
+      `setInterval(function repaintCheck() { __counts.b++; __antsCost(1); }, 100);`,
+      h.sandbox,
+      { filename: "http://localhost:8188/assets/GraphView-two.js" }
+    );
+    h.advance(1000);
+    // Both chains are one row in the table (same name, same delay), and with no
+    // limit set that row must not cost either of them a single tick.
+    assertGreater(h.sandbox.__counts.a, 8, "the first chain ran at its own rate");
+    assertGreater(h.sandbox.__counts.b, 8, "and so did the second");
+    assertEqual(h.tracker.governor.state.counters.skipped, 0, "no tick was swallowed by the shared row");
+    const r = row(h, "repaintCheck");
+    assertGreater(r.fires, 16, "the row accounts for both chains");
+    assertGreater(r.registrations, 1, "and knows it holds more than one registration");
+  });
+
+  test("paused means dropped, not deferred into a 1ms loop", async () => {
+    const h = await boot();
+    let runs = 0;
+    const chain = () => {
+      runs++;
+      h.sandbox.setTimeout(chain, 50);
+    };
+    h.sandbox.setTimeout(chain, 50);
+    h.advance(300);
+    const before = runs;
+    const deferredBefore = h.tracker.governor.state.counters.deferred;
+    h.tracker.governor.policy(row(h, "chain").key, "pause");
+    h.advance(1000);
+    assertEqual(runs, before, "a paused source stops running");
+    assertEqual(
+      h.tracker.governor.state.counters.deferred,
+      deferredBefore,
+      "and is not re-queued as an endless chain of deferred copies"
+    );
+  });
+
+  test("a limited chain's deferrals are bounded, and each deferred copy runs exactly once", async () => {
+    const h = await boot();
+    let runs = 0;
+    const frame = () => {
+      runs++;
+      h.sandbox.requestAnimationFrame(frame);
+    };
+    h.sandbox.requestAnimationFrame(frame);
+    h.advance(200);
+    const r = row(h, "frame");
+    const deferred0 = r.deferred;
+    h.tracker.governor.policy(r.key, "quarter");
+    h.advance(1000);
+    const after = row(h, "frame");
+    const newRuns = runs - 0;
+    assertLess(newRuns, 40, "the loop is slowed to roughly the quarter rate");
+    assertGreater(newRuns, 5, "but it keeps making progress");
+    const deferrals = after.deferred - deferred0;
+    assertLess(deferrals, newRuns + 3, `deferrals stay bounded (${deferrals} for ${newRuns} runs)`);
+    assertEqual(after.fires, runs, "the row counts every run exactly once, deferred ones included");
+  });
+});
+
+suite("governor: fail open, and the way back", () => {
+  // A hostile callback: reading `fn.name` throws. That is a stand-in for any
+  // internal error, and it must not stop the timer from being registered.
+  function hostile(fn) {
+    return new Proxy(fn, {
+      get(target, key) {
+        if (key === "name") throw new Error("hostile name getter");
+        return target[key];
+      },
+    });
+  }
+
+  test("a registration the layer cannot measure is still a registration", async () => {
+    const h = await boot();
+    let ran = 0;
+    h.sandbox.setTimeout(hostile(function weird() { ran++; }), 20);
+    h.advance(60);
+    assertEqual(ran, 1, "the callback ran even though measuring it failed");
+    assertGreater(h.tracker.governor.state.counters.errors, 0, "and the failure was reported, not swallowed");
+    assertEqual(h.tracker.governor.metrics.disabled, false, "one error does not take the layer down");
+  });
+
+  test("after repeated internal errors it turns itself off and hands the page back", async () => {
+    const h = await boot();
+    const wrappedSetTimeout = h.sandbox.setTimeout;
+    for (let i = 0; i < 3; i++) h.sandbox.setTimeout(hostile(function weird() {}), 30 + i);
+    assertEqual(h.tracker.governor.metrics.disabled, true, "it gave up after the third error");
+    assertIncludes(h.tracker.governor.metrics.offReason, "errors", "and says why");
+    assertEqual(h.sandbox.setTimeout, h.tracker.governor.state.orig.setTimeout, "the browser's own setTimeout is back");
+    assert(h.sandbox.setTimeout !== wrappedSetTimeout, "the wrapper is gone, not merely inert");
+
+    // New registrations are ungoverned, and an old one still runs.
+    let ran = 0;
+    const before = h.tracker.governor.metrics.registered;
+    h.sandbox.setTimeout(function afterwards() { ran++; }, 20);
+    h.advance(60);
+    assertEqual(ran, 1, "a timer registered afterwards still runs");
+    assertEqual(h.tracker.governor.metrics.registered, before, "and is not even registered as a source");
+  });
+
+  test("the panel and the report both say when the layer is off", async () => {
+    const h = await boot();
+    h.tracker.governor.off("turned off from the panel");
+    assertEqual(h.tracker.governor.metrics.disabled, true);
+    h.tracker.open();
+    const govTab = h.document
+      .getElementById("ants-tracker-tabs")
+      .children.find((n) => n.textContent.includes("Governor"));
+    govTab.click();
+    h.advance(1200);
+    await h.flush();
+    const text = h.document.body.descendants().map((n) => n._text || "").join(" ");
+    assertIncludes(text, "turned off from the panel", "the tab names the reason");
+    const copyBtn = h.document.body.descendants().find((n) => n._cls && n._cls.has("ants-hbtn") && n.textContent.includes("Copy"));
+    copyBtn.click();
+    await h.flush();
+    const report = h.clipboardWrites[h.clipboardWrites.length - 1] || "";
+    assertIncludes(report, "TURNED OFF", "and the copied report leads with it instead of listing limits that no longer exist");
+  });
+});
