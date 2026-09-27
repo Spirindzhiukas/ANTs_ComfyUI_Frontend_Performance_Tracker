@@ -317,8 +317,9 @@ scheduler can move them, and `OffscreenCanvas` only helps an application
 that created its canvas that way (ComfyUI does not). That is why the
 answer to a 280ms redraw is not a thread but *less drawing*: see
 **low-zoom drawing** in the Nodes tab, which paints nodes that are too
-small to read as one rectangle and rate-limits redraws while nobody is
-touching the page. What a scheduler
+small to read as one rectangle, thins links instead of straightening
+them, hides the DOM content of the nodes it boxed, and rate-limits
+redraws while nobody is touching the page. What a scheduler
 layer *can* do is serialise and rate-limit the main thread's competing
 tick sources, which is what this tab is for.
 
@@ -493,7 +494,7 @@ logged for DevTools.
 ## Development
 
 ```
-node tests/run-tests.mjs          # 101 tests, no dependencies, no browser
+node tests/run-tests.mjs          # 104 tests, no dependencies, no browser
 node tests/run-tests.mjs timing   # filter by name fragment
 python3 tests/test_init.py        # backend route parsing + graceful fallbacks
 node tests/demo.mjs               # print what the panel says, with no ComfyUI
@@ -532,6 +533,68 @@ installed as the sandbox's `CanvasRenderingContext2D` (the preview ladder
 patches `drawImage` there, the same way a browser exposes it), and
 `createImageBitmap` records the resize it was asked to perform instead of
 resizing anything.
+
+## What changed in v2.1.6
+
+- **Links are degraded, not straightened.** The old "links straight"
+  option is the one thing a spline-based workflow cannot survive: the
+  author placed the nodes to be read through the curves, so replacing
+  them with lines is a different graph, not a cheaper one. The new
+  setting — **links thinned below N% zoom**, 60% by default — keeps
+  every curve exactly where it was and changes how much ink it takes to
+  lay them down: strokes are 1px wide instead of 3, and the dark outline
+  ComfyUI draws under each link is skipped. That outline is a *second
+  full stroke* 4 units wider than the link (`render_connections_border`,
+  on by default), so on a long link it is most of the pixels the redraw
+  spends. Both are set on the canvas for the duration of that one
+  `renderLink` call and put back before it returns, so hit-testing,
+  dragging, selection and the panel never see the change. Measured on the
+  4K graph this was built for: 976 links cost ~101ms/frame as splines and
+  ~22ms as straight lines, and the difference between those two numbers
+  is the outline plus the extra width — this recovers a large part of it
+  *with the shapes intact*. Curves whose endpoints are close together
+  barely change at all; that is the point. The straight-line option
+  remains, but it is now described for what it is: a mode for graphs
+  already built out of straight links, where most nodes are rectangles
+  anyway.
+- **The DOM content of a boxed node is hidden with it.** Nodes whose
+  visuals are DOM — Nodes 2.0/Vue nodes, and any node with a DOM widget
+  (image and video previews, curve editors, custom node UIs) — live in
+  absolutely-positioned elements *on top of* the canvas and were
+  completely unaffected by flattening: the node became a rectangle and
+  its contents stayed at full size on top of it, which is the worst of
+  both. While a node is drawn as a rectangle, its elements get one CSS
+  class (`ants-lod-box`, `display: none`), and the class is removed the
+  moment the node is drawn properly again — zoom in, raise the threshold,
+  switch the mode off, or let it fail open, and the page is exactly as it
+  was. Nothing is moved, re-parented or edited; Vue nodes are found by
+  their `data-node-id` attribute and DOM widgets through the `.dom-widget`
+  wrapper ComfyUI positions. The panel and the report say how many
+  elements of how many nodes are hidden, so "nothing happened" is never
+  the only evidence. The set is re-checked when the zoom or the setting
+  changes and once a second, so nodes and widgets that arrive later (a
+  workflow load, an execution result) are picked up too.
+- **The frontend's own low-quality rendering is brought forward to your
+  zoom.** ComfyUI already has a cheaper drawing path — no node shadows,
+  no rounded corners, no link outline — gated on a font-size threshold
+  ("Zoom Node Level of Detail", 8px by default) that on a 4K screen at
+  10% zoom may or may not have engaged on its own. Below the zoom you
+  pick (60% by default), this tool now switches that flag on for the
+  duration of each frame and hands it back in a `finally` block, so what
+  you see is what ComfyUI itself
+  draws when you zoom out far enough. If a frontend version does not
+  expose the flag, the panel says so instead of pretending: the link
+  thinning above does not depend on it.
+- **The panel says what it did.** A new line in the low-zoom block
+  reports link segments thinned per frame and whether the low-quality
+  path is in use; a second reports DOM elements hidden, or that there
+  was no DOM content to hide on the nodes this threshold catches (their
+  visuals are canvas-drawn). The text report carries both. The preview
+  counters stay where they were — 489 of 496 image draws served from
+  thumbnails on the 4K test page, which is the answer to "do thumbnails
+  even work": they do, and what they recover is bounded by how much of
+  the frame the previews are; on a graph painted mostly by node chrome
+  that is a smaller number than it looks.
 
 ## What changed in v2.1.5
 

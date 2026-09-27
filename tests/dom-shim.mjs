@@ -132,8 +132,20 @@ class Node {
     return { top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 };
   }
 
-  querySelectorAll() {
-    return [];
+  // Only what the tracker asks for: a presence selector, and one that pins an
+  // attribute to a value. Anything else returns nothing rather than guessing.
+  querySelectorAll(selector) {
+    const sel = String(selector || "").trim();
+    const m = /^\[([\w:-]+)(?:=(?:"([^"]*)"|'([^']*)'|([^\]]+)))?\]$/.exec(sel);
+    if (!m) return [];
+    const attr = m[1];
+    const want = m[2] !== undefined ? m[2] : m[3] !== undefined ? m[3] : m[4];
+    const has = (node) => Object.prototype.hasOwnProperty.call(node._attrs, attr);
+    const value = (node) => String(node._attrs[attr]);
+    return this.descendants().filter((n) => {
+      if (n.nodeType !== 1 || !has(n)) return false;
+      return want === undefined ? true : value(n) === String(want);
+    });
   }
 
   descendants() {
@@ -162,6 +174,7 @@ export function createDocument() {
   };
   doc.getElementById = (id) => doc.descendants().find((n) => n.id === id || n._attrs.id === id) || null;
   doc.execCommand = () => true;
+  doc.querySelectorAll = Node.prototype.querySelectorAll;
   return doc;
 }
 

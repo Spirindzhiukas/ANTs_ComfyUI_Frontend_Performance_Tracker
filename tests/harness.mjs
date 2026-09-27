@@ -227,6 +227,13 @@ export function createHarness(options = {}) {
       this.drawCalls = 0;
       this.dirtyCalls = 0;
       this.ctx = makeStubCtx();
+      // The frontend's own canvas fields, so a wrapper that changes them for the
+      // duration of one call can be caught doing it (and caught putting it back).
+      this.connections_width = 3;
+      this.render_connections_border = true;
+      this._isLowQuality = false;
+      this.linkSettings = []; // what each link was rendered with
+      this.nodeLowQuality = []; // what the canvas flag was for each node draw
     }
     drawConnections() {
       busy(this.costs.connections);
@@ -236,6 +243,11 @@ export function createHarness(options = {}) {
     }
     renderLink(ctx, a, b) {
       this.linkDraws++;
+      this.linkSettings.push({
+        width: this.connections_width,
+        border: this.render_connections_border,
+        lowQuality: this._isLowQuality,
+      });
       busy(this.costs.link || 0);
       ctx.beginPath();
       ctx.moveTo(a[0], a[1]);
@@ -244,6 +256,7 @@ export function createHarness(options = {}) {
     }
     drawNode(node) {
       this.nodeDraws++;
+      this.nodeLowQuality.push(this._isLowQuality);
       busy(this.costs.chrome);
       if (node && typeof node.onDrawForeground === "function") node.onDrawForeground(this.ctx);
       if (node && typeof node.onDrawBackground === "function") node.onDrawBackground(this.ctx);

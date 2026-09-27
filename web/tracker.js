@@ -27,7 +27,7 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.1.5";
+const VERSION = "2.1.6";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
 const NODE_NAME = "ANTsNastyBastardsTracker";
 
@@ -873,6 +873,19 @@ const LOD = {
   thumbBytes: 0,
   thumbFailures: 0,
   zoom: 0,
+  // Zoomed-out detail. Past a zoom the user sets, links lose their outline and
+  // are stroked 1px wide, and the frontend is put into its own low-quality mode
+  // (no node shadows, no rounded corners, and widgets that asked to hide when
+  // zoomed out stay hidden). Curves are kept: what changes is how much ink is
+  // laid down, not the shape of the link.
+  detailZoom: 0.6, // below this zoom detail is reduced (0 = full detail)
+  thinLinks: 0, // link segments stroked thin so far
+  lqMissing: false, // the frontend does not expose its low-quality flag
+  domMarked: null, // Set of elements we are hiding right now
+  domHidden: 0, // elements hidden because their node is a box
+  domNodes: 0, // nodes whose DOM content is hidden
+  sweptZoom: NaN, // the zoom the DOM was last swept at
+  sweptPx: -1, // and the threshold
 };
 
 // Sizes a node can land at on screen. The upper half of this ladder exists for
@@ -888,9 +901,18 @@ const LOD_THUMB_LADDER = [64, 128, 256, 512, 1024, 2048]; // longest side, px
 const LOD_THUMB_MIN_SRC = 256; // sources smaller than this are not worth copying
 const LOD_THUMB_MAX = 48; // thumbnails kept before the oldest is dropped
 const LOD_THUMB_MAX_BYTES = 64 * 1024 * 1024; // and a byte budget, because 48 large copies are a lot of memory
+// Zoom levels below which links and node detail are reduced.
+const LOD_DETAIL_ZOOMS = [0, 1, 0.8, 0.6, 0.4, 0.2];
+const LOD_LINK_WIDTH = 1; // graph units; LiteGraph's own default is 3
+const LOD_DOM_CLASS = "ants-lod-box"; // elements hidden while their node is a box
+const LOD_DOM_SWEEP_MS = 1000; // how often newly added nodes/widgets are picked up
 
 function lodOn() {
-  return LOD.minPx > 0 || LOD.idleCapMs > 0 || LOD.thumbZoom > 0;
+  return LOD.minPx > 0 || LOD.idleCapMs > 0 || LOD.thumbZoom > 0 || LOD.detailZoom > 0;
+}
+
+function lodDetailOn() {
+  return LOD.detailZoom > 0 && LOD.zoom > 0 && LOD.zoom < LOD.detailZoom;
 }
 
 function lodPreviewsOn() {
@@ -942,6 +964,16 @@ function lodPlanFrame(canvas) {
   const plan = LOD.plan;
   plan.at = nowMs();
   LOD.zoom = (canvas && canvas.ds && Number(canvas.ds.scale)) || 0;
+  // Which nodes are boxes changes with the zoom, so does the set of DOM
+  // elements that belong to them. Sweeping on the change (and not every frame)
+  // keeps this at the cost of a zoom, not of a redraw.
+  if (LOD.minPx > 0 && (LOD.zoom !== LOD.sweptZoom || LOD.minPx !== LOD.sweptPx)) {
+    try {
+      lodSweepDom(canvas);
+    } catch (e) {
+      /* never fatal */
+    }
+  }
   plan.links = false;
   plan.tiny = 0;
   plan.sampled = 0;
@@ -1135,6 +1167,28 @@ function lodThumbArgs(args) {
   return [thumb, args[1], args[2], dw, dh];
 }
 
+let lodDomSweepTimer = null;
+
+// Nodes and widgets arrive while the page is running (a workflow load, an
+// execution result). One pass a second keeps the hidden set honest without
+// touching anything when the mode is off.
+function lodInstallDomSweep() {
+  if (lodDomSweepTimer) return;
+  try {
+    lodDomSweepTimer = govOwn(() =>
+      setInterval(() => {
+        try {
+          if (LOD.minPx > 0) lodSweepDom(app.canvas);
+        } catch (e) {
+          /* never fatal */
+        }
+      }, LOD_DOM_SWEEP_MS)
+    );
+  } catch (e) {
+    /* no timers: the sweep still runs whenever the zoom or the setting changes */
+  }
+}
+
 let lodDrawImagePatched = false;
 
 // Only image draws that happen *inside* a node are touched: the graph's own
@@ -1165,6 +1219,138 @@ function lodInstallDrawImage() {
   }
 }
 
+// The frontend has its own low-quality rendering: `_isLowQuality` is what
+// `low_quality` reads, and below its own threshold (Settings -> LiteGraph,
+// "Zoom Node Level of Detail") it stops drawing node shadows and rounded
+// corners, stops stroking a dark outline under every link, and lets DOM widgets
+// that asked to hide when zoomed out hide. Its threshold is a font size, so on a
+// 4K screen at 10% zoom it may or may not have engaged; this brings the same
+// rendering forward to the zoom the user picked, for the duration of one frame.
+// Returns a function that puts the flag back, or null if there was nothing to do.
+function lodLowQualityFrame(canvas) {
+  try {
+    if (!canvas || !("_isLowQuality" in canvas)) {
+      LOD.lqMissing = true;
+      return null;
+    }
+    const prev = canvas._isLowQuality;
+    if (prev === true) return null; // the frontend is already drawing this way
+    canvas._isLowQuality = true;
+    return () => {
+      try {
+        canvas._isLowQuality = prev;
+      } catch (e) {
+        /* it was writable a moment ago; if that changed, the next frame fails open */
+      }
+    };
+  } catch (e) {
+    LOD.lqMissing = true;
+    return null;
+  }
+}
+
+// ------------------------------------------------------------- DOM boxes ----
+// A node whose visuals are DOM (a Vue node, or any node with a DOM widget: an
+// image preview, a video, a curve editor, a custom panel) keeps that DOM on top
+// of the canvas at every zoom. Flattening the canvas node into a rectangle while
+// its DOM content stays at full size leaves the worst of both, so the elements
+// belonging to a boxed node are hidden with one CSS class, and unhidden the
+// moment it stops being a box. Nothing is moved, re-parented or edited: the
+// class is added and removed, and the browser does the rest.
+function lodDomTargets(node) {
+  const out = [];
+  try {
+    const widgets = node && node.widgets;
+    if (!widgets || !widgets.length) return out;
+    for (const w of widgets) {
+      const el = w && (w.element || w.inputEl);
+      if (!el || typeof el !== "object" || typeof el.classList !== "object") continue;
+      const target = (typeof el.closest === "function" && el.closest(".dom-widget")) || el;
+      if (target && target.classList) out.push(target);
+    }
+  } catch (e) {
+    /* a widget with a hostile element getter is simply not hidden */
+  }
+  return out;
+}
+
+// Vue-rendered nodes have no canvas visuals at all: the node *is* the DOM
+// element carrying data-node-id. Their root is hidden too, and the rectangle
+// this file paints takes its place.
+function lodDomRoots() {
+  try {
+    if (typeof document === "undefined" || typeof document.querySelectorAll !== "function") return [];
+    return document.querySelectorAll("[data-node-id]") || [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function lodNodeById(canvas, id) {
+  try {
+    const graph = canvas && canvas.graph;
+    if (graph && typeof graph.getNodeById === "function") {
+      const found = graph.getNodeById(Number(id));
+      if (found) return found;
+    }
+    const nodes = lodGraphNodes(canvas);
+    for (const n of nodes) if (n && String(n.id) === String(id)) return n;
+  } catch (e) {
+    /* no graph: nothing to hide */
+  }
+  return null;
+}
+
+function lodSweepDom(canvas) {
+  const marked = LOD.domMarked || (LOD.domMarked = new Set());
+  const keep = new Set();
+  let nodes = 0;
+  try {
+    if (canvas && LOD.minPx > 0) {
+      for (const node of lodGraphNodes(canvas) || []) {
+        if (!node || !(lodNodePx(node, canvas) < LOD.minPx)) continue;
+        let any = false;
+        for (const el of lodDomTargets(node)) {
+          el.classList.add(LOD_DOM_CLASS);
+          keep.add(el);
+          any = true;
+        }
+        if (any) nodes++;
+      }
+      for (const el of lodDomRoots()) {
+        const id = el && typeof el.getAttribute === "function" ? el.getAttribute("data-node-id") : null;
+        if (id === null || id === undefined) continue;
+        const node = lodNodeById(canvas, id);
+        if (!node || !(lodNodePx(node, canvas) < LOD.minPx)) continue;
+        if (el.classList) {
+          el.classList.add(LOD_DOM_CLASS);
+          keep.add(el);
+          nodes++;
+        }
+      }
+    }
+  } catch (e) {
+    /* hiding DOM is a courtesy: if the page's DOM is not what we expect, skip it */
+  }
+  let changed = keep.size !== marked.size;
+  for (const el of keep) if (!marked.has(el)) changed = true;
+  for (const el of marked) {
+    if (!keep.has(el)) {
+      try {
+        el.classList.remove(LOD_DOM_CLASS);
+      } catch (e) {
+        /* element is gone; dropping it from the set is enough */
+      }
+    }
+  }
+  LOD.domMarked = keep;
+  LOD.domHidden = keep.size;
+  LOD.domNodes = nodes;
+  LOD.sweptZoom = LOD.zoom;
+  LOD.sweptPx = LOD.minPx;
+  return changed;
+}
+
 // The redraw cap. A hard cap would make dragging feel broken, so it is only in
 // force while nobody has touched the page for a moment; any pointer, wheel or
 // key event lifts it instantly (the scheduler layer already watches for those).
@@ -1177,7 +1363,13 @@ function lodAbort(err) {
   LOD.error = (err && err.message) || String(err);
   LOD.minPx = 0;
   LOD.idleCapMs = 0;
+  LOD.detailZoom = 0;
   LOD.baseline = null;
+  try {
+    lodSweepDom(app.canvas);
+  } catch (e) {
+    /* unhiding is best-effort; the class is gone with the reload either way */
+  }
   try {
     warnOnce("lod-abort", `low-zoom drawing turned itself off after an error: ${LOD.error}`);
   } catch (e) {
@@ -1225,6 +1417,8 @@ function lodSet(opts) {
     LOD.thumbZoom = Math.max(0, Math.min(1, Number(o.thumbZoom) || 0));
     if (LOD.thumbZoom > 0) lodInstallDrawImage();
   }
+  if ("detailZoom" in o) LOD.detailZoom = Math.max(0, Math.min(1, Number(o.detailZoom) || 0));
+  if (LOD.minPx > 0) lodInstallDomSweep();
   const now = lodOn();
   if (now) LOD.error = "";
   // The first change is the moment worth measuring from, whether or not the mode
@@ -1232,6 +1426,13 @@ function lodSet(opts) {
   if (now && !LOD.baseline) lodCaptureBaseline();
   if (!now && was) LOD.baseline = null;
   if (LOD.idleCapMs > 0) govInstallInputGuard();
+  // A threshold change has to take effect now, not on the next frame the canvas
+  // happens to draw: the marks follow the setting, whatever the zoom is.
+  try {
+    lodSweepDom(app.canvas);
+  } catch (e) {
+    /* the sweep never throws, but setup is not worth a broken toggle */
+  }
   return now;
 }
 
@@ -1358,10 +1559,16 @@ function patchCanvasDraw() {
       // no node is being flattened.
       if (lodOn()) lodPlanFrame(this);
       drawDepth++;
+      // One frame drawn the way the frontend draws when it is zoomed far out:
+      // no node shadows, no rounded corners, no outline under every link. The
+      // flag is put back as soon as the frame is over, so nothing this tool did
+      // outlives the redraw it was for.
+      const restoreLq = lodDetailOn() ? lodLowQualityFrame(this) : null;
       let ret;
       try {
         ret = originalDraw.apply(this, args);
       } finally {
+        if (restoreLq) restoreLq();
         drawDepth--;
         const dt = performance.now() - t0;
         S.counters.framesTotal++;
@@ -1465,6 +1672,31 @@ function patchCanvasDraw() {
         LOD.links++;
         LOD.ms += performance.now() - lt0;
         return undefined;
+      }
+      // Told to keep the curves but draw them cheaply. What costs the pixels is
+      // the width of the stroke and the dark outline drawn under it (a second
+      // stroke 4 units wider, so on a long link the outline is most of the ink).
+      // Both live on the canvas object, so they are set for this one call and
+      // put straight back — hit-testing, dragging and the panel never see them.
+      if (ctx && a && b && lodDetailOn()) {
+        let restore = null;
+        try {
+          const width = this.connections_width;
+          const border = this.render_connections_border;
+          this.connections_width = LOD_LINK_WIDTH;
+          this.render_connections_border = false;
+          restore = () => {
+            this.connections_width = width;
+            this.render_connections_border = border;
+          };
+          const ret = originalRenderLink.apply(this, args);
+          LOD.thinLinks++;
+          return ret;
+        } catch (err) {
+          lodAbort(err);
+        } finally {
+          if (restore) restore();
+        }
       }
       return originalRenderLink.apply(this, args);
     };
@@ -3484,6 +3716,8 @@ tr.ants-details table.ants-sub td { color: #bbb; }
   background: #202024; color: #eee; border: 1px solid #444; border-radius: 4px;
   padding: 4px 8px; font-size: 12px; width: 100%; max-width: 380px;
 }
+/* Elements of a node that is currently drawn as a rectangle: see lodSweepDom. */
+.ants-lod-box { display: none !important; }
 .ants-section-title {
   color: #ccc; font-size: 11px; font-weight: 600; margin: 12px 0 4px;
   text-transform: uppercase; letter-spacing: 0.05em;
@@ -4359,6 +4593,26 @@ function buildNodesTab(container) {
     lodUpdate();
   });
 
+  const lodDetailSel = el("select", { class: "ants-select", style: { width: "auto", maxWidth: "260px" } });
+  for (const z of LOD_DETAIL_ZOOMS) {
+    const opt = el("option", {
+      text: z === 0 ? "full link and node detail" : `links thinned below ${Math.round(z * 100)}% zoom`,
+    });
+    opt.value = String(z);
+    lodDetailSel.appendChild(opt);
+  }
+  lodDetailSel.value = String(LOD.detailZoom);
+  lodDetailSel.title =
+    "Below this zoom, links are stroked 1px wide instead of 3 and lose the dark outline drawn under them (a second stroke 4 units " +
+    "wider, which on a long link is most of the ink) \u2014 the curves are kept exactly as they are, because straight lines destroy " +
+    "the shape of a workflow built out of splines. Those frames are also drawn with the frontend's own low-quality mode on: no " +
+    "node shadows and no rounded corners. Neither change touches hit-testing, dragging or what a node actually is \u2014 and both " +
+    "are handed back as soon as the frame is drawn.";
+  lodDetailSel.addEventListener("change", () => {
+    lodSet({ detailZoom: Number(lodDetailSel.value) });
+    lodUpdate();
+  });
+
   const lodThumbSel = el("select", { class: "ants-select", style: { width: "auto", maxWidth: "240px" } });
   for (const z of LOD_THUMB_ZOOMS) {
     const opt = el("option", {
@@ -4379,10 +4633,13 @@ function buildNodesTab(container) {
   });
 
   const lodOffBtn = el("button", { class: "ants-btn", text: "Back to full drawing" });
-  lodOffBtn.title = "Turn both off and let ComfyUI draw the canvas exactly as it wants.";
+  lodOffBtn.title =
+    "Turn all of them off \u2014 flattening, link thinning, thumbnails and the redraw cap \u2014 and let ComfyUI draw the canvas " +
+    "exactly as it wants, including any DOM content this tool was hiding.";
   lodOffBtn.addEventListener("click", () => {
-    lodSet({ minPx: 0, idleCapMs: 0, thumbZoom: 0 });
+    lodSet({ minPx: 0, idleCapMs: 0, thumbZoom: 0, detailZoom: 0 });
     lodPxSel.value = "0";
+    lodDetailSel.value = "0";
     lodThumbSel.value = "0";
     lodIdleSel.value = "0";
     lodUpdate();
@@ -4390,6 +4647,7 @@ function buildNodesTab(container) {
 
   const lodRow = el("div", { style: { display: "flex", flexWrap: "wrap", gap: "10px", alignItems: "center", margin: "4px 0" } });
   lodRow.appendChild(lodPxSel);
+  lodRow.appendChild(lodDetailSel);
   lodRow.appendChild(lodThumbSel);
   lodRow.appendChild(lodIdleSel);
   lodRow.appendChild(lodOffBtn);
@@ -4409,7 +4667,13 @@ function buildNodesTab(container) {
         "The preview setting is separate and works on its own: image, preview and compare nodes blit a full-resolution bitmap " +
         "into whatever box the node occupies, and at low zoom that box is a few dozen pixels \u2014 the thumbnail ladder follows the " +
         "screen (about 512px around 60% zoom down to 64px around 10%), so what changes is how much image data is uploaded per " +
-        "redraw, not what the node shows.",
+        "redraw, not what the node shows. " +
+        "The link setting is the third: below the zoom you pick, links are stroked 1px wide instead of 3 and lose the dark outline " +
+        "drawn under them, while keeping the curves \u2014 straight lines destroy the shape of a workflow built out of splines, so " +
+        "that stays a separate option and is only used when most of the graph is already rectangles. Those frames are drawn with the " +
+        "frontend's own low-quality mode on as well (no node shadows, no rounded corners). Every element of a " +
+        "node that is currently a rectangle \u2014 image and video previews, curve editors, custom Vue or JS node UIs \u2014 is hidden " +
+        "with one class while its node is a box, and unhidden the moment the node is drawn properly again.",
     })
   );
 
@@ -4479,6 +4743,43 @@ function buildNodesTab(container) {
             `and node drawing has not moved (${fmtMs(b.nodeMsPerFrame)} → ${fmtMs(since.nodeMsPerFrame)} ms/frame): what is left is in the ` +
               `nodes this setting does not catch — raise it and watch this line`
           );
+        }
+      }
+      if (LOD.detailZoom > 0) {
+        if (lodDetailOn()) {
+          const frames = Math.max(1, since ? since.n : 1);
+          if (LOD.plan.links) {
+            // Most of the graph is rectangles, and that path straightens links.
+            // Saying so is the difference between "this setting does nothing"
+            // and "this setting is not the one in charge right now".
+            bits2.push(
+              `zoomed out: ${LOD.links} link draw(s) on the straight-line path (most of the graph is rectangles, per the node ` +
+                `setting above) \u2014 the link-thinning setting applies to links ComfyUI draws as splines, so set the node ` +
+                `threshold to 0 to compare`
+            );
+          } else {
+            bits2.push(
+              `zoomed out: ${LOD.thinLinks} link segment(s) stroked 1px without their outline ` +
+                `(${(LOD.thinLinks / frames).toFixed(1)}/frame, curves kept)` +
+                (LOD.lqMissing
+                  ? " \u00b7 this frontend version does not expose its low-quality flag, so node shadows and rounded corners are unchanged"
+                  : " \u00b7 node shadows and rounded corners are off for the frame")
+            );
+          }
+        } else {
+          bits2.push(
+            `zoomed in: links and node detail are drawn in full above ${Math.round(LOD.detailZoom * 100)}% zoom`
+          );
+        }
+      }
+      if (LOD.minPx > 0) {
+        if (LOD.domHidden) {
+          bits2.push(
+            `${LOD.domHidden} DOM element(s) of ${LOD.domNodes} boxed node(s) hidden ` +
+              `(image and video previews, curve editors, custom node UIs) \u2014 they come back the moment the node does`
+          );
+        } else if (LOD.plan.tiny > 0) {
+          bits2.push("no DOM content to hide on the nodes this setting catches (their visuals are canvas-drawn)");
         }
       }
       if (LOD.thumbZoom > 0) {
@@ -6489,6 +6790,14 @@ function buildTelemetryReport() {
             (LOD.thumbZoom > 0
               ? `, previews ${LOD.imgThumb}/${LOD.imgSeen} served from thumbnails (${LOD.thumbsBuilt} cached, ${fmtBytes(LOD.thumbBytes)}) below ${Math.round(LOD.thumbZoom * 100)}% zoom`
               : "") +
+            (LOD.detailZoom > 0
+              ? LOD.thinLinks > 0
+                ? `, links ${LOD.thinLinks} segment(s) drawn 1px without outlines below ${Math.round(LOD.detailZoom * 100)}% zoom`
+                : LOD.plan.links
+                  ? `, links drawn straight (most of the graph is rectangles) while ${LOD.detailZoom > 0 ? Math.round(LOD.detailZoom * 100) : 0}% link thinning is available for the spline path`
+                  : ""
+              : "") +
+            (LOD.domHidden ? `, ${LOD.domHidden} DOM element(s) of boxed nodes hidden` : "") +
             (() => {
               const since = lodSinceSwitch();
               if (!since || !LOD.baseline) return "";
@@ -6751,6 +7060,25 @@ function installDebugApi() {
             idleCapMs: LOD_IDLE_CAP_MS.slice(),
             thumbZoom: LOD_THUMB_ZOOMS.slice(),
             thumbLadder: LOD_THUMB_LADDER.slice(),
+            detailZoom: LOD_DETAIL_ZOOMS.slice(),
+            linkWidth: LOD_LINK_WIDTH,
+          };
+        },
+        get detail() {
+          return {
+            on: lodDetailOn(),
+            belowZoom: LOD.detailZoom,
+            thinLinks: LOD.thinLinks,
+            linkWidth: LOD_LINK_WIDTH,
+            lowQualityForced: lodDetailOn() && !LOD.lqMissing,
+            lowQualityAvailable: !LOD.lqMissing,
+          };
+        },
+        get dom() {
+          return {
+            hidden: LOD.domHidden,
+            nodes: LOD.domNodes,
+            marked: LOD.domMarked ? LOD.domMarked.size : 0,
           };
         },
         get previews() {
@@ -6771,7 +7099,7 @@ function installDebugApi() {
           return lodFrontendLod(app.canvas);
         },
         set: (opts) => lodSet(opts),
-        off: () => lodSet({ minPx: 0, idleCapMs: 0, thumbZoom: 0 }),
+        off: () => lodSet({ minPx: 0, idleCapMs: 0, thumbZoom: 0, detailZoom: 0 }),
       },
       setSyntheticTick,
       benchmark: (ms, slot) => runScriptedPan(Number(ms) || 6000, slot || "A"),

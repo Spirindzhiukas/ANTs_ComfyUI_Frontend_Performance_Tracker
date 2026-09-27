@@ -272,7 +272,19 @@ for (let i = 0; i < 6; i++) {
   h.canvas.links.push({ color: "#888888", from: [i * 240, 0], to: [i * 240 + 200, 100] });
 }
 h.app.graph._nodes = h.canvas.nodes; // in ComfyUI the graph the canvas draws is canvas.graph
-h.tracker.lowZoom.set({ minPx: 24, idleCapMs: 500, thumbZoom: 0.6 });
+
+// One of those nodes carries a DOM widget — the shape ComfyUI uses for Vue
+// nodes, image/video previews and custom node UIs. Its element lives in the page,
+// on top of the canvas, and is sized for a readable zoom whatever the canvas
+// does, so it is hidden while its node is a rectangle and comes back when it is
+// not. (h.document is the harness DOM; the class is the only thing touched.)
+const demoWidget = h.document.createElement("div");
+demoWidget.className = "dom-widget";
+demoWidget.appendChild(h.document.createElement("canvas"));
+h.document.body.appendChild(demoWidget);
+h.canvas.nodes[3].widgets = [{ name: "curve", element: demoWidget.children[0] }];
+
+h.tracker.lowZoom.set({ minPx: 24, idleCapMs: 500, thumbZoom: 0.6, detailZoom: 0.6 });
 
 // One node with a 4096px image in it, drawn the way a preview/load/compare node
 // draws: the first frame paints the full bitmap, the next one is served from the
@@ -290,6 +302,66 @@ for (let i = 0; i < 2; i++) {
   h.canvas.setDirty(true, true);
   h.canvas.draw();
 }
+run(500);
+await pump();
+
+bullets("LOW-ZOOM MODE: WHAT IT DID TO THIS PAGE");
+const frame = (n) => {
+  for (let i = 0; i < (n || 1); i++) {
+    h.advance(FRAME_MS);
+    h.canvas.setDirty(true, true);
+    h.canvas.draw();
+  }
+};
+const lodBoxed = () => demoWidget.classList.contains("ants-lod-box");
+frame(2);
+run(500);
+await pump(); // the thumbnail is built asynchronously, like createImageBitmap in a browser
+frame(2);
+run(500);
+await pump();
+const s = h.tracker.lowZoom.state;
+console.log(
+  `  zoom 10%, everything on: ${s.plan.tiny}/${s.plan.total} nodes painted as rectangles, ` +
+    `links taken over by the straight-line path (${s.links} of them — that path needs most of the graph to be rectangles)`
+);
+console.log(
+  `  DOM widget of a boxed node hidden: ${lodBoxed()} (${h.tracker.lowZoom.dom.hidden} element(s) of ${h.tracker.lowZoom.dom.nodes} boxed node(s))` +
+    ` | low-quality frame handed to the frontend: ${h.tracker.lowZoom.detail.lowQualityForced}` +
+    ` | previews served from thumbnails: ${h.tracker.lowZoom.previews.served}/${h.tracker.lowZoom.previews.seen}`
+);
+
+// The link setting on its own, with the nodes left alone: the curves are kept,
+// the ink is not. This is the shape of a workflow the user actually zooms out of.
+h.tracker.lowZoom.set({ minPx: 0 });
+h.canvas.linkSettings.length = 0;
+h.canvas.ctx.ops.length = 0;
+const thinBefore = h.tracker.lowZoom.detail.thinLinks;
+frame(2);
+run(500);
+await pump();
+const last = h.canvas.linkSettings[h.canvas.linkSettings.length - 1];
+console.log(
+  `  links only (flattening off): ${h.tracker.lowZoom.detail.thinLinks - thinBefore} link segment(s) stroked ${last && last.width}px with ` +
+    `border ${last && last.border}, bezier segments drawn: ${h.canvas.ctx.ops.filter((o) => o[0] === "bezierCurveTo").length} ` +
+    `(the splines are all still there), canvas setting back to ${h.canvas.connections_width}/${h.canvas.render_connections_border}`
+);
+
+// And the same moment one zoom level up: nothing is degraded, the DOM element is
+// back on screen, the canvas object is exactly as ComfyUI left it. This is the
+// check that matters — the mode has to give the page back as it found it.
+h.tracker.lowZoom.set({ minPx: 24 });
+h.canvas.ds.scale = 0.9;
+const thinBefore2 = h.tracker.lowZoom.detail.thinLinks;
+frame(2);
+run(500);
+await pump();
+console.log(
+  `  at 90% zoom: nodes flattened ${h.tracker.lowZoom.state.plan.tiny}, links thinned ${h.tracker.lowZoom.detail.thinLinks - thinBefore2} (none),` +
+    ` DOM widget hidden ${lodBoxed()} (false), canvas link width ${h.canvas.connections_width}, border ${h.canvas.render_connections_border}`
+);
+h.canvas.ds.scale = 0.1;
+frame(2);
 run(500);
 await pump();
 
@@ -335,6 +407,12 @@ console.log(
     "\n      Its preview setting is the other half: image, preview and compare nodes blit a full-resolution bitmap every" +
     "\n      redraw, so below the zoom you set (60% by default) those draws are served from a cached copy of about the" +
     "\n      resolution the screen can show — 64px on the long side at 10% zoom, 512px around 60% for a big node." +
+    "\nnote: the third setting degrades links instead of straightening them: below its zoom they are stroked 1px wide" +
+    "\n      instead of 3 and lose the dark outline ComfyUI draws under every link — the curves themselves are untouched," +
+    "\n      so a workflow built out of splines still reads as one. Below 100% the frontend's own low-quality mode is" +
+    "\n      switched on for the duration of the frame as well (no node shadows, no rounded corners), and the DOM content" +
+    "\n      of a node that is currently a rectangle — previews, curve editors, Vue and custom node UIs — is hidden with" +
+    "\n      the .ants-lod-box class until the node is drawn properly again. All three are opt-in and hand everything back." +
     "\nnote: in this simulation the clock only advances with h.advance(), so the tracker's own" +
     "\n      per-render cost reads 0 — a real browser spends real time rendering the panel." +
     "\n      Everything else above is what web/tracker.js computes from the synthetic traffic."

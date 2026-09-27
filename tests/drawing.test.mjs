@@ -316,6 +316,113 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     assertEqual(cropped[9], 400, "and the destination untouched");
   });
 
+
+  test("links keep their curves below the zoom, and lose their ink instead", async () => {
+    const h = await boot();
+    h.window.devicePixelRatio = 1;
+    bigGraph(h, 6, 0.1);
+    h.tracker.lowZoom.set({ detailZoom: 0.6 });
+    h.canvas.ctx.ops.length = 0;
+    drawLoop(h, 0.1);
+
+    assertGreater(h.canvas.linkSettings.length, 0, "links were rendered");
+    assert(
+      h.canvas.linkSettings.every((s) => s.width === 1 && s.border === false),
+      "every one of them 1px wide, with no outline stroke"
+    );
+    const beziers = h.canvas.ctx.ops.filter((o) => o[0] === "bezierCurveTo").length;
+    assertGreater(beziers, 0, "and still drawn as splines: the shape of the link is not what changes");
+    assertEqual(h.tracker.lowZoom.detail.thinLinks, h.canvas.linkDraws, "the panel counts them");
+    assertEqual(h.canvas.connections_width, 3, "the canvas setting is put back after the call");
+    assertEqual(h.canvas.render_connections_border, true, "both of them");
+
+    // Zoomed in past the threshold, nothing is degraded.
+    const before = h.canvas.linkSettings.length;
+    h.canvas.ds.scale = 0.8;
+    drawLoop(h, 0.1);
+    const after = h.canvas.linkSettings.slice(before);
+    assert(after.length > 0, "links were rendered at 80% zoom too");
+    assert(after.every((s) => s.width === 3 && s.border === true), "and drawn the way ComfyUI draws them");
+    assertEqual(h.tracker.lowZoom.detail.on, false, "the panel says so");
+
+    // With flattening on and most of the graph rectangles, links are taken over
+    // by the straight-line path — which is a different thing from the thinning
+    // setting doing nothing, and the panel has to say so.
+    h.canvas.ds.scale = 0.1;
+    h.tracker.lowZoom.set({ minPx: 32 });
+    drawLoop(h, 0.1);
+    drawLoop(h, 0.1);
+    await openNodesTab(h);
+    const text = panelText(h);
+    assertIncludes(text, "straight-line path", "the panel names the path links are actually on");
+    assertIncludes(text, "the link-thinning setting applies", "and says how to see the thinning instead");
+  });
+
+  test("the frontend's own low-quality rendering is borrowed for the frame, then handed back", async () => {
+    const h = await boot();
+    bigGraph(h, 4, 0.1);
+    h.canvas._isLowQuality = false;
+    h.tracker.lowZoom.set({ detailZoom: 0.6 });
+    h.canvas.nodeLowQuality.length = 0;
+    drawLoop(h, 0.1);
+    assertGreater(h.canvas.nodeLowQuality.length, 0, "nodes were drawn");
+    assert(h.canvas.nodeLowQuality.every((v) => v === true), "each one inside the low-quality frame");
+    assertEqual(h.canvas._isLowQuality, false, "and the flag is back where the frontend left it");
+    assertEqual(h.tracker.lowZoom.detail.lowQualityForced, true, "the panel says the low-quality path is in use");
+
+    // A frontend that does not expose the flag is reported, not assumed.
+    const h2 = await boot();
+    bigGraph(h2, 4, 0.1);
+    delete h2.canvas._isLowQuality;
+    h2.tracker.lowZoom.set({ detailZoom: 0.6 });
+    drawLoop(h2, 0.1);
+    assertEqual(h2.tracker.lowZoom.detail.lowQualityAvailable, false, "this frontend cannot be put in that mode");
+    assertGreater(h2.canvas.linkSettings.length, 0, "links are still degraded, which does not need the flag");
+  });
+
+  test("the DOM content of a boxed node is hidden, and comes back when it is not a box", async () => {
+    const h = await boot();
+    h.window.devicePixelRatio = 1;
+    bigGraph(h, 2, 0.1); // 200 units x 0.1 = 20px on screen
+    // A DOM widget the way an extension adds one: an element inside a .dom-widget
+    // wrapper that ComfyUI positions over the canvas.
+    const wrapper = h.document.createElement("div");
+    wrapper.className = "dom-widget";
+    const inner = h.document.createElement("canvas");
+    wrapper.appendChild(inner);
+    h.document.body.appendChild(wrapper);
+    h.canvas.nodes[0].widgets = [{ name: "preview", element: inner }];
+    // And a Vue-rendered node, whose whole visual is one DOM element.
+    const vueRoot = h.document.createElement("div");
+    vueRoot.setAttribute("data-node-id", "7");
+    h.document.body.appendChild(vueRoot);
+    h.canvas.nodes[1].id = 7;
+    h.app.graph._nodes = h.canvas.nodes;
+
+    assertEqual(h.tracker.lowZoom.dom.hidden, 0, "nothing is hidden while nothing is boxed");
+    h.tracker.lowZoom.set({ minPx: 32 });
+    assertEqual(h.tracker.lowZoom.dom.hidden, 2, "both the widget and the Vue node are hidden");
+    assertEqual(h.tracker.lowZoom.dom.nodes, 2, "belonging to two boxed nodes");
+    assert(wrapper.classList.contains("ants-lod-box"), "the widget is hidden through its .dom-widget wrapper");
+    assert(vueRoot.classList.contains("ants-lod-box"), "and the Vue node by its own element");
+
+    // Zoom in far enough that the node is worth drawing properly again.
+    h.canvas.ds.scale = 0.5; // 200 x 0.5 = 100px > 32px
+    drawLoop(h, 0.1);
+    assertEqual(h.tracker.lowZoom.dom.hidden, 0, "nothing is hidden at a readable zoom");
+    assert(!wrapper.classList.contains("ants-lod-box"), "the widget is visible again");
+    assert(!vueRoot.classList.contains("ants-lod-box"), "so is the Vue node");
+
+    // And turning the mode off clears whatever is left.
+    h.canvas.ds.scale = 0.1;
+    h.tracker.lowZoom.set({ minPx: 32, detailZoom: 0.6 });
+    drawLoop(h, 0.1);
+    assertGreater(h.tracker.lowZoom.dom.hidden, 0, "boxed again");
+    h.tracker.lowZoom.off();
+    assertEqual(h.tracker.lowZoom.dom.hidden, 0, "nothing of somebody else's page is left hidden");
+    assert(!wrapper.classList.contains("ants-lod-box"));
+  });
+
   test("the panel says whether culling could help at this zoom, and what the mode is doing", async () => {
     const h = await boot();
     h.window.devicePixelRatio = 1;
