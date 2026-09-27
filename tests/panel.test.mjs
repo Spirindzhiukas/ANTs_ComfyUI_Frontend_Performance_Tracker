@@ -218,6 +218,36 @@ suite("panel", () => {
     assertEqual(h.errors().length, 0, "a 404 on the optional route must not be an error");
   });
 
+  test("GPU tab reads /system_stats the way ComfyUI defines it", async () => {
+    // Real payload shape and magnitudes (from ComfyUI OOM reports): on a 12.9GB
+    // card torch_vram_total is torch's RESERVED pool (1.17GB), not the device
+    // total, and torch_vram_free (0.19GB) is the unused part of that pool. So
+    // "allocated" = total - free, and it must never be rendered as the total.
+    const h = await boot();
+    h.fetchRoutes.set("/system_stats", {
+      devices: [
+        {
+          name: "cuda:0 NVIDIA GeForce RTX 2060",
+          type: "cuda",
+          vram_total: 12884443136,
+          vram_free: 10727621930,
+          torch_vram_total: 1174405120,
+          torch_vram_free: 192578858,
+        },
+      ],
+    });
+    h.tracker.open();
+    clickTab(h, "gpu");
+    await h.flush();
+    h.advance(300);
+    const text = byId(h, "ants-tracker-body").textContent;
+    assertIncludes(text, "VRAM used", "ComfyUI's own used figure");
+    assertIncludes(text, "torch pool", "torch's caching pool is named as a pool");
+    assertIncludes(text, "936.3 MB in use", "in use is reserved minus idle, not reserved");
+    assert(!text.includes("torch allocated"), "the mislabel that read reserved as allocated is gone");
+    assertIncludes(text, "not torch", "the remainder is attributed honestly");
+  });
+
   test("node widget button opens the panel", async () => {
     const h = await boot();
     const ext = h.app.extensions.find((e) => e.name === "ANTs.NastyBastardsTracker.Core");

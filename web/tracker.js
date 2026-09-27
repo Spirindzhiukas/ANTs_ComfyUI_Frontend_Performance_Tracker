@@ -78,6 +78,13 @@ function fmtBytes(n) {
   return `${n.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
 }
 
+// Numbers arriving from JSON: a missing field, a string, or NaN must never be
+// rendered as a plausible-looking number.
+function numOrNull(v) {
+  const n = typeof v === "number" ? v : Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
 function fmtPct(frac) {
   if (!Number.isFinite(frac)) return "—";
   const p = frac * 100;
@@ -2492,17 +2499,42 @@ function buildGpuTab(container) {
         header.appendChild(td({ class: "ants-kv-label", text: `${d.name || "device"}${d.type ? ` (${d.type})` : ""}` }));
         header.appendChild(td());
         kv.appendChild(header);
-        kvRow(kv, "VRAM used", `${fmtBytes((d.vram_total || 0) - (d.vram_free || 0))} / ${fmtBytes(d.vram_total || 0)}`, {
-          bar: d.vram_total ? (d.vram_total - d.vram_free) / d.vram_total : undefined,
-          title: "From ComfyUI's /system_stats (torch's view of the device).",
+        const used = (d.vram_total || 0) - (d.vram_free || 0);
+        kvRow(kv, "VRAM used", `${fmtBytes(used)} / ${fmtBytes(d.vram_total || 0)}`, {
+          bar: d.vram_total ? used / d.vram_total : undefined,
+          title:
+            "ComfyUI's own numbers (vram_total - vram_free). vram_free counts torch's idle pool as free, so this is the figure that answers " +
+            "'can another model load right now'; it is not the driver's used-bytes reading.",
         });
-        kvRow(kv, "torch allocated", `${fmtBytes(d.torch_vram_total || 0)} (${fmtBytes(d.torch_vram_free || 0)} free within torch)`);
-        if (d.torch_vram_total && d.vram_total) {
-          const gap = d.vram_total - d.vram_free - d.torch_vram_total;
-          if (gap > 0) {
-            kvRow(kv, "held outside torch", `${fmtBytes(gap)}`, {
-              title: "Driver/other processes holding VRAM that torch does not account for: other apps, a second ComfyUI instance, or fragmentation.",
-            });
+        // ComfyUI reports torch_vram_total as what torch has RESERVED from the
+        // driver, and torch_vram_free as the unused part of that pool, so
+        // in-use = total - free. (Real /system_stats payloads: 12.9GB device,
+        // torch_vram_total 1.17GB, torch_vram_free 0.19GB.)
+        const torchReserved = numOrNull(d.torch_vram_total);
+        const torchFree = numOrNull(d.torch_vram_free);
+        if (torchReserved !== null) {
+          const inUse = torchFree !== null ? Math.max(0, torchReserved - torchFree) : null;
+          kvRow(
+            kv,
+            "torch pool",
+            inUse !== null
+              ? `${fmtBytes(inUse)} in use · ${fmtBytes(torchReserved)} reserved · ${fmtBytes(torchFree)} idle`
+              : `${fmtBytes(torchReserved)} reserved`,
+            {
+              title:
+                "torch's caching allocator, as ComfyUI reports it (torch_vram_total = reserved from the driver, torch_vram_free = unused inside " +
+                "that pool). \"in use\" is reserved - idle: the tensors actually held. A large idle figure is normal caching, not a leak.",
+            }
+          );
+          if (inUse !== null && used > 0) {
+            const outside = used - inUse;
+            if (outside > 0) {
+              kvRow(kv, "not torch", `${fmtBytes(outside)}`, {
+                title:
+                  "ComfyUI's used figure minus torch's tensors: CUDA context, cuDNN/cuBLAS workspaces, other processes, display, or fragmentation. " +
+                  "A large value with a small torch pool means the pressure on the card is not coming from ComfyUI at all.",
+              });
+            }
           }
         }
       }

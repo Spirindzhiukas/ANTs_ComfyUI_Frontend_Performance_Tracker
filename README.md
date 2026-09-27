@@ -287,10 +287,17 @@ logged for DevTools.
 ## Development
 
 ```
-node tests/run-tests.mjs          # 36 tests, no dependencies, no browser
+node tests/run-tests.mjs          # 37 tests, no dependencies, no browser
 node tests/run-tests.mjs timing   # filter by name fragment
 python3 tests/test_init.py        # backend route parsing + graceful fallbacks
+node tests/demo.mjs               # print what the panel says, with no ComfyUI
 ```
+
+`tests/demo.mjs` drives a synthetic graph (two packs, four node types, a
+status heartbeat, one long animation frame per second) through the real
+tracker and prints the summary bar, all seven tabs and the text report —
+the fastest way to see exactly what the panel reports without installing
+anything, and a useful before/after when changing the UI.
 
 The JS suite loads `web/tracker.js` into a fake browser and a fake
 ComfyUI/LiteGraph with a controllable clock, then asserts the numbers

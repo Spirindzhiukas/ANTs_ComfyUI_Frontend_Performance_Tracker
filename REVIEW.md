@@ -212,11 +212,15 @@ contains per-device VRAM totals/free plus torch's own accounting, and nvidia-smi
 can be surfaced by the backend. The tab instead ended with "run a script
 alongside ComfyUI and eyeball it".
 
-**v2:** the GPU tab reads `/system_stats` (headroom, torch-allocated vs driver
-memory) and an optional new backend route, `GET /ants_tracker/gpu`, which shells
-out to nvidia-smi with a 2s cache and reports "not available, because X" when
-there is no NVIDIA tooling. Per-extension attribution is still documented as
-impossible rather than faked.
+**v2:** the GPU tab reads `/system_stats` — headroom from `vram_total`/
+`vram_free`, torch's pool read the way ComfyUI defines it (`torch_vram_total` is
+what torch has *reserved*, `torch_vram_free` the unused part of it, so in-use is
+total − free), and the remainder (`used − torch in use`) labelled "not torch"
+rather than blamed on fragmentation — plus an optional new backend route,
+`GET /ants_tracker/gpu`, which shells out to nvidia-smi with a 2s cache and
+reports "not available, because X" when there is no NVIDIA tooling.
+Per-extension VRAM attribution is still documented as impossible rather than
+faked.
 
 ---
 
