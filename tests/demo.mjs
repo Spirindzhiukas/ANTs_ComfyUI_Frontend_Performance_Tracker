@@ -406,38 +406,78 @@ console.log(
 );
 h.tracker.lowZoom.set({ linkStyle: "spline" });
 
-// Viewport focus: the interaction half. Below the zoom nobody can read a node,
-// so its UI — hover, click, drag, wheel capture, and with it a 3D viewport's
-// reason to re-render its scene — is switched off, and the frontend's own
-// backwards walk over every visible node per pointer move is answered with
-// nothing.
+// Viewport focus, half one: below the zoom nobody can read a node, so its widget
+// UI is switched off. The nodes themselves stay live — they still select, drag
+// and open their menu — and what goes is the hover reporting, the clicks and the
+// wheel capture that a 3D viewport needs before it will render its scene at all.
 h.tracker.lowZoom.set({ inertBelow: 0.4 });
 h.canvas.ds.scale = 0.1;
 placeViewport();
-let points = 0;
-for (let i = 0; i < 20; i++) {
-  const node = h.canvas.graph.getNodeOnPos(40 + i, 40, h.canvas.nodes);
-  if (!node) points++;
-}
 const focus = h.tracker.lowZoom.focus;
+const stillSelectable = h.canvas.graph.getNodeOnPos(10, 10, h.canvas.nodes);
 console.log(
-  `  focus mode below 40%: ${focus.inertElements} element(s) made inert (the 3D viewport among them), ` +
-    `${points}/20 simulated pointer-move hit-tests answered with nothing, ${focus.hitsBlocked} counted in total ` +
-    `— the node UI cannot be hovered, clicked, dragged or scrolled`
+  `  focus mode below 40%: ${focus.inertElements} element(s) switched off (the 3D viewport's wrapper among them, and that is what stops its ` +
+    `render loop) — while the node itself is still found by the frontend's own hit-test: ${stillSelectable ? "yes, it stays selectable" : "NO"}`
 );
 h.tracker.lowZoom.set({ inertBelow: 0 });
 
-// Foveated: off-screen node UI gets the same treatment at any zoom, so only what
-// is in front of you is live in both directions.
+// Half two: off-screen node DOM is boxed and inert at any zoom, and what comes
+// back does so on a budget — one element per drawn frame by default, so panning
+// keeps the graph boxed instead of rebuilding every widget it passes.
 h.canvas.ds.scale = 1;
-h.canvas.nodes[3].pos = [9000, 4000];
+// The idle cap from earlier in this demo merges redraws, and a merged redraw is
+// not a drawn frame — what this block counts is drawn frames, so it is off here.
+h.tracker.lowZoom.set({ idleCapMs: 0 });
+h.canvas.setDirty(true, true);
+h.canvas.draw();
+// Where "far" and "in the margin" are is measured against what the canvas is
+// showing, not guessed: the margin is half a screen of it.
+const shown = h.canvas.visible_area;
+const farX = shown[0] + shown[2] * 3;
+const marginX = shown[0] + shown[2] * (1 + 0.25);
+h.canvas.nodes[3].pos = [farX, shown[1] + 40];
+h.canvas.nodes[2].pos = [farX, shown[1] + 40];
+placeViewport(); // the frontend repositions a DOM widget every frame; so does this
 h.tracker.lowZoom.set({ flatBelow: 0, fovea: true });
-h.tracker.lowZoom.sweep();
+h.canvas.setDirty(true, true);
+h.canvas.draw();
 console.log(
   `  foveated at 100% zoom: ${h.tracker.lowZoom.focus.foveaElements} element(s) of far off-screen nodes boxed and switched off ` +
-    `(no node setting involved: ${h.tracker.lowZoom.state.flatBelow}), the ones on screen untouched`
+    `(node setting involved: ${h.tracker.lowZoom.state.flatBelow}; margin ${h.tracker.lowZoom.focus.margin} screen, i.e. ${h.tracker.lowZoom.focus.registered - h.tracker.lowZoom.focus.foveaElements} ` +
+    `of ${h.tracker.lowZoom.focus.registered} registered elements still live)`
 );
-h.canvas.nodes[3].pos = [0, 200];
+h.canvas.nodes[3].pos = [marginX, shown[1] + 40];
+h.canvas.nodes[2].pos = [marginX + 40, shown[1] + 140];
+placeViewport();
+h.canvas.setDirty(true, true);
+h.canvas.draw();
+const afterOne = h.tracker.lowZoom.focus.foveaElements;
+h.canvas.setDirty(true, true);
+h.canvas.draw();
+console.log(
+  `  coming back is rationed: ${afterOne} element(s) after the first drawn frame, ${h.tracker.lowZoom.focus.foveaElements} after the second ` +
+    `(${h.tracker.lowZoom.focus.cameBack} handed back so far)`
+);
+// A Windows display at 200%: the canvas backing store is twice the box the
+// element occupies, which is the difference between a viewport 1600 graph units
+// wide and one 3200 wide. The check reads the browser and the canvas, and says
+// which unit the frontend's own rectangle is in.
+h.canvas.canvas.width = h.canvas.canvas.clientWidth * 2;
+h.canvas.canvas.height = h.canvas.canvas.clientHeight * 2;
+h.window.devicePixelRatio = 2;
+h.canvas.setDirty(true, true);
+h.canvas.draw(); // a drawn frame is what keeps the frontend's own rectangle current
+const disp = h.tracker.lowZoom.checkDisplay();
+console.log(
+  `  display scale: browser ${disp.win}\u00d7, canvas backing store ${disp.backing}\u00d7 its ${disp.css}px CSS box, and the frontend's visible area ` +
+    `${disp.reported} vs our own ${disp.ours} graph units (${disp.factor}\u00d7, ${disp.unit}) \u2014 this is the check that runs at startup for a ` +
+    `Windows display set to 200%`
+);
+h.canvas.canvas.width = h.canvas.canvas.clientWidth;
+h.canvas.canvas.height = h.canvas.canvas.clientHeight;
+h.canvas.nodes[3].pos = [shown[0] + 40, shown[1] + 40];
+h.canvas.nodes[2].pos = [shown[0] + shown[2] * 0.6, shown[1] + 40];
+placeViewport();
 h.tracker.lowZoom.set({ fovea: false });
 
 // The measured answer to "does thinning do anything on this page": the panel

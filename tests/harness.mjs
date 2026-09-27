@@ -243,7 +243,11 @@ export function createHarness(options = {}) {
   class FakeLGraphCanvas {
     constructor() {
       this.ds = { offset: new Float32Array([0, 0]), scale: 1 };
-      this.canvas = { width: 1600, height: 900 };
+      // The canvas element: `width`/`height` are the backing store (device
+      // pixels) and clientWidth/clientHeight its CSS box. They are equal here,
+      // which is a 100% display; a test that wants a Windows display scale sets
+      // width/height to a multiple and devicePixelRatio alongside it.
+      this.canvas = { width: 1600, height: 900, clientWidth: 1600, clientHeight: 900 };
       this.nodes = [];
       this.links = [];
       this.nodeDraws = 0;
@@ -257,6 +261,7 @@ export function createHarness(options = {}) {
       // screen. The visible-node set the tracker reads for focus mode is this
       // in production; here it is derived the same way, from the viewport.
       this.visible_area = [0, 0, 1600, 900];
+      this.recomputeVisibleArea();
       // The frontend's own canvas fields, so a wrapper that changes them for the
       // duration of one call can be caught doing it (and caught putting it back).
       this.connections_width = 3;
@@ -264,6 +269,19 @@ export function createHarness(options = {}) {
       this._isLowQuality = false;
       this.linkSettings = []; // what each link was rendered with
       this.nodeLowQuality = []; // what the canvas flag was for each node draw
+    }
+    // What the real DragAndScale.computeVisibleArea does on every drawn frame:
+    // the area is the canvas's CSS box divided by the draw scale, offset by the
+    // pan. The width/height of the element are device pixels, so the CSS box is
+    // what the maths uses — a test that wants a display scale sets
+    // canvas.width/clientWidth apart and devicePixelRatio with them.
+    recomputeVisibleArea() {
+      const scale = Number(this.ds.scale) || 1;
+      const css = this.canvas.clientWidth || this.canvas.width;
+      const cssH = this.canvas.clientHeight || this.canvas.height;
+      this.visible_area = [-(Number(this.ds.offset[0]) || 0), -(Number(this.ds.offset[1]) || 0), css / scale, cssH / scale];
+      if (this.ds) this.ds.visible_area = this.visible_area;
+      return this.visible_area;
     }
     drawConnections() {
       busy(this.costs.connections);
@@ -298,6 +316,7 @@ export function createHarness(options = {}) {
       if (node && typeof node.onDrawBackground === "function") node.onDrawBackground(this.ctx);
     }
     draw() {
+      this.recomputeVisibleArea();
       this.drawCalls++;
       busy(this.costs.background);
       this.drawConnections();

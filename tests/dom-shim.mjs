@@ -174,7 +174,14 @@ export function createDocument() {
   };
   doc.getElementById = (id) => doc.descendants().find((n) => n.id === id || n._attrs.id === id) || null;
   doc.execCommand = () => true;
-  doc.querySelectorAll = Node.prototype.querySelectorAll;
+  // Counted, so a test can hold the tracker to "the page is discovered on a
+  // budget, not per frame": a pan must not re-walk the DOM.
+  const baseQsa = Node.prototype.querySelectorAll;
+  doc._qsaCalls = 0;
+  doc.querySelectorAll = function (selector) {
+    doc._qsaCalls++;
+    return baseQsa.call(this, selector);
+  };
   return doc;
 }
 

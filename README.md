@@ -496,7 +496,7 @@ logged for DevTools.
 ## Development
 
 ```
-node tests/run-tests.mjs          # 118 tests, no dependencies, no browser
+node tests/run-tests.mjs          # 122 tests, no dependencies, no browser
 node tests/run-tests.mjs timing   # filter by name fragment
 python3 tests/test_init.py        # backend route parsing + graceful fallbacks
 node tests/demo.mjs               # print what the panel says, with no ComfyUI
@@ -536,27 +536,27 @@ patches `drawImage` there, the same way a browser exposes it), and
 `createImageBitmap` records the resize it was asked to perform instead of
 resizing anything.
 
-## What changed in v2.1.12
+## What changed in v2.1.13
 
-- **Viewport focus: node UI is switched off when nobody can use it.** A graph at
-  10% zoom does not need a thousand nodes answering the pointer, and a node that
-  is not answering costs nothing. Two switches in the Tweaks tab:
-  - *nodes other than this one are unclickable and uneditable when zoomed out*
-    (off by default; the zoom is 20–60%, 40% when first switched on). Below it,
-    every node's DOM UI carries `pointer-events: none` — no hover reporting, no
-    tooltips, no click, no drag, no drop target, no wheel capture — and the
-    frontend's own node hit-test is answered with "nothing". That last part is
-    the measurable one: `LGraph.getNodeOnPos` is what the canvas calls on *every*
-    pointer move, and it walks backwards through every visible node calling
-    `isPointInside` until one matches. Below the zoom that walk is skipped
-    entirely and the count is shown in the panel. Panning, zooming and the
-    tracker's own node keep working.
-  - *off-screen nodes are boxed and inert too, at every zoom (foveated)*. Nodes
-    more than one viewport outside the visible area get the boxed treatment and
-    the inert class whatever the zoom, so only what is in front of you is live,
-    in both directions. The margin is deliberate: the sweep runs on a 250 ms
-    budget, and a node crossing a whole viewport of margin under a pan takes
-    longer to arrive than that, so nothing visible is ever blanked.
+- **Viewport focus reaches the 3D nodes this time, and stops taking the nodes
+  with it.** Two corrections to v2.1.12's focus mode, both from the report that
+  the 3D nodes were still clickable and the ordinary nodes had lost their
+  selectability:
+  - **A node is no longer made unclickable.** The frontend's own node hit-test
+    (`LGraph.getNodeOnPos`) is left exactly as ComfyUI wrote it, so nodes still
+    select, drag, edit and open their menus at any zoom. What is switched off is
+    the *widget* UI: the class now lands on the widget's wrapper plus everything
+    inside it (`pointer-events: none !important`, descendants included, because a
+    child that sets `pointer-events: auto` overrides an inert ancestor — and the
+    frontend's own widget layer sets it inline on the very wrappers we touch).
+  - **The 3D viewports are reachable at all.** The core 3D nodes are
+    `ComponentWidgetImpl`s: the widget object has no `element` to walk from, and
+    its DOM is a wrapper the frontend renders into the DOM widget layer. The old
+    sweep walked `node.widgets` and then only looked at the layer for nodes it was
+    already flattening, so with the node-flattening setting off a 3D viewport was
+    invisible to it. There is now one registry of node DOM — built from widget
+    elements, Vue node roots and the layer wrappers — and it is consulted for
+    every node, flattened or not.
 - **Why the 3D nodes care, specifically.** ComfyUI's 3D viewer decides whether to
   render by asking whether the pointer is over it (`isLoad3dActive` =
   `mouseOnNode || mouseOnScene || mouseOnViewer || recording || !initialRenderDone
@@ -564,13 +564,34 @@ resizing anything.
   while that is true. So merely moving the mouse across a 3D node makes it render
   its scene every frame *on top of* the canvas redraw, and its wheel handler
   captures scrolling to zoom the model instead of the graph. `pointer-events:
-  none` below the focus zoom turns all of that off at the source: the viewer is
-  told the pointer is not over it, so it stops rendering; the wheel goes to the
-  canvas, so the graph zooms. This is the first change in this project that makes
-  a 3D node cheaper by making it do *less*, rather than by painting it
-  differently.
-- Both switches are remembered across sessions, are off by default, and are
-  handed back by "Back to full drawing".
+  none` turns both off at the source: the viewer is told the pointer is not over
+  it, so it stops rendering; the wheel goes to the canvas, so the graph zooms.
+- **Foveation costs less than it saves, this time.** The first version re-walked
+  the DOM widget layer every 250 ms while the view moved, which is the one thing
+  that must not happen inside a pan. Now the layer is read once a second and
+  ownership is cached per element (an unchanged wrapper costs a float comparison),
+  while the per-frame work is arithmetic over the registry with a class written
+  only where the answer changed. Two more knobs:
+  - **margin: ½ a screen by default** (¼, ½, 1, 2), instead of a full viewport;
+  - **coming back is rationed: one element per drawn frame by default** (1, 4, or
+    all at once). Going away is a class on something nobody is looking at;
+    coming back re-runs layout for that widget and re-measures a 3D renderer, so
+    it is the expensive direction — and whatever is *on screen* is handed back
+    immediately regardless of the budget, so a visible widget is never blank.
+- **The display-scale check, run at startup.** Windows display scaling (System →
+  Display → Scale, 200% on a 4K screen) makes the canvas backing store larger than
+  the element it is drawn in, and anything that divides by the backing store is
+  out by exactly that factor. The check reads `window.devicePixelRatio`, the
+  canvas backing store against its own CSS box, and the frontend's own
+  `visible_area` against this tool's independent computation of it — then says
+  which unit that rectangle is in. The maths itself no longer depends on the
+  answer: the viewport comes from the canvas's *CSS* box and the draw state,
+  LiteGraph's own arithmetic in the unit that cannot be scaled. The check runs
+  once at startup, once a second with the sweep, whenever the panel refreshes,
+  and it is in the readout and in `snapshot().lowZoom.focus.display`. If it reads
+  wrong, "display scale" can be pinned by hand (auto / 100%…300%).
+- Everything here is off by default, remembered across sessions, and handed back
+  by "Back to full drawing".
 
 ## What changed in v2.1.11
 
