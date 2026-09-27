@@ -96,21 +96,59 @@ class Node {
     return Object.prototype.hasOwnProperty.call(this._attrs, k) ? this._attrs[k] : null;
   }
 
-  addEventListener(type, fn) {
+  addEventListener(type, fn, options) {
     if (!this._listeners.has(type)) this._listeners.set(type, []);
-    this._listeners.get(type).push(fn);
+    const capture = options === true || (options && options.capture === true);
+    this._listeners.get(type).push({ fn, capture });
   }
-  removeEventListener(type, fn) {
+  removeEventListener(type, fn, options) {
     const list = this._listeners.get(type);
     if (!list) return;
-    const i = list.indexOf(fn);
+    const capture = options === true || (options && options.capture === true);
+    const i = list.findIndex((l) => l.fn === fn && l.capture === capture);
     if (i >= 0) list.splice(i, 1);
   }
+  // A real dispatch: capture from the document down to the target, then bubble
+  // back up, with stopPropagation honoured — which is the only way to test the
+  // gate that swallows events aimed at switched-off elements.
   _fire(type, props) {
-    const list = this._listeners.get(type) || [];
-    const ev = Object.assign({ type, target: this, currentTarget: this, preventDefault() {}, stopPropagation() {} }, props || {});
-    for (const fn of list.slice()) fn.call(this, ev);
+    const path = [];
+    for (let n = this; n; n = n.parentNode) path.push(n);
+    const ev = Object.assign(
+      {
+        type,
+        target: this,
+        currentTarget: null,
+        defaultPrevented: false,
+        cancelable: true,
+        preventDefault() {
+          this.defaultPrevented = true;
+        },
+        stopPropagation() {
+          this._stopped = true;
+        },
+      },
+      props || {}
+    );
+    const call = (node, entry) => {
+      if (ev._stopped) return;
+      ev.currentTarget = node;
+      entry.fn.call(node, ev);
+    };
+    // root -> target, capture only
+    for (let i = path.length - 1; i >= 1; i--) {
+      for (const entry of (path[i]._listeners.get(type) || []).slice()) if (entry.capture) call(path[i], entry);
+    }
+    for (const entry of (this._listeners.get(type) || []).slice()) if (entry.capture) call(this, entry);
+    // target -> root, bubble only
+    for (const entry of (this._listeners.get(type) || []).slice()) if (!entry.capture) call(this, entry);
+    for (let i = 1; i < path.length; i++) {
+      for (const entry of (path[i]._listeners.get(type) || []).slice()) if (!entry.capture) call(path[i], entry);
+    }
     return ev;
+  }
+  dispatchEvent(ev) {
+    return this._fire(ev.type, ev);
   }
   click() {
     this._fire("click", {});
@@ -132,20 +170,31 @@ class Node {
     return { top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 };
   }
 
-  // Only what the tracker asks for: a presence selector, and one that pins an
-  // attribute to a value. Anything else returns nothing rather than guessing.
+  // What the tracker asks for: an attribute (with or without a value), a class,
+  // and the two chained. Anything else returns nothing rather than guessing.
   querySelectorAll(selector) {
     const sel = String(selector || "").trim();
-    const m = /^\[([\w:-]+)(?:=(?:"([^"]*)"|'([^']*)'|([^\]]+)))?\]$/.exec(sel);
-    if (!m) return [];
-    const attr = m[1];
-    const want = m[2] !== undefined ? m[2] : m[3] !== undefined ? m[3] : m[4];
-    const has = (node) => Object.prototype.hasOwnProperty.call(node._attrs, attr);
-    const value = (node) => String(node._attrs[attr]);
-    return this.descendants().filter((n) => {
-      if (n.nodeType !== 1 || !has(n)) return false;
-      return want === undefined ? true : value(n) === String(want);
-    });
+    const parts = sel.split(/(?=\[|\.)/).filter(Boolean);
+    if (!parts.length) return [];
+    const tests = [];
+    for (const part of parts) {
+      const attr = /^\[([\w:-]+)(?:=(?:"([^"]*)"|'([^']*)'|([^\]]+)))?\]$/.exec(part);
+      if (attr) {
+        const name = attr[1];
+        const want = attr[2] !== undefined ? attr[2] : attr[3] !== undefined ? attr[3] : attr[4];
+        tests.push((n) =>
+          Object.prototype.hasOwnProperty.call(n._attrs, name) && (want === undefined || String(n._attrs[name]) === String(want))
+        );
+        continue;
+      }
+      const cls = /^\.([\w-]+)$/.exec(part);
+      if (cls) {
+        tests.push((n) => n._cls && n._cls.has(cls[1]));
+        continue;
+      }
+      return [];
+    }
+    return this.descendants().filter((n) => n.nodeType === 1 && tests.every((t) => t(n)));
   }
 
   descendants() {

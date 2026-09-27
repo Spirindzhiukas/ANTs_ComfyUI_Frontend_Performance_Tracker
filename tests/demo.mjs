@@ -407,18 +407,60 @@ console.log(
 h.tracker.lowZoom.set({ linkStyle: "spline" });
 
 // Viewport focus, half one: below the zoom nobody can read a node, so its widget
-// UI is switched off. The nodes themselves stay live — they still select, drag
-// and open their menu — and what goes is the hover reporting, the clicks and the
-// wheel capture that a 3D viewport needs before it will render its scene at all.
-h.tracker.lowZoom.set({ inertBelow: 0.4 });
+// UI is switched off — by four mechanisms that do not depend on each other, since
+// the first version of this did not reach the widgets on a real page. A slider
+// drawn on the canvas is hit-tested by arithmetic; a 3D viewport's render loop
+// hangs off the *node's* hover flag, which the canvas calls from its own hit
+// testing and no CSS can reach.
 h.canvas.ds.scale = 0.1;
+// A node with the two seams the frontend really uses: a widget drawn on the
+// canvas, and the mouse hooks a 3D viewport hangs its "is the pointer over me"
+// flag on. `h.node()` is a node out of that class, the way a real one is.
+const probe = h.node({ pos: [0, 0], size: [200, 100], widgets: [{ name: "steps", last_y: 60, computedHeight: 20 }] });
+h.canvas.nodes.push(probe);
+h.canvas.graph._nodes = h.canvas.nodes;
+const slider = probe.widgets[0];
+let viewportHovered = false;
+probe.onMouseEnter = () => {
+  viewportHovered = true;
+};
+probe.onMouseLeave = () => {
+  viewportHovered = false;
+};
 placeViewport();
+// The idle cap from earlier in this demo merges redraws, and a merged redraw is
+// not a drawn frame — this block is about what a drawn frame does, so it is off.
+h.tracker.lowZoom.set({ idleCapMs: 0 });
+const widgetBefore = probe.getWidgetOnPos(50, 60) === slider;
+h.tracker.lowZoom.set({ inertBelow: 0.4 });
+h.canvas.setDirty(true, true);
+h.canvas.draw();
+h.canvas.hover(50, 60); // the canvas walks over the node, exactly as it does on mousemove
+const widgetNow = probe.getWidgetOnPos(50, 60) === slider;
+const selectable = h.canvas.graph.getNodeOnPos(50, 60) === probe;
 const focus = h.tracker.lowZoom.focus;
-const stillSelectable = h.canvas.graph.getNodeOnPos(10, 10, h.canvas.nodes);
 console.log(
-  `  focus mode below 40%: ${focus.inertElements} element(s) switched off (the 3D viewport's wrapper among them, and that is what stops its ` +
-    `render loop) — while the node itself is still found by the frontend's own hit-test: ${stillSelectable ? "yes, it stays selectable" : "NO"}`
+  `  focus mode below 40%: the canvas widget is ${widgetBefore ? "grabbed" : "not grabbed"} while the mode is off and ${widgetNow ? "grabbed" : "not grabbed"} ` +
+    `with it on (${focus.canvasWidgetsBlocked} hit-test(s) answered with "no widget"), the node is still found by the frontend's own hit-test (${selectable}), ` +
+    `${focus.hoverBlocked} node hover callback(s) held back so a 3D viewport's "pointer is over me" flag stays ${viewportHovered}, ` +
+    `${focus.inertElements} element(s) of node DOM switched off, ${focus.eventsBlocked} pointer event(s) swallowed at the document`
 );
+// And the last resort: an event aimed at a widget that is switched off never
+// reaches any handler, whatever the page's CSS says about it.
+const gateTarget = h.document.createElement("button");
+demoWidget.appendChild(gateTarget);
+let gateClicks = 0;
+gateTarget.addEventListener("click", () => {
+  gateClicks++;
+});
+gateTarget._fire("click");
+console.log(
+  `  the event gate: a click aimed at a switched-off widget reached its own handler ${gateClicks} time(s); ` +
+    `${h.tracker.lowZoom.focus.eventsBlocked} event(s) swallowed at the document so far`
+);
+demoWidget.removeChild(gateTarget);
+h.canvas.nodes = h.canvas.nodes.filter((n) => n !== probe);
+h.canvas.graph._nodes = h.canvas.nodes;
 h.tracker.lowZoom.set({ inertBelow: 0 });
 
 // Half two: off-screen node DOM is boxed and inert at any zoom, and what comes

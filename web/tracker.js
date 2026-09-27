@@ -27,7 +27,7 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.1.13";
+const VERSION = "2.1.14";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
 const NODE_NAME = "ANTsNastyBastardsTracker";
 
@@ -913,6 +913,15 @@ const LOD = {
   foveaRestore: 1, // elements brought back per drawn frame — see VIEW_FOVEA_RESTORES
   foveaQueue: 0, // elements waiting their turn to come back
   foveaCameBack: 0, // elements handed back since the mode was switched on
+  focusDom: "hide", // what "switched off" means for node DOM (see VIEW_FOCUS_DOM)
+  blockSet: null, // Set of elements currently switched off, for the event gate
+  hoverOff: null, // Set of nodes whose hover hooks are being held back
+  canvasWidgetHits: 0, // widget hit-tests seen on the canvas while the mode was on
+  canvasWidgetsBlocked: 0, // and answered with "no widget"
+  hoverBlocked: 0, // node hover callbacks held back
+  eventsBlocked: 0, // pointer events swallowed before they reached a switched-off element
+  domVerified: 0, // elements this tool looked at with getComputedStyle and found off
+  domBroken: 0, // ... and found still reachable, which is what the event gate is for
   domOwners: null, // Map<element, record>: every node DOM element we may hide
   displayScale: 0, // 0 = read it from the browser, otherwise the device-pixel ratio
   display: null, // what the display-scale check found last time it ran
@@ -972,6 +981,21 @@ const VIEW_FOVEA_RESTORES = [1, 4, 0];
 // otherwise; the panel reports what was detected rather than assuming it.
 const VIEW_DISPLAY_SCALES = [0, 1, 1.25, 1.5, 2, 2.5, 3];
 const VIEW_SWEEP_MS = 1000; // how often the registry of node DOM is refreshed
+// What "switched off" means for a node's DOM: hidden outright, or left on screen
+// with the pointer taken away from it. Hiding is the stronger one — an element
+// with display:none cannot be clicked, hovered, scrolled or dragged onto whatever
+// its CSS says, and a 3D viewport in it cannot be entered — so it is the default;
+// inert-only is there for anyone who wants to see the widgets they cannot use.
+const VIEW_FOCUS_DOM = ["hide", "inert"];
+const VIEW_FOCUS_DOM_DEFAULT = "hide";
+// Events that must never reach a switched-off element. Everything that starts or
+// continues an interaction, and nothing that ends one: the leave/out events are
+// what tell a hovered widget that the pointer is gone, so they are left alone.
+const VIEW_BLOCK_EVENTS = [
+  "pointerover", "pointerdown", "pointerup", "pointermove",
+  "mouseover", "mouseenter", "mousedown", "mouseup", "mousemove",
+  "click", "dblclick", "contextmenu", "wheel",
+];
 // The frontend renders every DOM widget — image previews, curve editors, and the
 // Vue components behind the core 3D nodes — in this layer, one wrapper per
 // widget. A wrapper is what is on screen; the widget object behind it may have no
@@ -1081,42 +1105,39 @@ function viewViewport(canvas) {
   const off = ds.offset || [0, 0];
   const ox = Number(off[0]) || 0;
   const oy = Number(off[1]) || 0;
-  const rect = (canvas && canvas.viewport) || null;
-  let x;
-  let y;
-  let w;
-  let h;
-  let src = "reported";
-  if (rect && Number(rect[2]) > 0 && Number(rect[3]) > 0) {
-    x = -ox + (Number(rect[0]) || 0) / scale;
-    y = -oy + (Number(rect[1]) || 0) / scale;
-    w = Number(rect[2]) / scale;
-    h = Number(rect[3]) / scale;
-    src = "viewport";
-  } else {
-    const el = canvas && canvas.canvas;
-    const css = viewCssSize(el);
-    const px = css ? css[0] : (el && Number(el.width) > 0 ? Number(el.width) / viewDisplayScale() : 0);
-    const py = css ? css[1] : (el && Number(el.height) > 0 ? Number(el.height) / viewDisplayScale() : 0);
-    if (!(px > 0 && py > 0)) {
-      const va = viewReportedArea(canvas);
-      return va ? { x: va[0], y: va[1], w: va[2], h: va[3], src: "reported" } : null;
-    }
-    x = -ox;
-    y = -oy;
-    w = px / scale;
-    h = py / scale;
-    src = "css";
-    // Agreement check: the frontend's rectangle is the same shape, in the same
-    // units, when it is within a few percent of this one.
+  const el = canvas && canvas.canvas;
+  const css = viewCssSize(el);
+  const px = css ? css[0] : (el && Number(el.width) > 0 ? Number(el.width) / viewDisplayScale() : 0);
+  const py = css ? css[1] : (el && Number(el.height) > 0 ? Number(el.height) / viewDisplayScale() : 0);
+  if (!(px > 0 && py > 0)) {
+    // No box to measure: the frontend's own rectangle is better than nothing.
     const va = viewReportedArea(canvas);
-    if (va) {
-      const f = va[2] / w;
-      if (f > 0.95 && f < 1.05) return { x: va[0], y: va[1], w: va[2], h: va[3], src: "reported" };
-      return { x, y, w, h, src: "css" };
-    }
+    return va ? { x: va[0], y: va[1], w: va[2], h: va[3], src: "reported" } : null;
   }
-  return { x, y, w, h, src };
+  const x = -ox;
+  const y = -oy;
+  const w = px / scale;
+  const h = py / scale;
+  // The frontend's own rectangles are *candidates*, never the authority: their
+  // unit is not guaranteed (a 200% display is enough to change it — see
+  // viewDisplayProbe), and this tool's whole job here is to not be the thing that
+  // is out by that factor. Either one is used only when it agrees with the canvas
+  // box within a few percent, which is also how a genuinely smaller viewport is
+  // told apart from a differently-scaled one.
+  const near = (n, m) => n / m > 0.95 && n / m < 1.05;
+  const rect = (canvas && canvas.viewport) || null;
+  if (rect && Number(rect[2]) > 0 && Number(rect[3]) > 0 && near(Number(rect[2]) / scale, w)) {
+    return {
+      x: -ox + (Number(rect[0]) || 0) / scale,
+      y: -oy + (Number(rect[1]) || 0) / scale,
+      w: Number(rect[2]) / scale,
+      h: Number(rect[3]) / scale,
+      src: "viewport",
+    };
+  }
+  const va = viewReportedArea(canvas);
+  if (va && near(va[2], w)) return { x: va[0], y: va[1], w: va[2], h: va[3], src: "reported" };
+  return { x, y, w, h, src: "css" };
 }
 
 function viewReportedArea(canvas) {
@@ -1322,6 +1343,14 @@ function lodPlanFrame(canvas) {
   if (lodOn() || (LOD.domOwners && LOD.domOwners.size)) {
     try {
       viewApplyFocus(canvas);
+    } catch (e) {
+      /* never fatal */
+    }
+    // The canvas calls a node's mouse hooks from its own hit-testing, and a 3D
+    // viewport's render loop hangs off exactly that flag — so it is held back
+    // here, per frame, with the same answer the DOM half uses.
+    try {
+      viewSuppressHover(canvas);
     } catch (e) {
       /* never fatal */
     }
@@ -1731,6 +1760,54 @@ function viewReleaseElement(el, rec) {
   }
 }
 
+function viewOwnerRecord(owners, el, node, via) {
+  let rec = owners.get(el);
+  if (!rec) {
+    // `flat` is the node-flattening setting's flag, `fovea` the off-screen one,
+    // and `boxed`/`inerted` what the element is actually wearing — so a class is
+    // written once per state change and never twice for the same state.
+    rec = { node, via, left: NaN, top: NaN, flat: false, fovea: false, boxed: false, inerted: false };
+    owners.set(el, rec);
+  } else {
+    if (node) rec.node = node;
+    rec.via = via;
+  }
+  return rec;
+}
+
+function viewReleaseElement(el, rec) {
+  try {
+    if (rec && rec.boxed) el.classList.remove(LOD_DOM_CLASS);
+    if (rec && rec.inerted) el.classList.remove(LOD_INERT_CLASS);
+  } catch (e) {
+    /* element is gone; dropping the record is enough */
+  }
+  if (rec) {
+    rec.boxed = false;
+    rec.inerted = false;
+    rec.flat = false;
+    rec.fovea = false;
+  }
+  if (LOD.blockSet) LOD.blockSet.delete(el);
+}
+
+// Every element in the page that belongs to a node, and which node that is.
+//
+// Three ways in, because the frontend offers three: a widget with an element of
+// its own (DOM widgets), a Vue-rendered node (the node *is* the element), and the
+// wrappers in the DOM widget layer — which is where the *component* widgets live,
+// the ones with no element of their own at all, and the core 3D viewports are
+// component widgets. A sweep that only walked `node.widgets` could never see one.
+//
+// The wrappers are positioned by their own inline left/top in client pixels (see
+// the frontend's useAbsolutePosition), so ownership is arithmetic, not a layout
+// read — and it is cached per element, so an unchanged wrapper costs a float
+// comparison. Ownership is also optional: an element whose owner cannot be worked
+// out is still *switched off* when the whole graph is switched off (the focus
+// zoom), because that decision does not need to know which node it is. That is
+// deliberate — a page where the position arithmetic comes out wrong (a display at
+// 200%, a layer inside a transformed container) must not end up with live 3D
+// viewports.
 function lodDomRegistrySweep(canvas) {
   const owners = LOD.domOwners || (LOD.domOwners = new Map());
   const nodes = lodGraphNodes(canvas) || [];
@@ -1741,6 +1818,7 @@ function lodDomRegistrySweep(canvas) {
     if (!node) continue;
     for (const t of lodDomTargets(node)) {
       if (!t.el || !t.el.classList) continue;
+      if (owners.has(t.el) && owners.get(t.el).via === "dom") continue; // already known, exact route
       seen.add(t.el);
       viewOwnerRecord(owners, t.el, node, "widget");
     }
@@ -1755,11 +1833,19 @@ function lodDomRegistrySweep(canvas) {
     seen.add(el);
     viewOwnerRecord(owners, el, node, "root");
   }
-  // 3. The layer: wrappers with no element of their own — the component widgets,
-  //    which is where the 3D viewports are.
+  // 3. Every wrapper in the page, wherever it is: the component widgets — the 3D
+  //    viewports among them — are only ever reachable this way.
   const layer = lodDomLayer();
   let layerCount = 0;
-  if (layer && layer.children) {
+  let wrappers = [];
+  try {
+    wrappers = typeof document !== "undefined" && typeof document.querySelectorAll === "function"
+      ? document.querySelectorAll(".dom-widget") || []
+      : [];
+  } catch (e) {
+    wrappers = [];
+  }
+  if (wrappers.length) {
     const ds = (canvas && canvas.ds) || null;
     const scale = ds ? Number(ds.scale) || 1 : 1;
     const offset = (ds && ds.offset) || [0, 0];
@@ -1767,38 +1853,25 @@ function lodDomRegistrySweep(canvas) {
     const oy = Number(offset[1]) || 0;
     let originX = NaN;
     let originY = NaN;
-    for (const el of layer.children) {
+    for (const el of wrappers) {
       if (!el || !el.classList) continue;
+      const rec = owners.get(el);
+      // Already known through an exact route: keep that, just remember the place.
+      if (rec && (rec.via === "widget" || rec.via === "root")) {
+        seen.add(el);
+        continue;
+      }
       const left = parseFloat(el.style && el.style.left);
       const top = parseFloat(el.style && el.style.top);
-      const rec = owners.get(el);
-      // Already known, and not through this path: the direct routes are exact.
-      if (rec && rec.via !== "layer") {
+      const moved = !rec || rec.left !== left || rec.top !== top;
+      const via = layer && el.parentNode === layer ? "layer" : "dom";
+      if (!moved && rec) {
         seen.add(el);
-        layerCount++;
+        if (rec.via === "layer" || rec.via === "dom") layerCount++;
         continue;
       }
-      // Known and unmoved: nothing to work out.
-      if (rec && rec.left === left && rec.top === top) {
-        seen.add(el);
-        layerCount++;
-        continue;
-      }
-      let clientX = left;
-      let clientY = top;
-      if (!Number.isFinite(clientX) || !Number.isFinite(clientY)) {
-        // No inline position: one layout read, and only for this element.
-        if (typeof el.getBoundingClientRect !== "function") continue;
-        try {
-          const r = el.getBoundingClientRect();
-          clientX = Number(r.left) || 0;
-          clientY = Number(r.top) || 0;
-        } catch (e) {
-          continue;
-        }
-      }
+      // One layout read for the whole sweep, not one per widget.
       if (!Number.isFinite(originX)) {
-        // One layout read for the whole sweep, not one per widget.
         const canvasEl = canvas && canvas.canvas;
         try {
           const rect = canvasEl && typeof canvasEl.getBoundingClientRect === "function" ? canvasEl.getBoundingClientRect() : null;
@@ -1809,23 +1882,19 @@ function lodDomRegistrySweep(canvas) {
           originY = 0;
         }
       }
-      const gx = (clientX - originX) / scale - ox;
-      const gy = (clientY - originY) / scale - oy;
-      // Topmost node wins: the last one in the draw order whose rectangle
-      // contains the wrapper's origin, which is the node it is drawn on top of.
       let owner = null;
-      for (const node of nodes) {
-        const r = viewNodeRect(node);
-        if (!r) continue;
-        if (gx >= r.x && gx <= r.x + r.w && gy >= r.y && gy <= r.y + r.h) owner = node;
+      if (Number.isFinite(left) && Number.isFinite(top)) {
+        const gx = (left - originX) / scale - ox;
+        const gy = (top - originY) / scale - oy;
+        // Topmost node wins: the last one in the draw order whose rectangle
+        // contains the wrapper's origin, which is the node it is drawn on top of.
+        for (const node of nodes) {
+          const r = viewNodeRect(node);
+          if (!r) continue;
+          if (gx >= r.x && gx <= r.x + r.w && gy >= r.y && gy <= r.y + r.h) owner = node;
+        }
       }
-      if (!owner) {
-        // Not on a node (or mid-flight): keep whatever it had, and try again
-        // next sweep rather than flapping the class off and on.
-        if (rec) seen.add(el);
-        continue;
-      }
-      const next = viewOwnerRecord(owners, el, owner, "layer");
+      const next = viewOwnerRecord(owners, el, owner || (rec && rec.node) || null, via);
       next.left = left;
       next.top = top;
       seen.add(el);
@@ -1835,7 +1904,7 @@ function lodDomRegistrySweep(canvas) {
   // 4. Nodes and elements that are gone: hand the element back and forget it.
   const live = new Set(nodes);
   for (const [el, rec] of [...owners]) {
-    if (seen.has(el) && live.has(rec.node)) continue;
+    if (seen.has(el) && (!rec.node || live.has(rec.node))) continue;
     viewReleaseElement(el, rec);
     owners.delete(el);
   }
@@ -1851,6 +1920,7 @@ function lodDomRegistrySweep(canvas) {
 function viewApplyFocus(canvas) {
   const owners = LOD.domOwners;
   const wanted = LOD.fovea || LOD.inertBelow > 0 || LOD.flatBelow > 0;
+  const blockSet = LOD.blockSet || (LOD.blockSet = new Set());
   if (!owners || !owners.size) {
     LOD.inertEls = 0;
     LOD.foveaEls = 0;
@@ -1866,6 +1936,7 @@ function viewApplyFocus(canvas) {
       released++;
     }
     owners.clear();
+    blockSet.clear();
     if (LOD.domMarked) LOD.domMarked.clear();
     LOD.domHidden = 0;
     LOD.domNodes = 0;
@@ -1878,13 +1949,17 @@ function viewApplyFocus(canvas) {
   const inertOn = viewInertOn(canvas);
   const flatOn = lodFlatOn(canvas);
   const foveaOn = !!LOD.fovea;
+  const hideDom = LOD.focusDom !== "inert";
   const area = foveaOn ? viewArea(canvas, LOD.foveaMargin) : null;
   const screen = foveaOn ? viewArea(canvas, 0) : null;
+  // Handed to the canvas widget gate, which is asked per pointer event and should
+  // not be the thing that measures the canvas on every mousemove.
+  LOD.frameAreas = { canvas, margin: area, screen };
   const back = [];
   for (const rec of owners.values()) {
     const node = rec.node;
-    rec.flat = flatOn ? lodFlatNode(node, canvas) : false;
-    if (!foveaOn) {
+    rec.flat = flatOn && node ? lodFlatNode(node, canvas) : false;
+    if (!foveaOn || !node) {
       rec.fovea = false;
       continue;
     }
@@ -1932,14 +2007,17 @@ function viewApplyFocus(canvas) {
   const flatNodes = flatOn ? new Set() : null;
   const marked = LOD.domMarked || (LOD.domMarked = new Set());
   for (const [el, rec] of owners) {
-    const wantBox = rec.flat || rec.fovea;
-    // The node-zoom half switches off *widgets*, never the node: with the canvas
-    // hit-test left alone, a node can still be selected, dragged and opened at a
-    // zoom where nobody could use what is drawn on it. Vue-rendered nodes are the
-    // exception to the exception — there the node *is* the element, so switching
-    // it off would be switching the node off, which is not what this setting is.
+    // Everything this tool switches off is a *part of a node* — its widgets and
+    // the DOM they are built from — never the node's own selectable body. With
+    // the canvas gates answering "no widget" and the hover hooks held back, a node
+    // at any zoom still selects, drags, edits and opens its menu. Vue-rendered
+    // nodes are the exception to the exception: there the node *is* the element,
+    // so it is left alone entirely — switching it off would be switching the node
+    // off, and the widget-level gates are what cover that rendering mode.
     const own = rec.node && rec.node.type === NODE_NAME;
-    const wantInert = rec.fovea || (inertOn && rec.via !== "root" && !own);
+    const widgetish = rec.via !== "root" && !own;
+    const wantBox = rec.flat || rec.fovea || (inertOn && hideDom && widgetish);
+    const wantInert = rec.fovea || (inertOn && widgetish);
     if (wantBox !== rec.boxed || wantInert !== rec.inerted) {
       try {
         if (wantBox !== rec.boxed) {
@@ -1956,12 +2034,15 @@ function viewApplyFocus(canvas) {
       } catch (e) {
         /* an element that cannot be dressed is pruned by the next sweep */
       }
-      if (rec.boxed) marked.add(el);
-      else marked.delete(el);
     }
+    if (rec.boxed || rec.inerted) blockSet.add(el);
+    else blockSet.delete(el);
     if (rec.boxed) {
       boxed++;
-      if (rec.via === "layer") layerBoxed++;
+      if (rec.via === "layer" || rec.via === "dom") layerBoxed++;
+      marked.add(el);
+    } else {
+      marked.delete(el);
     }
     if (rec.inerted) inert++;
     if (rec.fovea) {
@@ -1977,6 +2058,273 @@ function viewApplyFocus(canvas) {
   LOD.foveaEls = fovea;
   LOD.foveaQueue = queue;
   return changed;
+}
+
+// The per-redraw half. Everything here is arithmetic over the registry: no
+// layout reads, no graph walk, and a class is written only where the answer
+// changed. That is the whole point — the expensive direction is an element
+// *coming back* (a wrapper returning to `display: block` re-runs Vue's layout for
+// that widget, and a 3D viewport re-measures its renderer), so coming back is
+// rationed, while going away is a class on an element nobody is looking at.
+
+// ------------------------------------------------------------ the event gate ---
+// The last resort, and the only part of this that does not depend on the page's
+// CSS or on Vue leaving our classes alone. While an element is switched off, the
+// events that would start or continue an interaction *with it* are stopped in the
+// capture phase, before any handler anywhere can see them. Nobody else's code has
+// to cooperate: a click, a drag, a wheel tick or a pointer enter aimed at a
+// switched-off widget is swallowed, counted, and the panel says how many.
+//
+// It is deliberately blind to everything else — the canvas, the panels, links,
+// groups, our own UI — because against those it does nothing at all: the test is
+// a set lookup on the target's ancestors, and the set is empty whenever nothing is
+// switched off.
+function viewEventBlocked(target) {
+  const set = LOD.blockSet;
+  if (!set || !set.size || !target) return false;
+  let el = target;
+  let depth = 0;
+  while (el && el !== document && depth++ < 64) {
+    if (el.nodeType === 1 && set.has(el)) return true;
+    el = el.parentNode;
+  }
+  return false;
+}
+
+function viewGateEvent(ev) {
+  try {
+    if (!ev || !ev.target || ev.target.nodeType !== 1) return;
+    if (!viewEventBlocked(ev.target)) return;
+    LOD.eventsBlocked++;
+    ev.stopPropagation();
+    if (ev.cancelable !== false && typeof ev.preventDefault === "function") ev.preventDefault();
+  } catch (e) {
+    /* an event that cannot be inspected is left alone */
+  }
+}
+
+let viewEventGateOn = false;
+
+function viewInstallEventGate() {
+  if (viewEventGateOn || !(LOD.inertBelow > 0 || LOD.fovea)) return viewEventGateOn;
+  if (typeof document === "undefined" || typeof document.addEventListener !== "function") return false;
+  for (const type of VIEW_BLOCK_EVENTS) {
+    try {
+      document.addEventListener(type, viewGateEvent, true);
+    } catch (e) {
+      /* one missing event type is not a reason to skip the rest */
+    }
+  }
+  viewEventGateOn = true;
+  return true;
+}
+
+// What the page's own computed style says about an element this tool believes it
+// has switched off. This is the honest half of the claim: a class can be written
+// and then wiped by a framework's re-render, and a panel that only counts what it
+// wrote would be describing its own intentions rather than the page. Run on the
+// once-a-second sweep, on a sample, because it is a style read.
+function viewVerifyMarked(limit) {
+  const set = LOD.blockSet;
+  if (!set || !set.size) {
+    LOD.domVerified = 0;
+    LOD.domBroken = 0;
+    return 0;
+  }
+  if (typeof getComputedStyle !== "function") return 0;
+  let ok = 0;
+  let broken = 0;
+  let n = 0;
+  const max = Number(limit) || 5;
+  for (const el of set) {
+    if (n++ >= max) break;
+    try {
+      const cs = getComputedStyle(el);
+      if (!cs) continue;
+      if (cs.display === "none" || cs.pointerEvents === "none") ok++;
+      else broken++;
+    } catch (e) {
+      /* an element without a style: not counted either way */
+    }
+  }
+  LOD.domVerified = ok;
+  LOD.domBroken = broken;
+  return ok;
+}
+
+// ------------------------------------------------------- the canvas widgets ---
+// Not every widget is a DOM element. In this frontend a slider, a combo, a text
+// box or a button is drawn *on the canvas* and hit-tested by arithmetic:
+// `LGraphNode.getWidgetOnPos(x, y)` walks the node's widgets and returns the one
+// whose rectangle contains the point. It is asked on mousedown (so the widget can
+// be clicked or dragged), on mousemove (so hover reports and tooltips can be
+// built) and by the canvas's own helper for the wheel. No CSS class can reach any
+// of that, which is why a page can have every node's DOM switched off and still
+// have every widget answering the pointer.
+//
+// It is also the one gate that can be closed without taking the node with it:
+// `processMouseDown` asks for a widget *first* and only then falls through to
+// dragging the node, and mousemove asks for the widget under the cursor to build
+// its hover report. Answering "no widget" therefore means: the thing drawn on the
+// node cannot be grabbed or reported on, while the node itself still selects,
+// drags, opens its menu and edits exactly as before.
+//
+// The tracker's own node is exempt — its buttons are the panel's own controls.
+function viewWidgetsOff(node, canvas) {
+  if (!node) return false;
+  if (node.type === NODE_NAME) return false;
+  const c = canvas || (typeof app !== "undefined" && app && app.canvas) || null;
+  if (viewInertOn(c)) return true;
+  if (!LOD.fovea) return false;
+  // The areas the frame pass already worked out for this drawn frame, so a
+  // mousemove does not measure the canvas again: this is asked per pointer event.
+  const areas = LOD.frameAreas;
+  const area = areas && areas.canvas === c ? areas.margin : viewArea(c, LOD.foveaMargin);
+  return viewOutsideArea(node, area);
+}
+
+function viewWrapGetWidgetOnPos(proto) {
+  if (!proto || typeof proto.getWidgetOnPos !== "function") return false;
+  if (proto.getWidgetOnPos.__antsWidgetGate) return true;
+  const original = proto.getWidgetOnPos;
+  const gated = function (x, y, ...rest) {
+    if (viewWidgetsOff(this)) {
+      LOD.canvasWidgetHits++;
+      LOD.canvasWidgetsBlocked++;
+      return undefined;
+    }
+    return original.call(this, x, y, ...rest);
+  };
+  gated.__antsWidgetGate = true;
+  gated.__antsOriginal = original;
+  try {
+    proto.getWidgetOnPos = gated;
+  } catch (e) {
+    return false;
+  }
+  return true;
+}
+
+// Where the method lives is found rather than assumed: the global LiteGraph, or
+// the prototype chain of any node the graph is holding (nodes from extensions are
+// subclasses, and they all inherit this one method).
+function viewInstallWidgetGate(canvas) {
+  if (!(LOD.inertBelow > 0 || LOD.fovea)) return false;
+  let ok = false;
+  try {
+    const g = typeof window !== "undefined" && window.LiteGraph;
+    if (g && g.LGraphNode && g.LGraphNode.prototype) ok = viewWrapGetWidgetOnPos(g.LGraphNode.prototype) || ok;
+  } catch (e) {
+    /* no global LiteGraph: the node's own prototype is next */
+  }
+  try {
+    const nodes = lodGraphNodes(canvas || (typeof app !== "undefined" && app && app.canvas));
+    for (const node of nodes || []) {
+      let proto = node && Object.getPrototypeOf(node);
+      let depth = 0;
+      while (proto && proto !== Object.prototype && depth++ < 8) {
+        if (typeof proto.getWidgetOnPos === "function") {
+          ok = viewWrapGetWidgetOnPos(proto) || ok;
+          break;
+        }
+        proto = Object.getPrototypeOf(proto);
+      }
+    }
+  } catch (e) {
+    /* without the gate widgets stay live: the mode is smaller, not broken */
+  }
+  return ok;
+}
+
+// ---------------------------------------------------------- node hover hooks ---
+// A 3D viewport decides whether to render by asking whether the pointer is over
+// it, and that answer comes from the *node's* mouse hooks — `node.onMouseEnter` /
+// `onMouseLeave`, chained by the extension when the node is created — which the
+// canvas calls from its own hit-testing, not from the DOM. So switching the DOM
+// off cannot stop it: the canvas still walks over the node, still calls the hook,
+// and the render loop still runs a Three.js frame per rAF tick for a viewport
+// nobody can see.
+//
+// The hooks are wrapped per node, and while the node's widgets are off the enter
+// and move calls are held back. `onMouseLeave` is deliberately *not* held back: it
+// is what clears the flag, so it must always be allowed through — and when a node
+// goes off while the pointer is already on it, the leave is called by this code so
+// the flag cannot stay stuck on.
+const VIEW_HOVER_HOOKS = ["onMouseEnter", "onMouseMove"];
+
+function viewWrapNodeHover(node) {
+  if (!node) return false;
+  let wrapped = false;
+  for (const hook of VIEW_HOVER_HOOKS) {
+    const current = node[hook];
+    if (typeof current !== "function") continue;
+    if (current.__antsHoverGate) continue; // already ours
+    const gated = function (...args) {
+      if (viewWidgetsOff(this)) {
+        LOD.hoverBlocked++;
+        // The canvas has already recorded the node as hovered by the time it calls
+        // this hook, and a widget that is switched off is not hovered. Clearing the
+        // bookkeeping here keeps the two in step: without it the node would stay
+        // marked as "mouse over" while the page says the pointer is not on it, and
+        // the next real hover would be read as a continuation of the old one.
+        try {
+          this.mouseOver = null;
+          const c = (typeof app !== "undefined" && app && app.canvas) || null;
+          if (c && c.node_over === this) c.node_over = undefined;
+        } catch (e) {
+          /* bookkeeping is a courtesy; the hook is the point */
+        }
+        return undefined;
+      }
+      return current.apply(this, args);
+    };
+    gated.__antsHoverGate = true;
+    gated.__antsOriginal = current;
+    try {
+      node[hook] = gated;
+      wrapped = true;
+    } catch (e) {
+      /* a frozen node keeps its hooks; it simply stays as it was */
+    }
+  }
+  return wrapped;
+}
+
+// Called per drawn frame: wrap what needs wrapping (cheap — the flag is on the
+// function), and force a leave on any node that has just been switched off while
+// the pointer was sitting on it.
+function viewSuppressHover(canvas) {
+  if (!(LOD.inertBelow > 0 || LOD.fovea)) return 0;
+  const c = canvas || (typeof app !== "undefined" && app && app.canvas) || null;
+  const nodes = lodGraphNodes(c) || [];
+  const off = LOD.hoverOff || (LOD.hoverOff = new Set());
+  let held = 0;
+  for (const node of nodes) {
+    if (!node) continue;
+    const isOff = viewWidgetsOff(node, c);
+    if (!isOff) {
+      off.delete(node);
+      continue;
+    }
+    viewWrapNodeHover(node);
+    held++;
+    if (off.has(node)) continue;
+    off.add(node);
+    // It was live a moment ago. If the pointer is on it, tell it the pointer is
+    // gone: for a 3D viewport that single call is the difference between a render
+    // loop that keeps ticking and one that stops.
+    try {
+      const hovered = (c && c.node_over === node) || node.mouseOver;
+      if (hovered) {
+        if (typeof node.onMouseLeave === "function") node.onMouseLeave(null);
+        node.mouseOver = null;
+        if (c && c.node_over === node) c.node_over = undefined;
+      }
+    } catch (e) {
+      /* an extension's leave hook that throws is not worth breaking a frame for */
+    }
+  }
+  return held;
 }
 
 // Node hit-testing is the frontend's own O(visible nodes) walk — every pointer
@@ -2047,6 +2395,20 @@ function lodSweepDom(canvas) {
   } catch (e) {
     /* the check is a report, not a dependency */
   }
+  // Both gates and the seam they are installed on are re-checked here: a graph
+  // instance can be swapped, node classes arrive with packs, and an extension can
+  // re-chain a node's hooks after this tool last looked.
+  try {
+    viewInstallWidgetGate(canvas);
+    viewInstallEventGate();
+  } catch (e) {
+    /* never fatal */
+  }
+  try {
+    viewVerifyMarked(5);
+  } catch (e) {
+    /* the check is a report, not a dependency */
+  }
   LOD.domMarkedWidgets = LOD.domWidgets ? LOD.domWidgets.size : 0;
   // The flag only hides anything while the frontend is drawing in its own
   // low-quality mode (its DOM widget layer checks `hideOnZoom && lowQuality`),
@@ -2079,6 +2441,7 @@ function lodSaveSettings() {
         linkStyle: LOD.linkStyle,
         inertBelow: LOD.inertBelow,
         fovea: !!LOD.fovea,
+        focusDom: LOD.focusDom,
         foveaMargin: LOD.foveaMargin,
         foveaRestore: LOD.foveaRestore,
         displayScale: LOD.displayScale,
@@ -2122,6 +2485,7 @@ function lodLoadSettings() {
       linkStyle: saved.linkStyle === "straight" ? "straight" : "spline",
       inertBelow: saved.inertBelow === undefined ? 0 : Number(saved.inertBelow) || 0,
       fovea: !!saved.fovea,
+      focusDom: saved.focusDom === undefined ? VIEW_FOCUS_DOM_DEFAULT : String(saved.focusDom),
       foveaMargin: saved.foveaMargin === undefined ? VIEW_FOVEA_MARGIN_DEFAULT : Number(saved.foveaMargin) || 0,
       foveaRestore: saved.foveaRestore === undefined ? VIEW_FOVEA_RESTORES[0] : Number(saved.foveaRestore) || 0,
       displayScale: saved.displayScale === undefined ? 0 : Number(saved.displayScale) || 0,
@@ -2284,6 +2648,11 @@ function lodSet(opts) {
     LOD.inertBelow = z === 0 ? 0 : VIEW_INERT_ZOOMS.reduce((best, v) => (Math.abs(v - z) < Math.abs(best - z) ? v : best), VIEW_INERT_ZOOMS[0]) || z;
   }
   if ("fovea" in o) LOD.fovea = !!o.fovea;
+  // A focus setting changing is exactly when a node can go from "hovered" to
+  // "switched off", so the record of which nodes are already held back is dropped
+  // and the next drawn frame re-evaluates them — which is what forces the leave
+  // on whichever node the pointer happens to be sitting on.
+  if ("inertBelow" in o || "fovea" in o) LOD.hoverOff = null;
   if ("foveaMargin" in o) {
     const m = Math.max(0, Math.min(4, Number(o.foveaMargin) || 0));
     // Snapped to the ladder, so the panel and the state cannot disagree.
@@ -2297,6 +2666,10 @@ function lodSet(opts) {
     const d = Number(o.displayScale) || 0;
     LOD.displayScale = VIEW_DISPLAY_SCALES.includes(d) ? d : 0;
     LOD.display = null; // the check re-runs with the new ratio
+  }
+  if ("focusDom" in o) {
+    const m = String(o.focusDom);
+    LOD.focusDom = VIEW_FOCUS_DOM.includes(m) ? m : VIEW_FOCUS_DOM_DEFAULT;
   }
   if ("linkStyle" in o) {
     const style = String(o.linkStyle);
@@ -2312,6 +2685,12 @@ function lodSet(opts) {
     }
   }
   if (LOD.flatBelow > 0 || LOD.inertBelow > 0 || LOD.fovea) lodInstallDomSweep();
+  if (LOD.inertBelow > 0 || LOD.fovea || LOD.flatBelow > 0) {
+    // The canvas-side gate and the event gate are both inert until something is
+    // switched on, and both are needed the moment it is.
+    viewInstallWidgetGate();
+    viewInstallEventGate();
+  }
   const now = lodOn();
   if (now) LOD.error = "";
   // The first change is the moment worth measuring from, whether or not the mode
@@ -2323,6 +2702,10 @@ function lodSet(opts) {
   // happens to draw: the marks follow the setting, whatever the zoom is.
   try {
     lodSweepDom(app.canvas);
+    // ... and the hover half immediately, not on the next drawn frame: a redraw
+    // can be merged by the idle cap, and until one is drawn a 3D viewport whose
+    // node has just been switched off would keep its "pointer is over me" flag.
+    viewSuppressHover(app.canvas);
   } catch (e) {
     /* the sweep never throws, but setup is not worth a broken toggle */
   }
@@ -5721,10 +6104,28 @@ function buildTweaksTab(container) {
   viewRow.appendChild(viewInertSel);
   container.appendChild(viewRow);
   container.appendChild(viewFoveaLabel);
+  const viewDomSel = el("select", { class: "ants-select", style: { width: "auto", maxWidth: "190px" } });
+  for (const m of VIEW_FOCUS_DOM) {
+    const opt = el("option", { text: m === "hide" ? "widgets: hidden outright" : "widgets: inert only" });
+    opt.value = m;
+    viewDomSel.appendChild(opt);
+  }
+  viewDomSel.value = LOD.focusDom;
+  viewDomSel.title =
+    "What \"switched off\" means for a node's DOM below the focus zoom. Hidden outright is the default and the stronger of the two: an element with " +
+    "display:none cannot be clicked, hovered, dragged onto or scrolled into whatever its own CSS says, and a V8/driver cannot route a pointer into it " +
+    "at all. Inert only leaves the widget on screen with pointer-events taken away, which is enough for a page whose CSS cooperates and is the gentler " +
+    "of the two to look at.";
+  viewDomSel.addEventListener("change", () => {
+    lodSet({ focusDom: viewDomSel.value });
+    lodUpdate();
+  });
+
   const viewRow2 = el("div", { class: "ants-row" });
   viewRow2.appendChild(viewMarginSel);
   viewRow2.appendChild(viewRestoreSel);
   viewRow2.appendChild(viewScaleSel);
+  viewRow2.appendChild(viewDomSel);
   container.appendChild(viewRow2);
 
   const lodAbBtn = el("button", { class: "ants-btn", text: "Measure link thinning" });
@@ -5785,11 +6186,12 @@ function buildTweaksTab(container) {
         "the shape of a link: ComfyUI's curves, or straight lines. The thinning setting decides how much ink a curve uses \u2014 below " +
         "its zoom links are stroked 1px wide instead of 3 and lose the dark outline drawn under them, which on a long link is most of " +
         "the pixels, and the curves stay exactly where they were \u2014 link ink and nothing else, so a link setting never paints a node. " +
-        "Viewport focus is the interaction half: below the zoom you set, every node's DOM UI is switched off and the frontend's own hit-test walk " +
-        "is answered with nothing, so a node cannot be hovered, clicked, dragged or scrolled at a zoom where nobody could read it anyway. That is " +
-        "where a 3D viewport's cost actually lives \u2014 it renders while the pointer is over it \u2014 and switching it off is what removes it. " +
-        "The foveated half applies the same boxed-and-inert treatment to nodes a viewport away from the visible area, at every zoom, so off-screen " +
-        "node UI is not live either. " +
+        "Viewport focus is the interaction half, and it is four mechanisms because one is not enough: node DOM is hidden outright (so nothing can be " +
+        "routed into it), the canvas's own widget hit-test is answered with \"no widget\" (a slider drawn on the canvas cannot be grabbed or hovered, " +
+        "the node still selects and drags), the node mouse hooks a 3D viewport hangs its \"pointer is over me\" flag on are held back (the render loop " +
+        "asks exactly that before drawing a frame), and the events aimed at a switched-off widget are swallowed at the document (so it works even if a " +
+        "framework rewrites the class this tool wrote). The tracker's own node is exempt from all four. The foveated half applies the same treatment to " +
+        "nodes beyond the margin from the visible area, at every zoom, and comes back on a budget so panning does not rebuild everything it passes. " +
         "How much that is worth depends on the page, and the readout measures it rather than claiming it: the connections stage also contains " +
         "the frontend walking every input slot of every node before it decides which links are even on screen, and \"Measure link thinning\" " +
         "compares the setting against itself so the two parts are told apart. Everything here is remembered across sessions and handed back by " +
@@ -5914,10 +6316,14 @@ function buildTweaksTab(container) {
         if (LOD.inertBelow > 0) {
           const pct = Math.round(LOD.inertBelow * 100);
           if (viewInertOn()) {
+            const hid = LOD.focusDom === "hide";
             bits3.push(
-              `node widgets switched off below ${pct}% zoom: ${LOD.inertEls} element(s) carry the inert class (no hover, no tooltips, no click, ` +
-                `no drag onto a widget, no wheel capture) while the nodes themselves stay selectable and the canvas keeps panning \u2014 a 3D ` +
-                `viewport asked whether the pointer is over it says no, so its scene stops re-rendering`
+              `node widgets switched off below ${pct}% zoom, by four mechanisms that do not depend on each other: ` +
+                `${LOD.domHidden} element(s) ${hid ? "hidden outright and inert" : "made inert"} (${LOD.domVerified} of the sampled ones confirmed by the ` +
+                `page's own computed style${LOD.domBroken ? `, ${LOD.domBroken} still reachable` : ""}), ${LOD.canvasWidgetsBlocked} of ` +
+                `${LOD.canvasWidgetHits} widget hit-test(s) on the canvas answered with "no widget" (so a slider cannot be grabbed or hovered and the ` +
+                `node still selects and drags), ${LOD.hoverBlocked} node hover callback(s) held back \u2014 which is the flag a 3D viewport's render loop ` +
+                `asks about \u2014 and ${LOD.eventsBlocked} pointer event(s) swallowed at the document before they could reach a switched-off widget`
             );
           } else {
             bits3.push(`nodes stay live at this zoom (widgets are switched off below ${pct}%)`);
@@ -8368,6 +8774,7 @@ function installDebugApi() {
           return {
             flatZoom: LOD_FLAT_ZOOM.slice(),
             inertZoom: VIEW_INERT_ZOOMS.slice(),
+            focusDom: VIEW_FOCUS_DOM.slice(),
             foveaMargins: VIEW_FOVEA_MARGINS.slice(),
             foveaRestores: VIEW_FOVEA_RESTORES.slice(),
             displayScales: VIEW_DISPLAY_SCALES.slice(),
@@ -8456,6 +8863,19 @@ function installDebugApi() {
             inertOn: viewInertOn(app.canvas),
             inertBelow: LOD.inertBelow,
             inertElements: LOD.inertEls,
+            // What "switched off" means for the DOM: hidden outright, or inert.
+            dom: LOD.focusDom,
+            // The canvas half: widget hit-tests answered with "no widget", and
+            // the hover callbacks on nodes that were held back.
+            canvasWidgetsSeen: LOD.canvasWidgetHits,
+            canvasWidgetsBlocked: LOD.canvasWidgetsBlocked,
+            hoverBlocked: LOD.hoverBlocked,
+            // The event gate, and what the page's own computed style said about
+            // the elements this tool believes it switched off.
+            eventsBlocked: LOD.eventsBlocked,
+            blockedElements: LOD.blockSet ? LOD.blockSet.size : 0,
+            verifiedOff: LOD.domVerified,
+            stillReachable: LOD.domBroken,
             // The foveated half: how far off screen counts as far, how many
             // elements may come back per drawn frame, and what is queued.
             fovea: !!LOD.fovea,
@@ -8556,6 +8976,14 @@ app.registerExtension({
   async setup() {
     ensureCanvasPatched();
     lodLoadSettings();
+    // A saved focus setting has to be in force before the first frame, not after
+    // the first sweep: these are the seams that make it real.
+    try {
+      viewInstallWidgetGate();
+      viewInstallEventGate();
+    } catch (e) {
+      /* never fatal */
+    }
     // The display-scale check, once the page exists: what the browser reports,
     // what the canvas backing store says, and whether the frontend's own visible
     // area is in CSS pixels or device pixels. Nothing depends on the answer — the

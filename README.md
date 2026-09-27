@@ -496,7 +496,7 @@ logged for DevTools.
 ## Development
 
 ```
-node tests/run-tests.mjs          # 122 tests, no dependencies, no browser
+node tests/run-tests.mjs          # 126 tests, no dependencies, no browser
 node tests/run-tests.mjs timing   # filter by name fragment
 python3 tests/test_init.py        # backend route parsing + graceful fallbacks
 node tests/demo.mjs               # print what the panel says, with no ComfyUI
@@ -535,6 +535,71 @@ installed as the sandbox's `CanvasRenderingContext2D` (the preview ladder
 patches `drawImage` there, the same way a browser exposes it), and
 `createImageBitmap` records the resize it was asked to perform instead of
 resizing anything.
+
+## What changed in v2.1.14
+
+- **Why v2.1.13's focus mode did not stop the widgets, in one line each.** The
+  report from the real page was "all node widgets are still clickable at 10%
+  zoom, and the 3D viewports are still fully interactive", with the panel showing
+  144 elements carrying the inert class. All three of these were true at once:
+  - **Most widgets are not DOM elements at all.** A slider, a combo, a text box or
+    a button is drawn *on the canvas* and hit-tested by arithmetic:
+    `LGraphNode.getWidgetOnPos(x, y)` walks the node's widgets and returns the one
+    under the cursor. No CSS class can reach that — which is why a page can have
+    every node's DOM switched off and every widget still answering the pointer.
+  - **A 3D viewport's render loop is driven by the *node's* hover flag.** The
+    extension chains `node.onMouseEnter`/`onMouseLeave` when the node is created
+    (see `useLoad3d`), and the canvas calls those from its own hit-testing — not
+    from DOM events. Its `isActive()` is
+    `mouseOnNode || mouseOnScene || mouseOnViewer || recording || !initialRenderDone
+    || animationPlaying`, so `pointer-events: none` on the wrapper could never make
+    `mouseOnNode` false. Switching the DOM off stops `mouseOnScene`; the canvas
+    hover path keeps `mouseOnNode` alive and the Three.js frame keeps being drawn.
+  - **An element whose owner cannot be worked out was skipped entirely.** The
+    registry resolved a wrapper to a node by position arithmetic, and only looked
+    at the layer for nodes it was already flattening — so a page where the
+    arithmetic comes out differently (a display scale, a transformed container)
+    ended up with live viewports and a panel that still reported work done.
+- **Four mechanisms now, and they do not depend on each other.**
+  1. **The canvas widget gate.** `LGraphNode.prototype.getWidgetOnPos` answers
+     "no widget" below the focus zoom and for any node past the fovea margin. That
+     is the one gate that can be closed without taking the node with it:
+     `processMouseDown` asks for a widget *first* and only then falls through to
+     dragging the node, and mousemove asks for the widget under the cursor to build
+     its hover report. So a slider cannot be grabbed, dragged, hovered or
+     scrolled — and the node still selects, drags, edits and opens its menu. The
+     panel reports `blocked / seen`.
+  2. **The node hover hooks.** `onMouseEnter` and `onMouseMove` are wrapped per
+     node and held back while its widgets are off, so a 3D viewport's
+     "pointer is over me" flag never becomes true and its render loop stays idle.
+     `onMouseLeave` is deliberately *not* held back (it is what clears the flag),
+     and when a node is switched off while the pointer is on it the leave is called
+     by the tool — otherwise the flag would stay stuck and the viewport would keep
+     rendering forever. The canvas's own hover bookkeeping (`node.mouseOver`,
+     `canvas.node_over`) is cleared at the same time, so the two states cannot
+     disagree.
+  3. **Node DOM is hidden outright, not just made inert** (a new "widgets: hidden
+     outright / inert only" control, hidden by default). An element with
+     `display: none` cannot be clicked, hovered, dragged onto, scrolled into or
+     entered at all, whatever its own CSS says — and the registry now finds these
+     elements by `.dom-widget` anywhere in the page, and *does not require* an
+     owner: the focus half switches off every node-DOM element, because "which node
+     is this" is only needed for the per-node decisions (flattening, off-screen).
+  4. **The event gate.** While an element is switched off, the events that would
+     start or continue an interaction with it (pointer, mouse, click, contextmenu,
+     wheel) are stopped in the capture phase at the document, before any handler
+     anywhere can see them — counted, and reported. This is the part that does not
+     depend on the page's CSS or on a framework leaving this tool's classes alone.
+     It is blind to everything else by construction: the test is a set lookup on
+     the target's ancestors, and the set is empty whenever nothing is switched off.
+- **Honest verification, in the panel.** On the once-a-second sweep the tool reads
+  `getComputedStyle` for a sample of the elements it believes it switched off and
+  reports how many the *page* agrees about (`N of the sampled ones confirmed by the
+  page's own computed style`, plus `M still reachable` when the answer is no). A
+  readout that only counted what this tool wrote would be describing its
+  intentions, not the page.
+- The readout line now names all four counts, and the demonstration in
+  `tests/demo.mjs` prints the same numbers with none of the page present.
 
 ## What changed in v2.1.13
 

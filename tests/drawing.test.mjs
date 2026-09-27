@@ -692,13 +692,16 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     layer.appendChild(wrapper);
     h.document.body.appendChild(layer);
 
-    // The node-flattening setting is off: this is focus mode's own doing.
+    // The node-flattening setting is off: this is focus mode's own doing, and it
+    // hides as well as inertes \u2014 a hidden element cannot be clicked, hovered or
+    // scrolled onto however the page sets its own pointer-events.
     h.tracker.lowZoom.set({ flatBelow: 0, inertBelow: 0.4 });
+    assert(!h.tracker.lowZoom.state.flatBelow, "the node setting is off");
     assert(
       wrapper._cls.has("ants-lod-inert"),
       "the viewport's wrapper is switched off, and a viewport that cannot be hovered stops rendering its scene"
     );
-    assert(!wrapper._cls.has("ants-lod-box"), "without being boxed \u2014 the node setting is off and this is not its job");
+    assert(wrapper._cls.has("ants-lod-box"), "and hidden outright, which is what makes it unreachable");
 
     h.canvas.ds.scale = 0.5;
     h.tracker.lowZoom.sweep();
@@ -849,6 +852,183 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
       4,
       "and the way back cost no per-frame page queries either: what the frames do is arithmetic over what the sweep found"
     );
+  });
+
+  // The two halves that no CSS class can reach, and the page the first v2.1.13
+  // report came from: widgets drawn on the canvas, and a 3D viewport whose render
+  // loop hangs off the *node's* hover flag rather than off the DOM.
+
+  test("canvas widgets stop answering the pointer below the zoom, while the node still selects", async () => {
+    const h = await boot();
+    h.window.devicePixelRatio = 1;
+    h.canvas.ds.scale = 0.1;
+    h.canvas.ds.offset[0] = 0;
+    h.canvas.ds.offset[1] = 0;
+    // A slider: drawn on the canvas, hit-tested by arithmetic, not an element.
+    const slider = { name: "steps", last_y: 10, computedHeight: 20 };
+    const n = h.node({ pos: [0, 0], size: [200, 100], widgets: [slider] });
+    h.canvas.nodes = [n];
+    h.canvas.graph._nodes = h.canvas.nodes;
+
+    assertEqual(n.getWidgetOnPos(100, 20), slider, "the widget is hit-tested normally while the mode is off");
+    assertEqual(h.tracker.lowZoom.focus.canvasWidgetsBlocked, 0, "and nothing is counted");
+
+    h.tracker.lowZoom.set({ inertBelow: 0.4 });
+    h.canvas.setDirty(true, true);
+    h.canvas.draw(); // the gates are re-checked on the sweep, and installed per frame
+    assertEqual(n.getWidgetOnPos(100, 20), undefined, "below the zoom the same point finds no widget: no click, no drag, no hover report");
+    assertEqual(h.canvas.graph.getNodeOnPos(100, 20), n, "and the node under it is still found \u2014 selection and dragging are untouched");
+    assertGreater(h.tracker.lowZoom.focus.canvasWidgetsBlocked, 0, "the block is counted, so the panel can show it");
+    assertGreater(h.tracker.lowZoom.focus.canvasWidgetsSeen, 0, "against the calls it saw");
+
+    // Above the zoom, the widget answers again.
+    h.canvas.ds.scale = 0.5;
+    h.tracker.lowZoom.set({ inertBelow: 0.4 });
+    assertEqual(n.getWidgetOnPos(100, 20), slider, "above the setting the widget is live again");
+
+    // The foveated half reaches the canvas widgets too: at any zoom, a node that
+    // is off screen does not answer either \u2014 nothing is there to point at.
+    const far = h.node({ pos: [9000, 4000], size: [200, 100], widgets: [{ name: "steps", last_y: 10, computedHeight: 20 }] });
+    h.canvas.nodes.push(far);
+    h.canvas.graph._nodes = h.canvas.nodes;
+    h.tracker.lowZoom.set({ inertBelow: 0, fovea: true });
+    h.canvas.setDirty(true, true);
+    h.canvas.draw();
+    assertEqual(far.getWidgetOnPos(9100, 4020), undefined, "a node several screens away answers no widget");
+    assertEqual(n.getWidgetOnPos(100, 20), slider, "while the node on screen is untouched");
+
+    // Switching it off hands the widget back.
+    h.canvas.ds.scale = 0.1;
+    h.tracker.lowZoom.off();
+    assertEqual(n.getWidgetOnPos(100, 20), slider, "and switching the mode off restores the method");
+  });
+
+  test("a 3D viewport's hover flag never goes true while its node is switched off", async () => {
+    const h = await boot();
+    h.window.devicePixelRatio = 1;
+    h.canvas.ds.scale = 0.1;
+    h.canvas.ds.offset[0] = 0;
+    h.canvas.ds.offset[1] = 0;
+    const n = h.node({ pos: [0, 0], size: [200, 100] });
+    // The shape the core 3D nodes use: the extension chains the node's mouse
+    // hooks, and the viewport's render loop asks whether the pointer is over it.
+    let onNode = false;
+    n.onMouseEnter = () => {
+      onNode = true;
+      n.enters++;
+    };
+    n.onMouseLeave = () => {
+      onNode = false;
+      n.leaves++;
+    };
+    h.canvas.nodes = [n];
+    h.canvas.graph._nodes = h.canvas.nodes;
+
+    // Mode off: the canvas's own hover path reaches the node as usual.
+    h.canvas.hover(50, 50);
+    assertEqual(onNode, true, "with the mode off the node is told the pointer is over it");
+
+    // Mode on, at a zoom where nobody can use the viewport: the same hover path
+    // must not reach it, because that flag is what makes it render a frame.
+    h.canvas.node_over = undefined;
+    n.mouseOver = null;
+    n.onMouseLeave(); // the pointer leaves, the way the canvas reports it
+    assertEqual(onNode, false, "nothing is hovered before the mode is switched on");
+    h.tracker.lowZoom.set({ inertBelow: 0.4 });
+    h.canvas.setDirty(true, true);
+    h.canvas.draw();
+    const before = n.enters;
+    h.canvas.hover(50, 50);
+    assertEqual(n.enters, before, "the enter hook is held back");
+    assertEqual(onNode, false, "so the viewport's flag never becomes true and its render loop stays idle");
+    assertGreater(h.tracker.lowZoom.focus.hoverBlocked, 0, "and the panel can count what was held back");
+
+    // Hovering and *then* switching the mode on: the leave is forced, so a flag
+    // that was already true cannot stay stuck.
+    h.tracker.lowZoom.off();
+    h.canvas.setDirty(true, true);
+    h.canvas.draw(); // a frame with the mode off clears what it had held back
+    h.canvas.hover(50, 50);
+    assertEqual(onNode, true, "hovered while the mode is off");
+    h.tracker.lowZoom.set({ inertBelow: 0.4 });
+    h.canvas.setDirty(true, true);
+    h.canvas.draw();
+    assertEqual(onNode, false, "switching the mode on tells the node the pointer is gone");
+    assertGreater(n.leaves, 0, "with an actual leave call, which is what clears the flag");
+  });
+
+  test("a node's DOM is hidden below the zoom even when its owner cannot be worked out", async () => {
+    const h = await boot();
+    h.window.devicePixelRatio = 1;
+    h.canvas.ds.scale = 0.1;
+    bigGraph(h, 4, 0.1);
+    // A wrapper in the page whose position matches no node at all: the maths that
+    // resolves ownership cannot place it, which on a page with an unexpected
+    // display scale is exactly what happens. The focus half does not need to know
+    // which node it belongs to, so it must still be switched off.
+    const orphan = h.document.createElement("div");
+    orphan.className = "dom-widget size-full";
+    orphan.style.left = "12345px";
+    orphan.style.top = "6789px";
+    h.document.body.appendChild(orphan);
+
+    h.tracker.lowZoom.set({ flatBelow: 0, inertBelow: 0.4 });
+    assert(orphan._cls.has("ants-lod-box"), "it is hidden");
+    assert(orphan._cls.has("ants-lod-inert"), "and inert");
+
+    h.canvas.ds.scale = 0.5;
+    h.tracker.lowZoom.sweep();
+    assert(!orphan._cls.has("ants-lod-box"), "and it comes back above the zoom");
+
+    // The other way round: with only the foveated half on, an element whose owner
+    // is unknown is left alone, because that decision needs a node to measure.
+    h.canvas.ds.scale = 0.1;
+    h.tracker.lowZoom.set({ inertBelow: 0, fovea: true });
+    h.tracker.lowZoom.sweep();
+    assert(!orphan._cls.has("ants-lod-box"), "the off-screen half does not guess at ownership");
+  });
+
+  test("the event gate swallows what is aimed at a switched-off element, and nothing else", async () => {
+    const h = await boot();
+    h.window.devicePixelRatio = 1;
+    h.canvas.ds.scale = 0.1;
+    bigGraph(h, 4, 0.1);
+    const wrapper = h.document.createElement("div");
+    wrapper.className = "dom-widget";
+    const button = h.document.createElement("button");
+    wrapper.appendChild(button);
+    h.document.body.appendChild(wrapper);
+    h.canvas.nodes[0].widgets = [{ name: "viewport", element: button, options: {} }];
+    let clicks = 0;
+    button.addEventListener("click", () => {
+      clicks++;
+    });
+
+    // Off: the click arrives.
+    button._fire("click");
+    assertEqual(clicks, 1, "with the mode off the page's own handlers run");
+
+    h.tracker.lowZoom.set({ inertBelow: 0.4 });
+    button._fire("click");
+    assertEqual(clicks, 1, "and with the mode on the click never reaches them, whatever the CSS says");
+    assertGreater(h.tracker.lowZoom.focus.eventsBlocked, 0, "it is counted");
+
+    // A click somewhere else in the page is not this tool's business.
+    const other = h.document.createElement("button");
+    h.document.body.appendChild(other);
+    let otherClicks = 0;
+    other.addEventListener("click", () => {
+      otherClicks++;
+    });
+    h.tracker.lowZoom.set({ inertBelow: 0.4 });
+    other._fire("click");
+    assertEqual(otherClicks, 1, "an element that is not a node's DOM is left completely alone");
+
+    // And the canvas keeps working: the gate is blind to anything not marked.
+    h.canvas.ds.scale = 0.1;
+    h.tracker.lowZoom.off();
+    button._fire("click");
+    assertEqual(clicks, 2, "switching the mode off hands the page back");
   });
 
   test("the display-scale check reads the screen, and the viewport maths stays in CSS pixels", async () => {

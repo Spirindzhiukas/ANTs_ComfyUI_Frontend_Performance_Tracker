@@ -217,6 +217,52 @@ export function createHarness(options = {}) {
   // The graph class. The frontend's only node hit-test entry point is
   // LGraph.getNodeOnPos (LGraphCanvas calls it per pointer event), and that is
   // where the tracker's focus mode gates it — so the fake has to have it.
+  // A node class with the two seams the frontend actually uses to decide whether a
+  // widget answers the pointer: `getWidgetOnPos` for the widgets drawn on the
+  // canvas, and the mouse hooks a 3D viewport hangs its "is the pointer over me"
+  // flag on. Instances are what `h.node()` hands out.
+  class FakeLGraphNode {
+    constructor(opts = {}) {
+      this.type = opts.type || "KSampler";
+      this.pos = opts.pos ? [...opts.pos] : [0, 0];
+      this.size = opts.size ? [...opts.size] : [200, 100];
+      this.selected = false;
+      this.widgets = opts.widgets || [];
+      this.mouseOver = null;
+      this.enters = 0;
+      this.leaves = 0;
+      this.moves = 0;
+    }
+    getWidgetOnPos(x, y) {
+      const nx = Number(this.pos[0]) || 0;
+      const ny = Number(this.pos[1]) || 0;
+      const w = Math.abs(Number(this.size[0])) || 0;
+      for (const widget of this.widgets || []) {
+        if (widget.last_y === undefined) continue;
+        const top = ny + widget.last_y;
+        const height = Number(widget.computedHeight) || 20;
+        if (x >= nx && x <= nx + w && y >= top && y <= top + height) return widget;
+      }
+      return undefined;
+    }
+    onMouseEnter() {
+      this.enters++;
+    }
+    onMouseLeave() {
+      this.leaves++;
+    }
+    onMouseMove() {
+      this.moves++;
+    }
+    isPointInside(x, y) {
+      const nx = Number(this.pos[0]) || 0;
+      const ny = Number(this.pos[1]) || 0;
+      const w = Math.abs(Number(this.size[0])) || 0;
+      const hh = Math.abs(Number(this.size[1])) || 0;
+      return x >= nx && x <= nx + w && y >= ny && y <= ny + hh;
+    }
+  }
+
   class FakeLGraph {
     constructor() {
       this._nodes = [];
@@ -283,6 +329,21 @@ export function createHarness(options = {}) {
       if (this.ds) this.ds.visible_area = this.visible_area;
       return this.visible_area;
     }
+    // What the canvas does on mousemove: find the node through the graph, tell it
+    // the mouse entered (once), call its move hook, and report the widget under
+    // the cursor — the same order LGraphCanvas.processMouseMove uses.
+    hover(x, y) {
+      const graph = this.graph;
+      const node = graph && typeof graph.getNodeOnPos === "function" ? graph.getNodeOnPos(x, y) : null;
+      if (!node) return null;
+      if (!node.mouseOver) {
+        node.mouseOver = {};
+        this.node_over = node;
+        if (typeof node.onMouseEnter === "function") node.onMouseEnter(null);
+      }
+      if (typeof node.onMouseMove === "function") node.onMouseMove(null, [x, y], this);
+      return typeof node.getWidgetOnPos === "function" ? node.getWidgetOnPos(x, y, true) : undefined;
+    }
     drawConnections() {
       busy(this.costs.connections);
       for (const link of this.links) {
@@ -330,6 +391,7 @@ export function createHarness(options = {}) {
   app.graph = new FakeLGraph(); // the graph class, so the hit-test gate has its seam
   canvas.graph = app.graph; // LiteGraph keeps the graph on the canvas, and so does this fake
   app.canvas = canvas;
+  canvas.node_over = undefined;
 
   const LiteGraphShim = { registered_node_types: {}, LGraphCanvas: FakeLGraphCanvas };
 
@@ -452,6 +514,12 @@ export function createHarness(options = {}) {
     return node;
   }
 
+  // A node the frontend's own seams apply to: widgets drawn on the canvas
+  // (getWidgetOnPos) and the mouse hooks a 3D viewport hangs its hover flag on.
+  function node(opts) {
+    return new FakeLGraphNode(opts);
+  }
+
   function addResource(url, { startTime = 0, duration = 10, transferSize = 1000, encodedBodySize = 1000 } = {}) {
     resourceEntries.push({ name: url, startTime, duration, transferSize, encodedBodySize, decodedBodySize: encodedBodySize });
   }
@@ -504,6 +572,7 @@ export function createHarness(options = {}) {
     registerExtension,
     registerNodeType,
     makeNode,
+    node,
     addResource,
     panel,
     textOf,
