@@ -863,6 +863,57 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
   // setting: it is where the master switch lives. And the switch has to be a real
   // off — not a quieter tracker, but a page that is ComfyUI's own again.
 
+  test("the floating pill: a switch and a gear, and neither goes away when the tool is switched off", async () => {
+    const h = await boot();
+    h.window.devicePixelRatio = 1;
+    const pill = h.document.getElementById("ants-corner-pill");
+    assert(pill, "the floating pill is on the page from the moment the tracker starts");
+    assert(pill._cls.has("ants-own"), "and marked as this tool's own");
+    const buttons = pill.children.filter((c) => c.tagName === "BUTTON");
+    assertEqual(buttons.length, 2, "two controls in the one frame");
+    assert(buttons[0]._cls.has("ants-node-btn-tick"), "the switch first");
+    assert(buttons[1]._cls.has("ants-node-btn-gear"), "the gear after");
+    assertEqual(h.document.getElementById("ants-corner-btn"), buttons[1], "the button that always opened the panel is the gear");
+
+    // The gear opens the panel; it is not the switch.
+    buttons[1]._fire("click");
+    await h.flush();
+    assert(h.panel() && h.panel()._cls.has("open"), "clicking the gear opens the panel");
+    assertEqual(h.tracker.lowZoom.enabled, true, "and does not switch anything off");
+
+    // The switch switches, and nothing of this tool's UI goes anywhere.
+    buttons[0]._fire("click");
+    assertEqual(h.tracker.lowZoom.enabled, false, "the floating switch turns the hooks and the optimisations off");
+    assert(!pill._cls.has("ants-lod-box") && !pill._cls.has("ants-lod-inert"), "neither control is hidden or made inert");
+    assert(!pill._cls.has("ants-hidden-by-switch"), "and the pill is not taken off the screen");
+    assertEqual(buttons[0].getAttribute("aria-checked"), "false", "the switch reads off");
+    assert(h.panel() && h.panel()._cls.has("open"), "the panel that was open stays open");
+
+    buttons[0]._fire("click");
+    assertEqual(h.tracker.lowZoom.enabled, true, "and the same switch turns it back on");
+    assertEqual(buttons[0].getAttribute("aria-checked"), "true", "reading on again");
+    assert(pill._cls.has("ants-own"), "still this tool's own");
+  });
+
+  test("dragging the floating pill moves it and flips nothing", async () => {
+    const h = await boot();
+    h.window.devicePixelRatio = 1;
+    const pill = h.document.getElementById("ants-corner-pill");
+    const tick = pill.children.filter((c) => c.tagName === "BUTTON")[0];
+
+    // A press, a hold past the long-press threshold, a move, a release: the pill's
+    // own drag, then the click the browser delivers afterwards.
+    pill._fire("mousedown", { clientX: 100, clientY: 100 });
+    h.advance(400);
+    h.window.fire("mousemove", { clientX: 140, clientY: 130 });
+    h.window.fire("mouseup", {});
+    assert(pill.style.top !== "" || pill.style.left !== "", "the pill was moved");
+
+    tick._fire("click");
+    assertEqual(h.tracker.lowZoom.enabled, true, "the drag did not flip the switch it started on");
+    assert(!h.panel() || !h.panel()._cls.has("open"), "and did not open the panel either");
+  });
+
   test("the node's pill: a switch and a gear, and no low-zoom sweep may touch it", async () => {
     const h = await boot();
     h.window.devicePixelRatio = 1;
@@ -907,6 +958,9 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     const focus = h.tracker.lowZoom.focus;
     assertGreater(focus.inertElements + h.tracker.lowZoom.dom.hidden, 0, "the sweep did switch other things off");
     assert(otherWrap._cls.has("ants-lod-box"), "the ordinary node's widget is the thing it switched off");
+    const floatPill = h.document.getElementById("ants-corner-pill");
+    assert(floatPill, "the floating pill exists");
+    assert(!floatPill._cls.has("ants-lod-box") && !floatPill._cls.has("ants-lod-inert"), "and the sweep did not touch that either");
     assert(!pill._cls.has("ants-lod-box"), "the pill is not hidden");
     assert(!pill._cls.has("ants-lod-inert"), "and not made inert");
     assert(!wrapper._cls.has("ants-lod-box"), "nor is the wrapper the frontend put it in");
@@ -991,8 +1045,8 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     h.tracker.lowZoom.setEnabled(false);
     await h.flush();
     const text = panelText(h);
-    assertIncludes(text, "The tracker is switched off.", "the panel says so plainly");
-    assertIncludes(text, "switches it back on with exactly the settings you had", "and says how to get back");
+    assertIncludes(text, "The hooks and the optimisations are switched off.", "the panel says so plainly");
+    assertIncludes(text, "turns them back on with exactly the settings you had", "and says how to get back");
     assertIncludes(text, "⏻ On", "with the header button offering it");
     assertEqual(h.tracker.lowZoom.enabled, false, "and the API agrees");
 

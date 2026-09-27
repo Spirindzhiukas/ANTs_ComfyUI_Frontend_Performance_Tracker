@@ -38,16 +38,20 @@ The tracker starts recording automatically the moment the page loads —
 you don't need to place any node for it to work. Two ways to open the
 panel:
 
-1. A small 🔧 button appears pinned to the screen at all times. A
-   quick click opens/closes the panel. Press and hold it for a moment,
-   then drag — it switches into move mode instead of clicking, and
-   remembers wherever you drop it (via `localStorage`), even across
-   page reloads. Handy since its default spot can collide with
-   ComfyUI's own minimap/queue UI depending on your layout; drag it
-   up near the top bar or wherever's actually clear on your screen.
+1. A small pill appears pinned to the screen at all times, with two
+   round controls in it: a **switch** on the left and a **gear** on the
+   right. The gear opens/closes the panel. Press and hold anywhere on
+   the pill for a moment, then drag — it switches into move mode
+   instead of clicking, and remembers wherever you drop it (via
+   `localStorage`), even across page reloads. Handy since its default
+   spot can collide with ComfyUI's own minimap/queue UI depending on
+   your layout; drag it up near the top bar or wherever's actually
+   clear on your screen. The switch on the left is the tool's master
+   switch (see below), and neither control is ever taken off the
+   screen — not by a setting, not by the switch itself.
 2. Or drag in the **"ANTs Nasty Bastards Tracker"** node (category
-   `ANTs/debug`). It carries a small pill — `[switch][gear]`: the gear
-   (or a click on the pill) opens the panel, and the checkbox is the
+   `ANTs/debug`). It carries the same pill as the floating button —
+   `[switch][gear]`: the gear opens the panel, the checkbox is the
    tool's master switch. The node does nothing else — no inputs, no
    outputs, never executes. The pill is exempt from every setting this
    extension has, so it stays usable at any zoom, including at 10% on a
@@ -58,10 +62,10 @@ Panel header buttons:
 - **📋 Copy** — dumps a plain-text snapshot of every tab to the
   clipboard in one go, meant for pasting into a chat or bug report
   instead of a screenshot.
-- **⏻ Off / On** — the same master switch as the node's checkbox, for
-  when the node is off screen. Off means off: nothing is wrapped,
-  sampled, deferred or drawn differently, the page is handed back whole,
-  and the panel keeps your settings for when you switch it on again.
+- **⏻ Off / On** — the same master switch as the checkbox on the
+  floating pill. Off means off: nothing is wrapped, sampled, deferred or
+  drawn differently, the page is handed back whole, and the panel keeps
+  your settings for when you switch it on again.
 - **⏸ Pause** — freezes sampling. Drawing keeps happening; it just
   stops being timed, so a jumpy table holds still long enough to read.
   Meters are marked stale while paused.
@@ -504,11 +508,11 @@ logged for DevTools.
 ## Development
 
 ```
-node tests/run-tests.mjs          # 129 tests, no dependencies, no browser
+node tests/run-tests.mjs          # 131 tests, no dependencies, no browser
 node tests/run-tests.mjs timing   # filter by name fragment
 python3 tests/test_init.py        # backend route parsing + graceful fallbacks
 node tests/demo.mjs               # print what the panel says, with no ComfyUI
-node tools/pill-preview.mjs       # the node's pill, drawn with the real CSS and glyphs
+node tools/pill-preview.mjs       # the pill, drawn with the real CSS and the real glyphs
 ```
 
 `tests/demo.mjs` drives a synthetic graph (two packs, four node types, a
@@ -545,10 +549,45 @@ patches `drawImage` there, the same way a browser exposes it), and
 `createImageBitmap` records the resize it was asked to perform instead of
 resizing anything.
 
+## What changed in v2.1.16
+
+- **The pill belongs on the floating button, not only on the node.** v2.1.15 put
+  it on the node's DOM widget, which is a place the frontend can still take away
+  from it (it is the same layer every other widget lives in, and at low zoom the
+  node itself stops being drawn). The floating control — the thing that has always
+  been pinned to the screen — is now the pill: `[switch][gear]`, the same builder,
+  the same geometry, the same handlers as the node's widget. The old 🔧 emoji is
+  the drawn gear glyph, so both places look and behave identically.
+- **Switching the tool off no longer takes the tool's own UI with it.**
+  v2.1.15 closed the panel and hid the corner button when the switch went off,
+  which left the screen empty except for the node's pill — the worst possible
+  moment to make someone hunt for the way back. Now: the pill stays exactly where
+  it is (marked `.ants-own`, so no sweep, gate or hover rule of this tool can box
+  it, inert it or swallow a click aimed at it), the panel stays open if it was
+  open, and both the panel's banner and the panel's own ⏻ button say what
+  happened. What the switch does is hand the *page* back — hooks, sampling,
+  deferrals, the redraw cap, the low-zoom drawing, the DOM it dressed — and
+  nothing else.
+- **The switch is described as what it switches off**, in the tooltips, the
+  banner and here: the hooks and the optimisations. Its state is the same
+  `S.enabled` as before, so everything v2.1.15 gated is still gated.
+- Dragging the pill is still a drag: a press that moves past the long-press
+  threshold does not flip the switch it started on, and does not toggle the panel.
+- While the switch is off the panel keeps repainting itself, so its controls and
+  the banner stay truthful. That repaint is the panel's own cost, not a
+  measurement: nothing is sampled, and every number it shows is the frozen last
+  one from before the switch went off.
+- **New tests** (2): the floating pill carries the switch and the gear, the gear
+  opens the panel without switching anything off, the switch toggles without the
+  pill being hidden or the open panel being closed; and dragging the pill moves it
+  while flipping nothing. The low-zoom sweep test now also asserts the floating
+  pill is untouched by a sweep that hides an ordinary node's widget next to it.
+
 ## What changed in v2.1.15
 
 - **The node's own controls are back, and they are the way in and out of the whole
-  tool.** v2.1.14's focus mode fixed the widgets but took the tracker's *own* widget
+  tool.** *(v2.1.16 moved the primary copy of this pill to the floating button; the
+  node keeps its widget.)* v2.1.14's focus mode fixed the widgets but took the tracker's *own* widget
   with it: below the flatten zoom the node is a rectangle, the frontend stops drawing
   its header and its canvas-drawn button, and the node DOM that used to carry the
   gear was hidden by the same sweep that hid everybody else's. There is now a pill on
@@ -560,9 +599,10 @@ resizing anything.
   master switch (`S.enabled`) and, with it off: nothing is wrapped, nothing is sampled
   or timed, no redraw is capped or deferred, no drawing setting is applied (every
   low-zoom class is removed and node DOM is handed back), no hover hook is held back
-  and the event gate's set is empty, the raf monitor and the memory sampler stop, the
-  panel closes and the corner button hides. What is *not* touched is your settings,
-  the pill, and ComfyUI: the page goes back to being exactly ComfyUI's own, and the
+  and the event gate's set is empty, the raf monitor and the memory sampler stop.
+  (That release also closed the panel and hid the corner button for one version —
+  v2.1.16 takes that back: the tool's own UI stays put.) What is *not* touched is
+  your settings, the pill, and ComfyUI: the page goes back to being exactly ComfyUI's own, and the
   checkbox — or ⏻ On in the panel — brings everything back with the settings you had.
   The panel stays openable (the gear still works) and says so in a banner.
 - **Both controls are the same size and the same colour, by geometry rather than by

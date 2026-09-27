@@ -445,6 +445,18 @@ console.log(
     `${focus.hoverBlocked} node hover callback(s) held back so a 3D viewport's "pointer is over me" flag stays ${viewportHovered}, ` +
     `${focus.inertElements} element(s) of node DOM switched off, ${focus.eventsBlocked} pointer event(s) swallowed at the document`
 );
+// The floating controls: the switch and the gear, in one rounded frame pinned to
+// the screen, marked as this tool's own so no sweep can hide them — and never
+// taken away by the switch, because it is the way back. The node carries the same
+// pair as its own widget.
+const floatPill = h.document.getElementById("ants-corner-pill");
+const floatButtons = floatPill ? floatPill.children.filter((c) => c.tagName === "BUTTON") : [];
+console.log(
+  `  the floating pill: ${floatButtons.length} button(s) (${floatButtons.map((b) => b.tagName + "." + [...b._cls].join(".")).join(", ")}), ` +
+    `marked own: ${floatPill ? floatPill._cls.has("ants-own") : "no pill"}, the panel's own button: ` +
+    `${h.document.getElementById("ants-corner-btn") === floatButtons[1] ? "the gear" : "MISSING"}`
+);
+
 // The node's own controls: the switch and the gear, in one rounded frame, marked
 // as this tool's own so no sweep can hide them. The switch is the master switch.
 const NodeType = h.registerNodeType("ANTsNastyBastardsTracker");
@@ -467,6 +479,7 @@ console.log(
 // recorded, nothing drawn differently, every element handed back.
 const framesBefore = h.tracker.totals.frames;
 h.tracker.lowZoom.setEnabled(false);
+const panelWasOpen = !!(h.panel() && h.panel()._cls.has("open"));
 h.canvas.ds.scale = 0.1;
 const wrapperAfter = [...demoWidget._cls].join("+");
 for (let i = 0; i < 5; i++) {
@@ -478,6 +491,12 @@ console.log(
   `  switched off: ${h.tracker.totals.frames - framesBefore} frame(s) recorded in 5 draws (nothing is being measured), the webcam-style wrapper's ` +
     `classes are "${wrapperAfter}" (the low-zoom box was handed back), drawing settings kept: flat ${h.tracker.lowZoom.state.flatBelow}, focus ` +
     `${h.tracker.lowZoom.state.inertBelow}, fovea ${h.tracker.lowZoom.state.fovea}`
+);
+console.log(
+  `  and the UI is still there: float pill ${floatPill ? "present" : "GONE"}, ` +
+    `hidden or inert ${floatPill ? floatPill._cls.has("ants-lod-box") || floatPill._cls.has("ants-lod-inert") : "n/a"}, ` +
+    `switch reads ${floatButtons[0] ? floatButtons[0].getAttribute("aria-checked") : "n/a"}, ` +
+    `panel open before/after: ${panelWasOpen}/${!!(h.panel() && h.panel()._cls.has("open"))}`
 );
 h.tracker.lowZoom.setEnabled(true);
 console.log(`  switched on again: ${h.tracker.lowZoom.on ? "the same settings are in force" : "NOTHING is in force (a bug)"}`);

@@ -27,7 +27,7 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.1.15";
+const VERSION = "2.1.16";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
 const NODE_NAME = "ANTsNastyBastardsTracker";
 
@@ -2234,35 +2234,43 @@ function antsCheckSvg() {
   return antsSvg('<path d="M6.6 11.2 L9.7 14.2 L15.4 7.9"/>');
 }
 
-// The one element the frontend positions for this widget. Everything the switch
-// does happens inside it, and nothing outside this tool knows it exists.
-function buildAntsNodeWidget() {
-  const pill = el("div", { class: `ants-node-pill ${ANTS_OWN_CLASS}` });
-  pill.title = "ANTs Nasty Bastards Tracker — the switch on the left turns the whole tool off, the gear opens the panel";
+// A drag on a pill must not also count as a click on what the drag started on:
+// the floating pill is draggable, so the tick has to know when a press turned
+// into a move. The flag is set by the drag wiring below and read here.
+function antsClickSuppressed(el) {
+  let n = el;
+  let depth = 0;
+  while (n && depth++ < 8) {
+    if (n._antsSuppressClick) {
+      n._antsSuppressClick = false;
+      return true;
+    }
+    n = n.parentNode;
+  }
+  return false;
+}
 
+// The switch, as it appears on both pills. One piece of code, so the node's tick
+// and the floating one cannot drift apart — they are the same control, wired to
+// the same master switch.
+function antsBuildTick(pill) {
   const tick = el("button", { class: "ants-node-btn ants-node-btn-tick", type: "button" });
   tick.setAttribute("role", "checkbox");
-  const gear = el("button", { class: "ants-node-btn ants-node-btn-gear", type: "button" });
+  const glyph = antsCheckSvg();
+  if (glyph) tick.appendChild(glyph);
 
-  // The switch first, the gear after — the order the frame draws them in.
-  pill.appendChild(tick);
-  pill.appendChild(gear);
-  const tickGlyph = antsCheckSvg();
-  const gearGlyph = antsGearSvg();
-  if (tickGlyph) tick.appendChild(tickGlyph);
-  if (gearGlyph) gear.appendChild(gearGlyph);
-
-  // The switch is the master switch, and it says so plainly: it is not "pause the
-  // numbers", it is "make this tool not be here".
+  // The switch says what it is plainly: it is not "pause the numbers", it is
+  // "stop the hooks and the optimisations" — the numbers stop moving because
+  // nothing is being measured any more.
   const sync = () => {
     const on = antsEnabled();
     tick.setAttribute("aria-checked", on ? "true" : "false");
     tick.style.background = on ? ANTS_SWITCH_FILL : "transparent"; // no fill of ours while unchecked
     tick.style.borderColor = ANTS_ACCENT;
     tick.title = on
-      ? "Tracker is ON. Click to switch it off completely: no hooks wrapped, no sampling, no scheduler deferrals, no redraw cap, no low-zoom " +
-        "drawing, no DOM touched. Your settings are kept."
-      : "Tracker is OFF. Click to switch it back on with the settings you had.";
+      ? "Tracker is ON. Click to switch the hooks and the optimisations off: nothing wrapped, nothing sampled, no scheduler deferrals, no " +
+        "redraw cap, no low-zoom drawing, no DOM touched. Your settings are kept."
+      : "Tracker is OFF. Hooks and optimisations are off. Click to switch them back on with the settings you had.";
   };
   sync();
   ANTS_WIDGETS.add(sync);
@@ -2273,8 +2281,27 @@ function buildAntsNodeWidget() {
     } catch (e) {
       /* the click still counts */
     }
+    if (antsClickSuppressed(tick)) return; // that press was a drag of the pill
     antsSetEnabled(!antsEnabled());
   });
+  return tick;
+}
+
+// The one element the frontend positions for this widget. Everything the switch
+// does happens inside it, and nothing outside this tool knows it exists.
+function buildAntsNodeWidget() {
+  const pill = el("div", { class: `ants-node-pill ${ANTS_OWN_CLASS}` });
+  pill.title = "ANTs Nasty Bastards Tracker — the switch on the left turns the hooks and the optimisations off, the gear opens the panel";
+
+  const tick = antsBuildTick(pill);
+  const gear = el("button", { class: "ants-node-btn ants-node-btn-gear", type: "button" });
+
+  // The switch first, the gear after — the order the frame draws them in.
+  pill.appendChild(tick);
+  pill.appendChild(gear);
+  const gearGlyph = antsGearSvg();
+  if (gearGlyph) gear.appendChild(gearGlyph);
+
   gear.addEventListener("click", (ev) => {
     try {
       ev.stopPropagation();
@@ -2384,30 +2411,14 @@ function antsSetEnabled(on) {
   S.enabled = next;
   if (!next) {
     antsReleasePage();
-    // The panel and the corner button are this tool's own UI; with the tool off
-    // they go too, so nothing on screen claims to be measuring. The node's own
-    // pill stays — it is the way back.
-    try {
-      if (ui.built && ui.panel && ui.panel.classList.contains("open")) togglePanel(false);
-    } catch (e) {
-      /* never fatal */
-    }
-    try {
-      if (cornerBtnEl) cornerBtnEl.classList.add("ants-hidden-by-switch");
-    } catch (e) {
-      /* never fatal */
-    }
+    // Nothing of this tool's own UI goes away: the floating pill carries the
+    // switch that turns it back on, and closing the panel under someone who is
+    // reading it would be its own small bug. The page is what gets handed back.
     console.info(
-      "[ANTs Tracker] Switched off at the node's checkbox. Nothing is wrapped, sampled or drawn differently any more: no hooks, no " +
-        "scheduler deferrals, no redraw cap, no low-zoom drawing, no DOM touched. Your settings are kept — the checkbox next to the gear " +
-        "switches it back on."
+      "[ANTs Tracker] Switched off: no hooks wrapped, nothing sampled, no scheduler deferrals, no redraw cap, no low-zoom drawing, no DOM " +
+        "touched. The switch on the floating button (and the panel's own On button) switches it back on with the settings you had."
     );
   } else {
-    try {
-      if (cornerBtnEl) cornerBtnEl.classList.remove("ants-hidden-by-switch");
-    } catch (e) {
-      /* never fatal */
-    }
     try {
       if (LOD.flatBelow > 0 || LOD.inertBelow > 0 || LOD.fovea) {
         lodInstallDomSweep();
@@ -2421,9 +2432,8 @@ function antsSetEnabled(on) {
     console.info("[ANTs Tracker] Switched back on: the settings that were in force are in force again.");
   }
   antsSyncWidgets();
-  // The panel may be closed by now (switching off closes it), but it is built —
-  // and the banner and the header button have to say what happened before anyone
-  // looks at them again.
+  // The banner and the header button have to say what happened before anyone
+  // looks at them again — and an open panel is left open, showing them.
   try {
     if (ui.built) {
       renderSummary();
@@ -5459,16 +5469,17 @@ tr.ants-details table.ants-sub td { color: #bbb; }
 .ants-spark { display: flex; align-items: flex-end; gap: 1px; height: 40px; margin: 4px 0 2px; }
 .ants-spark > div { flex: 1; background: #46688c; min-height: 1px; }
 .ants-spark > div.ants-spark-hot { background: #f0a020; }
-#ants-corner-btn {
-  position: fixed; bottom: 16px; right: 16px; width: 34px; height: 34px;
-  border-radius: 50%; background: #26262c; border: 1px solid #444; color: #f0a020;
-  font-size: 16px; display: flex; align-items: center; justify-content: center;
-  cursor: pointer; z-index: 99998; box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+/* The floating pill: the switch and the gear, pinned to the screen. Wherever it
+   is dragged, it stays — and no setting and no click on the switch ever takes it
+   away, because it is the way back. */
+#ants-corner-pill {
+  position: fixed; bottom: 16px; right: 16px; z-index: 99998;
+  margin: 0; cursor: pointer; box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+  /* Slightly more solid than the node's pill: this one floats over the canvas,
+     which can be anything. */
+  background: rgba(24, 24, 28, 0.9);
 }
-#ants-corner-btn:hover { background: #33333a; }
-/* The master switch takes the corner button away with it: with the tool off,
-   nothing on screen should claim to be measuring. The node's own pill stays. */
-#ants-corner-btn.ants-hidden-by-switch { display: none !important; }
+#ants-corner-pill .ants-node-btn { cursor: pointer; }
 .ants-copyrow { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
 `;
 
@@ -5763,7 +5774,7 @@ function buildPanel() {
   if (ui.built) return ui.panel;
   injectStyle();
 
-  const panel = el("div", { id: "ants-tracker-panel" });
+  const panel = el("div", { id: "ants-tracker-panel", class: ANTS_OWN_CLASS });
   ui.panel = panel;
 
   const header = el("div", { id: "ants-tracker-header" });
@@ -5780,8 +5791,9 @@ function buildPanel() {
     class: "ants-hbtn",
     text: "⏻ Off",
     title:
-      "Switch the tracker off completely: no hooks wrapped, no sampling, no scheduler deferrals, no redraw cap, no low-zoom drawing, no DOM " +
-      "touched. Same switch as the checkbox on the tracker's own node. Your settings are kept and come back when you switch it on again.",
+      "Switch the hooks and the optimisations off: no hooks wrapped, no sampling, no scheduler deferrals, no redraw cap, no low-zoom drawing, " +
+      "no DOM touched. Same switch as the checkbox on the floating button (and on the tracker's own node). Your settings are kept, and come " +
+      "back when you switch it on again.",
   });
   ui.pauseBtn = el("span", {
     class: "ants-hbtn",
@@ -5943,9 +5955,9 @@ function renderSummary() {
       ui.offBanner,
       S.enabled
         ? ""
-        : "The tracker is switched off. Nothing is wrapped, sampled, deferred or drawn differently: this page is ComfyUI's own, and the numbers " +
-          "below are the last ones recorded before it went off. The checkbox next to the gear on the tracker's node — or ⏻ On here — switches it " +
-          "back on with exactly the settings you had."
+        : "The hooks and the optimisations are switched off. Nothing is wrapped, sampled, deferred or drawn differently: this page is ComfyUI's " +
+          "own, and the numbers below are the last ones recorded before it went off. The switch next to the gear on the floating button — " +
+          "or ⏻ On here — turns them back on with exactly the settings you had."
     );
     ui.offBanner.style.display = S.enabled ? "none" : "block";
     ui.offBanner.classList.toggle("ants-off-note", !S.enabled);
@@ -8742,6 +8754,8 @@ function wireCornerButton(node) {
     node.style.opacity = "1";
     if (movedDuringDrag) {
       suppressClick = true; // a drag must not also toggle the panel
+      // ...and must not flip the switch either, if the drag started on the tick.
+      node._antsSuppressClick = true;
       const rect = node.getBoundingClientRect();
       saveCornerPos(rect.top, rect.left);
     }
@@ -8756,24 +8770,52 @@ function wireCornerButton(node) {
   });
 }
 
-function buildCornerButton() {
+// The floating control: the switch and the button that opens the panel, in one
+// frame, pinned to the screen. This is the pair that has to survive everything —
+// so it is marked `.ants-own` (no sweep, gate or hover rule of this tool can
+// touch it) and it is *not* hidden when the tool is switched off, because it is
+// where the switch that turns it back on lives.
+function buildCornerPill() {
   if (cornerBtnEl) return cornerBtnEl;
   injectStyle();
-  cornerBtnEl = el("div", {
+  const pill = el("div", { id: "ants-corner-pill", class: `ants-node-pill ${ANTS_OWN_CLASS}` });
+  pill.title = "ANTs Nasty Bastards Tracker — the switch turns the hooks and the optimisations off, the gear opens the panel";
+  const tick = antsBuildTick(pill);
+  const gear = el("button", {
     id: "ants-corner-btn",
-    text: "🔧",
-    title: "ANTs Nasty Bastards Tracker — click to open, press and hold to move",
+    class: "ants-node-btn ants-node-btn-gear",
+    type: "button",
+    title: "ANTs Nasty Bastards Tracker — click to open the panel, press and hold to move this button",
   });
+  const glyph = antsGearSvg();
+  if (glyph) gear.appendChild(glyph);
+  gear.addEventListener("click", (ev) => {
+    try {
+      ev.stopPropagation();
+    } catch (e) {
+      /* the click still counts */
+    }
+    if (antsClickSuppressed(gear)) return; // that press was a drag of the pill
+    togglePanel();
+  });
+  // The switch first, the gear after — the order the frame draws them in.
+  pill.appendChild(tick);
+  pill.appendChild(gear);
   const saved = loadCornerPos();
   if (saved) {
-    cornerBtnEl.style.top = `${saved.top}px`;
-    cornerBtnEl.style.left = `${saved.left}px`;
-    cornerBtnEl.style.bottom = "auto";
-    cornerBtnEl.style.right = "auto";
+    pill.style.top = `${saved.top}px`;
+    pill.style.left = `${saved.left}px`;
+    pill.style.bottom = "auto";
+    pill.style.right = "auto";
   }
-  wireCornerButton(cornerBtnEl);
-  document.body.appendChild(cornerBtnEl);
-  return cornerBtnEl;
+  wireCornerButton(pill);
+  document.body.appendChild(pill);
+  cornerBtnEl = pill;
+  return pill;
+}
+
+function buildCornerButton() {
+  return buildCornerPill();
 }
 
 // ------------------------------------------------------- snapshot & report --
@@ -9256,7 +9298,8 @@ function installDebugApi() {
         },
         get focus() {
           return {
-            // Whether the whole tool is switched on at all (the node's checkbox).
+            // Whether the whole tool is switched on at all (the floating switch,
+            // and the one on the tracker's own node).
             enabled: antsEnabled(),
             // The node-zoom half: widget UI switched off below this zoom. The
             // nodes themselves keep selecting, dragging and opening — only the
@@ -9421,7 +9464,7 @@ app.registerExtension({
       if (ui.built && ui.panel.classList.contains("open") && ui.active === "gpu") refreshGpu();
     }, 2500));
     console.info(
-      `[ANTs Tracker] v${VERSION} running. Open the panel with the 🔧 button (or the gear on the tracker's own node); ` +
+      `[ANTs Tracker] v${VERSION} running. Open the panel with the gear on the floating button (or the one on the tracker's own node); ` +
         "window.__antsTracker.snapshot / .report give the same data from the console."
     );
   },
