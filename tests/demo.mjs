@@ -282,7 +282,7 @@ const demoWidget = h.document.createElement("div");
 demoWidget.className = "dom-widget";
 demoWidget.appendChild(h.document.createElement("canvas"));
 h.document.body.appendChild(demoWidget);
-h.canvas.nodes[3].widgets = [{ name: "curve", element: demoWidget.children[0] }];
+h.canvas.nodes[3].widgets = [{ name: "curve", element: demoWidget.children[0], options: { hideOnZoom: false } }];
 
 h.tracker.lowZoom.set({ minPx: 24, idleCapMs: 500, thumbZoom: 0.6, detailZoom: 0.6 });
 
@@ -326,7 +326,8 @@ console.log(
     `links taken over by the straight-line path (${s.links} of them — that path needs most of the graph to be rectangles)`
 );
 console.log(
-  `  DOM widget of a boxed node hidden: ${lodBoxed()} (${h.tracker.lowZoom.dom.hidden} element(s) of ${h.tracker.lowZoom.dom.nodes} boxed node(s))` +
+  `  DOM widget of a boxed node hidden: ${lodBoxed()} (${h.tracker.lowZoom.dom.hidden} element(s) of ${h.tracker.lowZoom.dom.nodes} boxed node(s),` +
+    ` ${h.tracker.lowZoom.dom.stilled} also out of the per-frame layout pass)` +
     ` | low-quality frame handed to the frontend: ${h.tracker.lowZoom.detail.lowQualityForced}` +
     ` | previews served from thumbnails: ${h.tracker.lowZoom.previews.served}/${h.tracker.lowZoom.previews.seen}`
 );

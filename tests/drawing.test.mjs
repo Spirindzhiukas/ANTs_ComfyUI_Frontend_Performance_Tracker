@@ -423,6 +423,52 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     assert(!wrapper.classList.contains("ants-lod-box"));
   });
 
+
+  test("a boxed node's DOM widget also stops being laid out every frame, and gets its own setting back", async () => {
+    const h = await boot();
+    h.window.devicePixelRatio = 1;
+    bigGraph(h, 2, 0.1);
+    const wrapper = h.document.createElement("div");
+    wrapper.className = "dom-widget";
+    const inner = h.document.createElement("canvas");
+    wrapper.appendChild(inner);
+    h.document.body.appendChild(wrapper);
+    // An image preview: ComfyUI registers these with hideOnZoom false precisely
+    // because a picture is worth seeing while zoomed out.
+    const widget = { name: "preview", element: inner, options: { hideOnZoom: false } };
+    h.canvas.nodes[0].widgets = [widget];
+
+    h.tracker.lowZoom.set({ minPx: 32 });
+    assertEqual(widget.options.hideOnZoom, true, "the store is told to skip it while its node is a rectangle");
+    assertEqual(h.tracker.lowZoom.dom.stilled, 1, "and the panel counts it");
+    assertEqual(h.tracker.lowZoom.dom.widgets.length, 1, "the widget itself is exposed, not just a count");
+
+    // Zoom in: the widget is the frontend's business again.
+    h.canvas.ds.scale = 0.5;
+    drawLoop(h, 0.1);
+    assertEqual(widget.options.hideOnZoom, false, "its own answer is restored");
+    assertEqual(h.tracker.lowZoom.dom.stilled, 0);
+
+    // A widget that already asked to hide on zoom is left exactly as it was.
+    const own = { name: "text", element: inner, options: { hideOnZoom: true } };
+    h.canvas.nodes[0].widgets = [own];
+    h.canvas.ds.scale = 0.1;
+    h.tracker.lowZoom.set({ minPx: 32 });
+    drawLoop(h, 0.1);
+    assertEqual(own.options.hideOnZoom, true, "unchanged while boxed");
+    assertEqual(h.tracker.lowZoom.dom.stilled, 0, "and not claimed as work this tool did");
+    h.canvas.ds.scale = 0.5;
+    drawLoop(h, 0.1);
+    assertEqual(own.options.hideOnZoom, true, "still unchanged after zooming in");
+
+    // Switching the mode off hands everything back.
+    h.canvas.ds.scale = 0.1;
+    h.canvas.nodes[0].widgets = [widget];
+    h.tracker.lowZoom.set({ minPx: 32 });
+    h.tracker.lowZoom.off();
+    assertEqual(widget.options.hideOnZoom, false, "nothing of somebody else's widget options is left changed");
+  });
+
   test("the panel says whether culling could help at this zoom, and what the mode is doing", async () => {
     const h = await boot();
     h.window.devicePixelRatio = 1;

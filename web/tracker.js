@@ -27,7 +27,7 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.1.6";
+const VERSION = "2.1.7";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
 const NODE_NAME = "ANTsNastyBastardsTracker";
 
@@ -882,8 +882,10 @@ const LOD = {
   thinLinks: 0, // link segments stroked thin so far
   lqMissing: false, // the frontend does not expose its low-quality flag
   domMarked: null, // Set of elements we are hiding right now
+  domWidgets: null, // Map<widget, original hideOnZoom> for the ones we flipped
   domHidden: 0, // elements hidden because their node is a box
   domNodes: 0, // nodes whose DOM content is hidden
+  domStilled: 0, // widgets also taken out of the per-frame layout pass
   sweptZoom: NaN, // the zoom the DOM was last swept at
   sweptPx: -1, // and the threshold
 };
@@ -913,6 +915,20 @@ function lodOn() {
 
 function lodDetailOn() {
   return LOD.detailZoom > 0 && LOD.zoom > 0 && LOD.zoom < LOD.detailZoom;
+}
+
+// Something on screen is being drawn as a rectangle this frame. The plan is
+// sampled at the top of the frame, so this is the current frame's answer, not
+// last frame's.
+function lodBoxifyOn() {
+  return LOD.minPx > 0 && LOD.plan.tiny > 0;
+}
+
+// One frame drawn the cheap way — link outlines skipped, node detail reduced,
+// and (see lodSweepDom) the DOM content of boxed nodes out of the layout pass.
+// True when either setting asks for it.
+function lodCheapFrameOn() {
+  return lodDetailOn() || lodBoxifyOn();
 }
 
 function lodPreviewsOn() {
@@ -1266,12 +1282,46 @@ function lodDomTargets(node) {
       const el = w && (w.element || w.inputEl);
       if (!el || typeof el !== "object" || typeof el.classList !== "object") continue;
       const target = (typeof el.closest === "function" && el.closest(".dom-widget")) || el;
-      if (target && target.classList) out.push(target);
+      if (target && target.classList) out.push({ el: target, widget: w });
     }
   } catch (e) {
     /* a widget with a hostile element getter is simply not hidden */
   }
   return out;
+}
+
+// Hiding an element with CSS stops it being *painted*; it does not stop the
+// frontend positioning it. Every DOM widget of every node goes through the
+// widget store on every drawn frame — position, size, z-order — and for a graph
+// of a thousand nodes that is a thousand Vue components' worth of layout work
+// per redraw, all of it for content that is currently a rectangle. ComfyUI's own
+// escape hatch is `hideOnZoom`, which its store consults before doing any of
+// that. Widgets that asked for it are left alone; the ones that did not (image
+// and video previews pass `hideOnZoom: false` deliberately) get it while their
+// node is a box, and get their own value back the moment it is not. If the flip
+// ever fails, the CSS class has already hidden the element, so the fallback is
+// exactly the old behaviour.
+function lodStillWidget(widget, want) {
+  const map = LOD.domWidgets || (LOD.domWidgets = new Map());
+  const opts = widget && widget.options;
+  if (!opts || typeof opts !== "object") return false;
+  try {
+    if (want) {
+      if (map.has(widget)) return false; // already taken out by an earlier sweep
+      if (opts.hideOnZoom === true) return false; // already its own answer, not our doing
+      map.set(widget, opts.hideOnZoom);
+      opts.hideOnZoom = true;
+      return true;
+    }
+    if (!map.has(widget)) return false;
+    opts.hideOnZoom = map.get(widget);
+    map.delete(widget);
+    return true;
+  } catch (e) {
+    // A frozen options object is a valid answer: the element is still hidden by
+    // the class, the layout pass just keeps running for it.
+    return false;
+  }
 }
 
 // Vue-rendered nodes have no canvas visuals at all: the node *is* the DOM
@@ -1310,9 +1360,10 @@ function lodSweepDom(canvas) {
       for (const node of lodGraphNodes(canvas) || []) {
         if (!node || !(lodNodePx(node, canvas) < LOD.minPx)) continue;
         let any = false;
-        for (const el of lodDomTargets(node)) {
-          el.classList.add(LOD_DOM_CLASS);
-          keep.add(el);
+        for (const t of lodDomTargets(node)) {
+          t.el.classList.add(LOD_DOM_CLASS);
+          keep.add(t.el);
+          lodStillWidget(t.widget, true); // returns true only when it changed something
           any = true;
         }
         if (any) nodes++;
@@ -1332,6 +1383,15 @@ function lodSweepDom(canvas) {
   } catch (e) {
     /* hiding DOM is a courtesy: if the page's DOM is not what we expect, skip it */
   }
+  // Widgets whose node is no longer a box go back to asking for their own
+  // placement on the next frame.
+  if (LOD.domWidgets && LOD.domWidgets.size) {
+    for (const node of lodGraphNodes(canvas) || []) {
+      const box = !!node && LOD.minPx > 0 && lodNodePx(node, canvas) < LOD.minPx;
+      if (box) continue;
+      for (const w of node.widgets || []) if (LOD.domWidgets.has(w)) lodStillWidget(w, false);
+    }
+  }
   let changed = keep.size !== marked.size;
   for (const el of keep) if (!marked.has(el)) changed = true;
   for (const el of marked) {
@@ -1346,6 +1406,7 @@ function lodSweepDom(canvas) {
   LOD.domMarked = keep;
   LOD.domHidden = keep.size;
   LOD.domNodes = nodes;
+  LOD.domStilled = LOD.domWidgets ? LOD.domWidgets.size : 0;
   LOD.sweptZoom = LOD.zoom;
   LOD.sweptPx = LOD.minPx;
   return changed;
@@ -1555,6 +1616,13 @@ function patchCanvasDraw() {
       curNodeStageMs = 0;
       curConnStageMs = 0;
       curAttrMs = 0;
+      // Whoever is inside this draw is on the display lane: a source that draws
+      // is a source whose skipped ticks the user can see (see GOV_DISPLAY_FLOOR_MS).
+      const drawOwner = GOV.running;
+      if (drawOwner && !drawOwner.ours) {
+        if (!drawOwner.display) drawOwner.display = true;
+        drawOwner.drew = (drawOwner.drew || 0) + 1;
+      }
       // The plan also carries the zoom, which the preview ladder needs even when
       // no node is being flattened.
       if (lodOn()) lodPlanFrame(this);
@@ -1563,7 +1631,7 @@ function patchCanvasDraw() {
       // no node shadows, no rounded corners, no outline under every link. The
       // flag is put back as soon as the frame is over, so nothing this tool did
       // outlives the redraw it was for.
-      const restoreLq = lodDetailOn() ? lodLowQualityFrame(this) : null;
+      const restoreLq = lodCheapFrameOn() ? lodLowQualityFrame(this) : null;
       let ret;
       try {
         ret = originalDraw.apply(this, args);
@@ -2178,7 +2246,7 @@ const GOV = {
   savedPolicies: null, // from localStorage, applied as sources appear
   attrTokens: 0,
   lastAttrAt: 0,
-  counters: { skipped: 0, deferred: 0, coalesced: 0, redrawReqs: 0, forced: 0, errors: 0, autolimited: 0 },
+  counters: { skipped: 0, deferred: 0, coalesced: 0, redrawReqs: 0, forced: 0, errors: 0, autolimited: 0, inputLifted: 0 },
   auto: { measuredMsPerSec: 0, reachableMsPerSec: 0, note: "", lastAt: 0, actions: [], mine: [] },
   disabled: false,
   offReason: "",
@@ -2690,6 +2758,17 @@ function govRun(src, reg, fn, thisArg, args, registrationId) {
       adaptive = true;
     }
   }
+  const cappedGap = gap;
+  if (
+    gap > GOV_DISPLAY_FLOOR_MS &&
+    src.display &&
+    GOV.controls.inputGuard &&
+    govInputRecently(tEnter)
+  ) {
+    // Dragging a 4K canvas is exactly the moment a repaint cap turns into a
+    // slideshow. The cap comes back as soon as the pointer stops.
+    gap = GOV_DISPLAY_FLOOR_MS;
+  }
   try {
     if (gap > 0 && tEnter - src.lastRunAt < gap) {
       const late = tEnter - src.lastRunAt;
@@ -2707,6 +2786,13 @@ function govRun(src, reg, fn, thisArg, args, registrationId) {
       return undefined;
     }
     if (adaptive) GOV.rafSkippedInARow = 0;
+    if (gap < cappedGap && tEnter - src.lastRunAt < cappedGap) {
+      // It would have been skipped by the cap and it is running because a human
+      // is interacting: counted, because that is the answer to "is the drag
+      // slow, or is my own limit the thing making it slow".
+      src.inputLifted = (src.inputLifted || 0) + 1;
+      GOV.counters.inputLifted++;
+    }
     if (GOV.adaptiveForced && reg.pending !== null && reg.pendingFn === fn && reg.pendingId !== null) {
       // The progress guarantee is about to run this exact callback, so the copy
       // deferred earlier would be a second run of it. One callback, one run.
@@ -2847,6 +2933,16 @@ function govCancelDeferral(id) {
 // Adaptive mode may only slow things down when nobody is typing, dragging or
 // wheeling: input latency is the one cost a smoother graph may not pay for.
 
+// A limit is a bet that the tick it skips is a tick nobody sees. That bet holds
+// for a heartbeat that polls state and fails for anything that *draws*: cap the
+// tick that repaints the canvas and the canvas stops repainting, which is the
+// one thing a redraw cap must never be mistaken for. So a source that has ever
+// run the canvas draw inside itself is marked as part of the display lane, and
+// while somebody is actually dragging or typing, its cap is lifted down to this
+// floor — about 30 redraws a second, the slowest a drag can look continuous.
+// The moment the input stops, the limit is back exactly as it was.
+const GOV_DISPLAY_FLOOR_MS = 33;
+
 let govInputGuardInstalled = false;
 
 function govInstallInputGuard() {
@@ -2945,12 +3041,16 @@ function govSuggest() {
   const applied = [];
   for (const r of rows) {
     if (r.ours || r.kind === "raf") continue;
-    if (r.msPerSec < 5) continue; // it has to be costing something real
+    // The display lane is exempt from *suggestions*: a redraw source capped
+    // below the rate its page asks for is a broken page, not a faster one.
+    if (r.display) continue;
+    const pressure = Math.max(r.msPerSec, r.pressureMsPerSec || 0);
+    if (pressure < 5) continue; // it has to be costing something real
     const src = govHeaviestSource(r);
     if (!src) continue;
     // Aim to at least halve what this row costs, and never below the floor (a
     // source that is already cheap gets the mildest limit that bites).
-    const goal = Math.max(GOV.controls.autoMinMsPerSec, r.msPerSec / 2);
+    const goal = Math.max(GOV.controls.autoMinMsPerSec, pressure / 2);
     const wasNoop = r.policy !== "full" && govLimitIsNoop(r);
     const id = govPickPolicy(src, {
       current: r.policy === "full" ? null : r.policy,
@@ -2962,9 +3062,16 @@ function govSuggest() {
     const gap = govGapForPolicy(src, GOV_POLICY_BY_ID.get(id));
     const predicted = Math.round(govPredictedMsPerSec(r.perRunMs, gap, r.runsPerSec));
     if (!govSetPolicy(r.key, id)) continue;
+    // The window figure is what it cost in the last few seconds; the pressure
+    // figure is what its mean run costs at the rate it is running. When they
+    // disagree the second is the honest one, so both are shown.
+    const spread =
+      r.pressureMsPerSec > r.msPerSec * 2
+        ? `; ${fmtMs(r.perRunMs)}/run × ${fmtRate(r.runsPerSec)}/s ≈ ${Math.round(r.pressureMsPerSec)} ms/s at its current rate`
+        : "";
     applied.push(
       `${r.name} → ${GOV_POLICY_BY_ID.get(id).label} ` +
-        `(was ${Math.round(r.msPerSec)} ms/s, ≈${predicted} after` +
+        `(was ${Math.round(r.msPerSec)} ms/s${spread}, ≈${predicted} after` +
         `${wasNoop ? "; the limit that was there could not bite" : ""})`
     );
   }
@@ -3224,6 +3331,17 @@ function govRows() {
       runsPerSec: winN > 0 ? (winN / observedMs) * 1000 : 0,
       msPerSec: winMs > 0 ? (winMs / observedMs) * 1000 : 0,
       perRunMs: g.fires > 0 ? g.ms / g.fires : NaN,
+      // What this source costs per second *at its current rate*, from its mean
+      // run cost over its whole life. The window figure misses the scan that
+      // only does real work every few seconds (its cheap early-exit runs land in
+      // the window instead), and that is exactly the source worth capping.
+      pressureMsPerSec: g.fires > 0 ? (g.ms / g.fires) * (winN > 0 ? (winN / observedMs) * 1000 : 0) : 0,
+      // A grouped row is display-lane if any registration behind it ever drew
+      // the canvas: the row exists to describe the source, and "this one can
+      // repaint the page" is a property of it, not of the group bookkeeping.
+      display: g.sink.some((x) => x.display),
+      drew: g.sink.reduce((n, x) => n + (x.drew || 0), 0),
+      inputLifted: g.sink.reduce((n, x) => n + (x.inputLifted || 0), 0),
       savedMsPerSec: 0,
       sourceRateBefore: NaN,
       sourceRateAfter: NaN,
@@ -4776,7 +4894,11 @@ function buildNodesTab(container) {
         if (LOD.domHidden) {
           bits2.push(
             `${LOD.domHidden} DOM element(s) of ${LOD.domNodes} boxed node(s) hidden ` +
-              `(image and video previews, curve editors, custom node UIs) \u2014 they come back the moment the node does`
+              `(image and video previews, curve editors, custom node UIs)` +
+              (LOD.domStilled
+                ? `, ${LOD.domStilled} widget(s) also out of the per-frame layout pass`
+                : "") +
+              ` \u2014 they come back the moment the node does`
           );
         } else if (LOD.plan.tiny > 0) {
           bits2.push("no DOM content to hide on the nodes this setting catches (their visuals are canvas-drawn)");
@@ -6261,7 +6383,11 @@ function buildGovernorTab(container) {
         "What this layer cannot do, so nobody has to reverse-engineer it: only callbacks that reach the page's own timer and rAF entry " +
         "points can be governed (a microtask, a promise chain, browser layout/paint and a loop that never re-registers itself are out of " +
         "reach); a limit changes behaviour by design; and the \"kept off the main thread\" figure is an estimate from the ticks that did " +
-        "run. The strongest card here is the combination: limit a source, then watch it disappear from the traces below.",
+        "run. The strongest card here is the combination: limit a source, then watch it disappear from the traces below. " +
+        "One exemption is built in, because a redraw cap that hides itself inside a drag is worse than no cap: a source that has ever " +
+        "run the canvas draw inside itself is on the display lane (marked \"display\" in the table), it is never suggested a limit by " +
+        "the autopilot, and while a pointer, wheel or key event is arriving its cap is lifted to about 30 runs a second \u2014 back to " +
+        "its limit the moment you stop. What a drag cost is then a fact, not a suspicion: the lift is counted and reported.",
     })
   );
 
@@ -6336,10 +6462,18 @@ function buildGovernorTab(container) {
       (r) => r.key,
       (row, r) => {
         const c = row.cells;
-        setText(c[0], r.ours ? `${r.name} (this tracker)` : r.name + (r.file ? ` @ ${r.file}${r.line ? `:${r.line}` : ""}` : " @ (not sampled yet)"));
+        setText(
+          c[0],
+          (r.ours ? `${r.name} (this tracker)` : r.name + (r.file ? ` @ ${r.file}${r.line ? `:${r.line}` : ""}` : " @ (not sampled yet)")) +
+            (r.display ? " · display" : "")
+        );
         c[0].title = r.ours
           ? "This is the tracker's own timer: it is measured but can never be limited."
-          : `${r.kindLabel}${r.registrations > 1 ? `, ${r.registrations} registrations` : ""}${r.provisional ? "; attribution is sampled, so the file may appear shortly" : ""}`;
+          : `${r.kindLabel}${r.registrations > 1 ? `, ${r.registrations} registrations` : ""}${r.provisional ? "; attribution is sampled, so the file may appear shortly" : ""}` +
+            (r.display
+              ? `.\nThis one drew the canvas ${r.drew ? `${r.drew} time(s)` : ""} inside its own callback, so it is on the display lane: ` +
+                `the autopilot will not suggest a limit for it, and while you are dragging or typing its cap is lifted to ~30 runs/s.`
+              : "");
         setText(c[1], r.kindLabel);
         setText(c[2], `${fmtMs(r.requestedMs || GOV_RAF_REQUESTED_MS, r.requestedMs && r.requestedMs < 100 ? 1 : 0)}ms`);
         const noop = govLimitIsNoop(r);
@@ -6357,6 +6491,9 @@ function buildGovernorTab(container) {
         setText(c[4], r.runsPerSec ? fmtRate(r.runsPerSec) : "—");
         setText(c[5], r.msPerSec ? fmtMs(r.msPerSec) : "—");
         setText(c[6], Number.isFinite(r.perRunMs) ? fmtMs(r.perRunMs, 3) : "—");
+        c[5].title =
+          `Measured in the last 4s: ${fmtMs(r.msPerSec)}ms/s. At its current rate that is ≈${fmtMs(r.pressureMsPerSec, 0)}ms/s ` +
+          `(mean ${fmtMs(r.perRunMs, 1)}ms × ${fmtRate(r.runsPerSec)}/s) — the two disagree when the expensive runs are older than the window.`;
         setText(c[7], r.worst ? `${fmtMs(r.worst, 1)}ms` : "—");
         setText(c[8], r.skipped ? String(r.skipped) : "—");
         if (Number.isFinite(r.sourceRateBefore) && Number.isFinite(r.sourceRateAfter) && r.fires > 3) {
@@ -6797,7 +6934,10 @@ function buildTelemetryReport() {
                   ? `, links drawn straight (most of the graph is rectangles) while ${LOD.detailZoom > 0 ? Math.round(LOD.detailZoom * 100) : 0}% link thinning is available for the spline path`
                   : ""
               : "") +
-            (LOD.domHidden ? `, ${LOD.domHidden} DOM element(s) of boxed nodes hidden` : "") +
+            (LOD.domHidden
+              ? `, ${LOD.domHidden} DOM element(s) of boxed nodes hidden` +
+                (LOD.domStilled ? ` (${LOD.domStilled} out of the per-frame widget layout pass)` : "")
+              : "") +
             (() => {
               const since = lodSinceSwitch();
               if (!since || !LOD.baseline) return "";
@@ -6884,7 +7024,8 @@ function buildTelemetryReport() {
   } else {
     lines.push(
       `${gv.sourceCount} source(s), ${gv.throttled} limited | ${gv.counters.skipped} ticks skipped (${fmtRate(gv.skippedPerSec)}/s) | ` +
-        `${gv.counters.deferred} deferred | ${gv.counters.coalesced} redraw request(s) merged | rAF mode ${gv.controls.rafMode}` +
+        `${gv.counters.deferred} deferred | ${gv.counters.coalesced} redraw request(s) merged | ` +
+        `${gv.counters.inputLifted} display-lane tick(s) let through while the input guard was recent | rAF mode ${gv.controls.rafMode}` +
         `${gv.controls.rafMode === "adaptive" ? ` at ${gv.controls.rafMinHz}Hz floor` : ""} | ` +
         `estimated ${fmtMs(gv.savedMsPerSec)}ms/s kept off the main thread | governor's own overhead ${fmtMs(gv.overheadMsPerSec * 1000, 0)}µs/s`
     );
@@ -7079,6 +7220,10 @@ function installDebugApi() {
             hidden: LOD.domHidden,
             nodes: LOD.domNodes,
             marked: LOD.domMarked ? LOD.domMarked.size : 0,
+            stilled: LOD.domStilled,
+            // The widgets themselves, for anyone who wants to see what was
+            // touched rather than take the count on faith.
+            widgets: LOD.domWidgets ? [...LOD.domWidgets.keys()] : [],
           };
         },
         get previews() {

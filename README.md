@@ -494,7 +494,7 @@ logged for DevTools.
 ## Development
 
 ```
-node tests/run-tests.mjs          # 104 tests, no dependencies, no browser
+node tests/run-tests.mjs          # 108 tests, no dependencies, no browser
 node tests/run-tests.mjs timing   # filter by name fragment
 python3 tests/test_init.py        # backend route parsing + graceful fallbacks
 node tests/demo.mjs               # print what the panel says, with no ComfyUI
@@ -533,6 +533,45 @@ installed as the sandbox's `CanvasRenderingContext2D` (the preview ladder
 patches `drawImage` there, the same way a browser exposes it), and
 `createImageBitmap` records the resize it was asked to perform instead of
 resizing anything.
+
+## What changed in v2.1.7
+
+- **A cap on the thing that repaints the page is now lifted while you are
+  dragging.** A limit is a bet that the tick it skips is a tick nobody sees.
+  That bet holds for a heartbeat polling state and fails hard for anything that
+  draws: on a 4K graph the source that repaints the canvas is a timer, and
+  capping it to 1/s turns a pan into a slideshow — the page asks for a redraw
+  on every pointer move and gets one per second. So a source that has ever run
+  the canvas draw *inside itself* is marked as part of the **display lane**
+  (shown as `· display` in the Governor table). Two things follow: the
+  autopilot never suggests a limit for a display-lane source, and while a
+  pointer, wheel or key event has arrived recently its cap is lifted to about
+  30 runs a second, back to the limit the moment the input stops. The ticks that
+  ran only because of that lift are counted and reported, which turns "is my
+  drag slow, or is my own limit the thing making it slow?" into a number.
+- **A boxed node's DOM widget now also leaves the per-frame layout pass.** v2.1.6
+  hid the elements of a boxed node with one CSS class. That stops them being
+  *painted*, but not the frontend stepping through every DOM widget of every
+  node on every drawn frame to set its position and z-order — on a graph of a
+  thousand DOM widgets that is a thousand components' worth of layout work per
+  redraw, for content that is currently a rectangle. ComfyUI's own escape hatch
+  is `hideOnZoom`, which its widget store consults before doing any of that:
+  while a node is a rectangle, its widgets get that flag (the ones that already
+  asked for it are left alone, and image and video previews deliberately ask for
+  the opposite), and they get their own value back the moment the node is drawn
+  properly again. If the option object is frozen the class still hides the
+  element, so the fallback is exactly the old behaviour. The panel reports how
+  many widgets left that pass, and the API exposes the widget objects themselves
+  rather than only a count.
+- **Cost per second, not just cost in the last four seconds.** A scan that runs
+  every 700ms and does real work on some of its runs can look cheap in a
+  4-second window (its early-exit runs land there) and be expensive in fact.
+  Rows now carry the figure that catches it: mean run cost × current rate. The
+  autopilot and the suggestions rank by the larger of the two, the Governor
+  table's tooltip shows both, and the reason line of an applied limit says when
+  they disagree. This is how a third-party culling pass that costs ~150ms/s
+  while reporting single-digit ms/s gets offered a limit instead of being
+  skipped for looking cheap.
 
 ## What changed in v2.1.6
 

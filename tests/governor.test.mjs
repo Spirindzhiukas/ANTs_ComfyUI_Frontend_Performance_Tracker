@@ -1050,3 +1050,80 @@ suite("governor: suggestions and the autopilot target what actually costs time",
 function fmt(n) {
   return Number.isFinite(n) ? n.toFixed(2) : String(n);
 }
+
+suite("governor: the display lane", () => {
+  test("a source that draws the canvas is on the display lane, and the lane gives way while you drag", async () => {
+    const h = await boot();
+    let runs = 0;
+    h.sandbox.setInterval(function repaintTicker() {
+      runs++;
+      h.busy(6);
+      h.canvas.setDirty(true, true);
+      h.canvas.draw(); // a repaint ticker: its ticks are pixels on the screen
+    }, 100);
+    h.advance(300);
+    const first = row(h, "repaintTicker");
+    assert(first, "the ticker is registered as a source");
+    assert(first.display, "and marked as part of the display lane, because it draws");
+    assertGreater(first.drew, 0, "with the draws it made counted");
+
+    // A limit the autopilot would have to refuse: this source is the thing that
+    // repaints the page, so a cap below the display rate is a slideshow.
+    assert(h.tracker.governor.policy(first.key, "hz1"), "a 1/s limit is applied for the test");
+    const idleFrom = runs;
+    h.advance(3000);
+    const idleRuns = runs - idleFrom;
+    assertLess(idleRuns, 8, `while nobody is touching the page the cap holds (${idleRuns} runs in 3s)`);
+
+    // A drag: input arrives every 100ms, as it does while panning. The cap must
+    // not be the reason the canvas stops repainting.
+    const dragFrom = runs;
+    for (let i = 0; i < 20; i++) {
+      h.window.fire("pointermove");
+      h.advance(100);
+    }
+    const dragRuns = runs - dragFrom;
+    assertGreater(dragRuns, 12, `while dragging, the display lane runs at ~30/s at most, not 1/s (${dragRuns} in 2s)`);
+    const lifted = row(h, "repaintTicker").inputLifted;
+    assertGreater(lifted, 0, "and the ticks that only ran because of the lift are counted, not guessed");
+
+    // The moment the drag stops, the limit is back.
+    const afterFrom = runs;
+    h.advance(3000);
+    assertLess(runs - afterFrom, 8, "the cap is back as soon as the input stops");
+  });
+
+  test("the display lane is never the source the autopilot picks", async () => {
+    const h = await boot();
+    // Two heavy sources: one draws the canvas, one does not. Only the second is
+    // a candidate for a cap.
+    h.sandbox.setInterval(function drawingLoop() {
+      h.busy(40);
+      h.canvas.draw();
+    }, 50);
+    h.sandbox.setInterval(function busyWork() {
+      h.busy(40);
+    }, 50);
+    h.advance(1500);
+    const suggested = h.tracker.governor.suggest();
+    assertEqual(row(h, "drawingLoop").display, true, "the drawing loop is display lane");
+    assertEqual(row(h, "busyWork").display, false, "the other one is not");
+    assert(
+      suggested.every((s) => !s.includes("drawingLoop")),
+      `no cap is offered for the thing that repaints the page (${JSON.stringify(suggested)})`
+    );
+    assertGreater(row(h, "busyWork").msPerSec, 100, "the non-drawing source is expensive enough to be suggested");
+  });
+
+  test("a source whose expensive runs fall outside the window is still ranked by what it really costs", async () => {
+    const h = await boot();
+    h.sandbox.setInterval(function heavyScan() {
+      h.busy(120);
+    }, 700);
+    h.advance(1400); // two runs, so the mean run cost is real
+    const r = row(h, "heavyScan");
+    assertGreater(r.perRunMs, 100, `the run cost is measured (${r.perRunMs.toFixed(0)}ms)`);
+    assertGreater(r.pressureMsPerSec, r.msPerSec * 0.9, "and the per-rate figure is at least what the window saw");
+    assertGreater(r.pressureMsPerSec, 100, `≈120ms/run at 1.4/s is ≈170ms/s (${r.pressureMsPerSec.toFixed(0)})`);
+  });
+});
