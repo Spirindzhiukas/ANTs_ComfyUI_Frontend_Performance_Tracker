@@ -507,6 +507,12 @@ logged for DevTools.
 
 ## Development
 
+Three documents exist for whoever works on this next: `CLAUDE.md` (the rules and
+the architecture map — read this first), `memory.md` (what was built and why,
+what was rejected, what is still unverified), and `plan.md` (the roadmap and its
+open questions). The code follows the rules in `CLAUDE.md` deliberately; a change
+that breaks one of them is a bug even if the tests pass.
+
 ```
 node tests/run-tests.mjs          # 131 tests, no dependencies, no browser
 node tests/run-tests.mjs timing   # filter by name fragment
