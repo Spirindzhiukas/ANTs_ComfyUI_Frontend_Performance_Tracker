@@ -496,7 +496,7 @@ logged for DevTools.
 ## Development
 
 ```
-node tests/run-tests.mjs          # 116 tests, no dependencies, no browser
+node tests/run-tests.mjs          # 118 tests, no dependencies, no browser
 node tests/run-tests.mjs timing   # filter by name fragment
 python3 tests/test_init.py        # backend route parsing + graceful fallbacks
 node tests/demo.mjs               # print what the panel says, with no ComfyUI
@@ -535,6 +535,42 @@ installed as the sandbox's `CanvasRenderingContext2D` (the preview ladder
 patches `drawImage` there, the same way a browser exposes it), and
 `createImageBitmap` records the resize it was asked to perform instead of
 resizing anything.
+
+## What changed in v2.1.12
+
+- **Viewport focus: node UI is switched off when nobody can use it.** A graph at
+  10% zoom does not need a thousand nodes answering the pointer, and a node that
+  is not answering costs nothing. Two switches in the Tweaks tab:
+  - *nodes other than this one are unclickable and uneditable when zoomed out*
+    (off by default; the zoom is 20–60%, 40% when first switched on). Below it,
+    every node's DOM UI carries `pointer-events: none` — no hover reporting, no
+    tooltips, no click, no drag, no drop target, no wheel capture — and the
+    frontend's own node hit-test is answered with "nothing". That last part is
+    the measurable one: `LGraph.getNodeOnPos` is what the canvas calls on *every*
+    pointer move, and it walks backwards through every visible node calling
+    `isPointInside` until one matches. Below the zoom that walk is skipped
+    entirely and the count is shown in the panel. Panning, zooming and the
+    tracker's own node keep working.
+  - *off-screen nodes are boxed and inert too, at every zoom (foveated)*. Nodes
+    more than one viewport outside the visible area get the boxed treatment and
+    the inert class whatever the zoom, so only what is in front of you is live,
+    in both directions. The margin is deliberate: the sweep runs on a 250 ms
+    budget, and a node crossing a whole viewport of margin under a pan takes
+    longer to arrive than that, so nothing visible is ever blanked.
+- **Why the 3D nodes care, specifically.** ComfyUI's 3D viewer decides whether to
+  render by asking whether the pointer is over it (`isLoad3dActive` =
+  `mouseOnNode || mouseOnScene || mouseOnViewer || recording || !initialRenderDone
+  || animationPlaying`), and its render loop runs a Three.js frame per rAF tick
+  while that is true. So merely moving the mouse across a 3D node makes it render
+  its scene every frame *on top of* the canvas redraw, and its wheel handler
+  captures scrolling to zoom the model instead of the graph. `pointer-events:
+  none` below the focus zoom turns all of that off at the source: the viewer is
+  told the pointer is not over it, so it stops rendering; the wheel goes to the
+  canvas, so the graph zooms. This is the first change in this project that makes
+  a 3D node cheaper by making it do *less*, rather than by painting it
+  differently.
+- Both switches are remembered across sessions, are off by default, and are
+  handed back by "Back to full drawing".
 
 ## What changed in v2.1.11
 

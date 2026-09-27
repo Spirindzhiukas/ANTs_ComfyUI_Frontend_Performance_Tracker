@@ -406,6 +406,40 @@ console.log(
 );
 h.tracker.lowZoom.set({ linkStyle: "spline" });
 
+// Viewport focus: the interaction half. Below the zoom nobody can read a node,
+// so its UI — hover, click, drag, wheel capture, and with it a 3D viewport's
+// reason to re-render its scene — is switched off, and the frontend's own
+// backwards walk over every visible node per pointer move is answered with
+// nothing.
+h.tracker.lowZoom.set({ inertBelow: 0.4 });
+h.canvas.ds.scale = 0.1;
+placeViewport();
+let points = 0;
+for (let i = 0; i < 20; i++) {
+  const node = h.canvas.graph.getNodeOnPos(40 + i, 40, h.canvas.nodes);
+  if (!node) points++;
+}
+const focus = h.tracker.lowZoom.focus;
+console.log(
+  `  focus mode below 40%: ${focus.inertElements} element(s) made inert (the 3D viewport among them), ` +
+    `${points}/20 simulated pointer-move hit-tests answered with nothing, ${focus.hitsBlocked} counted in total ` +
+    `— the node UI cannot be hovered, clicked, dragged or scrolled`
+);
+h.tracker.lowZoom.set({ inertBelow: 0 });
+
+// Foveated: off-screen node UI gets the same treatment at any zoom, so only what
+// is in front of you is live in both directions.
+h.canvas.ds.scale = 1;
+h.canvas.nodes[3].pos = [9000, 4000];
+h.tracker.lowZoom.set({ flatBelow: 0, fovea: true });
+h.tracker.lowZoom.sweep();
+console.log(
+  `  foveated at 100% zoom: ${h.tracker.lowZoom.focus.foveaElements} element(s) of far off-screen nodes boxed and switched off ` +
+    `(no node setting involved: ${h.tracker.lowZoom.state.flatBelow}), the ones on screen untouched`
+);
+h.canvas.nodes[3].pos = [0, 200];
+h.tracker.lowZoom.set({ fovea: false });
+
 // The measured answer to "does thinning do anything on this page": the panel
 // button runs exactly this, alternating the setting and comparing.
 h.canvas.costs.link = 1.5; // make the ink expensive enough to measure in a demo

@@ -27,7 +27,7 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.1.11";
+const VERSION = "2.1.12";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
 const NODE_NAME = "ANTsNastyBastardsTracker";
 
@@ -896,11 +896,22 @@ const LOD = {
   linkCalls: 0, // renderLink calls made (links actually drawn)
   domMarked: null, // Set of elements we are hiding right now
   domLayer: 0, // wrappers hidden through the DOM widget layer
+  inertMarked: null, // Set of elements carrying the inert class right now
   domMarkedWidgets: 0, // widgets carrying our hideOnZoom flag
   domWidgets: null, // Map<widget, original hideOnZoom> for the ones we flipped
   domHidden: 0, // elements hidden because their node is a box
   domNodes: 0, // nodes whose DOM content is hidden
   domStilled: 0, // widgets the frontend will actually honour hideOnZoom for
+  // Focus mode. Two independent halves: the zoom at which node UI is switched
+  // off, and whether off-screen nodes get the same treatment at any zoom.
+  inertBelow: 0, // node UI is switched off below this zoom (0 = off)
+  fovea: false, // off-screen DOM content is taken out of the picture at any zoom
+  inertEls: 0, // elements carrying the inert class right now
+  foveaEls: 0, // elements hidden because their node is far off screen
+  hitsBlocked: 0, // node hit-tests refused while node UI is switched off
+  hitTests: 0, // node hit-tests seen at all (the cost this avoids)
+  sweptViewAt: 0, // when the viewport-focus sweep last ran
+  sweptViewKey: "", // the viewport it ran for
   sweptZoom: NaN, // the zoom the DOM was last swept at
   sweptKey: "", // and the flat decision it was swept for
   autoLinkCarried: false, // a v2.1.9 "auto" link setting was carried over
@@ -933,6 +944,17 @@ const LOD_DETAIL_ZOOMS = [0, 1, 0.8, 0.6, 0.4, 0.2];
 const LOD_LINK_WIDTH = 1; // graph units; LiteGraph's own default is 3
 const LOD_FULL_LINK_WIDTH = 3; // what ComfyUI draws when nothing is thinned
 const LOD_DOM_CLASS = "ants-lod-box"; // elements hidden while their node is a box
+const LOD_INERT_CLASS = "ants-lod-inert"; // elements switched off while their node is inert
+// Below this zoom nobody can read a node, let alone use one, so its UI is
+// switched off rather than paid for on every pointer event.
+const VIEW_INERT_ZOOMS = [0, 0.2, 0.3, 0.4, 0.5, 0.6];
+const VIEW_INERT_DEFAULT = 0.4; // what the toggle uses when it is switched on
+// Foveated: how far outside the viewport a node must be before its DOM content is
+// taken out of the picture entirely. One viewport of margin, because the sweep
+// runs on a budget: a node crossing that margin under a fast pan takes longer to
+// arrive than the sweep takes to notice, so nothing visible is ever blanked.
+const VIEW_FOVEA_MARGIN = 1; // in viewports
+const VIEW_FOVEA_SWEEP_MS = 250;
 // The frontend renders every DOM widget — image previews, curve editors, and the
 // Vue components behind the core 3D nodes — in this layer, one wrapper per
 // widget. A wrapper is what is on screen; the widget object behind it may have no
@@ -946,7 +968,7 @@ const LOD_LINK_STYLES = ["spline", "straight"];
 const LOD_STORE_KEY = "ants.lowZoom.v1";
 
 function lodOn() {
-  return LOD.flatBelow > 0 || LOD.idleCapMs > 0 || LOD.thumbZoom > 0 || LOD.detailZoom > 0;
+  return LOD.flatBelow > 0 || LOD.idleCapMs > 0 || LOD.thumbZoom > 0 || LOD.detailZoom > 0 || LOD.inertBelow > 0 || LOD.fovea;
 }
 
 // The zoom as the canvas has it *now*. LOD.zoom is the value the last drawn
@@ -982,6 +1004,58 @@ function lodFlatNode(node, canvas) {
   if (node.type === NODE_NAME) return false;
   if (lodVueNodesMode()) return false;
   return true;
+}
+
+// Is node UI switched off at this zoom? Asked of the canvas currently on screen,
+// like every other zoom decision here.
+function viewInertOn(canvas) {
+  if (!(LOD.inertBelow > 0)) return false;
+  const z = lodZoomOf(canvas);
+  return z > 0 && z < LOD.inertBelow;
+}
+
+// The area the canvas is showing, in graph units, inflated by `pad` viewports.
+function viewArea(canvas, pad) {
+  const vp = canvas && canvas.visible_area;
+  let x;
+  let y;
+  let w;
+  let h;
+  if (vp && Number.isFinite(Number(vp[0])) && Number.isFinite(Number(vp[2])) && Number(vp[2]) > 0) {
+    x = Number(vp[0]);
+    y = Number(vp[1]);
+    w = Number(vp[2]);
+    h = Number(vp[3]);
+  } else {
+    const ds = (canvas && canvas.ds) || null;
+    const el = canvas && canvas.canvas;
+    const scale = ds ? Number(ds.scale) || 1 : 1;
+    const offset = ds && ds.offset ? ds.offset : [0, 0];
+    const cw = (el && Number(el.width)) || 0;
+    const ch = (el && Number(el.height)) || 0;
+    if (!(cw > 0 && ch > 0)) return null;
+    w = cw / scale;
+    h = ch / scale;
+    x = -(Number(offset[0]) || 0);
+    y = -(Number(offset[1]) || 0);
+  }
+  const px = w * (Number(pad) || 0);
+  const py = h * (Number(pad) || 0);
+  return { x: x - px, y: y - py, w: w + px * 2, h: h + py * 2 };
+}
+
+// Is this node outside the (inflated) viewport?
+function viewNodeFar(node, canvas) {
+  if (!LOD.fovea || !node) return false;
+  const area = viewArea(canvas, VIEW_FOVEA_MARGIN);
+  if (!area) return false;
+  const size = node.size || node.renderingSize;
+  if (!size) return false;
+  const w = Math.abs(Number(size[0])) || 0;
+  const h = Math.abs(Number(size[1])) || 0;
+  const x = Number(node.pos && node.pos[0]) || 0;
+  const y = Number(node.pos && node.pos[1]) || 0;
+  return x + w < area.x || x > area.x + area.w || y + h < area.y || y > area.y + area.h;
 }
 
 function lodDetailOn(canvas) {
@@ -1058,11 +1132,29 @@ function lodPlanFrame(canvas) {
   // Which nodes are rectangles changes only with the zoom (and with nodes
   // arriving), so the DOM sweep runs on that change rather than every frame:
   // this stays at the cost of a zoom, not of a redraw.
-  if (LOD.flatBelow > 0 && LOD.zoom !== LOD.sweptZoom) {
+  const focusOn = LOD.inertBelow > 0 || LOD.fovea;
+  if ((LOD.flatBelow > 0 || focusOn) && LOD.zoom !== LOD.sweptZoom) {
     try {
       lodSweepDom(canvas);
     } catch (e) {
       /* never fatal */
+    }
+  }
+  // The foveated half moves with the viewport, not with the zoom, so it runs on
+  // a budget while the view is moving: the margin is a whole viewport, which is
+  // more than a pan can cross in the time one sweep takes.
+  if (LOD.fovea && canvas) {
+    const now = nowMs();
+    const ds = canvas.ds || null;
+    const key = ds ? `${Math.round((Number(ds.offset[0]) || 0) / 50)}:${Math.round((Number(ds.offset[1]) || 0) / 50)}:${Number(ds.scale) || 1}` : "";
+    if ((key !== LOD.sweptViewKey || now - LOD.sweptViewAt > 2000) && now - LOD.sweptViewAt >= VIEW_FOVEA_SWEEP_MS) {
+      LOD.sweptViewAt = now;
+      LOD.sweptViewKey = key;
+      try {
+        lodSweepDom(canvas);
+      } catch (e) {
+        /* never fatal */
+      }
     }
   }
   plan.links = false;
@@ -1260,7 +1352,11 @@ function lodInstallDomSweep() {
     lodDomSweepTimer = govOwn(() =>
       setInterval(() => {
         try {
-          if (LOD.flatBelow > 0) lodSweepDom(app.canvas);
+          if (LOD.flatBelow > 0 || LOD.inertBelow > 0 || LOD.fovea) lodSweepDom(app.canvas);
+          // The hit-test gate is installed per graph object, and a graph is not
+          // always there when the setting is switched on (and navigating into a
+          // subgraph is a different one), so this is where it is kept current.
+          if (LOD.inertBelow > 0) viewInstallHitTestGate();
         } catch (e) {
           /* never fatal */
         }
@@ -1416,7 +1512,7 @@ function lodNodeById(canvas, id) {
 // (see the frontend's useAbsolutePosition), so the node can be found by a
 // containment test in graph coordinates — no layout read per widget, and it works
 // for component widgets, which have no element of their own to key on.
-function lodDomLayerSweep(canvas, keep) {
+function lodDomLayerSweep(canvas, keep, inertSet, foveaSet) {
   let layer = null;
   try {
     if (typeof document === "undefined" || typeof document.querySelectorAll !== "function") return 0;
@@ -1474,6 +1570,21 @@ function lodDomLayerSweep(canvas, keep) {
       if (gx >= x && gx <= x + w && gy >= y && gy <= y + h) owner = node;
     }
     if (!owner) continue;
+    // Focus mode reaches these wrappers too: this is where the 3D viewports are,
+    // and switching one off is what stops it rendering its scene on hover.
+    if (viewInertOn(canvas) || viewNodeFar(owner, canvas)) {
+      el.classList.add(LOD_INERT_CLASS);
+      inertSet.add(el);
+    }
+    if (viewNodeFar(owner, canvas)) {
+      if (!keep.has(el)) {
+        el.classList.add(LOD_DOM_CLASS);
+        keep.add(el);
+        foveaSet.add(el);
+      }
+      continue;
+    }
+    if (!lodFlatNode(owner, canvas)) continue;
     // A widget with an element of its own was already hidden through its node;
     // this pass is for the wrappers nothing else can reach.
     if (keep.has(el)) continue;
@@ -1484,9 +1595,124 @@ function lodDomLayerSweep(canvas, keep) {
   return hidden;
 }
 
+// Node hit-testing is the frontend's own O(visible nodes) walk — every pointer
+// move asks "which node is under the cursor", backwards through the draw order,
+// calling isPointInside until one says yes. Below the focus zoom nobody can see
+// what they would be clicking, so the walk is answered with "nothing" instead:
+// no hover, no tooltip, no node drag, no selection — and no per-move cost.
+// The tracker's own node is exempt even here, so the panel stays reachable.
+function viewNodeForHit(graph, x, y) {
+  try {
+    const nodes = (graph && graph._nodes) || [];
+    for (const node of nodes) {
+      if (!node || node.type !== NODE_NAME) continue;
+      if (typeof node.isPointInside === "function") {
+        if (node.isPointInside(x, y)) return node;
+        continue;
+      }
+      const size = node.size || node.renderingSize;
+      if (!size) continue;
+      const nx = Number(node.pos && node.pos[0]) || 0;
+      const ny = Number(node.pos && node.pos[1]) || 0;
+      const w = Math.abs(Number(size[0])) || 0;
+      const h = Math.abs(Number(size[1])) || 0;
+      if (x >= nx && x <= nx + w && y >= ny && y <= ny + h) return node;
+    }
+  } catch (e) {
+    /* the exemption is a courtesy; the gate still answers */
+  }
+  return null;
+}
+
+function viewWrapHitTest(target, label) {
+  if (!target || typeof target.getNodeOnPos !== "function") return false;
+  if (target.getNodeOnPos.__antsInertWrapped) return true;
+  const original = target.getNodeOnPos;
+  const wrapped = function (x, y, ...rest) {
+    if (viewInertOn(app.canvas)) {
+      LOD.hitTests++;
+      const own = viewNodeForHit(this, x, y);
+      if (!own) {
+        LOD.hitsBlocked++;
+        return null;
+      }
+      return own;
+    }
+    return original.call(this, x, y, ...rest);
+  };
+  wrapped.__antsInertWrapped = true;
+  wrapped.__antsInertOriginal = original;
+  try {
+    target.getNodeOnPos = wrapped;
+  } catch (e) {
+    return false;
+  }
+  return true;
+}
+
+// Gated wherever the frontend keeps it: the graph class is the seam the canvas
+// actually calls (LGraphCanvas does `graph.getNodeOnPos(...)` at event time, so
+// a prototype patch takes effect immediately), and the live graph instance is
+// patched too, because a subgraph is a different class.
+function viewInstallHitTestGate() {
+  let ok = false;
+  try {
+    const graph = (app.canvas && app.canvas.graph) || app.graph;
+    if (graph) {
+      if (graph.constructor && graph.constructor.prototype) ok = viewWrapHitTest(graph.constructor.prototype, "proto") || ok;
+      ok = viewWrapHitTest(graph, "instance") || ok;
+    }
+  } catch (e) {
+    /* the gate is best-effort: without it node UI stays live, nothing breaks */
+  }
+  return ok;
+}
+
+// The DOM half of focus mode. Everything that answers the pointer lives in the
+// DOM widget layer and the Vue node roots: a class that says "not now" is enough
+// to stop hover reporting, tooltips, click handlers, drag-and-drop targets and
+// wheel capture — and, for a 3D viewport, to stop it deciding to render.
+function viewSweepDom(canvas, keep, inertSet, foveaSet) {
+  const inertOn = viewInertOn(canvas);
+  for (const node of lodGraphNodes(canvas) || []) {
+    if (!node) continue;
+    const far = viewNodeFar(node, canvas);
+    const idle = inertOn || far;
+    if (!idle) continue;
+    for (const t of lodDomTargets(node)) {
+      if (!t.el || !t.el.classList) continue;
+      t.el.classList.add(LOD_INERT_CLASS);
+      inertSet.add(t.el);
+      if (far) {
+        t.el.classList.add(LOD_DOM_CLASS);
+        keep.add(t.el);
+        foveaSet.add(t.el);
+      }
+    }
+  }
+  for (const el of lodDomRoots()) {
+    if (!el || !el.classList) continue;
+    const id = typeof el.getAttribute === "function" ? el.getAttribute("data-node-id") : null;
+    if (id === null || id === undefined) continue;
+    const node = lodNodeById(canvas, id);
+    const far = viewNodeFar(node, canvas);
+    if (inertOn || far) {
+      el.classList.add(LOD_INERT_CLASS);
+      inertSet.add(el);
+    }
+    if (far) {
+      el.classList.add(LOD_DOM_CLASS);
+      keep.add(el);
+      foveaSet.add(el);
+    }
+  }
+}
+
 function lodSweepDom(canvas) {
   const marked = LOD.domMarked || (LOD.domMarked = new Set());
   const keep = new Set();
+  const inertSet = new Set();
+  const foveaSet = new Set();
   let nodes = 0;
   try {
     if (canvas && lodFlatOn(canvas)) {
@@ -1518,12 +1744,20 @@ function lodSweepDom(canvas) {
   } catch (e) {
     /* hiding DOM is a courtesy: if the page's DOM is not what we expect, skip it */
   }
+  // Focus mode: inert below the zoom, boxed and inert when far off screen.
+  try {
+    viewSweepDom(canvas, keep, inertSet, foveaSet);
+  } catch (e) {
+    /* never fatal */
+  }
   // The DOM widget layer: the wrappers behind every DOM widget, including the
   // Vue-component widgets the core 3D nodes are built from, which have no
   // element of their own for the loop above to find.
   let layerHidden = 0;
   try {
-    if (canvas && lodFlatOn(canvas)) layerHidden = lodDomLayerSweep(canvas, keep);
+    if (canvas && (lodFlatOn(canvas) || viewInertOn(canvas) || LOD.fovea)) {
+      layerHidden = lodDomLayerSweep(canvas, keep, inertSet, foveaSet);
+    }
   } catch (e) {
     /* never fatal */
   }
@@ -1547,6 +1781,21 @@ function lodSweepDom(canvas) {
       }
     }
   }
+  const inertMarked = LOD.inertMarked || (LOD.inertMarked = new Set());
+  if (inertSet.size !== inertMarked.size) changed = true;
+  for (const el of inertSet) if (!inertMarked.has(el)) changed = true;
+  for (const el of inertMarked) {
+    if (!inertSet.has(el)) {
+      try {
+        el.classList.remove(LOD_INERT_CLASS);
+      } catch (e) {
+        /* element is gone */
+      }
+    }
+  }
+  LOD.inertMarked = inertSet;
+  LOD.inertEls = inertSet.size;
+  LOD.foveaEls = foveaSet.size;
   LOD.domMarked = keep;
   LOD.domHidden = keep.size;
   LOD.domNodes = nodes;
@@ -1581,6 +1830,8 @@ function lodSaveSettings() {
         thumbZoom: LOD.thumbZoom,
         idleCapMs: LOD.idleCapMs,
         linkStyle: LOD.linkStyle,
+        inertBelow: LOD.inertBelow,
+        fovea: !!LOD.fovea,
       })
     );
   } catch (e) {
@@ -1619,6 +1870,8 @@ function lodLoadSettings() {
       // Anything that is not an explicit "straight" means curves. A v2.1.9
       // "auto" record becomes "spline" and raises the note above.
       linkStyle: saved.linkStyle === "straight" ? "straight" : "spline",
+      inertBelow: saved.inertBelow === undefined ? 0 : Number(saved.inertBelow) || 0,
+      fovea: !!saved.fovea,
       autoLinkCarried: saved.linkStyle === "auto",
     });
     return true;
@@ -1773,6 +2026,13 @@ function lodSet(opts) {
     if (LOD.thumbZoom > 0) lodInstallDrawImage();
   }
   if ("detailZoom" in o) LOD.detailZoom = Math.max(0, Math.min(1, Number(o.detailZoom) || 0));
+  if ("inertBelow" in o) {
+    const z = Math.max(0, Math.min(1, Number(o.inertBelow) || 0));
+    LOD.inertBelow = z === 0 ? 0 : VIEW_INERT_ZOOMS.reduce((best, v) => (Math.abs(v - z) < Math.abs(best - z) ? v : best), VIEW_INERT_ZOOMS[0]) || z;
+    // Switching it on installs the gate; the class work happens on the sweep.
+    if (LOD.inertBelow > 0) viewInstallHitTestGate();
+  }
+  if ("fovea" in o) LOD.fovea = !!o.fovea;
   if ("linkStyle" in o) {
     const style = String(o.linkStyle);
     // "auto" from v2.1.9 and earlier meant "follow the node setting", which is
@@ -1786,7 +2046,8 @@ function lodSet(opts) {
       if (o.autoLinkCarried === undefined) LOD.autoLinkCarried = false;
     }
   }
-  if (LOD.flatBelow > 0) lodInstallDomSweep();
+  if (LOD.flatBelow > 0 || LOD.inertBelow > 0 || LOD.fovea) lodInstallDomSweep();
+  if (LOD.inertBelow > 0) viewInstallHitTestGate();
   const now = lodOn();
   if (now) LOD.error = "";
   // The first change is the moment worth measuring from, whether or not the mode
@@ -4152,6 +4413,9 @@ table.ants-table tr.ants-warm td.ants-ms { color: #f0a020; }
 tr.ants-details > td { background: #17171b; padding: 6px 10px 10px 22px; }
 tr.ants-details table.ants-sub th { color: #777; position: static; background: none; }
 tr.ants-details table.ants-sub td { color: #bbb; }
+.ants-inline { display: inline-flex; align-items: center; gap: 6px; margin: 4px 12px 4px 0; cursor: pointer; }
+.ants-inline input[type="checkbox"] { width: 13px; height: 13px; accent-color: #6ea8fe; cursor: pointer; }
+.ants-row .ants-inline { margin: 0; }
 .ants-btn {
   background: #2c2c33; border: 1px solid #444; color: #ccc; border-radius: 4px;
   padding: 1px 7px; cursor: pointer; font-size: 10px; white-space: nowrap;
@@ -4186,6 +4450,12 @@ tr.ants-details table.ants-sub td { color: #bbb; }
 }
 /* Elements of a node that is currently drawn as a rectangle: see lodSweepDom. */
 .ants-lod-box { display: none !important; }
+/* Focus mode: the node's DOM UI is switched off — no hover, no click, no wheel
+   capture, no tooltips — while it is too small on screen to be used. This is not
+   only about the user's own mouse: a 3D viewport decides whether to render by
+   asking whether the pointer is over it (see load3d's isLoad3dActive), so an
+   inert widget stops redrawing a Three.js scene nobody is looking at. */
+.ants-lod-inert { pointer-events: none !important; user-select: none !important; }
 .ants-section-title {
   color: #ccc; font-size: 11px; font-weight: 600; margin: 12px 0 4px;
   text-transform: uppercase; letter-spacing: 0.05em;
@@ -4223,6 +4493,8 @@ function el(tag, opts) {
   if (!opts) return node;
   if (opts.class) node.className = opts.class;
   if (opts.id) node.id = opts.id;
+  if (opts.type) node.type = opts.type;
+  if (opts.checked !== undefined) node.checked = !!opts.checked;
   if (opts.text !== undefined && opts.text !== null) node.textContent = String(opts.text);
   if (opts.title) node.title = opts.title;
   if (opts.style) for (const k in opts.style) node.style[k] = opts.style[k];
@@ -5084,6 +5356,58 @@ function buildTweaksTab(container) {
     lodUpdate();
   });
 
+  container.appendChild(el("div", { class: "ants-section-title", text: "Viewport focus" }));
+
+  const viewInertBox = el("input", { type: "checkbox", checked: LOD.inertBelow > 0 });
+  viewInertBox.title =
+    "Switches every node's UI off below the zoom on the right: no hover, no tooltips, no click, no drag, no wheel capture \u2014 the canvas " +
+    "keeps panning and zooming, and the tracker's own node stays reachable. It is not only about your mouse: a node that cannot be pointed at " +
+    "stops doing work, and a 3D viewport that is asked whether the pointer is over it says no, so it stops re-rendering its scene.";
+  const viewInertLabel = el("label", { class: "ants-inline" });
+  viewInertLabel.appendChild(viewInertBox);
+  viewInertLabel.appendChild(el("span", { text: " nodes other than this one are unclickable and uneditable when zoomed out" }));
+
+  const viewInertSel = el("select", { class: "ants-select", style: { width: "auto", maxWidth: "200px" } });
+  for (const z of VIEW_INERT_ZOOMS) {
+    const opt = el("option", { text: z === 0 ? "never (nodes stay live)" : `below ${Math.round(z * 100)}% zoom` });
+    opt.value = String(z);
+    viewInertSel.appendChild(opt);
+  }
+  viewInertSel.value = String(LOD.inertBelow);
+  viewInertBox.addEventListener("change", () => {
+    lodSet({ inertBelow: viewInertBox.checked ? Math.max(VIEW_INERT_DEFAULT, Number(viewInertSel.value) || 0) : 0 });
+    viewInertSel.value = String(LOD.inertBelow);
+    lodUpdate();
+  });
+  viewInertSel.addEventListener("change", () => {
+    const z = Number(viewInertSel.value) || 0;
+    lodSet({ inertBelow: z });
+    viewInertBox.checked = z > 0;
+    lodUpdate();
+  });
+
+  const viewFoveaBox = el("input", { type: "checkbox", checked: !!LOD.fovea });
+  viewFoveaBox.title =
+    "Off-screen nodes get the boxed treatment at every zoom, however far in you are: their DOM content is hidden and made inert while their node " +
+    "is more than one viewport away from the visible area. The margin is deliberate \u2014 a node crossing it under a fast pan takes longer to " +
+    "arrive than a sweep takes to notice, so nothing you can see is ever blanked. This is the foveated part: only what is in front of you is " +
+    "live, in both directions.";
+  viewFoveaBox.addEventListener("change", () => {
+    lodSet({ fovea: viewFoveaBox.checked });
+    lodUpdate();
+  });
+  const viewFoveaLabel = el("label", { class: "ants-inline" });
+  viewFoveaLabel.appendChild(viewFoveaBox);
+  viewFoveaLabel.appendChild(
+    el("span", { text: " off-screen nodes are boxed and inert too, at every zoom (foveated)" })
+  );
+
+  const viewRow = el("div", { class: "ants-row" });
+  viewRow.appendChild(viewInertLabel);
+  viewRow.appendChild(viewInertSel);
+  container.appendChild(viewRow);
+  container.appendChild(viewFoveaLabel);
+
   const lodAbBtn = el("button", { class: "ants-btn", text: "Measure link thinning" });
   lodAbBtn.title =
     "Answers \"is this setting doing anything on my page\" by measuring instead of arguing: the thinning is alternated on and off, one second each, " +
@@ -5100,7 +5424,7 @@ function buildTweaksTab(container) {
     "Turn all of them off \u2014 flattening, link thinning, thumbnails and the redraw cap \u2014 and let ComfyUI draw the canvas " +
     "exactly as it wants, including any DOM content this tool was hiding.";
   lodOffBtn.addEventListener("click", () => {
-    lodSet({ flatBelow: 0, idleCapMs: 0, thumbZoom: 0, detailZoom: 0, linkStyle: "spline" });
+    lodSet({ flatBelow: 0, idleCapMs: 0, thumbZoom: 0, detailZoom: 0, linkStyle: "spline", inertBelow: 0, fovea: false });
     lodFlatSel.value = "0";
     lodLinkSel.value = "spline";
     lodDetailSel.value = "0";
@@ -5142,6 +5466,11 @@ function buildTweaksTab(container) {
         "the shape of a link: ComfyUI's curves, or straight lines. The thinning setting decides how much ink a curve uses \u2014 below " +
         "its zoom links are stroked 1px wide instead of 3 and lose the dark outline drawn under them, which on a long link is most of " +
         "the pixels, and the curves stay exactly where they were \u2014 link ink and nothing else, so a link setting never paints a node. " +
+        "Viewport focus is the interaction half: below the zoom you set, every node's DOM UI is switched off and the frontend's own hit-test walk " +
+        "is answered with nothing, so a node cannot be hovered, clicked, dragged or scrolled at a zoom where nobody could read it anyway. That is " +
+        "where a 3D viewport's cost actually lives \u2014 it renders while the pointer is over it \u2014 and switching it off is what removes it. " +
+        "The foveated half applies the same boxed-and-inert treatment to nodes a viewport away from the visible area, at every zoom, so off-screen " +
+        "node UI is not live either. " +
         "How much that is worth depends on the page, and the readout measures it rather than claiming it: the connections stage also contains " +
         "the frontend walking every input slot of every node before it decides which links are even on screen, and \"Measure link thinning\" " +
         "compares the setting against itself so the two parts are told apart. Everything here is remembered across sessions and handed back by " +
@@ -5251,6 +5580,33 @@ function buildTweaksTab(container) {
       }
       if (LOD.ab) {
         bits2.push(LOD.ab.text);
+      }
+      if (LOD.inertBelow > 0 || LOD.fovea) {
+        const bits3 = [];
+        if (LOD.inertBelow > 0) {
+          const pct = Math.round(LOD.inertBelow * 100);
+          if (viewInertOn()) {
+            bits3.push(
+              `nodes inert below ${pct}% zoom: ${LOD.inertEls} element(s) switched off (no hover, click, drag or wheel capture) and ` +
+                `${LOD.hitsBlocked} of ${LOD.hitTests} node hit-test(s) answered with nothing \u2014 the frontend's own backwards walk through ` +
+                `every visible node, per pointer move, is what that saves. A 3D viewport asked whether the pointer is over it says no, so its ` +
+                `scene stops re-rendering`
+            );
+          } else {
+            bits3.push(
+              `nodes stay live at this zoom (inert mode starts below ${pct}%): ${LOD.hitTests} node hit-test(s) went through as usual`
+            );
+          }
+        }
+        if (LOD.fovea) {
+          bits3.push(
+            `foveated: ${LOD.foveaEls} element(s) of off-screen nodes hidden and inert, at any zoom \u2014 only what is on screen is live` +
+              (LOD.foveaEls === 0 && LOD.plan.total > 0
+                ? " (right now every node IS on screen, which is why the count is zero)"
+                : "")
+          );
+        }
+        if (bits3.length) bits2.push(bits3.join(" \u00b7 "));
       }
       if (LOD.detailZoom > 0) {
         const frames = Math.max(1, since ? since.n : 1);
@@ -7670,6 +8026,7 @@ function installDebugApi() {
         get limits() {
           return {
             flatZoom: LOD_FLAT_ZOOM.slice(),
+            inertZoom: VIEW_INERT_ZOOMS.slice(),
             idleCapMs: LOD_IDLE_CAP_MS.slice(),
             thumbZoom: LOD_THUMB_ZOOMS.slice(),
             thumbLadder: LOD_THUMB_LADDER.slice(),
@@ -7747,6 +8104,17 @@ function installDebugApi() {
         // Starts the on/off measurement of the link setting and returns its
         // state; the verdict lands in `state.ab.text` when it finishes.
         measureLinks: () => lodAbStart(),
+        get focus() {
+          return {
+            inertOn: viewInertOn(app.canvas),
+            inertBelow: LOD.inertBelow,
+            fovea: !!LOD.fovea,
+            inertElements: LOD.inertEls,
+            foveaElements: LOD.foveaEls,
+            hitTests: LOD.hitTests,
+            hitsBlocked: LOD.hitsBlocked,
+          };
+        },
         // Re-runs the DOM sweep. The tracker does this itself on a zoom or a
         // setting change; this is here so a test (or a script) can ask for it.
         sweep: () => {
@@ -7756,7 +8124,7 @@ function installDebugApi() {
             return false;
           }
         },
-        off: () => lodSet({ flatBelow: 0, idleCapMs: 0, thumbZoom: 0, detailZoom: 0, linkStyle: "spline" }),
+        off: () => lodSet({ flatBelow: 0, idleCapMs: 0, thumbZoom: 0, detailZoom: 0, linkStyle: "spline", inertBelow: 0, fovea: false }),
       },
       setSyntheticTick,
       benchmark: (ms, slot) => runScriptedPan(Number(ms) || 6000, slot || "A"),

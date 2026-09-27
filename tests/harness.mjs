@@ -157,7 +157,7 @@ export function createHarness(options = {}) {
       this.extensions.push(ext);
       return Promise.resolve();
     },
-    graph: { _nodes: [], links: new Map() },
+    graph: null, // installed below: the fake graph class, so the hit-test gate has a seam
   };
 
   // A 2D context stub that records the calls a draw path made: enough to tell a
@@ -214,6 +214,32 @@ export function createHarness(options = {}) {
     return Promise.resolve({ width: w, height: h, close() {}, __antsThumbOf: img });
   }
 
+  // The graph class. The frontend's only node hit-test entry point is
+  // LGraph.getNodeOnPos (LGraphCanvas calls it per pointer event), and that is
+  // where the tracker's focus mode gates it — so the fake has to have it.
+  class FakeLGraph {
+    constructor() {
+      this._nodes = [];
+      this.links = new Map();
+      this.hitTests = 0;
+    }
+    getNodeOnPos(x, y, nodeList) {
+      this.hitTests++;
+      const nodes = nodeList && nodeList.length ? nodeList : this._nodes;
+      for (let i = nodes.length - 1; i >= 0; i--) {
+        const node = nodes[i];
+        const size = node.size || node.renderingSize;
+        if (!size) continue;
+        const w = Math.abs(Number(size[0])) || 0;
+        const hh = Math.abs(Number(size[1])) || 0;
+        const nx = Number(node.pos && node.pos[0]) || 0;
+        const ny = Number(node.pos && node.pos[1]) || 0;
+        if (x >= nx && x <= nx + w && y >= ny && y <= ny + hh) return node;
+      }
+      return null;
+    }
+  }
+
   class FakeLGraphCanvas {
     constructor() {
       this.ds = { offset: new Float32Array([0, 0]), scale: 1 };
@@ -227,6 +253,10 @@ export function createHarness(options = {}) {
       this.drawCalls = 0;
       this.dirtyCalls = 0;
       this.ctx = makeStubCtx();
+      // What the frontend computes each drawn frame: the graph-space area on
+      // screen. The visible-node set the tracker reads for focus mode is this
+      // in production; here it is derived the same way, from the viewport.
+      this.visible_area = [0, 0, 1600, 900];
       // The frontend's own canvas fields, so a wrapper that changes them for the
       // duration of one call can be caught doing it (and caught putting it back).
       this.connections_width = 3;
@@ -278,6 +308,7 @@ export function createHarness(options = {}) {
     }
   }
   const canvas = new FakeLGraphCanvas();
+  app.graph = new FakeLGraph(); // the graph class, so the hit-test gate has its seam
   canvas.graph = app.graph; // LiteGraph keeps the graph on the canvas, and so does this fake
   app.canvas = canvas;
 

@@ -596,6 +596,120 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
   });
 
 
+  test("focus mode switches node UI off below the zoom, and hands it back above it", async () => {
+    const h = await boot();
+    h.window.devicePixelRatio = 1;
+    bigGraph(h, 4, 0.1);
+    // A DOM widget on a node: this is the element a user would be hovering,
+    // clicking, dragging and — with a 3D viewport — rotating and scrolling.
+    const wrapper = h.document.createElement("div");
+    wrapper.className = "dom-widget";
+    const inner = h.document.createElement("canvas");
+    wrapper.appendChild(inner);
+    h.document.body.appendChild(wrapper);
+    const widget = { name: "viewport", element: inner, options: {} };
+    h.canvas.nodes[0].widgets = [widget];
+    h.canvas.nodes[0]._setConcreteSlots = null;
+
+    // Off by default: nothing is switched off and every hit-test goes through.
+    h.tracker.lowZoom.set({ inertBelow: 0 });
+    const before = h.canvas.graph.hitTests;
+    h.canvas.graph.getNodeOnPos(10, 10, h.canvas.nodes);
+    assertEqual(h.canvas.graph.hitTests, before + 1, "hit-tests are the frontend's own while focus mode is off");
+    assert(!wrapper._cls.has("ants-lod-inert"), "and nothing is switched off in the DOM");
+
+    // Below the zoom: the node's DOM is inert and the hit-test walk is skipped.
+    h.tracker.lowZoom.set({ inertBelow: 0.4 });
+    assertEqual(h.tracker.lowZoom.state.inertBelow, 0.4, "the setting is taken as given (it is on the ladder)");
+    assertEqual(h.tracker.lowZoom.focus.inertOn, true, "and the zoom is below it");
+    assert(wrapper._cls.has("ants-lod-inert"), "the node's DOM widget is switched off — no hover, click, drag or wheel capture");
+    const blockedFrom = h.tracker.lowZoom.state.hitsBlocked;
+    const node = h.canvas.graph.getNodeOnPos(10, 10, h.canvas.nodes);
+    assertEqual(node, null, "the hit-test answers with nothing");
+    assertEqual(h.tracker.lowZoom.state.hitsBlocked, blockedFrom + 1, "and it is counted, so the saving is visible");
+
+    // This tool's own node stays reachable even here.
+    const own = { type: "ANTsNastyBastardsTracker", pos: [10, 10], size: [200, 100], selected: false };
+    h.canvas.nodes.push(own);
+    h.canvas.graph._nodes = h.canvas.nodes;
+    assertEqual(h.canvas.graph.getNodeOnPos(50, 50, h.canvas.nodes), own, "but the panel's own node can still be clicked");
+
+    // Above the zoom, everything is live again.
+    h.canvas.ds.scale = 0.5;
+    h.tracker.lowZoom.set({ inertBelow: 0.4 });
+    assertEqual(h.tracker.lowZoom.focus.inertOn, false, "above the setting nothing is inert");
+    assert(!wrapper._cls.has("ants-lod-inert"), "and the class is gone");
+    h.canvas.graph._nodes = h.canvas.nodes.slice(0, 4);
+    assert(h.canvas.graph.getNodeOnPos(10, 10, h.canvas.nodes), "hit-tests answer again");
+
+    // The panel says what it did, in the same terms.
+    h.canvas.ds.scale = 0.1;
+    h.tracker.lowZoom.set({ inertBelow: 0.4 });
+    h.canvas.graph.getNodeOnPos(10, 10, h.canvas.nodes);
+    await openTweaksTab(h);
+    h.advance(600);
+    await h.flush();
+    const text = panelText(h);
+    assertIncludes(text, "nodes inert below 40% zoom", "the panel names the mode and the zoom");
+    assertIncludes(text, "answered with nothing", "and what the hit-test walk did");
+    assertIncludes(text, "hit-test(s)", "with the count of what it saved");
+
+    // Switching the mode off gives the page back untouched.
+    h.canvas.ds.scale = 0.1;
+    h.tracker.lowZoom.off();
+    assertEqual(h.tracker.lowZoom.state.inertBelow, 0, "the setting is off");
+    assertEqual(h.tracker.lowZoom.focus.inertElements, 0, "and nothing is left switched off");
+    assert(!wrapper._cls.has("ants-lod-inert"));
+  });
+
+  test("foveated mode boxes and switches off nodes that are a viewport away, at any zoom", async () => {
+    const h = await boot();
+    h.window.devicePixelRatio = 1;
+    bigGraph(h, 4, 1); // 100% zoom: nothing is flattened by the node setting
+    // Two nodes: one inside the visible area, one several viewports away.
+    h.canvas.visible_area = [0, 0, 1600, 900];
+    h.canvas.nodes.forEach((n, i) => {
+      n.pos = [i * 300, 100];
+    });
+    h.canvas.nodes[3].pos = [9000, 4000]; // far off screen
+    const widgets = h.canvas.nodes.map(() => {
+      const w = h.document.createElement("div");
+      w.className = "dom-widget";
+      const inner = h.document.createElement("canvas");
+      w.appendChild(inner);
+      h.document.body.appendChild(w);
+      return { el: w, widget: { name: "preview", element: inner, options: {} } };
+    });
+    h.canvas.nodes.forEach((n, i) => {
+      n.widgets = [widgets[i].widget];
+    });
+
+    h.tracker.lowZoom.set({ flatBelow: 0, fovea: true });
+    assertEqual(h.tracker.lowZoom.state.nodes, 0, "no node is flattened: this is not the node setting");
+    assert(!widgets[0].el._cls.has("ants-lod-box"), "the node on screen keeps its DOM content");
+    assert(widgets[3].el._cls.has("ants-lod-box"), "the node a viewport away is boxed");
+    assert(widgets[3].el._cls.has("ants-lod-inert"), "and switched off");
+    assertEqual(h.tracker.lowZoom.focus.foveaElements, 1, "one element, and the panel counts it");
+
+    // Bringing it into view hands it back.
+    h.canvas.nodes[3].pos = [600, 400];
+    h.tracker.lowZoom.sweep();
+    assert(!widgets[3].el._cls.has("ants-lod-box"), "in view, the DOM content is back");
+    assert(!widgets[3].el._cls.has("ants-lod-inert"), "and live again");
+    assertEqual(h.tracker.lowZoom.focus.foveaElements, 0);
+
+    // The margin is the safety: a node just outside the viewport is not touched,
+    // because a pan can bring it in faster than a sweep runs.
+    h.canvas.nodes[3].pos = [1650, 100]; // just past the right edge
+    h.tracker.lowZoom.sweep();
+    assert(!widgets[3].el._cls.has("ants-lod-box"), "just off screen is still drawn in full — it is about to be visible");
+
+    // And it survives a reload with the other settings.
+    const h2 = await boot({ storage: h.localStorage });
+    assertEqual(h2.tracker.lowZoom.state.fovea, true, "the foveated toggle is remembered");
+    assertEqual(h2.tracker.lowZoom.state.inertBelow, 0, "and the inert zoom it was saved with");
+  });
+
   test("a boxed node's DOM widget also stops being laid out every frame, and gets its own setting back", async () => {
     const h = await boot();
     h.window.devicePixelRatio = 1;
