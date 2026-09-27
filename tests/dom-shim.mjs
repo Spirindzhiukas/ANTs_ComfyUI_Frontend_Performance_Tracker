@@ -216,6 +216,9 @@ export function createDocument() {
   doc.head = head;
   doc.body = body;
   doc.createElement = (tag) => new Node(tag);
+  // SVG elements are built with a namespace in the real DOM; the tracker draws its
+  // glyphs that way, so the shim has to answer the same question.
+  doc.createElementNS = (ns, tag) => new Node(tag);
   doc.createTextNode = (text) => {
     const n = new Node(null);
     n._text = String(text);

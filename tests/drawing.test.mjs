@@ -858,6 +858,152 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
   // report came from: widgets drawn on the canvas, and a 3D viewport whose render
   // loop hangs off the *node's* hover flag rather than off the DOM.
 
+  // ------------------------------------------------- the node's own controls --
+  // The pill on the tracker's node is the one piece of UI that has to survive every
+  // setting: it is where the master switch lives. And the switch has to be a real
+  // off — not a quieter tracker, but a page that is ComfyUI's own again.
+
+  test("the node's pill: a switch and a gear, and no low-zoom sweep may touch it", async () => {
+    const h = await boot();
+    h.window.devicePixelRatio = 1;
+    // The node the extension builds its UI on.
+    const NodeType = h.registerNodeType("ANTsNastyBastardsTracker");
+    const node = h.makeNode(NodeType);
+    node.pos = [0, 0];
+    node.size = [200, 100];
+    node.onNodeCreated();
+    // A normal node next to it, with a DOM widget of its own: the sweep needs
+    // something it *is* allowed to switch off, or "it left ours alone" proves
+    // nothing.
+    const other = h.node({ pos: [400, 0], size: [200, 100] });
+    const otherWrap = h.document.createElement("div");
+    otherWrap.className = "dom-widget";
+    const otherInner = h.document.createElement("canvas");
+    otherWrap.appendChild(otherInner);
+    h.document.body.appendChild(otherWrap);
+    other.widgets = [{ name: "preview", element: otherInner, options: {} }];
+    h.canvas.nodes = [node, other];
+    h.canvas.graph._nodes = h.canvas.nodes;
+
+    const widget = (node._domWidgets || [])[0];
+    assert(widget, "the node got a DOM widget for its controls");
+    const pill = widget.element;
+    const wrapper = widget.wrapper;
+    assert(pill._cls.has("ants-own"), "the pill is marked as this tool's own");
+    assert(pill._cls.has("ants-node-pill"), "and is the pill that frames the two controls");
+    const buttons = pill.children.filter((c) => c.tagName === "BUTTON");
+    assertEqual(buttons.length, 2, "two controls: the switch first, the gear after");
+    assert(buttons[0]._cls.has("ants-node-btn-tick"), "the first is the switch");
+    assert(buttons[1]._cls.has("ants-node-btn-gear"), "the second is the gear");
+    assertEqual(widget.options.hideOnZoom, false, "the frontend's own low-quality mode is told to keep it");
+
+    // Every setting on, zoomed out, and the node off screen to boot: the pill is
+    // exactly the element every other rule in this file would hide.
+    h.canvas.ds.scale = 0.1;
+    node.pos = [9000, 4000];
+    h.tracker.lowZoom.set({ flatBelow: 0.5, inertBelow: 0.6, fovea: true });
+    h.canvas.setDirty(true, true);
+    h.canvas.draw();
+    const focus = h.tracker.lowZoom.focus;
+    assertGreater(focus.inertElements + h.tracker.lowZoom.dom.hidden, 0, "the sweep did switch other things off");
+    assert(otherWrap._cls.has("ants-lod-box"), "the ordinary node's widget is the thing it switched off");
+    assert(!pill._cls.has("ants-lod-box"), "the pill is not hidden");
+    assert(!pill._cls.has("ants-lod-inert"), "and not made inert");
+    assert(!wrapper._cls.has("ants-lod-box"), "nor is the wrapper the frontend put it in");
+    assert(!wrapper._cls.has("ants-lod-inert"), "which is the element a class would land on");
+    assertEqual(
+      focus.blockedElements,
+      1,
+      "and the only element in the gate's set is the other node's widget \u2014 never this tool's own"
+    );
+
+    // Which means the switch still works: the event gate does not swallow it and
+    // the click reaches the handler.
+    h.tracker.lowZoom.setEnabled(true);
+    buttons[0]._fire("click");
+    assertEqual(h.tracker.lowZoom.enabled, false, "clicking the switch turns the tracker off");
+
+    // And it is the way back.
+    buttons[0]._fire("click");
+    assertEqual(h.tracker.lowZoom.enabled, true, "and clicking it again turns it back on");
+    assertEqual(h.tracker.lowZoom.state.flatBelow, 0.5, "with the settings untouched");
+    assertEqual(h.tracker.lowZoom.state.inertBelow, 0.6);
+    assertEqual(h.tracker.lowZoom.focus.fovea, true);
+    h.tracker.lowZoom.off();
+  });
+
+  test("switching the tracker off leaves the page to ComfyUI, and switching it on restores the settings", async () => {
+    const h = await boot();
+    h.window.devicePixelRatio = 1;
+    bigGraph(h, 6, 0.1);
+    const wrapper = h.document.createElement("div");
+    wrapper.className = "dom-widget";
+    const inner = h.document.createElement("canvas");
+    wrapper.appendChild(inner);
+    h.document.body.appendChild(wrapper);
+    h.canvas.nodes[0].widgets = [{ name: "preview", element: inner, options: {} }];
+
+    h.tracker.lowZoom.set({ flatBelow: 0.2, detailZoom: 0.6, inertBelow: 0.4, fovea: true });
+    drawLoop(h, 0.2);
+    assert(h.tracker.lowZoom.on, "the settings are in force");
+    assert(wrapper._cls.has("ants-lod-box"), "and they are doing something to the page");
+    assertLess(h.canvas.linkSettings.slice(-1)[0].width, 3, "links are being drawn thin");
+
+    // Off.
+    assertEqual(h.tracker.lowZoom.setEnabled(false), false, "the switch takes effect");
+    assertEqual(h.tracker.lowZoom.on, false, "nothing in the drawing settings is in force any more");
+    assert(!wrapper._cls.has("ants-lod-box"), "and what was hidden is handed back");
+    assert(!wrapper._cls.has("ants-lod-inert"), "including the inert half");
+    assertEqual(h.tracker.lowZoom.focus.blockedElements, 0, "the event gate's set is empty");
+    assertEqual(h.tracker.lowZoom.state.flatBelow, 0.2, "while the settings themselves are untouched");
+
+    // Nothing is measured, nothing is deferred, nothing is drawn differently.
+    const before = h.tracker.totals;
+    drawLoop(h, 0.5);
+    assertEqual(h.tracker.totals.frames, before.frames, "no frame is recorded while it is off");
+    assertEqual(h.tracker.totals.hookCalls, before.hookCalls, "and no wrapped hook is being timed");
+    assertEqual(h.tracker.lowZoom.state.ab, null, "and no measurement is running");
+    assertEqual(h.canvas.linkSettings.slice(-1)[0].width, 3, "links are drawn at ComfyUI's own width again");
+    // Even at a zoom below the focus setting, with the tool off, a widget on a node
+    // answers: the gate passes everything through.
+    const real = h.node({ pos: [0, 0], size: [200, 100], widgets: [{ name: "steps", last_y: 10, computedHeight: 20 }] });
+    h.canvas.nodes.push(real);
+    h.canvas.graph._nodes = h.canvas.nodes;
+    h.canvas.setDirty(true, true);
+    h.canvas.draw();
+    assertEqual(real.getWidgetOnPos(100, 20), real.widgets[0], "and a node's own widget answers again \u2014 nothing of this tool's is in the way");
+
+    // On again: the same settings, in force.
+    assertEqual(h.tracker.lowZoom.setEnabled(true), true, "switched back on");
+    h.canvas.ds.scale = 0.1;
+    drawLoop(h, 0.2);
+    assert(h.tracker.lowZoom.on, "the settings are in force again");
+    assert(wrapper._cls.has("ants-lod-box"), "and are hiding what they were hiding");
+    assertLess(h.canvas.linkSettings.slice(-1)[0].width, 3, "and thinning the links again");
+    h.tracker.lowZoom.off();
+  });
+
+  test("the panel says what the switch means, and its own button drives it", async () => {
+    const h = await boot();
+    h.window.devicePixelRatio = 1;
+    bigGraph(h, 4, 0.1);
+    await openTweaksTab(h); // built while the tool is still on
+    h.tracker.lowZoom.setEnabled(false);
+    await h.flush();
+    const text = panelText(h);
+    assertIncludes(text, "The tracker is switched off.", "the panel says so plainly");
+    assertIncludes(text, "switches it back on with exactly the settings you had", "and says how to get back");
+    assertIncludes(text, "⏻ On", "with the header button offering it");
+    assertEqual(h.tracker.lowZoom.enabled, false, "and the API agrees");
+
+    // The header button is the same switch.
+    const power = h.panel().descendants().find((n) => n.textContent === "⏻ On");
+    assert(power, "the button is on screen");
+    power._fire("click");
+    assertEqual(h.tracker.lowZoom.enabled, true, "clicking it switches the tracker back on");
+    assertIncludes(panelText(h), "⏻ Off", "and the button offers the other direction again");
+  });
+
   test("canvas widgets stop answering the pointer below the zoom, while the node still selects", async () => {
     const h = await boot();
     h.window.devicePixelRatio = 1;

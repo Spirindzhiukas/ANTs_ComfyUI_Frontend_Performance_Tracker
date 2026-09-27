@@ -233,6 +233,34 @@ export function createHarness(options = {}) {
       this.leaves = 0;
       this.moves = 0;
     }
+    // The canvas widget API, as far as a test needs it: a widget with a position
+    // whose hit-test is arithmetic, and the callback a click would run.
+    addWidget(type, name, value, callback, options) {
+      const widget = { type, name, value, callback, options: options || {}, last_y: this.widgets.length * 22, computedHeight: 20 };
+      this.widgets.push(widget);
+      return widget;
+    }
+    // The DOM widget API: the frontend renders a positioned wrapper into its layer
+    // and puts the element inside it. This mirrors that structure, because that
+    // structure is what a low-zoom sweep has to walk past.
+    addDOMWidget(name, type, element, options) {
+      let layer = document.querySelectorAll('[data-testid="dom-widgets"]')[0] || null;
+      if (!layer) {
+        layer = document.createElement("div");
+        layer.className = "isolate";
+        layer._attrs["data-testid"] = "dom-widgets";
+        document.body.appendChild(layer);
+      }
+      const wrapper = document.createElement("div");
+      wrapper.className = "dom-widget size-full";
+      wrapper.appendChild(element);
+      layer.appendChild(wrapper);
+      const widget = { name, type, element, options: options || {}, node: this, wrapper };
+      this.widgets.push(widget);
+      this._domWidgets = this._domWidgets || [];
+      this._domWidgets.push(widget);
+      return widget;
+    }
     getWidgetOnPos(x, y) {
       const nx = Number(this.pos[0]) || 0;
       const ny = Number(this.pos[1]) || 0;
@@ -491,11 +519,17 @@ export function createHarness(options = {}) {
   }
 
   function registerNodeType(name, protoHooks) {
-    function NodeType() {
-      this.type = name;
-      this.comfyClass = name;
-      this.mode = 0;
-      this.visible = true;
+    // A registered node type in this harness is a FakeLGraphNode with the type
+    // fields a real one carries, so the widget seams (canvas widgets, DOM widgets,
+    // the mouse hooks) exist on it exactly as on a real node.
+    class NodeType extends FakeLGraphNode {
+      constructor(opts) {
+        super(Object.assign({ type: name }, opts || {}));
+        this.type = name;
+        this.comfyClass = name;
+        this.mode = 0;
+        this.visible = true;
+      }
     }
     NodeType.type = name;
     NodeType.comfyClass = name;

@@ -46,14 +46,22 @@ panel:
    ComfyUI's own minimap/queue UI depending on your layout; drag it
    up near the top bar or wherever's actually clear on your screen.
 2. Or drag in the **"ANTs Nasty Bastards Tracker"** node (category
-   `ANTs/debug`) and click its **Open Tracker** button. The node does
-   nothing else — no inputs, no outputs, never executes.
+   `ANTs/debug`). It carries a small pill — `[switch][gear]`: the gear
+   (or a click on the pill) opens the panel, and the checkbox is the
+   tool's master switch. The node does nothing else — no inputs, no
+   outputs, never executes. The pill is exempt from every setting this
+   extension has, so it stays usable at any zoom, including at 10% on a
+   graph it is otherwise flattening to rectangles.
 
 Panel header buttons:
 
 - **📋 Copy** — dumps a plain-text snapshot of every tab to the
   clipboard in one go, meant for pasting into a chat or bug report
   instead of a screenshot.
+- **⏻ Off / On** — the same master switch as the node's checkbox, for
+  when the node is off screen. Off means off: nothing is wrapped,
+  sampled, deferred or drawn differently, the page is handed back whole,
+  and the panel keeps your settings for when you switch it on again.
 - **⏸ Pause** — freezes sampling. Drawing keeps happening; it just
   stops being timed, so a jumpy table holds still long enough to read.
   Meters are marked stale while paused.
@@ -496,10 +504,11 @@ logged for DevTools.
 ## Development
 
 ```
-node tests/run-tests.mjs          # 126 tests, no dependencies, no browser
+node tests/run-tests.mjs          # 129 tests, no dependencies, no browser
 node tests/run-tests.mjs timing   # filter by name fragment
 python3 tests/test_init.py        # backend route parsing + graceful fallbacks
 node tests/demo.mjs               # print what the panel says, with no ComfyUI
+node tools/pill-preview.mjs       # the node's pill, drawn with the real CSS and glyphs
 ```
 
 `tests/demo.mjs` drives a synthetic graph (two packs, four node types, a
@@ -535,6 +544,48 @@ installed as the sandbox's `CanvasRenderingContext2D` (the preview ladder
 patches `drawImage` there, the same way a browser exposes it), and
 `createImageBitmap` records the resize it was asked to perform instead of
 resizing anything.
+
+## What changed in v2.1.15
+
+- **The node's own controls are back, and they are the way in and out of the whole
+  tool.** v2.1.14's focus mode fixed the widgets but took the tracker's *own* widget
+  with it: below the flatten zoom the node is a rectangle, the frontend stops drawing
+  its header and its canvas-drawn button, and the node DOM that used to carry the
+  gear was hidden by the same sweep that hid everybody else's. There is now a pill on
+  the node — `[switch][gear]`, one rounded frame, round ends — and it is exempt from
+  every rule this extension has: it is marked `.ants-own` and the sweeps, the widget
+  gate, the hover hooks and the event gate all skip it by construction, so at 10% zoom
+  with every setting on it is the one live element on the page.
+- **The switch is a real off, not a quieter tracker.** Clicking the checkbox sets the
+  master switch (`S.enabled`) and, with it off: nothing is wrapped, nothing is sampled
+  or timed, no redraw is capped or deferred, no drawing setting is applied (every
+  low-zoom class is removed and node DOM is handed back), no hover hook is held back
+  and the event gate's set is empty, the raf monitor and the memory sampler stop, the
+  panel closes and the corner button hides. What is *not* touched is your settings,
+  the pill, and ComfyUI: the page goes back to being exactly ComfyUI's own, and the
+  checkbox — or ⏻ On in the panel — brings everything back with the settings you had.
+  The panel stays openable (the gear still works) and says so in a banner.
+- **Both controls are the same size and the same colour, by geometry rather than by
+  eye.** The button box is 22px with `box-sizing: border-box`, and the glyph is drawn
+  in a 22-unit viewBox where one unit is one pixel — so the switch's ring, drawn as a
+  1.5px border *inside* the box, has its centre line at r = (22 − 1.5) / 2 = 10.25,
+  and the gear's teeth end on exactly that circle in exactly that 1.5px line. Both are
+  `#AE7719` in every state: hover only moves the background behind them.
+  - Unchecked, nothing of ours is painted inside the ring — the ComfyUI theme's own
+    background shows through — and the ring is the accent colour.
+  - Checked, the interior becomes `#0D2A2A`, and the ring and the checkmark stay the
+    accent.
+- **Nothing in the suite could look at the pill**, so `tools/pill-preview.mjs` renders
+  it — the real CSS and the real glyph builders extracted from `web/tracker.js` — into
+  a page you can open (`preview/pill.html`, and `preview/pill-4x.png` /
+  `preview/pill-8x.png` if you would rather just look at a picture). It exits non-zero
+  if the extraction stops matching, so the picture cannot quietly disagree with the
+  extension.
+- **New tests** (3): the pill survives a sweep that hides everything else and its
+  switch still toggles the tool; switching off hands the page back (links drawn at
+  ComfyUI's own width, elements un-hidden, nothing recorded, no widget gate left in
+  the way) and switching on restores the same settings; and the panel's banner and its
+  own ⏻ button say and do what the checkbox does.
 
 ## What changed in v2.1.14
 

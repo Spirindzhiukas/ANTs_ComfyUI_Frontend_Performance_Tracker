@@ -27,7 +27,7 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.1.14";
+const VERSION = "2.1.15";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
 const NODE_NAME = "ANTsNastyBastardsTracker";
 
@@ -299,6 +299,11 @@ const S = {
   version: VERSION,
   startedAt: performance.now(),
   paused: false,
+  // The master switch, driven by the checkbox on the tracker's own node. Off means
+  // off: no wrapped hooks, no scheduler deferrals, no sampling, no redraw cap, no
+  // low-zoom drawing, no DOM touched — the page is ComfyUI's own again, and the
+  // settings are kept so switching back on restores exactly what was there.
+  enabled: true,
   hooks: new Map(), // "label::hook" -> bucket   (never deleted while wrapped)
   nodes: new Map(), // typeName -> {type, series: Ring, calls}
   muted: new Set(), // labels
@@ -689,6 +694,7 @@ function wrapHook(fn, label, hookName, kind) {
     S.hooks.set(key, bucket);
   }
   const wrapped = function (...args) {
+    if (!S.enabled) return fn.apply(this, args); // switched off = nothing but the call
     if (S.paused) return fn.apply(this, args); // pause = no timing, behavior unchanged
     if (S.muted.has(label)) {
       bucket.skipped++;
@@ -1007,8 +1013,16 @@ const LOD_LINK_STYLES = ["spline", "straight"];
 // and re-picking four dropdowns after every ComfyUI restart is not a feature.
 const LOD_STORE_KEY = "ants.lowZoom.v1";
 
+// Every decision in this file goes through one of these predicates, which is why
+// the master switch is a single flag rather than a hunt for call sites: switched
+// off, they all answer "no" and the page is drawn exactly as ComfyUI draws it.
 function lodOn() {
+  if (!S.enabled) return false;
   return LOD.flatBelow > 0 || LOD.idleCapMs > 0 || LOD.thumbZoom > 0 || LOD.detailZoom > 0 || LOD.inertBelow > 0 || LOD.fovea;
+}
+
+function antsEnabled() {
+  return !!S.enabled;
 }
 
 // The zoom as the canvas has it *now*. LOD.zoom is the value the last drawn
@@ -1027,6 +1041,7 @@ function lodZoomOf(canvas) {
 }
 
 function lodFlatOn(canvas) {
+  if (!S.enabled) return false;
   if (!(LOD.flatBelow > 0)) return false;
   const z = lodZoomOf(canvas);
   return z > 0 && z < LOD.flatBelow;
@@ -1049,6 +1064,7 @@ function lodFlatNode(node, canvas) {
 // Is node UI switched off at this zoom? Asked of the canvas currently on screen,
 // like every other zoom decision here.
 function viewInertOn(canvas) {
+  if (!S.enabled) return false;
   if (!(LOD.inertBelow > 0)) return false;
   const z = lodZoomOf(canvas);
   return z > 0 && z < LOD.inertBelow;
@@ -1253,6 +1269,7 @@ function viewDistance2(node, area) {
 }
 
 function lodDetailOn(canvas) {
+  if (!S.enabled) return false;
   if (!(LOD.detailZoom > 0)) return false;
   const z = lodZoomOf(canvas);
   return z > 0 && z < LOD.detailZoom;
@@ -1264,6 +1281,7 @@ function lodDetailOn(canvas) {
 // is exactly the coupling the three settings are supposed to not have, so it is
 // gone: straight lines happen when the user says so, and at no other time.
 function lodLinksStraight() {
+  if (!S.enabled) return false;
   return LOD.linkStyle === "straight";
 }
 
@@ -1550,6 +1568,7 @@ function lodInstallDomSweep() {
     lodDomSweepTimer = govOwn(() =>
       setInterval(() => {
         try {
+          if (!S.enabled) return;
           if (LOD.flatBelow > 0 || LOD.inertBelow > 0 || LOD.fovea) lodSweepDom(app.canvas);
         } catch (e) {
           /* never fatal */
@@ -1706,20 +1725,9 @@ function lodNodeById(canvas, id) {
 // (see the frontend's useAbsolutePosition), so the node can be found by a
 // containment test in graph coordinates — no layout read per widget, and it works
 // for component widgets, which have no element of their own to key on.
-// Every element in the page that belongs to a node, and which node that is.
 //
-// Three ways in, because the frontend offers three: a widget with an element of
-// its own (DOM widgets), a Vue-rendered node (the node *is* the element), and a
-// wrapper in the DOM widget layer. That third one is not optional — it is where
-// the *component* widgets live, the ones with no element of their own at all, and
-// the core 3D viewports are component widgets. A sweep that only walked
-// node.widgets could never see one.
-//
-// The wrappers are positioned by their own inline left/top in client pixels (see
-// the frontend's useAbsolutePosition), so ownership is arithmetic, not a layout
-// read — and it is cached per element, so an unchanged wrapper costs a float
-// comparison. This runs on a zoom change, once a second, and when a setting
-// changes. It hides nothing itself: the per-redraw pass below writes the classes,
+// Kept in step with the notes above: what a wrapper costs, and that this hides
+// nothing itself — the per-redraw pass below writes the classes,
 // from this registry, which is what keeps a pan from walking any of this.
 function lodDomLayer() {
   try {
@@ -1727,36 +1735,6 @@ function lodDomLayer() {
     return document.querySelectorAll(LOD_DOM_LAYER)[0] || null;
   } catch (e) {
     return null;
-  }
-}
-
-function viewOwnerRecord(owners, el, node, via) {
-  let rec = owners.get(el);
-  if (!rec) {
-    // `flat` is the node-flattening setting's flag, `fovea` the off-screen one,
-    // and `boxed`/`inerted` what the element is actually wearing — so a class is
-    // written once per state change and never twice for the same state.
-    rec = { node, via, left: NaN, top: NaN, flat: false, fovea: false, boxed: false, inerted: false };
-    owners.set(el, rec);
-  } else {
-    rec.node = node;
-    rec.via = via;
-  }
-  return rec;
-}
-
-function viewReleaseElement(el, rec) {
-  try {
-    if (rec && rec.boxed) el.classList.remove(LOD_DOM_CLASS);
-    if (rec && rec.inerted) el.classList.remove(LOD_INERT_CLASS);
-  } catch (e) {
-    /* element is gone; dropping the record is enough */
-  }
-  if (rec) {
-    rec.boxed = false;
-    rec.inerted = false;
-    rec.flat = false;
-    rec.fovea = false;
   }
 }
 
@@ -1791,6 +1769,47 @@ function viewReleaseElement(el, rec) {
   if (LOD.blockSet) LOD.blockSet.delete(el);
 }
 
+
+// Is this element — or anything above it — this tool's own UI? The registry skips
+// these outright: the switch on the node must work at 10% zoom with every setting
+// on, which is exactly when everything around it is being switched off.
+function viewOwnAncestor(el, maxDepth) {
+  let n = el;
+  let depth = 0;
+  const limit = Number(maxDepth) || 16;
+  while (n && depth++ < limit) {
+    try {
+      if (n.classList && typeof n.classList.contains === "function" && n.classList.contains(ANTS_OWN_CLASS)) return true;
+    } catch (e) {
+      /* an element without a classList is not ours */
+    }
+    n = n.parentNode;
+  }
+  return false;
+}
+
+// Does anything inside this element (to a shallow depth) belong to this tool?
+// That is the DOM widget layer's wrapper around the pill, which the frontend
+// creates after the element exists.
+function viewOwnInside(el, depth) {
+  if (!el || !el.children || !el.children.length) return false;
+  if (depth <= 0) return false;
+  for (const child of el.children) {
+    try {
+      if (child.classList && typeof child.classList.contains === "function" && child.classList.contains(ANTS_OWN_CLASS)) return true;
+    } catch (e) {
+      /* keep looking */
+    }
+    if (viewOwnInside(child, depth - 1)) return true;
+  }
+  return false;
+}
+
+function viewIsOwnDom(el) {
+  if (!el) return false;
+  return viewOwnAncestor(el, 16) || viewOwnInside(el, 4);
+}
+
 // Every element in the page that belongs to a node, and which node that is.
 //
 // Three ways in, because the frontend offers three: a widget with an element of
@@ -1818,6 +1837,7 @@ function lodDomRegistrySweep(canvas) {
     if (!node) continue;
     for (const t of lodDomTargets(node)) {
       if (!t.el || !t.el.classList) continue;
+      if (viewIsOwnDom(t.el)) continue; // never ours to hide
       if (owners.has(t.el) && owners.get(t.el).via === "dom") continue; // already known, exact route
       seen.add(t.el);
       viewOwnerRecord(owners, t.el, node, "widget");
@@ -1855,6 +1875,7 @@ function lodDomRegistrySweep(canvas) {
     let originY = NaN;
     for (const el of wrappers) {
       if (!el || !el.classList) continue;
+      if (viewIsOwnDom(el)) continue; // this tool's own pill, wrapper and all
       const rec = owners.get(el);
       // Already known through an exact route: keep that, just remember the place.
       if (rec && (rec.via === "widget" || rec.via === "root")) {
@@ -1919,7 +1940,7 @@ function lodDomRegistrySweep(canvas) {
 // rationed, while going away is a class on an element nobody is looking at.
 function viewApplyFocus(canvas) {
   const owners = LOD.domOwners;
-  const wanted = LOD.fovea || LOD.inertBelow > 0 || LOD.flatBelow > 0;
+  const wanted = S.enabled && (LOD.fovea || LOD.inertBelow > 0 || LOD.flatBelow > 0);
   const blockSet = LOD.blockSet || (LOD.blockSet = new Set());
   if (!owners || !owners.size) {
     LOD.inertEls = 0;
@@ -2015,7 +2036,7 @@ function viewApplyFocus(canvas) {
     // so it is left alone entirely — switching it off would be switching the node
     // off, and the widget-level gates are what cover that rendering mode.
     const own = rec.node && rec.node.type === NODE_NAME;
-    const widgetish = rec.via !== "root" && !own;
+    const widgetish = rec.via !== "root" && !own && !viewOwnAncestor(el, 8);
     const wantBox = rec.flat || rec.fovea || (inertOn && hideDom && widgetish);
     const wantInert = rec.fovea || (inertOn && widgetish);
     if (wantBox !== rec.boxed || wantInert !== rec.inerted) {
@@ -2106,6 +2127,7 @@ function viewGateEvent(ev) {
 let viewEventGateOn = false;
 
 function viewInstallEventGate() {
+  if (!S.enabled) return false;
   if (viewEventGateOn || !(LOD.inertBelow > 0 || LOD.fovea)) return viewEventGateOn;
   if (typeof document === "undefined" || typeof document.addEventListener !== "function") return false;
   for (const type of VIEW_BLOCK_EVENTS) {
@@ -2152,6 +2174,267 @@ function viewVerifyMarked(limit) {
   return ok;
 }
 
+// ------------------------------------------------------------ the node UI ---
+// The pill on this tool's own node: [ switch ][ gear ]. Round, drawn in the same
+// line as the tool's own colours, and marked .ants-own so that no part of the
+// low-zoom machinery can hide, inert or gate it — a switch that disappears exactly
+// when the graph is zoomed out would be useless.
+const ANTS_ACCENT = "#AE7719";
+const ANTS_SWITCH_FILL = "#0D2A2A"; // the checked interior
+const ANTS_GLYPH_LINE = 1.5; // one line weight for the gear, the ring and the check
+
+const ANTS_WIDGETS = new Set(); // sync functions, one per live node
+
+// One glyph box for both controls, and one unit is one CSS pixel: the button is
+// 22px square with a 1.5px ring drawn *inside* it (box-sizing: border-box), so the
+// ring's centre line is at r = (22 - 1.5) / 2 = 10.25. The gear is drawn on that
+// same circle, in the same 1.5px line — the two controls are the same size and the
+// same weight because the geometry makes them so, not because two numbers were
+// picked to look alike.
+const ANTS_GLYPH_BOX = 22; // px, and the viewBox, so 1 unit = 1px
+const ANTS_GLYPH_R = 10.25; // the switch ring's centre line, and the gear's tips
+function antsSvg(inner, extraClass) {
+  const svg = document.createElementNS ? document.createElementNS("http://www.w3.org/2000/svg", "svg") : null;
+  if (!svg) return null;
+  svg.setAttribute("viewBox", `0 0 ${ANTS_GLYPH_BOX} ${ANTS_GLYPH_BOX}`);
+  svg.setAttribute("width", String(ANTS_GLYPH_BOX));
+  svg.setAttribute("height", String(ANTS_GLYPH_BOX));
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("stroke", ANTS_ACCENT);
+  svg.setAttribute("stroke-width", String(ANTS_GLYPH_LINE));
+  svg.setAttribute("stroke-linecap", "round");
+  svg.setAttribute("stroke-linejoin", "round");
+  if (extraClass) svg.setAttribute("class", extraClass);
+  svg.innerHTML = inner;
+  return svg;
+}
+
+// A gearbox drawn as a silhouette: eight teeth around a ring, in the accent.
+function antsGearSvg() {
+  const c = ANTS_GLYPH_BOX / 2;
+  const body = ANTS_GLYPH_R - 1.9;
+  const teeth = [];
+  for (let i = 0; i < 8; i++) {
+    // Offset by half a tooth so the silhouette has a tooth straight up, and the
+    // teeth straddle the ring the switch draws.
+    const a = (i / 8) * Math.PI * 2 + Math.PI / 8;
+    const x0 = c + Math.cos(a) * body;
+    const y0 = c + Math.sin(a) * body;
+    const x1 = c + Math.cos(a) * ANTS_GLYPH_R;
+    const y1 = c + Math.sin(a) * ANTS_GLYPH_R;
+    teeth.push(`<line x1="${x0.toFixed(2)}" y1="${y0.toFixed(2)}" x2="${x1.toFixed(2)}" y2="${y1.toFixed(2)}"/>`);
+  }
+  // The teeth, then the body they sit on, then the hub.
+  return antsSvg(`<circle cx="${c}" cy="${c}" r="${body.toFixed(2)}"/>${teeth.join("")}<circle cx="${c}" cy="${c}" r="3"/>`);
+}
+
+function antsCheckSvg() {
+  // Sized to the interior of the ring, so the checkmark is drawn inside the switch
+  // rather than across it, and clear of the ring's own line.
+  return antsSvg('<path d="M6.6 11.2 L9.7 14.2 L15.4 7.9"/>');
+}
+
+// The one element the frontend positions for this widget. Everything the switch
+// does happens inside it, and nothing outside this tool knows it exists.
+function buildAntsNodeWidget() {
+  const pill = el("div", { class: `ants-node-pill ${ANTS_OWN_CLASS}` });
+  pill.title = "ANTs Nasty Bastards Tracker — the switch on the left turns the whole tool off, the gear opens the panel";
+
+  const tick = el("button", { class: "ants-node-btn ants-node-btn-tick", type: "button" });
+  tick.setAttribute("role", "checkbox");
+  const gear = el("button", { class: "ants-node-btn ants-node-btn-gear", type: "button" });
+
+  // The switch first, the gear after — the order the frame draws them in.
+  pill.appendChild(tick);
+  pill.appendChild(gear);
+  const tickGlyph = antsCheckSvg();
+  const gearGlyph = antsGearSvg();
+  if (tickGlyph) tick.appendChild(tickGlyph);
+  if (gearGlyph) gear.appendChild(gearGlyph);
+
+  // The switch is the master switch, and it says so plainly: it is not "pause the
+  // numbers", it is "make this tool not be here".
+  const sync = () => {
+    const on = antsEnabled();
+    tick.setAttribute("aria-checked", on ? "true" : "false");
+    tick.style.background = on ? ANTS_SWITCH_FILL : "transparent"; // no fill of ours while unchecked
+    tick.style.borderColor = ANTS_ACCENT;
+    tick.title = on
+      ? "Tracker is ON. Click to switch it off completely: no hooks wrapped, no sampling, no scheduler deferrals, no redraw cap, no low-zoom " +
+        "drawing, no DOM touched. Your settings are kept."
+      : "Tracker is OFF. Click to switch it back on with the settings you had.";
+  };
+  sync();
+  ANTS_WIDGETS.add(sync);
+
+  tick.addEventListener("click", (ev) => {
+    try {
+      ev.stopPropagation();
+    } catch (e) {
+      /* the click still counts */
+    }
+    antsSetEnabled(!antsEnabled());
+  });
+  gear.addEventListener("click", (ev) => {
+    try {
+      ev.stopPropagation();
+    } catch (e) {
+      /* the click still counts */
+    }
+    togglePanel();
+  });
+  // Presses and drags on the pill are ours: letting them through would start a
+  // node drag when someone meant to flip the switch.
+  for (const type of ["pointerdown", "mousedown", "pointerup", "wheel", "contextmenu"]) {
+    pill.addEventListener(type, (ev) => {
+      const target = ev.target;
+      if (target && target.tagName === "BUTTON") {
+        try {
+          ev.stopPropagation();
+        } catch (e) {
+          /* nothing to stop */
+        }
+      }
+    });
+  }
+  return pill;
+}
+
+// Attaching the pill to a node, through whichever API this frontend version has.
+function antsAttachNodeWidget(node) {
+  const pill = buildAntsNodeWidget();
+  try {
+    if (typeof node.addDOMWidget === "function") {
+      const widget = node.addDOMWidget("ants_controls", "ants-ui", pill, {
+        serialize: false,
+        hideOnZoom: false, // the frontend's own LOD must not take the switch away
+        selectOn: [], // clicking the switch is not "select this node"
+      });
+      if (widget) return pill;
+    }
+  } catch (e) {
+    /* the fallback below is a canvas button, which is worse but not nothing */
+  }
+  try {
+    node.addWidget("button", "Open Tracker", null, () => togglePanel());
+  } catch (e) {
+    /* a node with no widget API at all: the corner button is the only UI left */
+  }
+  return null;
+}
+
+// ------------------------------------------------------- the master switch ---
+// The checkbox on this tool's own node. Off means the page is ComfyUI's own
+// again: every predicate above answers "no", the scheduler hands calls straight
+// through, no sample is recorded, no redraw is capped, and every element this
+// tool dressed is handed back. The *settings* are not touched — switching back on
+// restores exactly what was there, which is the difference between this and the
+// individual toggles.
+
+const ANTS_OWN_CLASS = "ants-own";
+
+// Everything this tool has changed about the page, undone: classes removed, the
+// `hideOnZoom` flags it flipped put back, the gates' sets emptied. Deliberately
+// blunt — it is the path that has to be right, not the one that has to be quick.
+function antsReleasePage() {
+  let released = 0;
+  try {
+    const owners = LOD.domOwners;
+    if (owners) {
+      for (const [el, rec] of owners) {
+        viewReleaseElement(el, rec);
+        released++;
+      }
+      owners.clear();
+    }
+    if (LOD.domMarked) LOD.domMarked.clear();
+    if (LOD.blockSet) LOD.blockSet.clear();
+    if (LOD.domWidgets && LOD.domWidgets.size) {
+      for (const w of [...LOD.domWidgets.keys()]) lodStillWidget(w, false);
+    }
+    LOD.hoverOff = null;
+    LOD.frameAreas = null;
+    LOD.domHidden = 0;
+    LOD.domNodes = 0;
+    LOD.domLayer = 0;
+    LOD.inertEls = 0;
+    LOD.foveaEls = 0;
+    LOD.foveaQueue = 0;
+    LOD.blockedSet = null;
+  } catch (e) {
+    /* the release is best-effort by nature: a page that throws here is a page
+       whose elements are already gone */
+  }
+  return released;
+}
+
+function antsSyncWidgets() {
+  for (const sync of ANTS_WIDGETS) {
+    try {
+      sync();
+    } catch (e) {
+      /* a node can be gone at any moment */
+    }
+  }
+}
+
+function antsSetEnabled(on) {
+  const next = !!on;
+  if (next === !!S.enabled) return antsEnabled();
+  S.enabled = next;
+  if (!next) {
+    antsReleasePage();
+    // The panel and the corner button are this tool's own UI; with the tool off
+    // they go too, so nothing on screen claims to be measuring. The node's own
+    // pill stays — it is the way back.
+    try {
+      if (ui.built && ui.panel && ui.panel.classList.contains("open")) togglePanel(false);
+    } catch (e) {
+      /* never fatal */
+    }
+    try {
+      if (cornerBtnEl) cornerBtnEl.classList.add("ants-hidden-by-switch");
+    } catch (e) {
+      /* never fatal */
+    }
+    console.info(
+      "[ANTs Tracker] Switched off at the node's checkbox. Nothing is wrapped, sampled or drawn differently any more: no hooks, no " +
+        "scheduler deferrals, no redraw cap, no low-zoom drawing, no DOM touched. Your settings are kept — the checkbox next to the gear " +
+        "switches it back on."
+    );
+  } else {
+    try {
+      if (cornerBtnEl) cornerBtnEl.classList.remove("ants-hidden-by-switch");
+    } catch (e) {
+      /* never fatal */
+    }
+    try {
+      if (LOD.flatBelow > 0 || LOD.inertBelow > 0 || LOD.fovea) {
+        lodInstallDomSweep();
+        lodSweepDom(app.canvas);
+      }
+      viewInstallWidgetGate();
+      viewInstallEventGate();
+    } catch (e) {
+      /* never fatal */
+    }
+    console.info("[ANTs Tracker] Switched back on: the settings that were in force are in force again.");
+  }
+  antsSyncWidgets();
+  // The panel may be closed by now (switching off closes it), but it is built —
+  // and the banner and the header button have to say what happened before anyone
+  // looks at them again.
+  try {
+    if (ui.built) {
+      renderSummary();
+      if (ui.panel && ui.panel.classList.contains("open")) updateActiveTab();
+    }
+  } catch (e) {
+    /* never fatal */
+  }
+  return antsEnabled();
+}
+
 // ------------------------------------------------------- the canvas widgets ---
 // Not every widget is a DOM element. In this frontend a slider, a combo, a text
 // box or a button is drawn *on the canvas* and hit-tested by arithmetic:
@@ -2171,6 +2454,7 @@ function viewVerifyMarked(limit) {
 //
 // The tracker's own node is exempt — its buttons are the panel's own controls.
 function viewWidgetsOff(node, canvas) {
+  if (!S.enabled) return false;
   if (!node) return false;
   if (node.type === NODE_NAME) return false;
   const c = canvas || (typeof app !== "undefined" && app && app.canvas) || null;
@@ -2209,7 +2493,7 @@ function viewWrapGetWidgetOnPos(proto) {
 // the prototype chain of any node the graph is holding (nodes from extensions are
 // subclasses, and they all inherit this one method).
 function viewInstallWidgetGate(canvas) {
-  if (!(LOD.inertBelow > 0 || LOD.fovea)) return false;
+  if (!S.enabled || !(LOD.inertBelow > 0 || LOD.fovea)) return false;
   let ok = false;
   try {
     const g = typeof window !== "undefined" && window.LiteGraph;
@@ -2294,7 +2578,7 @@ function viewWrapNodeHover(node) {
 // function), and force a leave on any node that has just been switched off while
 // the pointer was sitting on it.
 function viewSuppressHover(canvas) {
-  if (!(LOD.inertBelow > 0 || LOD.fovea)) return 0;
+  if (!S.enabled || !(LOD.inertBelow > 0 || LOD.fovea)) return 0;
   const c = canvas || (typeof app !== "undefined" && app && app.canvas) || null;
   const nodes = lodGraphNodes(c) || [];
   const off = LOD.hoverOff || (LOD.hoverOff = new Set());
@@ -2424,6 +2708,7 @@ function lodSweepDom(canvas) {
 // force while nobody has touched the page for a moment; any pointer, wheel or
 // key event lifts it instantly (the scheduler layer already watches for those).
 function lodDrawCapMs(t) {
+  if (!S.enabled) return 0;
   if (LOD.idleCapMs > 0 && !govInputRecently(t, LOD_IDLE_INPUT_MS)) return LOD.idleCapMs;
   return drawThrottleMs > 0 ? drawThrottleMs : 0;
 }
@@ -2833,7 +3118,9 @@ function patchCanvasDraw() {
       const t0 = performance.now();
       // The Testing tab's hard cap, or the low-zoom idle cap — which only counts
       // as idle until somebody touches the page again.
-      const capMs = lodDrawCapMs(t0);
+      // The master switch is off: this is a plain draw call. No cap, no
+      // scheduling, no bookkeeping — not even the cheap kind.
+      const capMs = S.enabled ? lodDrawCapMs(t0) : 0;
       if (capMs > 0) {
         const gap = t0 - lastRealDrawAt;
         if (gap < capMs) {
@@ -2861,7 +3148,7 @@ function patchCanvasDraw() {
       }
       // The plan also carries the zoom, which the preview ladder needs even when
       // no node is being flattened.
-      if (lodOn()) lodPlanFrame(this);
+      if (S.enabled && lodOn()) lodPlanFrame(this);
       drawDepth++;
       let ret;
       try {
@@ -2870,7 +3157,7 @@ function patchCanvasDraw() {
         drawDepth--;
         const dt = performance.now() - t0;
         S.counters.framesTotal++;
-        if (!S.paused) {
+        if (S.enabled && !S.paused) {
           S.frames.push(t0, dt);
           S.frameAttr.push(t0, curAttrMs);
           S.frameNodeStage.push(t0, curNodeStageMs);
@@ -3349,9 +3636,13 @@ function installRafMonitor() {
     const t = performance.now();
     if (!Number.isNaN(prev)) {
       GOV.lastFrameGap = t - prev;
-      if (!S.paused) S.raf.push(t, t - prev);
+      if (!S.paused && S.enabled) S.raf.push(t, t - prev);
     }
     prev = t;
+    if (!S.enabled) {
+      govOwn(() => requestAnimationFrame(tick));
+      return;
+    }
     S.renderTicks++;
     govOwn(() => requestAnimationFrame(tick));
   };
@@ -3361,7 +3652,7 @@ function installRafMonitor() {
 function installMemorySampler() {
   if (!performance.memory) return;
   const sample = () => {
-    if (!S.paused && performance.memory) S.mem.push(nowMs(), performance.memory.usedJSHeapSize);
+    if (S.enabled && !S.paused && performance.memory) S.mem.push(nowMs(), performance.memory.usedJSHeapSize);
   };
   sample();
   govOwn(() => setInterval(sample, 1000));
@@ -3991,7 +4282,7 @@ function govRun(src, reg, fn, thisArg, args, registrationId) {
   // Once this layer has taken itself out (or been switched off from the panel)
   // it must be nothing but a pass-through: these wrappers stay installed on
   // timers the page registered before it gave up.
-  if (GOV.disabled || !reg) return fn.apply(thisArg, args);
+  if (GOV.disabled || !S.enabled || !reg) return fn.apply(thisArg, args);
   const tEnter = performance.now();
   let gap = govMinGap(src);
   let adaptive = false;
@@ -5097,6 +5388,52 @@ tr.ants-details table.ants-sub td { color: #bbb; }
 }
 /* Elements of a node that is currently drawn as a rectangle: see lodSweepDom. */
 .ants-lod-box { display: none !important; }
+.ants-off-note {
+  border-left: 3px solid #AE7719; padding: 6px 8px; margin: 6px 0;
+  background: rgba(174, 119, 25, 0.08); color: #e8e8ee;
+}
+/* The tracker's own node UI: a pill holding a round switch and the gear that
+   opens the panel. Marked with .ants-own, which every low-zoom sweep skips — this
+   is the control that switches the tool off, so it must be reachable at 10% zoom
+   with every setting on, on a page where nothing else is. */
+.ants-node-pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px; margin: 5px 0;
+  border: 1px solid rgba(174, 119, 25, 0.55);
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.12);
+  width: max-content; box-sizing: border-box;
+}
+.ants-node-pill button {
+  /* 22px including the ring, and the same 22px the glyph is drawn in: one unit of
+     the glyph's viewBox is one pixel, so the gear's tips and the ring's centre line
+     are the same circle. */
+  width: 22px; height: 22px; padding: 0; margin: 0; box-sizing: border-box;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 50%;
+  background: transparent;
+  cursor: pointer;
+  line-height: 0;
+  font: inherit;
+  -webkit-appearance: none; appearance: none;
+}
+.ants-node-btn-gear { border: none; }
+.ants-node-btn-gear svg { stroke: #AE7719; }
+.ants-node-btn-tick {
+  /* The ring is the same line as the gear's silhouette, in the same colour. */
+  border: 1.5px solid #AE7719 !important;
+  background: transparent; /* unchecked: the theme's own background, no fill of ours */
+}
+.ants-node-btn-tick svg { stroke: #AE7719; }
+.ants-node-btn-tick[aria-checked="true"] {
+  /* Checked: the inside becomes the dark fill, ring and checkmark stay the accent. */
+  background: #0D2A2A !important;
+}
+/* Hovering never changes the accent: both controls are #AE7719, checked or not,
+   hovered or not. Only the background behind them moves. */
+.ants-node-btn:hover { background: rgba(174, 119, 25, 0.16); }
+.ants-node-btn-tick:hover { border-color: #AE7719 !important; }
+.ants-node-btn-tick[aria-checked="true"]:hover { background: #0D2A2A !important; }
 /* Focus mode: the node's DOM UI is switched off — no hover, no click, no wheel
    capture, no tooltips — while it is too small on screen to be used, or while it
    is far enough off screen not to be looked at. Only the *widgets* go: the node
@@ -5129,6 +5466,9 @@ tr.ants-details table.ants-sub td { color: #bbb; }
   cursor: pointer; z-index: 99998; box-shadow: 0 2px 8px rgba(0,0,0,0.4);
 }
 #ants-corner-btn:hover { background: #33333a; }
+/* The master switch takes the corner button away with it: with the tool off,
+   nothing on screen should claim to be measuring. The node's own pill stays. */
+#ants-corner-btn.ants-hidden-by-switch { display: none !important; }
 .ants-copyrow { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
 `;
 
@@ -5436,6 +5776,13 @@ function buildPanel() {
     text: "📋 Copy",
     title: "Copy a plain-text snapshot of every tab, for pasting into a chat or bug report",
   });
+  ui.powerBtn = el("span", {
+    class: "ants-hbtn",
+    text: "⏻ Off",
+    title:
+      "Switch the tracker off completely: no hooks wrapped, no sampling, no scheduler deferrals, no redraw cap, no low-zoom drawing, no DOM " +
+      "touched. Same switch as the checkbox on the tracker's own node. Your settings are kept and come back when you switch it on again.",
+  });
   ui.pauseBtn = el("span", {
     class: "ants-hbtn",
     text: "⏸ Pause",
@@ -5444,12 +5791,20 @@ function buildPanel() {
   const resetBtn = el("span", { class: "ants-hbtn", text: "⟲ Reset", title: "Clear all recorded samples (keeps mutes and settings)" });
   const closeBtn = el("span", { class: "ants-hbtn", text: "✕", title: "Close" });
   actions.appendChild(copyBtn);
+  actions.appendChild(ui.powerBtn);
   actions.appendChild(ui.pauseBtn);
   actions.appendChild(resetBtn);
   actions.appendChild(closeBtn);
   header.appendChild(title);
   header.appendChild(actions);
   panel.appendChild(header);
+
+  // The state banner. With the tracker switched off the panel still opens (the
+  // gear on the node is the way back), and this is what it says instead of a wall
+  // of frozen numbers.
+  ui.offBanner = el("div", { id: "ants-tracker-off-banner", class: "ants-note" });
+  ui.offBanner.style.display = "none";
+  panel.appendChild(ui.offBanner);
 
   const summary = el("div", { id: "ants-tracker-summary" });
   const row1 = el("div", { class: "ants-sum-row" });
@@ -5522,6 +5877,11 @@ function buildPanel() {
   copyBtn.addEventListener("click", (e) => copyTelemetryReport(e.currentTarget));
   ui.pauseBtn.addEventListener("click", () => togglePause());
   resetBtn.addEventListener("click", () => resetAllStats(true));
+  if (ui.powerBtn) {
+    ui.powerBtn.addEventListener("click", () => {
+      antsSetEnabled(!antsEnabled());
+    });
+  }
   closeBtn.addEventListener("click", () => togglePanel(false));
   makeDraggable(header, panel);
 
@@ -5578,6 +5938,22 @@ function makeDraggable(handle, target) {
 // ------------------------------------------------------------ summary bar --
 
 function renderSummary() {
+  if (ui.offBanner) {
+    setText(
+      ui.offBanner,
+      S.enabled
+        ? ""
+        : "The tracker is switched off. Nothing is wrapped, sampled, deferred or drawn differently: this page is ComfyUI's own, and the numbers " +
+          "below are the last ones recorded before it went off. The checkbox next to the gear on the tracker's node — or ⏻ On here — switches it " +
+          "back on with exactly the settings you had."
+    );
+    ui.offBanner.style.display = S.enabled ? "none" : "block";
+    ui.offBanner.classList.toggle("ants-off-note", !S.enabled);
+  }
+  if (ui.powerBtn) {
+    setText(ui.powerBtn, S.enabled ? "⏻ Off" : "⏻ On");
+    ui.powerBtn.classList.toggle("active", !S.enabled);
+  }
   const fm = frameMetrics();
   const pct = framePercentiles();
   const raf = rafMetrics();
@@ -8411,6 +8787,7 @@ function environmentInfo() {
     else if (typeof links === "object") linkCount = Object.keys(links).length;
   }
   return {
+    enabled: antsEnabled(),
     ua: typeof navigator !== "undefined" ? navigator.userAgent : "unknown",
     dpr: typeof window !== "undefined" ? window.devicePixelRatio : NaN,
     cores: typeof navigator !== "undefined" ? navigator.hardwareConcurrency : NaN,
@@ -8741,6 +9118,22 @@ function installDebugApi() {
       get report() {
         return buildTelemetryReport();
       },
+      // What has been recorded so far, for a script or a test that wants to hold
+      // the master switch to "nothing is measured while it is off".
+      get totals() {
+        let hookCalls = 0;
+        try {
+          for (const bucket of S.hooks.values()) hookCalls += bucket.calls || 0;
+        } catch (e) {
+          /* a bucket list that is mid-update is not worth a throw */
+        }
+        return {
+          frames: S.counters.frames,
+          framesTotal: S.counters.framesTotal,
+          draws: S.counters.draws,
+          hookCalls,
+        };
+      },
       open: () => togglePanel(true),
       close: () => togglePanel(false),
       toggle: () => togglePanel(),
@@ -8855,8 +9248,16 @@ function installDebugApi() {
         // Starts the on/off measurement of the link setting and returns its
         // state; the verdict lands in `state.ab.text` when it finishes.
         measureLinks: () => lodAbStart(),
+        // Is any of the drawing settings doing anything *right now*? (They can all
+        // be set and still be out of force, either because the zoom is above every
+        // threshold or because the master switch is off.)
+        get on() {
+          return lodOn();
+        },
         get focus() {
           return {
+            // Whether the whole tool is switched on at all (the node's checkbox).
+            enabled: antsEnabled(),
             // The node-zoom half: widget UI switched off below this zoom. The
             // nodes themselves keep selecting, dragging and opening — only the
             // DOM content on them stops answering the pointer.
@@ -8900,6 +9301,12 @@ function installDebugApi() {
           }
         },
         off: () => lodSet({ flatBelow: 0, idleCapMs: 0, thumbZoom: 0, detailZoom: 0, linkStyle: "spline", inertBelow: 0, fovea: false }),
+        // The master switch: the same one the checkbox on the tracker's own node
+        // and the ⏻ button in the panel drive.
+        get enabled() {
+          return antsEnabled();
+        },
+        setEnabled: (on) => antsSetEnabled(on),
         // Re-runs the display-scale check on demand (it also runs at startup,
         // once a second, and on every sweep) and hands back what it found.
         checkDisplay: () => {
@@ -9014,7 +9421,7 @@ app.registerExtension({
       if (ui.built && ui.panel.classList.contains("open") && ui.active === "gpu") refreshGpu();
     }, 2500));
     console.info(
-      `[ANTs Tracker] v${VERSION} running. Open the panel with the 🔧 button (or the node's Open Tracker widget); ` +
+      `[ANTs Tracker] v${VERSION} running. Open the panel with the 🔧 button (or the gear on the tracker's own node); ` +
         "window.__antsTracker.snapshot / .report give the same data from the console."
     );
   },
@@ -9028,14 +9435,16 @@ app.registerExtension({
     const onNodeCreated = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function () {
       const ret = onNodeCreated ? onNodeCreated.apply(this, arguments) : undefined;
-      this.addWidget("button", "Open Tracker", null, () => {
-        togglePanel();
-        try {
-          this.setDirtyCanvas(true, true);
-        } catch (e) {
-          /* cosmetic only */
-        }
-      });
+      // The pill: a master switch and the gear that opens the panel, side by side
+      // in one rounded frame. Marked .ants-own, so no low-zoom sweep can hide it —
+      // it is the control that switches the tool off, so it has to be there when
+      // everything else has been switched off.
+      antsAttachNodeWidget(this);
+      try {
+        this.setDirtyCanvas(true, true);
+      } catch (e) {
+        /* cosmetic only */
+      }
       return ret;
     };
   },
