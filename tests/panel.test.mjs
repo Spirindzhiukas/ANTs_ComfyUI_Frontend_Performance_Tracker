@@ -4,7 +4,7 @@
 // every 500ms, and an empty panel that could not explain itself.
 
 import { createHarness, FRAME_MS } from "./harness.mjs";
-import { suite, test, assert, assertEqual, assertGreater, assertIncludes } from "./framework.mjs";
+import { suite, test, assert, assertEqual, assertGreater, assertLess, assertIncludes } from "./framework.mjs";
 
 async function boot() {
   const h = createHarness();
@@ -22,6 +22,69 @@ function byId(h, id) {
 function byClass(h, cls) {
   return findAll(h, (n) => n._cls && n._cls.has(cls));
 }
+// Rows of the <tbody> of the n-th .ants-table inside a tab (the Nodes and
+// Testing tabs have several tables, so the index matters).
+function tableRows(h, tab, which = 0) {
+  const body = byId(h, "ants-tracker-body");
+  const idx = { timing: 0, nodes: 1, stalls: 2, load: 3, memory: 4, gpu: 5, testing: 6 }[tab];
+  const tables = body.children[idx].descendants().filter((n) => n.tagName === "TABLE" && n._cls && n._cls.has("ants-table"));
+  const table = tables[which];
+  if (!table) return [];
+  return table.children
+    .find((c) => c.tagName === "TBODY")
+    .children.filter((tr) => (tr._cls ? !tr._cls.has("ants-details") : true))
+    .map((tr) => tr.children.map((cell) => cell.textContent));
+}
+
+function headersOf(h, tab, which = 0) {
+  const body = byId(h, "ants-tracker-body");
+  const idx = { timing: 0, nodes: 1, stalls: 2 }[tab];
+  const tables = body.children[idx].descendants().filter((n) => n.tagName === "TABLE" && n._cls && n._cls.has("ants-table"));
+  const thead = tables[which].children.find((c) => c.tagName === "THEAD");
+  return thead.children[0].children;
+}
+
+// Click a header by its label; the active column carries a ▲/▼ in its text.
+function clickHeader(h, tab, label, which = 0) {
+  const th = headersOf(h, tab, which).find((x) => x.textContent.replace(/[▲▼]/g, "").trim() === label);
+  assert(th, `header "${label}" exists on the ${tab} tab (table ${which})`);
+  th.click();
+}
+
+// Owners with costs chosen so that "most expensive per frame" and "alphabetical"
+// are different orders — otherwise a sort test can pass with sorting broken.
+//   ZetaPack:  1 instance  x 9ms  = 9ms/frame, 9.0ms/call
+//   AlphaPack: 10 instances x 0.6ms = 6ms/frame, 0.6ms/call
+async function ownerFixture(h, owners) {
+  const list = owners || [
+    { pack: "ZetaPack", type: "ZetaNode", cost: 9, count: 1 },
+    { pack: "AlphaPack", type: "AlphaNode", cost: 0.6, count: 10 },
+  ];
+  const nodes = [];
+  for (const o of list) {
+    await h.registerExtension(o.pack, {
+      beforeRegisterNodeDef(nodeType, nodeData) {
+        if (nodeData.name !== o.type) return;
+        nodeType.prototype.onDrawForeground = function () {
+          h.busy(o.cost);
+        };
+      },
+    });
+    const Type = h.registerNodeType(o.type);
+    for (let i = 0; i < (o.count || 1); i++) nodes.push(h.makeNode(Type));
+  }
+  h.canvas.nodes = nodes;
+  return list;
+}
+
+async function openTab(h, tab) {
+  h.tracker.open();
+  clickTab(h, tab);
+  h.advance(600);
+  await h.flush();
+  await new Promise((r) => setImmediate(r));
+}
+
 function tabButtons(h) {
   const bar = byId(h, "ants-tracker-tabs");
   return bar ? bar.children.filter((c) => c.tagName === "BUTTON") : [];
@@ -246,6 +309,159 @@ suite("panel", () => {
     assertIncludes(text, "936.3 MB in use", "in use is reserved minus idle, not reserved");
     assert(!text.includes("torch allocated"), "the mislabel that read reserved as allocated is gone");
     assertIncludes(text, "not torch", "the remainder is attributed honestly");
+  });
+
+  test("Timing headers sort by every column, with unmeasured rows last", async () => {
+    const h = await boot();
+    await ownerFixture(h);
+    drawLoop(h, 3);
+    await openTab(h, "timing");
+
+    const owner = (i) => tableRows(h, "timing")[i][1];
+    assert(owner(0).includes("ZetaPack"), "default order is most expensive per drawn frame first");
+    assert(owner(1).includes("AlphaPack"), "and the cheaper-per-frame owner is second");
+
+    // ms/call asks a different question, and must produce a different order.
+    clickHeader(h, "timing", "ms/call");
+    assert(owner(0).includes("ZetaPack"), "sorting by ms/call leads with the 9ms single call");
+    clickHeader(h, "timing", "ms/call");
+    assert(owner(0).includes("AlphaPack"), "second click reverses the order");
+    clickHeader(h, "timing", "ms/call");
+    assert(owner(0).includes("ZetaPack"), "third click is back to the default order");
+
+    clickHeader(h, "timing", "Owner");
+    assert(owner(0).includes("AlphaPack"), "plain A→Z for a name column");
+    clickHeader(h, "timing", "Owner");
+    assert(owner(0).includes("ZetaPack"), "reversed A→Z");
+    clickHeader(h, "timing", "Owner");
+    assert(owner(0).includes("ZetaPack"), "and back to the default order");
+  });
+
+  test("sorting by a column nobody measured keeps those rows last", async () => {
+    const h = await boot();
+    await ownerFixture(h);
+    drawLoop(h, 3);
+    // Call one owner's wrapped hook outside any redraw: that is off-frame work.
+    const ZetaNode = h.LiteGraph.registered_node_types.ZetaNode;
+    for (let i = 0; i < 4; i++) ZetaNode.prototype.onDrawForeground.call({});
+    h.advance(300);
+    await openTab(h, "timing");
+
+    const rows = () => tableRows(h, "timing");
+    clickHeader(h, "timing", "off-frame ms");
+    assert(rows()[0][1].includes("ZetaPack"), "the only measured off-frame value sorts first");
+    assert(rows()[1][6] === "—", "the other row has no off-frame value and is rendered as a dash");
+    clickHeader(h, "timing", "off-frame ms");
+    assert(rows()[0][1].includes("ZetaPack"), "reversing the sort still keeps the unmeasured row last");
+    // 4 off-frame calls at 9ms each must not have been folded into the frame:
+    // ms/frame is the one in-frame call per redraw, not 45ms.
+    const zRow = rows().find((r) => r[1].includes("ZetaPack"));
+    assertLess(Number(zRow[2]), 15, "off-frame time is not counted as part of a frame");
+    assertGreater(Number(zRow[6]), 20, "and it is reported in its own column instead");
+  });
+
+  test("header clicks reorder rows even though the pointer is inside the panel", async () => {
+    const h = await boot();
+    await ownerFixture(h);
+    drawLoop(h, 3);
+    await openTab(h, "timing");
+    // Hovering the tab body sets deferReorder, which is what stops rows moving
+    // under the pointer during the periodic refresh.
+    byId(h, "ants-tracker-body")._fire("mouseenter");
+    const before = tableRows(h, "timing")[0][1];
+    clickHeader(h, "timing", "Owner");
+    const after = tableRows(h, "timing")[0][1];
+    assert(after !== before, "an explicit sort click applies immediately");
+    assert(after.includes("AlphaPack"), "and the new order is in place");
+    h.advance(1000);
+    await h.flush();
+    assertEqual(tableRows(h, "timing")[0][1], after, "the pointer freeze is restored afterwards");
+  });
+
+  test("Stalls table is sortable and reports per-stall cost and share", async () => {
+    const h = await boot();
+    await openTab(h, "stalls");
+    h.advance(4000);
+    const loaf = (fn, duration, blocking, layout) => ({
+      startTime: h.clock.now - 100,
+      duration,
+      blockingDuration: blocking,
+      scripts: [
+        {
+          sourceURL: `http://localhost:8188/extensions/${fn}pack/js/${fn}.js`,
+          sourceFunctionName: fn,
+          invoker: "TimerHandler:setInterval",
+          duration: blocking,
+          forcedStyleAndLayoutDuration: layout,
+        },
+      ],
+    });
+    // Slow and rare vs fast and frequent, so the two orders disagree.
+    h.emitPerformance("long-animation-frame", [loaf("rare", 400, 380, 0)]);
+    for (let i = 0; i < 8; i++) h.emitPerformance("long-animation-frame", [loaf("often", 90, 70, 40)]);
+    h.advance(600);
+    await h.flush();
+
+    const rows = () => tableRows(h, "stalls");
+    assertGreater(rows().length, 1, "both scripts are listed");
+    assert(rows()[0][0].includes("often"), "default order is by total blocking time");
+    assertGreater(rows()[0][3], rows()[1][3], "count is a column");
+    assert(rows()[0][5].endsWith("%"), "share of all blocking is a column");
+    assert(rows()[0][6].endsWith("ms"), "average ms per stall is a column");
+
+    clickHeader(h, "stalls", "ms/stall");
+    assert(rows()[0][0].includes("rare"), "one heavy stall sorts first by ms/stall");
+    clickHeader(h, "stalls", "forced layout");
+    assert(rows()[0][0].includes("often"), "forced-layout sort points at the thrashing script");
+    clickHeader(h, "stalls", "forced layout");
+    assert(rows()[0][0].includes("often"), "reversing it keeps the measured row first");
+    assert(rows()[1][0].includes("rare"), "because the script with no forced layout is unmeasured, not zero");
+  });
+
+  test("long tables say how many rows they are hiding, and can show them all", async () => {
+    const h = await boot();
+    await ownerFixture(h);
+    drawLoop(h, 3);
+    await openTab(h, "timing");
+    const caps = h.sandbox.window.__antsTracker.rowCaps;
+    assertEqual(caps.timing, 120, "the cap is exposed so it can be tuned");
+    assertEqual(tableRows(h, "timing").length, 2, "two owners fit under the cap");
+    caps.timing = 1;
+    h.advance(600);
+    await h.flush();
+    const body = byId(h, "ants-tracker-body");
+    const more = body.descendants().find((n) => n._cls && n._cls.has("ants-more"));
+    assert(more, "a truncation note exists");
+    assert(more.style.display !== "none", "and is visible when rows are hidden");
+    assertIncludes(more.textContent, "Showing 1 of 2", "it says how many rows are hidden");
+    assertEqual(tableRows(h, "timing").length, 1, "only the capped rows are rendered");
+    more.children.find((c) => c.tagName === "BUTTON").click();
+    h.advance(600);
+    await h.flush();
+    assertEqual(tableRows(h, "timing").length, 2, "Show all renders every row again");
+    caps.timing = 120;
+  });
+
+  test("node types are capped and sortable by per-call cost", async () => {
+    const h = await boot();
+    // HeavyNode: 2 instances x 6ms = 12ms/frame, 6ms/call.
+    // ManyNode:  1 instance  x 3ms =  3ms/frame, 3ms/call.
+    await ownerFixture(h, [
+      { pack: "HeavyPack", type: "HeavyThing", cost: 6, count: 2 }, // 12ms/frame, 6ms/call
+      { pack: "ManyPack", type: "CheapThing", cost: 3, count: 1 }, //  3ms/frame, 3ms/call
+    ]);
+    drawLoop(h, 3);
+    await openTab(h, "nodes");
+
+    const types = () => tableRows(h, "nodes", 1);
+    assert(types()[0][0].includes("HeavyThing"), "default order is most expensive per frame first");
+    assertGreater(Number(types()[0][4]), 5, "ms/call is reported");
+    clickHeader(h, "nodes", "ms/call", 1);
+    assert(types()[0][0].includes("HeavyThing"), "sorted by ms/call, the 6ms call still leads");
+    clickHeader(h, "nodes", "ms/call", 1);
+    assert(types()[0][0].includes("CheapThing"), "reversing puts the cheap call first");
+    clickHeader(h, "nodes", "Node type", 1);
+    assert(types()[0][0].includes("CheapThing"), "A→Z is available too (CheapThing < HeavyThing)");
   });
 
   test("node widget button opens the panel", async () => {

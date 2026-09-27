@@ -83,6 +83,32 @@ seconds. Frame statistics cover 10 seconds, and automatically widen to
 so a 1 fps or 5-second cap still produces meaningful `fps` and p95
 numbers instead of `0`. The panel prints which window it used.
 
+### Sorting and long lists
+
+Every column header in the Timing, Nodes and Stalls tables is a sort
+button: click to sort by that column, click again to reverse, click a
+third time to go back to the table's default (most expensive first).
+
+Two details that matter on live data:
+
+- Sorting uses the underlying numbers, never the displayed text.
+  As text, `1,234.5ms` sorts before `9.2ms`.
+- A row with no value for the chosen column (`—`) sorts **last in both
+  directions**. A dash means unmeasured, not cheap — a node pack that
+  never reported off-frame time should not outrank one that did.
+
+Ordering is frozen while the pointer is inside the table, so rows do not
+move out from under your cursor during the twice-a-second refresh; an
+explicit header click still applies immediately.
+
+A thousand-node graph produces several hundred owners and node types.
+Rendering all of them twice a second costs real milliseconds, so the
+tables render the most expensive 120 owners / 60 node types / 60 scripts
+and print how many are hidden, with a **Show all rows** button that lifts
+the cap for that tab. The caps live on `window.__antsTracker.rowCaps`
+(`{ timing, nodes, stalls }`), so a console can lower them further — the
+Stalls tab will happily show you what this panel costs if you get greedy.
+
 ### Timing tab
 
 Rows are *other* extensions (this tracker never lists itself).
@@ -106,6 +132,15 @@ while drawing and listed as `(unattributed) <Type> · instance hook`
 already present on a node prototype before this extension loaded are
 adopted too, and labelled `(pre-existing) <Type>`.
 
+When an instance hook *delegates* to the prototype method (or one
+extension wraps another's hook), the same work appears in two rows. The
+outer row carries the milliseconds and the inner one is tagged
+**nested**: its calls are counted, its time is not, because the outer
+hook's measured time already contains it. That is what keeps the table
+adding up to the frame budget instead of reporting double the truth —
+and it is why a row can legitimately show `calls/frame 2.0` with
+`ms/call —`.
+
 ### Nodes tab
 
 Where the frame actually went, measured around LiteGraph's own calls
@@ -122,27 +157,42 @@ rather than through extension hooks:
   own `draw()`, or a Nodes-2.0/Vue component; the Stalls tab is the
   next place to look.
 
-A per-node-type table follows (cost per *drawn* node of that type, so a
-type used 50 times is not penalised for existing), plus a sampled
-`canvas.setDirty()` caller table — see Stalls below.
+A per-node-type table follows, sortable by any column. `calls/frame` is
+calls per redraw of the canvas, so for a type painted every frame it is
+close to the number of instances on screen, and a value well below 1
+means most of that type is off-screen or culled on a given redraw. The
+interesting pair is `% of frame` (how much of the budget this type eats)
+and `ms/call` (whether that is one heavy node or many cheap ones). A
+sampled `canvas.setDirty()` caller table follows — see Stalls below.
 
 ### Stalls tab
 
 Frame cost is not the only way to lose FPS, so this tab reports
 main-thread blocking *outside* the draw path, from Long Animation
-Frames (Chrome 123+) with a `longtask` fallback:
+Frames (Chrome 123+) with a `longtask` fallback. Columns, all sortable:
 
 - **blocking ms/s** and **stalls/s**, the honest headline numbers.
 - **where** — script URL, function name, source line, and the
-  extension pack when the script lives under `/extensions/`.
+  extension pack when the script lives under `/extensions/`. Scripts
+  from ComfyUI's own bundle appear as `assets/<file>.js` with pack
+  `unknown`, which is itself the answer: it is the frontend, not a custom
+  node pack.
 - **invoker** — e.g. `TimerHandler:setInterval`, which names the
   mechanism behind a heartbeat.
+- **count / blocking / % of blocking / ms per stall / worst** — a high
+  count with a low ms-per-stall is a cheap heartbeat; a low count with a
+  high ms-per-stall is one expensive operation worth a DevTools trace.
 - **forced layout ms** — style/layout time inside the long frame,
   which is the signature of a DOM-thrashing extension.
 - **redraw requests/s by caller** — `canvas.setDirty()` wrapped
   exactly (the request rate is precise) and its call stack sampled
   ~20×/second to say *who* is asking for redraws. A rogue heartbeat
   shows up here by name instead of as "something is ticking".
+
+This tab also names **this panel** when the panel itself stalls the
+thread — look for `ANTs_ComfyUI_Frontend_Performance_Tracker/tracker.js`
+— and the Memory tab's "tracker's own footprint" block gives the
+per-second cost. If those numbers are not small, say so: it is a bug.
 
 ### Load tab
 
@@ -287,7 +337,7 @@ logged for DevTools.
 ## Development
 
 ```
-node tests/run-tests.mjs          # 37 tests, no dependencies, no browser
+node tests/run-tests.mjs          # 45 tests, no dependencies, no browser
 node tests/run-tests.mjs timing   # filter by name fragment
 python3 tests/test_init.py        # backend route parsing + graceful fallbacks
 node tests/demo.mjs               # print what the panel says, with no ComfyUI
@@ -345,5 +395,8 @@ behaviour first; see `REVIEW.md` for line references):
   second) in the report, and Pause/Reset.
 
 Also new: ring buffers are typed arrays written in place instead of
-allocating one object per hook call and shifting arrays, so the profiler
-is cheaper while profiling than it was.
+allocating one object per hook call and shifting arrays, and long tables
+render the top rows with an explicit count of what is hidden (a
+10,000-hook graph made the panel itself a visible entry in the Stalls
+tab, which is a bug report against this tool, so the row caps are
+deliberate and tunable).

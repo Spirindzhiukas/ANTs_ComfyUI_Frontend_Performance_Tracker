@@ -486,11 +486,13 @@ function hookRows() {
   for (const [key, bucket] of S.hooks.entries()) {
     trimIfLive(bucket.inside, now - WINDOW_MS);
     if (bucket.outside) trimIfLive(bucket.outside, now - WINDOW_MS);
+    if (bucket.nested) trimIfLive(bucket.nested, now - WINDOW_MS);
     const insideMs = bucket.inside.sum;
     const insideCalls = bucket.inside.n;
     const outsideMs = bucket.outside ? bucket.outside.sum : 0;
     const outsideCalls = bucket.outside ? bucket.outside.n : 0;
-    if (!insideCalls && !outsideCalls && !S.muted.has(bucket.label)) continue;
+    const nestedCalls = bucket.nested ? bucket.nested.n : 0;
+    if (!insideCalls && !outsideCalls && !nestedCalls && !S.muted.has(bucket.label)) continue;
 
     let row = byLabel.get(bucket.label);
     if (!row) {
@@ -501,6 +503,7 @@ function hookRows() {
         insideCalls: 0,
         outsideMs: 0,
         outsideCalls: 0,
+        nestedCalls: 0,
         skipped: 0,
         lifetimeCalls: 0,
         hooks: [],
@@ -513,6 +516,7 @@ function hookRows() {
     row.insideCalls += insideCalls;
     row.outsideMs += outsideMs;
     row.outsideCalls += outsideCalls;
+    row.nestedCalls += nestedCalls;
     row.skipped += bucket.skipped;
     row.lifetimeCalls += bucket.calls;
     const msPerCall = insideCalls ? insideMs / insideCalls : NaN;
@@ -522,6 +526,7 @@ function hookRows() {
       insideCalls,
       outsideMs,
       outsideCalls,
+      nestedCalls,
       msPerCall,
       skipped: bucket.skipped,
       muted: row.muted,
@@ -541,6 +546,7 @@ function hookRows() {
         insideCalls: 0,
         outsideMs: 0,
         outsideCalls: 0,
+        nestedCalls: 0,
         skipped: 0,
         lifetimeCalls: 0,
         hooks: [],
@@ -554,7 +560,9 @@ function hookRows() {
   for (const row of rows) {
     row.msPerFrame = framesInWindow > 0 ? row.insideMs / framesInWindow : NaN;
     row.share = windowMeanFrameMs > 0 ? row.msPerFrame / windowMeanFrameMs : NaN;
-    row.callsPerFrame = framesInWindow > 0 ? row.insideCalls / framesInWindow : NaN;
+    // Every invocation counts as a call, nested ones included — the call really
+    // happened. Only the milliseconds are owned by the outer hook.
+    row.callsPerFrame = framesInWindow > 0 ? (row.insideCalls + row.nestedCalls) / framesInWindow : NaN;
     row.msPerCall = row.insideCalls ? row.insideMs / row.insideCalls : NaN;
     row.hooks.sort((a, b) => b.insideMs - a.insideMs);
   }
@@ -694,12 +702,21 @@ function wrapHook(fn, label, hookName, kind) {
     }
     const dt = performance.now() - t0;
     bucket.calls++;
-    if (drawDepth > 0) {
+    if (hookDepth > 0) {
+      // Called from inside another wrapped hook — the pattern that produces
+      // paired rows on real graphs, where a node's own hook delegates to the
+      // (already wrapped) prototype method, or an extension wraps another
+      // extension's hook. The outer call's measured time already includes this
+      // one, so recording the milliseconds here too made the Timing rows add up
+      // to double the frame they describe. Count the call, claim no time.
+      if (!bucket.nested) bucket.nested = new Ring();
+      bucket.nested.push(t0, 0);
+    } else if (drawDepth > 0) {
+      // Outermost hook, inside a canvas draw: this is the frame's attributed
+      // time. Nested hooks never reach here (see above), so the budget cannot
+      // be inflated twice by the same milliseconds.
       bucket.inside.push(t0, dt);
-      // Only the outermost wrapped hook adds to the frame's attributed time: an
-      // extension that calls another (already wrapped) hook would otherwise be
-      // counted twice, once on its own and once inside its caller's total.
-      if (hookDepth === 0) curAttrMs += dt;
+      curAttrMs += dt;
     } else {
       // Called outside canvas draw() — an onExecuted/onConfigure hook, a
       // setInterval, a DOM event. v1 added this to the frame that happened to
@@ -1325,6 +1342,10 @@ tr.ants-details table.ants-sub td { color: #bbb; }
 .ants-btn.active { background: #6b2c2c; border-color: #a04a4a; color: #fff; }
 .ants-btn.primary { background: #33465c; border-color: #46688c; color: #dfe9f5; }
 .ants-caret { cursor: pointer; color: #777; user-select: none; display: inline-block; width: 10px; }
+.ants-table th.ants-sortable { cursor: pointer; }
+.ants-table th.ants-sortable:hover { color: #f0a020; }
+.ants-table th.ants-sorted { color: #f0a020; }
+.ants-more { margin-top: 4px; }
 .ants-caret:hover { color: #f0a020; }
 .ants-tag {
   font-size: 10px; color: #8b8b96; border: 1px solid #3a3a42; border-radius: 3px;
@@ -1417,12 +1438,145 @@ function makeTable(headers) {
   const table = el("table", { class: "ants-table" });
   const thead = el("thead");
   const tr = el("tr");
-  for (const h of headers) tr.appendChild(el("th", { text: h.label, class: h.right ? "ants-num" : null }));
+  const ths = [];
+  for (const h of headers) {
+    const th = el("th", { text: h.label, class: h.right ? "ants-num" : null });
+    ths.push(th);
+    tr.appendChild(th);
+  }
   thead.appendChild(tr);
   const tbody = el("tbody");
   table.appendChild(thead);
   table.appendChild(tbody);
-  return { table, thead, tbody };
+  return { table, thead, tbody, ths, headers };
+}
+
+// --- sorting ---------------------------------------------------------------
+// Click a header to sort by that column, click again to reverse it, click a
+// third time to go back to the table's default order.
+//
+// Two rules make this behave on live data:
+//   * sorting uses the underlying numbers, never the formatted text — as text,
+//     "1,234.5ms" sorts before "9.2ms", and a column of "—" has no order at all;
+//   * rows with no value for the chosen column sink to the bottom in BOTH
+//     directions, because a row showing "—" is unmeasured, not the cheapest
+//     thing on screen.
+function makeSorter(headers, getters, options) {
+  const opts = options || {};
+  const defaultKey = opts.defaultKey || null;
+  const dirFor = (key) => {
+    const h = headers.find((x) => x.key === key);
+    return h && h.text ? 1 : -1; // names read A→Z, costs read biggest-first
+  };
+  const defaultDir = opts.defaultDir || dirFor(defaultKey);
+  const state = { key: defaultKey, dir: defaultDir };
+  const sets = [];
+
+  function decorate() {
+    for (const ths of sets) {
+      for (let i = 0; i < ths.length; i++) {
+        const th = ths[i];
+        const h = headers[i];
+        if (!th || !h || !h.key) continue;
+        const active = state.key === h.key;
+        if (active) th.classList.add("ants-sorted");
+        else th.classList.remove("ants-sorted");
+        setText(th, active ? `${h.label} ${state.dir > 0 ? "▲" : "▼"}` : h.label);
+      }
+    }
+  }
+
+  function cycle(key) {
+    if (!key) return;
+    if (state.key !== key) {
+      state.key = key;
+      state.dir = dirFor(key);
+    } else if (state.dir === dirFor(key)) {
+      state.dir = -dirFor(key);
+    } else {
+      state.key = defaultKey;
+      state.dir = defaultDir;
+    }
+    decorate();
+    if (opts.onChange) opts.onChange();
+  }
+
+  function attach(ths) {
+    sets.push(ths);
+    for (let i = 0; i < ths.length; i++) {
+      const th = ths[i];
+      const h = headers[i];
+      if (!th || !h || !h.key || th.__antsSortKey) continue;
+      th.__antsSortKey = h.key;
+      th.classList.add("ants-sortable");
+      th.title = `Sort by ${h.label}. Click again to reverse, a third time for the default order.`;
+      th.addEventListener("click", () => cycle(h.key));
+    }
+    decorate();
+  }
+
+  function sort(items) {
+    const get = getters[state.key];
+    if (!get) return items;
+    const out = items.slice();
+    out.sort((a, b) => {
+      const av = get(a);
+      const bv = get(b);
+      const aMissing = av === null || av === undefined || (typeof av === "number" && !Number.isFinite(av));
+      const bMissing = bv === null || bv === undefined || (typeof bv === "number" && !Number.isFinite(bv));
+      if (aMissing && bMissing) return 0;
+      if (aMissing) return 1;
+      if (bMissing) return -1;
+      if (typeof av === "string" || typeof bv === "string") return String(av).localeCompare(String(bv)) * state.dir;
+      return (av - bv) * state.dir;
+    });
+    return out;
+  }
+
+  const api = { state, attach, sort, decorate, cycle };
+  api.reset = () => {
+    state.key = defaultKey;
+    state.dir = defaultDir;
+    decorate();
+  };
+  return api;
+}
+
+// Row caps. A graph with a thousand nodes produces six hundred owners and four
+// hundred node types; rendering all of them twice a second costs the page real
+// milliseconds (the Stalls tab will happily name this panel for it) and nobody
+// reads row 400 anyway. Tables render the most expensive N rows, say how many
+// are hidden, and offer "Show all" if you actually want the whole list.
+const rowCaps = { timing: 120, nodes: 60, stalls: 60 };
+
+function makeRowCapper(container, capKey, noun, onChange) {
+  const wrap = el("div", { class: "ants-note ants-more" });
+  const note = el("span");
+  const btn = el("button", { class: "ants-btn", text: "Show all rows" });
+  const api = { all: false };
+  btn.addEventListener("click", () => {
+    api.all = !api.all;
+    setText(btn, api.all ? "Back to the most expensive rows" : "Show all rows");
+    if (onChange) onChange();
+  });
+  wrap.appendChild(note);
+  wrap.appendChild(document.createTextNode(" "));
+  wrap.appendChild(btn);
+  container.appendChild(wrap);
+  api.apply = (rows) => {
+    const cap = api.all ? Infinity : rowCaps[capKey] || rows.length;
+    if (rows.length <= cap) {
+      // Nothing hidden: hide the whole line, including the button. A "Show all
+      // rows" button next to three visible rows is just noise.
+      setText(note, "");
+      wrap.style.display = "none";
+      return rows;
+    }
+    setText(note, `Showing ${cap} of ${rows.length} ${noun}, most expensive first by the current sort.`);
+    wrap.style.display = "";
+    return rows.slice(0, cap);
+  };
+  return api;
 }
 
 // Keyed, order-stable row set. Rows keep their identity across refreshes, so
@@ -1773,25 +1927,76 @@ function buildTimingTab(container) {
   const context = el("div", { class: "ants-note" });
   const empty = el("div", { class: "ants-empty" });
   const table = makeTable([
-    { label: "Owner" },
-    { label: "ms/frame", right: true },
-    { label: "% of frame", right: true },
-    { label: "calls/frame", right: true },
-    { label: "ms/call", right: true },
-    { label: "off-frame ms", right: true },
+    { label: "Owner", key: "label", text: true },
+    { label: "ms/frame", right: true, key: "ms" },
+    { label: "% of frame", right: true, key: "share" },
+    { label: "calls/frame", right: true, key: "calls" },
+    { label: "ms/call", right: true, key: "perCall" },
+    { label: "off-frame ms", right: true, key: "off" },
     { label: "", right: true },
   ]);
   const note = el("p", { class: "ants-note" });
   note.textContent =
-    "Sorted by cost per drawn frame, which is the number that does not change just because you panned faster. " +
+    "Click any column header to sort by it (again to reverse, a third time for the default: most expensive first). " +
+    "Cost per drawn frame is the number that does not change just because you panned faster. " +
     "\"Mute\" skips that owner's draw hooks outright, so the FPS change you then measure is real rather than merely unmeasured, " +
     "and it is reversible instantly. Off-frame ms is hook time that ran outside a canvas redraw (onExecuted, a timer, a DOM event): " +
     "it is deliberately kept out of ms/frame, but if it is large it is stealing main-thread time that frames need. " +
-    "Click a row's ▸ for the per-hook breakdown.";
+    "Click a row's ▸ for the per-hook breakdown. A row tagged \"nested\" was called from inside another wrapped hook " +
+    "(normally a node's own hook delegating to the prototype method): its calls are real, but its milliseconds are already " +
+    "inside the outer hook, so they are not counted twice.";
   container.appendChild(context);
   container.appendChild(empty);
   container.appendChild(table.table);
+  const capper = makeRowCapper(container, "timing", "owners", () => update());
   container.appendChild(note);
+
+  // Hook rows share one sort order across every expanded row, so the whole tab
+  // reads consistently.
+  let framesInWindowNow = 0;
+  const hookSorter = makeSorter(
+    [
+      { label: "Hook", key: "hook", text: true },
+      { label: "ms/frame", right: true, key: "ms" },
+      { label: "calls", right: true, key: "calls" },
+      { label: "ms/call", right: true, key: "perCall" },
+      { label: "off-frame ms", right: true, key: "off" },
+      { label: "skipped", right: true, key: "skipped" },
+    ],
+    {
+      hook: (h) => h.hook,
+      ms: (h) => (framesInWindowNow ? h.insideMs / framesInWindowNow : null),
+      calls: (h) => h.insideCalls,
+      perCall: (h) => h.msPerCall,
+      off: (h) => (h.outsideMs > 0 ? h.outsideMs : null),
+      skipped: (h) => (h.skipped > 0 ? h.skipped : null),
+    },
+    { defaultKey: "ms", onChange: () => update() }
+  );
+
+  const sorter = makeSorter(
+    table.headers,
+    {
+      label: (r) => r.label,
+      ms: (r) => r.msPerFrame,
+      share: (r) => r.share,
+      calls: (r) => r.callsPerFrame,
+      perCall: (r) => r.msPerCall,
+      off: (r) => (r.outsideMs > 0 ? r.outsideMs : null),
+    },
+    {
+      defaultKey: "ms",
+      // A header click happens with the pointer inside the panel, where rows are
+      // normally frozen in place; sorting is an explicit request, so apply it
+      // immediately and then keep the freeze until the pointer leaves.
+      onChange: () => {
+        rowSet.deferReorder = false;
+        update();
+        rowSet.deferReorder = true;
+      },
+    }
+  );
+  sorter.attach(table.ths);
 
   const rowSet = new RowSet(table.tbody, () => {
     const caretCell = td();
@@ -1814,13 +2019,14 @@ function buildTimingTab(container) {
     details.appendChild(dcell);
     const summaryLine = el("div", { class: "ants-note" });
     const sub = makeTable([
-      { label: "Hook" },
-      { label: "ms/frame", right: true },
-      { label: "calls", right: true },
-      { label: "ms/call", right: true },
-      { label: "off-frame ms", right: true },
-      { label: "skipped", right: true },
+      { label: "Hook", key: "hook", text: true },
+      { label: "ms/frame", right: true, key: "ms" },
+      { label: "calls", right: true, key: "calls" },
+      { label: "ms/call", right: true, key: "perCall" },
+      { label: "off-frame ms", right: true, key: "off" },
+      { label: "skipped", right: true, key: "skipped" },
     ]);
+    hookSorter.attach(sub.ths);
     dcell.appendChild(summaryLine);
     dcell.appendChild(sub.table);
     const subRows = new RowSet(sub.tbody, () => {
@@ -1846,10 +2052,22 @@ function buildTimingTab(container) {
       row.nameCell.appendChild(el("span", { class: "ants-tag", text: r.label.startsWith("(pre-existing)") ? "adopted" : "instance" }));
     }
     if (r.muted) row.nameCell.appendChild(el("span", { class: "ants-tag", text: "muted" }));
+    if (r.nestedCalls > 0) {
+      const tag = el("span", { class: "ants-tag", text: "nested" });
+      tag.title =
+        `${r.nestedCalls} call(s) in the window came from inside another wrapped hook — usually a node's own hook delegating to ` +
+        "the prototype method, or one extension wrapping another. The outer hook's time already includes them, so they are counted " +
+        "as calls but not as milliseconds: that is what keeps this table adding up to the frame budget instead of doubling it.";
+      row.nameCell.appendChild(tag);
+    }
     setText(row.msCell, Number.isFinite(r.msPerFrame) ? fmtMs(r.msPerFrame) : "—");
     setText(row.shareCell, Number.isFinite(r.share) ? fmtPct(r.share) : "—");
     setText(row.callsCell, Number.isFinite(r.callsPerFrame) ? r.callsPerFrame.toFixed(r.callsPerFrame < 10 ? 2 : 0) : "—");
     setText(row.perCallCell, fmtMs(r.msPerCall, 3));
+    if (r.nestedCalls > 0) {
+      row.perCallCell.title =
+        "No ms/call for a hook that never owns any time: its cost is inside the outer hook it was called from.";
+    }
     setText(row.offCell, r.outsideMs > 0 ? fmtMs(r.outsideMs) : "—");
     if (r.outsideCalls > 0) {
       row.offCell.title = `${r.outsideCalls} call(s) outside a redraw (onExecuted / timer / DOM event driven), ${fmtMs(r.outsideMs / r.outsideCalls, 3)} ms/call.`;
@@ -1869,6 +2087,7 @@ function buildTimingTab(container) {
       [
         `${fmtMs(r.insideMs)}ms inside redraws in the window`,
         r.outsideMs > 0 ? `${fmtMs(r.outsideMs)}ms off-frame` : null,
+        r.nestedCalls ? `${r.nestedCalls} nested call(s) counted on the outer hook` : null,
         r.skipped ? `${r.skipped} call(s) skipped while muted` : null,
         r.lifetimeCalls ? `${r.lifetimeCalls} lifetime calls` : null,
       ]
@@ -1879,25 +2098,29 @@ function buildTimingTab(container) {
 
   function update() {
     const { rows, framesInWindow } = hookRows();
-    const visible = rows.filter((r) => r.insideCalls > 0 || r.outsideCalls > 0 || r.muted);
+    framesInWindowNow = framesInWindow;
+    const visible = sorter.sort(
+      rows.filter((r) => r.insideCalls > 0 || r.outsideCalls > 0 || r.nestedCalls > 0 || r.muted)
+    );
     setText(context, timingContextLine());
     setText(empty, visible.length ? "" : timingEmptyText());
     empty.style.display = visible.length ? "none" : "";
     table.table.style.display = visible.length ? "" : "none";
     rowSet.sync(
-      visible,
+      capper.apply(visible),
       (r) => r.label,
       (row, r) => {
         updateRow(row, r);
         if (row.isOpen()) {
           row.subRows.sync(
-            r.hooks,
+            hookSorter.sort(r.hooks),
             (h) => h.hook,
             (subRow, h) => {
               const c = subRow.nodes[0].children;
               setText(c[0], h.hook);
               setText(c[1], framesInWindow ? fmtMs(h.insideMs / framesInWindow) : "—");
-              setText(c[2], h.insideCalls);
+              setText(c[2], h.nestedCalls ? `${h.insideCalls} + ${h.nestedCalls} nested` : h.insideCalls);
+              if (h.nestedCalls) c[2].title = "Total calls, plus the ones that came from inside another wrapped hook (counted as calls, timed on the outer hook).";
               setText(c[3], fmtMs(h.msPerCall, 3));
               setText(c[4], h.outsideMs > 0 ? fmtMs(h.outsideMs) : "—");
               setText(c[5], h.skipped ? h.skipped : "—");
@@ -1908,7 +2131,7 @@ function buildTimingTab(container) {
     );
   }
 
-  ui.state.timing = { rowSet, update };
+  ui.state.timing = { rowSet, update, sorter };
 }
 
 // --- Nodes -----------------------------------------------------------------
@@ -1947,19 +2170,21 @@ function buildNodesTab(container) {
   ]);
 
   const types = makeTable([
-    { label: "Node type" },
-    { label: "ms/frame", right: true },
-    { label: "% of frame", right: true },
-    { label: "calls/frame", right: true },
-    { label: "ms/call", right: true },
-    { label: "p95 call", right: true },
+    { label: "Node type", key: "type", text: true },
+    { label: "ms/frame", right: true, key: "ms" },
+    { label: "% of frame", right: true, key: "share" },
+    { label: "calls/frame", right: true, key: "calls" },
+    { label: "ms/call", right: true, key: "perCall" },
+    { label: "p95 call", right: true, key: "p95" },
   ]);
   const typeNote = el("p", { class: "ants-note" });
   typeNote.textContent =
+    "Click any column header to sort by it (again to reverse, a third time for the default: most expensive first). " +
     "drawNode() time includes every wrapped hook as a subset, so do not add this table to the Timing tab. " +
-    "calls/frame near a small whole number means the type is purely paint-driven, which is normal. " +
-    "A ⏱ marks a type whose call count does not track the frame count: something is redrawing it on its own clock " +
-    "(a setInterval heartbeat) instead of because you panned.";
+    "\"calls/frame\" is calls per redraw of the canvas, so for a type that is painted every frame it is close to the number of " +
+    "instances on screen; a value well below 1 means most of this type is off-screen or culled on a given redraw, which is cheap " +
+    "by definition. Use \"% of frame\" and \"ms/call\" to find the expensive ones: a high ms/call with a low calls/frame is one " +
+    "heavy node, a low ms/call with a high calls/frame is many cheap nodes.";
 
   container.appendChild(budgetCallout);
   container.appendChild(el("div", { class: "ants-section-title", text: "Who is asking for redraws" }));
@@ -1978,6 +2203,40 @@ function buildNodesTab(container) {
   container.appendChild(el("div", { class: "ants-section-title", text: "Per node type" }));
   container.appendChild(types.table);
   container.appendChild(typeNote);
+
+  const typeCapper = makeRowCapper(container, "nodes", "node types", () => update());
+  const typeSorter = makeSorter(
+    types.headers,
+    {
+      type: (r) => r.type,
+      ms: (r) => r.msPerFrame,
+      share: (r) => (frameMetrics().meanFrameMs > 0 ? r.msPerFrame / frameMetrics().meanFrameMs : null),
+      calls: (r) => r.callsPerFrame,
+      perCall: (r) => r.msPerCall,
+      p95: (r) => r.p95,
+    },
+    {
+      defaultKey: "ms",
+      onChange: () => {
+        typeRows.deferReorder = false;
+        update();
+        typeRows.deferReorder = true;
+      },
+    }
+  );
+  typeSorter.attach(types.ths);
+  const invSorter = makeSorter(
+    invTable.headers,
+    {
+      sig: (s) => s.sig,
+      pack: (s) => s.pack,
+      est: (s) => s.estPerSec,
+      share: (s) => s.share,
+      samples: (s) => s.sampled,
+    },
+    { defaultKey: "est", onChange: () => update() }
+  );
+  invSorter.attach(invTable.ths);
 
   const typeRows = new RowSet(types.tbody, () => {
     const tr = el("tr", { class: "ants-row" });
@@ -2043,7 +2302,7 @@ function buildNodesTab(container) {
     invBits.push(inv.sources.length ? `top caller: ${inv.sources[0].sig}` : "no caller sampled yet");
     setText(invLine, invBits.join(" · "));
     invRows.sync(
-      inv.sources.slice(0, 12),
+      invSorter.sort(inv.sources).slice(0, 12),
       (s) => s.sig,
       (row, s) => {
         const c = row.nodes[0].children;
@@ -2055,20 +2314,15 @@ function buildNodesTab(container) {
       }
     );
 
-    const rows = nodeRows();
+    const rows = typeSorter.sort(nodeRows());
     typeRows.sync(
-      rows.slice(0, 40),
+      typeCapper.apply(rows),
       (r) => r.type,
       (row, r) => {
         const c = row.nodes[0].children;
         const share = fm.meanFrameMs > 0 ? r.msPerFrame / fm.meanFrameMs : NaN;
         setText(c[0], r.type);
         const perFrame = r.callsPerFrame;
-        // Own-clock heuristic: this many nodes on screen should produce close to
-        // one call per instance per repaint. A rate that is far too high (or too
-        // low for its cost) means something else is driving it.
-        const ownClock = Number.isFinite(perFrame) && perFrame > 0.05 && perFrame < 0.3 && r.calls >= 5;
-        if (ownClock) c[0].appendChild(el("span", { class: "ants-tag", text: "⏱ own clock" }));
         setText(c[1], Number.isFinite(r.msPerFrame) ? fmtMs(r.msPerFrame) : "—");
         setText(c[2], Number.isFinite(share) ? fmtPct(share) : "—");
         setText(c[3], Number.isFinite(perFrame) ? perFrame.toFixed(2) : "—");
@@ -2080,7 +2334,7 @@ function buildNodesTab(container) {
     );
   }
 
-  ui.state.nodes = { rowSet: typeRows, update };
+  ui.state.nodes = { rowSet: typeRows, update, sorter: typeSorter };
 }
 
 // --- Stalls ----------------------------------------------------------------
@@ -2106,36 +2360,72 @@ function buildStallsTab(container) {
   callout.appendChild(kv);
 
   const table = makeTable([
-    { label: "Script / function (most blocking first)" },
-    { label: "pack" },
-    { label: "trigger" },
-    { label: "count", right: true },
-    { label: "blocking", right: true },
-    { label: "worst", right: true },
-    { label: "forced layout", right: true },
+    { label: "Script / function", key: "sig", text: true },
+    { label: "pack", key: "pack", text: true },
+    { label: "trigger", key: "trigger", text: true },
+    { label: "count", right: true, key: "count" },
+    { label: "blocking", right: true, key: "blocking" },
+    { label: "% of blocking", right: true, key: "share" },
+    { label: "ms/stall", right: true, key: "perStall" },
+    { label: "worst", right: true, key: "worst" },
+    { label: "forced layout", right: true, key: "layout" },
   ]);
   const empty = el("div", { class: "ants-empty" });
   const note = el("p", { class: "ants-note" });
   note.textContent =
+    "Click any column header to sort by it (again to reverse, a third time for the default: most blocking first). " +
     "This lane is deliberately not canvas drawing. It is main-thread time that no draw hook owns: a heartbeat setInterval, a " +
-    "fetch/DOM polling loop, forced layout thrash, a big GC, a Vue re-render. The distinction matters for the fix: if blocking is " +
-    "high while the Nodes tab's frame budget is small, capping the redraw rate treats a symptom, and the actual fix is in whatever " +
-    "owns this script. \"trigger\" is the Long Animation Frame invoker (TimerHandler:setInterval, event-listener, microtask, " +
-    "user-callback...). Script-level attribution needs Chrome 123+; older Chromium reports task durations without naming the " +
-    "script, and Firefox/Safari expose no API for this at all.";
+    "fetch/DOM polling loop, forced layout thrash, a big GC, a Vue re-render, or this panel itself (look for " +
+    "extensions/ANTs_ComfyUI_Frontend_Performance_Tracker/tracker.js and compare it to the figures in the Memory tab's self-cost " +
+    "block). The distinction matters for the fix: if blocking is high while the Nodes tab's frame budget is small, capping the " +
+    "redraw rate treats a symptom, and the actual fix is in whatever owns this script. \"trigger\" is the Long Animation Frame " +
+    "invoker (TimerHandler:setInterval, event-listener, microtask, user-callback...). Script-level attribution needs Chrome 123+; " +
+    "older Chromium reports task durations without naming the script, and Firefox/Safari expose no API for this at all.";
   container.appendChild(callout);
   container.appendChild(empty);
   container.appendChild(table.table);
+  const capper = makeRowCapper(container, "stalls", "scripts", () => update());
   container.appendChild(note);
 
+  const sorter = makeSorter(
+    table.headers,
+    {
+      sig: (s) => s.sig,
+      pack: (s) => s.pack,
+      trigger: (s) => s.invoker,
+      count: (s) => s.count,
+      blocking: (s) => s.blockingMs,
+      share: (s) => (shareOfBlocking > 0 ? s.blockingMs / shareOfBlocking : null),
+      perStall: (s) => (s.count > 0 ? s.blockingMs / s.count : null),
+      worst: (s) => s.worstMs,
+      layout: (s) => (s.forcedLayoutMs > 0 ? s.forcedLayoutMs : null),
+    },
+    {
+      defaultKey: "blocking",
+      onChange: () => {
+        rows.deferReorder = false;
+        update();
+        rows.deferReorder = true;
+      },
+    }
+  );
+  sorter.attach(table.ths);
+
+  let shareOfBlocking = 0;
   const rows = new RowSet(table.tbody, () => {
     const tr = el("tr");
-    for (let i = 0; i < 7; i++) tr.appendChild(td({ class: i > 1 ? "ants-num" : null }));
+    for (const i of [0, 1, 2, 3, 4, 5, 6, 7, 8]) {
+      const numeric = i >= 3;
+      const cell = td({ class: numeric ? "ants-num" : null });
+      if (i === 4) cell.classList.add("ants-ms");
+      tr.appendChild(cell);
+    }
     return [tr];
   });
 
   function update() {
     const st = stallMetrics();
+    shareOfBlocking = st.lifetimeBlocking;
     setText(vals.blocking, `${fmtRate(st.blockingMsPerSec)} ms of blocking per second of wall clock`);
     setText(vals.count, `${st.perSec.toFixed(1)} per second (${st.total} total this session)`);
     setText(vals.worst, st.worst ? `${fmtMs(st.worst, 0)} ms` : "—");
@@ -2153,7 +2443,7 @@ function buildStallsTab(container) {
     );
     empty.style.display = st.total === 0 ? "" : "none";
     rows.sync(
-      st.rows.slice(0, 20),
+      capper.apply(sorter.sort(st.rows)),
       (s) => s.sig,
       (row, s) => {
         const c = row.nodes[0].children;
@@ -2162,14 +2452,18 @@ function buildStallsTab(container) {
         setText(c[2], s.invoker || "—");
         setText(c[3], s.count);
         setText(c[4], `${fmtMs(s.blockingMs, 0)} ms`);
-        setText(c[5], `${fmtMs(s.worstMs, 0)} ms`);
-        setText(c[6], s.forcedLayoutMs > 0 ? `${fmtMs(s.forcedLayoutMs, 0)} ms` : "—");
-        if (s.forcedLayoutMs > 0) c[6].title = "Forced style/layout recalculation inside this script — usually a DOM read after a write (layout thrash).";
+        setText(c[5], shareOfBlocking > 0 ? fmtPct(s.blockingMs / shareOfBlocking) : "—");
+        c[5].title = "This script's share of all blocking time attributed in the last 30 seconds.";
+        setText(c[6], s.count > 0 ? `${fmtMs(s.blockingMs / s.count, 1)} ms` : "—");
+        c[6].title = "Average blocking time per occurrence (blocking ÷ count). A high count with a low ms/stall is a cheap heartbeat; a low count with a high ms/stall is one heavy operation worth a DevTools trace.";
+        setText(c[7], `${fmtMs(s.worstMs, 0)} ms`);
+        setText(c[8], s.forcedLayoutMs > 0 ? `${fmtMs(s.forcedLayoutMs, 0)} ms` : "—");
+        if (s.forcedLayoutMs > 0) c[8].title = "Forced style/layout recalculation inside this script — usually a DOM read after a write (layout thrash).";
       }
     );
   }
 
-  ui.state.stalls = { rowSet: rows, update };
+  ui.state.stalls = { rowSet: rows, update, sorter };
 }
 
 // --- Load ------------------------------------------------------------------
@@ -3285,7 +3579,8 @@ function buildTelemetryReport() {
   if (!s.stalls.sources.length) lines.push("(no stalls recorded)");
   for (const c of s.stalls.sources) {
     lines.push(
-      `  ${c.sig}\t${c.pack || "pack unknown"}\ttrigger: ${c.invoker || "?"}\t${c.count}x\t${fmtMs(c.blockingMs, 0)}ms blocking\tworst ${fmtMs(c.worstMs, 0)}ms` +
+      `  ${c.sig}\t${c.pack || "pack unknown"}\ttrigger: ${c.invoker || "?"}\t${c.count}x\t${fmtMs(c.blockingMs, 0)}ms blocking` +
+        `${c.count > 0 ? `\t${fmtMs(c.blockingMs / c.count, 1)}ms/stall` : ""}\tworst ${fmtMs(c.worstMs, 0)}ms` +
         `${c.forcedLayoutMs > 0 ? `\tforced layout ${fmtMs(c.forcedLayoutMs, 0)}ms` : ""}`
     );
   }
@@ -3420,9 +3715,15 @@ function installDebugApi() {
       setSyntheticTick,
       benchmark: (ms, slot) => runScriptedPan(Number(ms) || 6000, slot || "A"),
       parseCallerStack,
+      // Live row caps: lower them (or raise them) to trade panel render cost
+      // against how much of a long list is on screen.
+      rowCaps,
       // Internal state, for tests and for debugging the tracker itself.
       get _state() {
         return S;
+      },
+      get _panel() {
+        return ui;
       },
     };
   } catch (e) {

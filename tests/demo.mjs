@@ -20,7 +20,7 @@ const h = createHarness();
 // ---------------------------------------------------------------- scenario ---
 // Two packs with different costs, one node type instrumented by each.
 const nasty = { fg: 1.6, bg: 0.5 }; // per node, per frame
-const nice = { fg: 0.06, bg: 0 };
+const nice = { fg: 0.06, bg: 0.25 };
 
 function pack(name, cost, owns) {
   return h.registerExtension(name, {
@@ -54,6 +54,14 @@ preview.onDrawBackground = function () {
 };
 
 const nodes = [h.makeNode(NastyA), h.makeNode(NastyA), h.makeNode(NastyB), h.makeNode(NiceThing), preview];
+
+// The pattern that produces paired rows in real graphs: a node's own hook
+// delegates to the (already wrapped) prototype method. The Timing tab must show
+// the cost once, on the outer hook, with a "nested" tag on the inner one.
+const niceNode = nodes[3];
+niceNode.onDrawBackground = function (...args) {
+  return NiceThing.prototype.onDrawBackground.apply(this, args);
+};
 h.canvas.nodes = nodes;
 h.app.graph._nodes = nodes; // what the panel counts and the Nodes tab walks
 
@@ -155,6 +163,10 @@ function textWithoutTables(node) {
 
 function linesOf(node, depth = 0) {
   const tag = node.tagName;
+  // The shim has no layout, so hidden blocks are skipped by hand: the printer
+  // should show what the user sees, not what is merely in the DOM.
+  if (node.style && node.style.display === "none") return [];
+  if (node._cls && node._cls.has("ants-more") && node.style && node.style.display === "none") return [];
   if (tag === "TABLE" || tag === "THEAD" || tag === "TBODY") {
     return node.children.flatMap((c) => linesOf(c, depth));
   }
@@ -180,9 +192,15 @@ function dump(container) {
   for (const line of linesOf(container)) if (line.trim()) console.log(line);
 }
 
-// Expand the two heaviest owners so the per-hook breakdown is in the output.
-for (const caret of h.document.body.descendants().filter((n) => n._cls && n._cls.has("ants-caret")).slice(0, 2)) {
-  caret.click();
+// Expand the two heaviest owners, plus anything tagged nested, so the per-hook
+// breakdown (including the nested-call accounting) is in the output.
+const rowsToOpen = h.document.body
+  .descendants()
+  .filter((n) => n.tagName === "TR")
+  .filter((tr, i) => i < 2 || tr.textContent.includes("nested"));
+for (const tr of rowsToOpen) {
+  const caret = tr.descendants().find((n) => n._cls && n._cls.has("ants-caret"));
+  if (caret) caret.click();
 }
 await pump();
 

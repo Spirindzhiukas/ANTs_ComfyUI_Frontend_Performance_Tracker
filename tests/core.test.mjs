@@ -508,6 +508,66 @@ suite("nesting and self-attribution", () => {
   });
 });
 
+suite("nested hook rows do not double count", () => {
+  // The pattern that shows up in real graphs (and in the report that prompted
+  // this): a node type's prototype hook is adopted, and the node instance has
+  // its own hook that delegates to it. The frame total was already correct, but
+  // both rows recorded the same milliseconds, so the table read as double the
+  // truth.
+  async function delegateFixture(h, cost) {
+    await h.registerExtension("DelegatePack", {
+      beforeRegisterNodeDef(nodeType, nodeData) {
+        if (nodeData.name !== "DelegateNode") return;
+        nodeType.prototype.onDrawBackground = function () {
+          h.busy(cost);
+        };
+      },
+    });
+    const Node = h.registerNodeType("DelegateNode");
+    const node = h.makeNode(Node);
+    node.onDrawBackground = function (...args) {
+      return Node.prototype.onDrawBackground.apply(this, args);
+    };
+    h.canvas.nodes = [node];
+  }
+
+  test("rows add up to the frame's hook total", async () => {
+    const h = await boot();
+    await delegateFixture(h, 2);
+    for (let i = 0; i < 60; i++) {
+      h.advance(FRAME_MS);
+      h.canvas.draw(true, true);
+    }
+    const snap = h.tracker.snapshot;
+    assertGreater(snap.hooks.length, 1, "both hooks are still reported");
+    const rowSum = snap.hooks.reduce((a, r) => a + (Number.isFinite(r.msPerFrame) ? r.msPerFrame : 0), 0);
+    assertClose(rowSum, snap.frame.attrMsPerFrame, 0.1, "the Timing rows must add up to the frame's hook total");
+    assertClose(snap.frame.attrMsPerFrame, 2, 0.1, "and the frame sees the hook work exactly once");
+  });
+
+  test("the nested hook says so instead of claiming the milliseconds", async () => {
+    const h = await boot();
+    await delegateFixture(h, 2);
+    for (let i = 0; i < 60; i++) {
+      h.advance(FRAME_MS);
+      h.canvas.draw(true, true);
+    }
+    const rows = h.tracker.snapshot.hooks;
+    // Which of the pair is the outer one depends on what the frontend calls
+    // first (here: the instance hook, which delegates to the prototype method),
+    // so identify them by what they report rather than by name.
+    const nested = rows.find((r) => r.nestedCalls > 0);
+    const outer = rows.find((r) => r.msPerFrame > 0);
+    assert(outer && nested, "the delegating and the delegated hook are both listed");
+    assert(outer.label !== nested.label, "and they are two different rows");
+    assertClose(outer.msPerFrame, 2, 0.1, "the outermost hook carries the cost");
+    assertEqual(nested.msPerFrame, 0, "the nested one carries none of it");
+    assertGreater(nested.nestedCalls, 0, "but its calls are still reported");
+    assertClose(nested.callsPerFrame, outer.callsPerFrame, 0.05, "each call happened once, in both rows");
+    assert(!Number.isFinite(nested.msPerCall), "so its ms/call is unknown rather than zero");
+  });
+});
+
 suite("scripted pan benchmark", () => {
   test("produces comparable A/B numbers and warns when the mutes differ", async () => {
     const h = await boot();
