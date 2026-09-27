@@ -4,10 +4,12 @@ A frontend-side profiler for ComfyUI. Answers "which extension is
 actually costing me FPS while panning this graph?" without needing
 Chrome DevTools open, and without restarting ComfyUI to bisect.
 
-Version 2.0. This is a rewrite: the semantics changed (costs are now per
-drawn frame, not per 4-second window), five new tabs exist, and a
-handful of v1 bugs that could make the panel lie are fixed. If you are
-coming from v1, read **"What changed in v2"** at the bottom.
+Version 2.1. The v2 rewrite changed the semantics (costs are now per
+drawn frame, not per 4-second window), added five tabs, and fixed a
+handful of v1 bugs that could make the panel lie. 2.1 adds an eighth
+tab that can **act** on what the others find: a tunable scheduler layer
+over the page's own timers, rAF callbacks and redraw requests. If you
+are coming from v1, read **"What changed in v2"** at the bottom.
 `REVIEW.md` in this repo documents the v1 defects with line references.
 
 ## Install
@@ -199,6 +201,76 @@ thread — look for `ANTs_ComfyUI_Frontend_Performance_Tracker/tracker.js`
 — and the Memory tab's "tracker's own footprint" block gives the
 per-second cost. If those numbers are not small, say so: it is a bug.
 
+### Governor tab
+
+The Stalls tab tells you *what* blocked the main thread; this tab is the
+one that can do something about it. Every `setInterval`, `setTimeout`
+and `requestAnimationFrame` the page registers after this module loads
+is measured by source — function name, the file that registered it, the
+delay it asked for — and each source can be given a limit:
+
+| Limit | Effect |
+| --- | --- |
+| normal | measured only: same call, same arguments, same ids |
+| ½ speed / ¼ speed | one run per 2× / 4× the delay it asked for (floored at 33ms / 66ms) |
+| 2/s, 1/s | one run per 500ms / 1000ms |
+| paused | the callback is not run at all |
+
+Two rules make it safe to leave switched on:
+
+- **A source on "normal" is untouched.** Same arguments, same `this`,
+  and the ids returned by `setInterval`/`setTimeout` are the browser's
+  own, so `clearInterval`, `clearTimeout` and `cancelAnimationFrame`
+  keep working exactly as before. That is why the table can report
+  "was 50/s before the limit, now 12/s" without having changed anything
+  until you asked it to.
+- **A limited source is slowed, never silenced.** A skipped interval
+  tick is covered by the next one; a skipped one-shot or chained
+  `setTimeout`/rAF callback is re-scheduled for when its window opens,
+  and a callback that re-registers itself is respected, so a loop
+  cannot be killed or duplicated by accident. The only exception is
+  "paused", which is exactly what it says.
+
+Above the table: the frame budget, the rAF governor (`off` = measure
+only, `adaptive` = skip rAF ticks while the main thread is behind the
+budget and mouse/keyboard are quiet, or a fixed floor in Hz), redraw
+merging, the input guard, and the trace threshold. Limits and controls
+live in `localStorage` (`ants-governor-v1`) so a tuning session survives
+a reload; **Reset to untouched** clears them, and **Suggest limits from
+this session** proposes a limit per source from its measured cost —
+nothing is applied until you pick it.
+
+**Redraw merging** is the other half of the same idea. `setDirty`
+requests were already counted exactly (and the Testing tab's cap can
+delay them); with merging on, requests inside one frame are combined:
+the first goes through, later ones only pass on flags the frame has not
+asked for yet, and a request that asks for nothing new is dropped and
+counted. Nothing is ever cleared, so the worst case is one extra redraw
+— never a stale canvas.
+
+**Long-frame traces** record frames over a threshold (50ms default) with
+the scripts the browser named inside them, their forced layout, which
+governed sources ran inside that window with what cost, which limits
+were active, and which script asked for a redraw while the frame was
+blocked ("state was mutated / a redraw was asked for by"). This is the
+card for one of your own `renderFrame @ .../settingStore-*.js` frames:
+the Scripts tab names the frame, this card says what else was in it and
+who made it long. Click a row to expand it.
+
+**Off-thread lane**: a worker is offered for pure computation, with a
+sanity check that runs the same seeded sort-and-sum on both threads and
+compares the answer. The boundary is worth being blunt about: Vue's
+render, the DOM and canvas drawing cannot leave the main thread — no
+scheduler can move them, and `OffscreenCanvas` only helps an application
+that created its canvas that way (ComfyUI does not). What a scheduler
+layer *can* do is serialise and rate-limit the main thread's competing
+tick sources, which is what this tab is for.
+
+The Governor measures and reports its own bookkeeping cost, and the
+tracker's own timers are exempt from limits (marked as such in the
+table). Without `Worker`/`Blob` support the lane says so and answers on
+the main thread instead of pretending.
+
 ### Load tab
 
 Page-load cost per extension pack from the browser's own Resource
@@ -320,6 +392,13 @@ the bisection tool: mute a suspect and watch the fps number change.
   Memory and Stalls tabs say so rather than showing zeroes.
 - A hook's share of frame is a share of the *mean* frame in the same
   window, not of the specific frame it ran in.
+- The Governor can only see what is registered after this module loads.
+  A long-lived timer created at page bootstrap that never re-registers
+  is invisible to it (ComfyUI's own rAF loops re-register every frame,
+  so they are picked up).
+- Nothing can move Vue's render, the DOM or canvas drawing off the main
+  thread. The Governor removes work from the main thread by making
+  offenders run less often, not by parallelising them.
 
 ## Compatibility note
 
@@ -342,7 +421,7 @@ logged for DevTools.
 ## Development
 
 ```
-node tests/run-tests.mjs          # 46 tests, no dependencies, no browser
+node tests/run-tests.mjs          # 72 tests, no dependencies, no browser
 node tests/run-tests.mjs timing   # filter by name fragment
 python3 tests/test_init.py        # backend route parsing + graceful fallbacks
 node tests/demo.mjs               # print what the panel says, with no ComfyUI
@@ -350,7 +429,7 @@ node tests/demo.mjs               # print what the panel says, with no ComfyUI
 
 `tests/demo.mjs` drives a synthetic graph (two packs, four node types, a
 status heartbeat, one long animation frame per second) through the real
-tracker and prints the summary bar, all seven tabs and the text report —
+tracker and prints the summary bar, all eight tabs and the text report —
 the fastest way to see exactly what the panel reports without installing
 anything, and a useful before/after when changing the UI.
 
@@ -359,7 +438,24 @@ ComfyUI/LiteGraph with a controllable clock, then asserts the numbers
 (per-frame attribution, budget additivity, mute semantics, cap
 deferral, fps under loose caps, instance/pre-existing hook adoption,
 stall and redraw attribution, panel row identity, and the A/B
-benchmark) rather than only the code paths.
+benchmark) rather than only the code paths. The Governor has its own
+suite: limits applied to a real foreign heartbeat, the "slowed, never
+silenced" guarantees (a deferred callback still runs; a source that
+re-registers itself is not duplicated), adaptive rAF with the input
+guard, merging semantics, persistence, the trace contents, and the
+worker lane's fallback when there is no `Worker`.
+
+## What changed in v2.1
+
+- **New Governor tab** (see above): per-source limits on the page's own
+  timers and rAF callbacks, an adaptive rAF gate with an input guard,
+  redraw-request merging, long-frame traces, and an off-thread lane.
+  Everything is opt-in and persistent; with the defaults the only
+  difference is that these sources are measured.
+- **Traces name the caller.** A long frame now records which script
+  asked for a redraw while it was blocked, so a frame attributed to
+  ComfyUI's own `renderFrame` can be traced back to the extension that
+  triggered it (and to the ticks that ran inside it).
 
 ## What changed in v2
 

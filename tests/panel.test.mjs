@@ -26,7 +26,7 @@ function byClass(h, cls) {
 // Testing tabs have several tables, so the index matters).
 function tableRows(h, tab, which = 0) {
   const body = byId(h, "ants-tracker-body");
-  const idx = { timing: 0, nodes: 1, stalls: 2, load: 3, memory: 4, gpu: 5, testing: 6 }[tab];
+  const idx = { timing: 0, nodes: 1, stalls: 2, governor: 3, load: 4, memory: 5, gpu: 6, testing: 7 }[tab];
   const tables = body.children[idx].descendants().filter((n) => n.tagName === "TABLE" && n._cls && n._cls.has("ants-table"));
   const table = tables[which];
   if (!table) return [];
@@ -85,12 +85,16 @@ async function openTab(h, tab) {
   await new Promise((r) => setImmediate(r));
 }
 
+function rowOf(h, name) {
+  return h.tracker.governor.sources.find((r) => r.name === name || r.label.includes(name));
+}
+
 function tabButtons(h) {
   const bar = byId(h, "ants-tracker-tabs");
   return bar ? bar.children.filter((c) => c.tagName === "BUTTON") : [];
 }
 function clickTab(h, name) {
-  const labels = { timing: 0, nodes: 1, stalls: 2, load: 3, memory: 4, gpu: 5, testing: 6 };
+  const labels = { timing: 0, nodes: 1, stalls: 2, governor: 3, load: 4, memory: 5, gpu: 6, testing: 7 };
   tabButtons(h)[labels[name]].click();
 }
 function drawLoop(h, seconds, intervalMs = FRAME_MS) {
@@ -138,7 +142,7 @@ suite("panel", () => {
     drawLoop(h, 1);
     h.advance(600); // let a refresh tick land
 
-    for (const name of ["timing", "nodes", "stalls", "load", "memory", "gpu", "testing"]) {
+    for (const name of ["timing", "nodes", "stalls", "governor", "load", "memory", "gpu", "testing"]) {
       clickTab(h, name);
       h.advance(600);
       const container = byId(h, "ants-tracker-body").children.find((c) => c._cls.has("active"));
@@ -496,5 +500,89 @@ suite("panel", () => {
     assertEqual(node.widgets[0].label, "Open Tracker");
     node.widgets[0].cb();
     assert(byId(h, "ants-tracker-panel")._cls.has("open"), "widget opens the panel");
+  });
+});
+
+suite("panel: the Governor tab", () => {
+  test("it lists tick sources and can limit one through its own control", async () => {
+    const h = await boot();
+    h.sandbox.setInterval(function panelPoll() {
+      h.busy(2);
+    }, 20);
+    h.advance(600);
+    await openTab(h, "governor");
+    const rows = tableRows(h, "governor");
+    const poll = rows.find((r) => r[0].includes("panelPoll"));
+    assert(poll, `the heartbeat is listed (${JSON.stringify(rows.map((r) => r[0]))})`);
+    assertEqual(poll[1], "setInterval", "the kind column says how it is scheduled");
+    assertEqual(poll[2], "20.0ms", "the asked-for delay is shown");
+    assert(poll[5] !== "—", "its measured ms/s is shown");
+    assert(poll[9].startsWith("normal"), "and it starts untouched");
+
+    // The limit control is the point of the tab: pick one and it applies.
+    const select = byId(h, "ants-tracker-body")
+      .descendants()
+      .find((n) => n.tagName === "SELECT" && n.value === "full" && n.children.some((o) => o.value === "hz1"));
+    assert(select, "a per-source limit control exists");
+    select.value = "hz1";
+    select._fire("change", {});
+    h.advance(300);
+    assertEqual(rowOf(h, "panelPoll").policy, "hz1", "the policy is applied to the real source");
+    // The <select> itself is the readout: its textContent lists every option.
+    const applied = byId(h, "ants-tracker-body")
+      .descendants()
+      .find((n) => n.tagName === "SELECT" && n.value === "hz1");
+    assert(applied, "the row's control now shows 1 /s");
+    assertEqual(rowOf(h, "panelPoll").policyLabel, "1 /s");
+  });
+
+  test("the controls change the governor, and reset puts it back", async () => {
+    const h = await boot();
+    await openTab(h, "governor");
+    const selects = byId(h, "ants-tracker-body").descendants().filter((n) => n.tagName === "SELECT");
+    const merge = selects.find((s) => s.children.some((o) => o.value === "on" && o.textContent.includes("one redraw")));
+    assert(merge, "the redraw-merging control exists");
+    merge.value = "on";
+    merge._fire("change", {});
+    assertEqual(h.tracker.governor.metrics.controls.coalesce, true, "merging is on");
+
+    const resetBtn = byId(h, "ants-tracker-body").descendants().find((n) => n.tagName === "BUTTON" && n.textContent.includes("Reset to untouched"));
+    assert(resetBtn, "a reset button exists");
+    resetBtn.click();
+    assertEqual(h.tracker.governor.metrics.controls.coalesce, false, "reset restores the defaults");
+  });
+
+  test("the trace card shows what was inside a long frame", async () => {
+    const h = await boot();
+    h.sandbox.setInterval(function insideFramePoll() {
+      h.busy(2);
+    }, 20);
+    h.advance(400);
+    await openTab(h, "governor");
+    const start = h.clock.now;
+    h.advance(200);
+    h.emitPerformance("long-animation-frame", [
+      {
+        startTime: start,
+        duration: 200,
+        blockingDuration: 160,
+        scripts: [
+          {
+            sourceURL: "http://localhost:8188/assets/settingStore-DDHzGrHr.js",
+            sourceFunctionName: "renderFrame",
+            invoker: "user-callback",
+            duration: 180,
+            forcedStyleAndLayoutDuration: 120,
+          },
+        ],
+      },
+    ]);
+    await h.flush();
+    h.advance(600);
+    await h.flush();
+    const text = byId(h, "ants-tracker-body").textContent;
+    assertIncludes(text, "renderFrame", "the offending script is named in the trace row");
+    assertIncludes(text, "forced layout", "forced layout is reported");
+    assertIncludes(text, "insideFramePoll", "and the governed source that ran inside the frame is listed");
   });
 });

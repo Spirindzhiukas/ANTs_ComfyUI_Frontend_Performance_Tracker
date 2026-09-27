@@ -108,7 +108,7 @@ export function createHarness(options = {}) {
 
   // ---------------------------------------------------------------- DOM ----
   const document = createDocument();
-  const localStorage = createStorage();
+  const localStorage = opts.storage || createStorage();
   const clipboardWrites = [];
   const navigatorShim = {
     userAgent: "Mozilla/5.0 (TestBrowser) Chrome/130.0.0.0 Safari/537.36",

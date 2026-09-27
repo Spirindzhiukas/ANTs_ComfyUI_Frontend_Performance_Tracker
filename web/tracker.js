@@ -27,7 +27,7 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.0.0";
+const VERSION = "2.1.0";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
 const NODE_NAME = "ANTsNastyBastardsTracker";
 
@@ -940,6 +940,7 @@ function patchCanvasDraw() {
         S.invalidations.push(t0, 1);
         maybeSampleCaller(t0);
       }
+      if (GOV.controls.coalesce) return govCoalesceRedraw(originalSetDirty, this, args);
       return originalSetDirty.apply(this, args);
     };
     wrappedSetDirty.__antsWrapped = true;
@@ -959,14 +960,14 @@ function patchCanvasDraw() {
 function scheduleTrailingDraw(canvas, delayMs) {
   if (capTrailingTimer) return;
   S.counters.deferred++;
-  capTrailingTimer = setTimeout(() => {
+  capTrailingTimer = govOwn(() => setTimeout(() => {
     capTrailingTimer = null;
     try {
       if (canvas && typeof canvas.draw === "function") canvas.draw(true, true);
     } catch (e) {
       warnOnce("trailing-draw-fail", `Trailing redraw after rate cap failed: ${e && e.message}`);
     }
-  }, Math.max(1, Math.ceil(delayMs)));
+  }, Math.max(1, Math.ceil(delayMs))));
 }
 
 // --- 4. invalidation caller sampling ---------------------------------------
@@ -985,7 +986,7 @@ const SELF_HINT = (() => {
   return "tracker.js";
 })();
 
-const PLUMBING = /(setDirtyCanvas|setDirty|dirty_canvas|dirty_bgcanvas|__ants)/;
+const PLUMBING = /(setDirtyCanvas|setDirty|dirty_canvas|dirty_bgcanvas|__ants|govWrapperFrame)/;
 
 // Pure + exported for tests: turn a stack string into a caller signature.
 function parseCallerStack(stack) {
@@ -1105,6 +1106,18 @@ function installStallObserver() {
 function recordStall(entry, kind) {
   if (S.paused) return;
   const duration = entry.duration || 0;
+  if (Number.isFinite(entry.blockingDuration)) {
+    GOV.lastBlockMs = entry.blockingDuration;
+    GOV.lastBlockAt = nowMs();
+  } else if (duration > 50) {
+    GOV.lastBlockMs = Math.max(0, duration - 50);
+    GOV.lastBlockAt = nowMs();
+  }
+  try {
+    govRecordTrace(entry);
+  } catch (e) {
+    warnOnce("gov-trace", `Frame trace failed: ${e && e.message}`);
+  }
   // Chrome's LoAF blockingDuration is the part attributable to the main thread
   // being blocked; the longtask fallback convention is duration - 50ms.
   const blocking = Number.isFinite(entry.blockingDuration)
@@ -1180,13 +1193,14 @@ function installRafMonitor() {
   const tick = (ts) => {
     const t = performance.now();
     if (!Number.isNaN(prev)) {
+      GOV.lastFrameGap = t - prev;
       if (!S.paused) S.raf.push(t, t - prev);
     }
     prev = t;
     S.renderTicks++;
-    requestAnimationFrame(tick);
+    govOwn(() => requestAnimationFrame(tick));
   };
-  requestAnimationFrame(tick);
+    govOwn(() => requestAnimationFrame(tick));
 }
 
 function installMemorySampler() {
@@ -1195,14 +1209,14 @@ function installMemorySampler() {
     if (!S.paused && performance.memory) S.mem.push(nowMs(), performance.memory.usedJSHeapSize);
   };
   sample();
-  setInterval(sample, 1000);
-  setInterval(() => {
+  govOwn(() => setInterval(sample, 1000));
+  govOwn(() => setInterval(() => {
     try {
       performance.setResourceTimingBufferSize && performance.setResourceTimingBufferSize(2000);
     } catch (e) {
       /* ignore */
     }
-  }, 30000);
+  }, 30000));
   try {
     if (performance.setResourceTimingBufferSize) performance.setResourceTimingBufferSize(2000);
   } catch (e) {
@@ -1256,6 +1270,1107 @@ function resourceLoadSummary() {
     },
   };
 }
+
+// ============================================================================
+// SECTION 7 — THE GOVERNOR: a scheduler layer over the page's own tick sources
+// ============================================================================
+// The rest of this file answers "what costs frames". This half answers "and now
+// what" — because naming a 3-second setInterval does not stop it, and a panel
+// that only measures a blocked main thread is a spectator.
+//
+// What it sits between: the page's own tick sources and the browser.
+//   * Every setInterval / setTimeout / requestAnimationFrame registered after
+//     this module loads is measured per source (registration site, delay, cost)
+//     and can be given a policy: normal, ½ speed, ¼ speed, 2/s, 1/s, pause.
+//   * Redraw requests (LGraphCanvas.setDirty) that arrive more than once in the
+//     same display frame are merged instead of each being honoured.
+//   * An adaptive rAF mode lowers the callback rate while the main thread is
+//     behind its frame budget AND nobody is interacting, with a hard floor so a
+//     loop can never starve.
+//   * A worker lane for pure compute, with the honest boundary spelled out in
+//     LIMITS at the bottom: Vue's render, the DOM and canvas pixels cannot move
+//     off the main thread at all.
+//
+// Two invariants the implementation never breaks:
+//   1. A source with the "normal" policy is measured and otherwise untouched:
+//      same call, same arguments, same return value, and the ids returned by
+//      setInterval/setTimeout/requestAnimationFrame are the browser's own, so
+//      clearInterval/clearTimeout/cancelAnimationFrame keep working untouched.
+//   2. A limited source is slowed, never silenced. A skipped interval tick is
+//      covered by the next tick; a skipped one-shot or chained timeout/rAF
+//      callback is re-scheduled for when its window opens; the adaptive rAF
+//      mode force-runs a callback after a bounded number of skips.
+//
+// Everything here is opt-in. With default settings the only difference to the
+// page is the measurement itself (plus whatever it shows in the Stalls tab).
+
+const GOV_ATTR_PER_SEC = 25; // registration-stack samples per second (attribution)
+const GOV_MAX_SOURCES = 400; // bounded registry: beyond this, sources share a bucket
+const GOV_RAF_REQUESTED_MS = 1000 / 60;
+const GOV_PERSIST_KEY = "ants-governor-v1";
+const GOV_IDLE_MS = 150; // no input for this long counts as "nobody is interacting"
+
+// A policy turns "how often the source wants to run" into "how often it may".
+// The gap is a minimum spacing between runs; "normal" imposes none at all.
+const GOV_POLICIES = [
+  { id: "full", label: "normal", gap: 0 },
+  { id: "half", label: "½ speed", factor: 2, floorMs: 33 },
+  { id: "quarter", label: "¼ speed", factor: 4, floorMs: 66 },
+  { id: "hz2", label: "2 /s", gap: 500 },
+  { id: "hz1", label: "1 /s", gap: 1000 },
+  { id: "pause", label: "pause", pause: true },
+];
+const GOV_POLICY_BY_ID = new Map(GOV_POLICIES.map((p) => [p.id, p]));
+
+const GOV_KIND_LABEL = { interval: "setInterval", timeout: "setTimeout", raf: "rAF" };
+
+const GOV = {
+  installed: false,
+  installError: null,
+  orig: null,
+  internalDepth: 0, // >0 while this file registers one of its own timers
+  running: null, // the source whose callback is on the stack right now
+  sources: new Map(), // key -> source (shared by equal registrations)
+  live: new Map(), // browser timer id -> source, so clear*() can cancel deferrals
+  pendingByRegistration: null, // timer id -> {handle, src}: a deferred copy of that registration
+  savedPolicies: null, // from localStorage, applied as sources appear
+  attrTokens: 0,
+  lastAttrAt: 0,
+  counters: { skipped: 0, deferred: 0, coalesced: 0, redrawReqs: 0, forced: 0 },
+  skipRing: new Ring(256),
+  coalescedRing: new Ring(256),
+  overheadMs: 0,
+  overheadPerSec: 0,
+  lastFrameGap: 0,
+  lastBlockMs: 0,
+  lastBlockAt: -1e9,
+  lastInputAt: -1e9,
+  inputSeen: false,
+  rafSkippedInARow: 0,
+  overBudget: false,
+  redraw: null, // {frame, fg, bg} — the current frame's merged redraw request
+  traces: [],
+  traceVersion: 0,
+  selfTest: null,
+  controls: {
+    budgetMs: 12,
+    rafMode: "off", // "off" | "adaptive"
+    rafMinHz: 20,
+    coalesce: false,
+    inputGuard: true,
+    adaptiveSkipMax: 3,
+    traceMinMs: 50,
+    traceCap: 40,
+  },
+  worker: { available: false, why: "not probed", jobs: 0, mainMs: 0, offThreadMs: 0, lastError: null },
+};
+
+function govPolicy(src) {
+  return GOV_POLICY_BY_ID.get(src.policy) || GOV_POLICY_BY_ID.get("full");
+}
+
+// Minimum spacing between runs for this source under its current policy.
+// A source owned by this file is never gated, whatever a policy says: the
+// profiler slowing its own refresh down is handled (and tunable) elsewhere and
+// must not depend on a table row a user can click.
+function govMinGap(src) {
+  if (src.ours) return 0;
+  const pol = govPolicy(src);
+  if (pol.pause) return Infinity;
+  if (pol.gap) return pol.gap;
+  const requested = src.requestedMs > 0 ? src.requestedMs : GOV_RAF_REQUESTED_MS;
+  return Math.max(requested * (pol.factor || 1), pol.floorMs || 0);
+}
+
+function govEffectiveMs(src) {
+  const gap = govMinGap(src);
+  if (!Number.isFinite(gap)) return NaN;
+  if (gap <= 0) return Math.max(1, Math.round(src.requestedMs || GOV_RAF_REQUESTED_MS));
+  return Math.round(gap);
+}
+
+function govDisplayKey(src) {
+  const where = src.file ? ` @ ${src.file}` : "";
+  return `${src.kind}|${src.name}${where}`;
+}
+
+function govSourceLabel(src) {
+  const where = src.file ? ` @ ${src.file}${src.line ? `:${src.line}` : ""}` : "";
+  return `${src.name}${where}`;
+}
+
+// ------------------------------------------------------------- install -----
+// Wrapped at module load, not in setup(): core and other extensions register
+// their heartbeats during startup, and a source registered before the wrapper
+// exists is a source this layer can never see.
+
+function govOwn(fn) {
+  GOV.internalDepth++;
+  try {
+    return fn();
+  } finally {
+    GOV.internalDepth--;
+  }
+}
+
+function govTrack(kind, fn, requestedMs) {
+  const name = (fn && fn.name) || "(anonymous)";
+  const ms = kind === "raf" ? 0 : Math.max(0, Number(requestedMs) || 0);
+  const key = `${kind}|${name}|${ms}`;
+  let src = GOV.sources.get(key);
+  if (src) {
+    if (src.provisional && !src.ours) govAttribute(src);
+    return src;
+  }
+  if (GOV.sources.size >= GOV_MAX_SOURCES) {
+    const overflowKey = `${kind}|(registry full)`;
+    src = GOV.sources.get(overflowKey);
+    if (src) return src;
+    src = govNewSource(overflowKey, kind, "(registry full)", ms);
+    GOV.sources.set(overflowKey, src);
+    return src;
+  }
+  src = govNewSource(key, kind, name, ms);
+  GOV.sources.set(key, src);
+  govApplySaved(src);
+  govAttribute(src);
+  return src;
+}
+
+function govNewSource(key, kind, name, requestedMs) {
+  return {
+    key,
+    kind,
+    name,
+    file: null,
+    line: "",
+    requestedMs,
+    fires: 0,
+    ms: 0,
+    worst: 0,
+    ring: new Ring(64),
+    skipped: 0,
+    deferred: 0,
+    registrations: 0,
+    ours: GOV.internalDepth > 0,
+    provisional: true,
+    attribution: "pending",
+    policy: "full",
+    firstSeen: nowMs(),
+    lastRunAt: -1e9,
+    lastFnMs: 0,
+    pending: null, // outstanding deferred run (one per source, never a storm)
+    pendingId: null, // the registration id that deferral belongs to
+    pendingFn: null, // the callback it will run, so a forced run can drop it
+    samples: 0,
+    reRegisteredDuringRun: false,
+    policySetAt: 0,
+    firesAtPolicySet: 0,
+  };
+}
+
+// Attribution of a new source: the stack at registration time names the file
+// and line that called setInterval/setTimeout/requestAnimationFrame. Sampling
+// (not every registration) keeps the profiler's own cost invisible: a heartbeat
+// registers once and is usually attributed on the first try, while a debounce
+// storm costs at most a couple of stacks per second.
+function govAttribute(src) {
+  const t = nowMs();
+  const gap = t - GOV.lastAttrAt;
+  GOV.attrTokens = Math.min(2, GOV.attrTokens + (GOV_ATTR_PER_SEC * gap) / 1000);
+  if (GOV.attrTokens < 1) return;
+  GOV.attrTokens -= 1;
+  GOV.lastAttrAt = t;
+  if (src.kind === "interval") {
+    // An interval registers once and then lives for the session, so it must be
+    // attributed on that one chance. Intervals are counted in tens, not
+    // thousands, so paying for a stack each time is not a hot-path cost.
+    GOV.attrTokens = Math.min(2, GOV.attrTokens + 1);
+  }
+  let info = null;
+  try {
+    info = parseCallerStack(new Error().stack);
+  } catch (e) {
+    return;
+  }
+  src.samples++;
+  if (!info || !info.file) return;
+  const beforeKey = govDisplayKey(src);
+  src.file = info.file;
+  src.line = info.line || "";
+  src.provisional = false;
+  src.attribution = "registration stack";
+  if (info.fn && info.fn !== "(anonymous)" && src.name === "(anonymous)") src.name = info.fn;
+  govApplySaved(src, beforeKey);
+}
+
+// A saved limit is keyed by what the row said when it was set. Rows gain their
+// file name as attribution arrives, so a policy saved against the unattributed
+// key is re-attached the moment the source can be named.
+function govApplySaved(src, provisionalKey) {
+  if (!GOV.savedPolicies || src.ours) return;
+  const want = GOV.savedPolicies[govDisplayKey(src)] || (provisionalKey ? GOV.savedPolicies[provisionalKey] : null);
+  if (!want || !GOV_POLICY_BY_ID.has(want) || src.policy === want) return;
+  src.policy = want;
+  src.policySetAt = nowMs();
+  src.firesAtPolicySet = src.fires;
+}
+
+function govInstall() {
+  if (GOV.installed || GOV.installError) return;
+  try {
+    let g = null;
+    try {
+      g = typeof globalThis !== "undefined" && globalThis ? globalThis : null;
+    } catch (e) {
+      g = null;
+    }
+    if (!g || typeof g.setTimeout !== "function") return;
+    GOV.orig = {
+      setTimeout: g.setTimeout,
+      clearTimeout: g.clearTimeout,
+      setInterval: g.setInterval,
+      clearInterval: g.clearInterval,
+      requestAnimationFrame: typeof g.requestAnimationFrame === "function" ? g.requestAnimationFrame : null,
+      cancelAnimationFrame: typeof g.cancelAnimationFrame === "function" ? g.cancelAnimationFrame : null,
+    };
+    const targets = [g];
+    try {
+      if (typeof window !== "undefined" && window && window !== g) targets.push(window);
+    } catch (e) {
+      /* an embedder with a hostile window proxy: globalThis alone is enough */
+    }
+    for (const target of targets) {
+      if (typeof target.setTimeout === "function") target.setTimeout = govWrapRegister(target.setTimeout, "timeout");
+      if (typeof target.setInterval === "function") target.setInterval = govWrapRegister(target.setInterval, "interval");
+      if (typeof target.clearTimeout === "function") target.clearTimeout = govWrapClear(target.clearTimeout);
+      if (typeof target.clearInterval === "function") target.clearInterval = govWrapClear(target.clearInterval);
+      if (typeof target.requestAnimationFrame === "function") target.requestAnimationFrame = govWrapRaf(target.requestAnimationFrame);
+      if (typeof target.cancelAnimationFrame === "function") target.cancelAnimationFrame = govWrapCancel(target.cancelAnimationFrame);
+    }
+    govInstallInputGuard();
+    govProbeWorker();
+    govLoad();
+    GOV.installed = true;
+  } catch (e) {
+    GOV.installError = e && e.message ? e.message : String(e);
+    warnOnce("gov-install", `Scheduler layer not installed: ${GOV.installError}`);
+  }
+}
+
+function govWrapRegister(orig, kind) {
+  if (orig.__antsGovWrapped) return orig;
+  const wrapped = function govWrapperFrame(fn, ms, ...rest) {
+    if (typeof fn !== "function") return orig.apply(this, [fn, ms, ...rest]);
+    const src = govTrack(kind, fn, ms);
+    if (src.ours) return orig.call(this, fn, ms, ...rest);
+    const real = orig.call(
+      this,
+      function () {
+        GOV.live.delete(real);
+        return govRun(src, fn, this, arguments, real);
+      },
+      ms,
+      ...rest
+    );
+    src.registrations++;
+    if (real !== undefined && real !== null) GOV.live.set(real, src);
+    return real;
+  };
+  wrapped.__antsGovWrapped = true;
+  return wrapped;
+}
+
+function govWrapClear(orig) {
+  if (orig.__antsGovWrapped) return orig;
+  const wrapped = function (id) {
+    govCancelDeferral(id);
+    const src = GOV.live.get(id);
+    if (src) {
+      GOV.live.delete(id);
+      // A skipped one-shot callback is sitting in this source's deferred slot:
+      // if the caller cancels the timer, the deferred run has to go with it.
+      if (src.pending !== null) {
+        try {
+          if (GOV.orig && GOV.orig.clearTimeout) GOV.orig.clearTimeout(src.pending);
+        } catch (e) {
+          /* the deferred run already fired */
+        }
+        src.pending = null;
+      }
+    }
+    return orig.call(this, id);
+  };
+  wrapped.__antsGovWrapped = true;
+  return wrapped;
+}
+
+function govWrapCancel(orig) {
+  if (orig.__antsGovWrapped) return orig;
+  const wrapped = function (id) {
+    govCancelDeferral(id);
+    GOV.live.delete(id);
+    return orig.call(this, id);
+  };
+  wrapped.__antsGovWrapped = true;
+  return wrapped;
+}
+
+// rAF is wrapped for the same reason as timers, and it is how a self-scheduling
+// render loop becomes governable: a loop that calls requestAnimationFrame from
+// inside itself re-registers through this wrapper on its next tick, so a loop
+// that started before this module loaded is still measured and limitable from
+// the tick after that.
+function govWrapRaf(orig) {
+  if (orig.__antsGovWrapped) return orig;
+  const wrapped = function govWrapperFrame(cb) {
+    if (typeof cb !== "function") return orig.call(this, cb);
+    const src = govTrack("raf", cb, 0);
+    if (GOV.running) GOV.running.reRegisteredDuringRun = true;
+    if (src.ours) return orig.call(this, cb);
+    const handle = orig.call(this, function (ts) {
+      GOV.live.delete(handle);
+      return govRun(src, cb, this, [ts]);
+    });
+    src.registrations++;
+    if (handle !== undefined && handle !== null) GOV.live.set(handle, src);
+    return handle;
+  };
+  wrapped.__antsGovWrapped = true;
+  return wrapped;
+}
+
+// ------------------------------------------------------------- dispatch ----
+
+function govRun(src, fn, thisArg, args, registrationId) {
+  const tEnter = performance.now();
+  let gap = govMinGap(src);
+  let adaptive = false;
+  GOV.adaptiveForced = false;
+  if (src.kind === "raf" && GOV.controls.rafMode === "adaptive" && govAdaptiveWants(src, tEnter)) {
+    const adaptiveGap = govAdaptiveGap();
+    if (adaptiveGap > gap) {
+      gap = adaptiveGap;
+      adaptive = true;
+    }
+  }
+  if (gap > 0 && tEnter - src.lastRunAt < gap) {
+    src.skipped++;
+    GOV.counters.skipped++;
+    if (adaptive) GOV.rafSkippedInARow++;
+    if (!S.paused) GOV.skipRing.push(tEnter, 1);
+    if (src.kind === "timeout" || src.kind === "raf") {
+      govDefer(src, fn, thisArg, args, Math.max(1, gap - (tEnter - src.lastRunAt)), registrationId);
+    }
+    GOV.overheadMs += Math.max(0, performance.now() - tEnter);
+    return undefined;
+  }
+  if (adaptive) GOV.rafSkippedInARow = 0;
+  if (GOV.adaptiveForced && src.pending !== null && src.pendingFn === fn && src.pendingId !== null) {
+    // The progress guarantee is about to run this exact callback, so the copy
+    // deferred earlier would be a second run of it. One callback, one run.
+    govCancelDeferral(src.pendingId);
+  }
+  const out = govExecute(src, fn, thisArg, args);
+  // The callback's own time is counted as the callback's, not as this layer's.
+  GOV.overheadMs += Math.max(0, performance.now() - tEnter - (src.lastFnMs || 0));
+  return out;
+}
+
+// Adaptive mode is allowed to bite only when the main thread is missing its
+// budget AND no human is interacting, and only for a bounded number of ticks in
+// a row, so a self-scheduling loop keeps making progress no matter what.
+function govAdaptiveWants(src, t) {
+  if (src.ours) return false;
+  if (!govBehindBudget()) {
+    GOV.rafSkippedInARow = 0;
+    return false;
+  }
+  if (GOV.controls.inputGuard && govInputRecently(t)) return false;
+  if (GOV.rafSkippedInARow >= Math.max(1, Number(GOV.controls.adaptiveSkipMax) || 3)) {
+    GOV.rafSkippedInARow = 0;
+    GOV.counters.forced++;
+    GOV.adaptiveForced = true; // the run about to happen is the progress guarantee
+    return false;
+  }
+  return true;
+}
+
+function govAdaptiveGap() {
+  return 1000 / Math.max(1, Number(GOV.controls.rafMinHz) || 20);
+}
+
+function govBehindBudget() {
+  const budget = Math.max(1, Number(GOV.controls.budgetMs) || 12);
+  const gap = GOV.lastFrameGap;
+  // Two independent signals, because either one alone can be blind: the gap
+  // between display frames (what the browser is actually managing), and a
+  // recent long animation frame (the main thread was demonstrably blocked).
+  const gapBehind = Number.isFinite(gap) && gap > Math.max(16.7, budget) * 1.5;
+  const blockBehind = GOV.lastBlockMs > budget && nowMs() - GOV.lastBlockAt < 1500;
+  const behind = gapBehind || blockBehind;
+  GOV.overBudget = behind;
+  return behind;
+}
+
+function govExecute(src, fn, thisArg, args) {
+  const t0 = performance.now();
+  src.lastRunAt = t0; // also for a deferred run: it is still a run
+  const prev = GOV.running;
+  GOV.running = src;
+  src.reRegisteredDuringRun = false;
+  let ret;
+  try {
+    ret = fn.apply(thisArg, args);
+  } finally {
+    GOV.running = prev;
+    const dt = performance.now() - t0;
+    src.lastFnMs = dt;
+    src.fires++;
+    src.ms += dt;
+    if (dt > src.worst) src.worst = dt;
+    if (!S.paused) src.ring.push(t0, dt);
+    if (src.pending !== null && src.reRegisteredDuringRun) {
+      // The callback keeps itself alive, so our deferred copy would become a
+      // second chain for the same loop: cancel it and let the loop's own
+      // registration win.
+      try {
+        if (GOV.orig && GOV.orig.clearTimeout) GOV.orig.clearTimeout(src.pending);
+      } catch (e) {
+        /* already fired */
+      }
+      src.pending = null;
+    }
+  }
+  return ret;
+}
+
+// Deferral uses the *original* timer functions, so a re-scheduled callback is
+// never counted twice and never governed twice.
+function govDefer(src, fn, thisArg, args, delayMs, registrationId) {
+  if (src.pending !== null || !GOV.orig || !GOV.orig.setTimeout) return;
+  GOV.counters.deferred++;
+  src.deferred++;
+  const handle = GOV.orig.setTimeout(() => {
+    if (registrationId !== undefined && registrationId !== null) GOV.pendingByRegistration.delete(registrationId);
+    src.pending = null;
+    src.pendingId = null;
+    src.pendingFn = null;
+    govExecute(src, fn, thisArg, args);
+  }, Math.max(1, Math.ceil(delayMs)));
+  src.pending = handle;
+  src.pendingId = registrationId === undefined ? null : registrationId;
+  src.pendingFn = fn;
+  if (registrationId !== undefined && registrationId !== null) {
+    if (!GOV.pendingByRegistration) GOV.pendingByRegistration = new Map();
+    GOV.pendingByRegistration.set(registrationId, { handle, src });
+  }
+}
+
+// Cancel a deferred copy through the id the caller was given. Without this, a
+// callback the caller cancelled would still run when its window opened, which
+// is the kind of "governor broke my extension" bug that makes a tool unusable.
+function govCancelDeferral(id) {
+  if (!GOV.pendingByRegistration) return false;
+  const rec = GOV.pendingByRegistration.get(id);
+  if (!rec) return false;
+  GOV.pendingByRegistration.delete(id);
+  try {
+    if (GOV.orig && GOV.orig.clearTimeout) GOV.orig.clearTimeout(rec.handle);
+  } catch (e) {
+    /* it already fired */
+  }
+  if (rec.src && rec.src.pending === rec.handle) {
+    rec.src.pending = null;
+    rec.src.pendingId = null;
+    rec.src.pendingFn = null;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------- input guard ----
+// Adaptive mode may only slow things down when nobody is typing, dragging or
+// wheeling: input latency is the one cost a smoother graph may not pay for.
+
+function govInstallInputGuard() {
+  try {
+    if (typeof window === "undefined" || !window || typeof window.addEventListener !== "function") return;
+    const note = () => {
+      GOV.lastInputAt = nowMs();
+      GOV.inputSeen = true;
+    };
+    // Pointer events cover modern browsers; mouse events still arrive on their
+    // own in older/embedded ones, and either is proof that somebody is there.
+    for (const type of ["pointerdown", "pointermove", "mousedown", "mousemove", "keydown", "wheel", "touchstart"]) {
+      window.addEventListener(type, note, { passive: true });
+    }
+  } catch (e) {
+    /* an embedder without window events just means the guard stays off */
+  }
+}
+
+function govInputRecently(t) {
+  if (!GOV.inputSeen) return false;
+  return t - GOV.lastInputAt < GOV_IDLE_MS;
+}
+
+// ------------------------------------------------- redraw request merging ---
+// Called from the setDirty wrapper. LiteGraph only ever *sets* dirty flags from
+// the truthy arguments it is handed, so within one display frame the union of
+// the requests is all the canvas needs: the first request goes straight through,
+// a later one only carries flags that were not requested yet, and a request that
+// adds nothing is dropped and counted. A merged request never clears a flag, so
+// the worst case is one extra redraw, never a stale canvas.
+
+function govCoalesceRedraw(original, canvas, args) {
+  const fg = args.length > 0 ? !!args[0] : true;
+  const bg = args.length > 1 ? !!args[1] : false;
+  const frame = S.renderTicks;
+  const pending = GOV.redraw;
+  if (!pending || pending.frame !== frame) {
+    GOV.redraw = { frame, fg, bg };
+    return original.apply(canvas, args);
+  }
+  GOV.counters.redrawReqs++;
+  const needFg = fg && !pending.fg;
+  const needBg = bg && !pending.bg;
+  if (!needFg && !needBg) {
+    GOV.counters.coalesced++;
+    if (!S.paused) GOV.coalescedRing.push(performance.now(), 1);
+    return undefined;
+  }
+  if (needFg) pending.fg = true;
+  if (needBg) pending.bg = true;
+  return original.call(canvas, pending.fg, pending.bg);
+}
+
+// ------------------------------------------------------------- policies ----
+
+function govSetPolicy(displayKey, policyId) {
+  const pol = GOV_POLICY_BY_ID.get(policyId);
+  if (!pol) return false;
+  let touched = 0;
+  for (const src of GOV.sources.values()) {
+    if (govDisplayKey(src) !== displayKey) continue;
+    if (src.ours && pol.id !== "full") continue; // this file's own timers stay out of it
+    if (src.policy === pol.id) continue;
+    src.policy = pol.id;
+    src.policySetAt = nowMs();
+    src.firesAtPolicySet = src.fires;
+    touched++;
+  }
+  if (touched || pol.id === "full") govSave();
+  return touched > 0;
+}
+
+function govSetControl(key, value) {
+  if (!(key in GOV.controls)) return false;
+  GOV.controls[key] = value;
+  if (key === "rafMode" || key === "rafMinHz" || key === "adaptiveSkipMax") GOV.rafSkippedInARow = 0;
+  govSave();
+  return true;
+}
+
+// Suggested limits: derived from what this session actually measured, and only
+// applied to a source the panel can see burning real milliseconds. A starting
+// point for tuning, not an autopilot.
+function govSuggest() {
+  const rows = govRows();
+  const applied = [];
+  for (const r of rows) {
+    if (r.ours || r.msPerSec < 1 || r.runsPerSec < 4) continue;
+    let id = "half";
+    if (r.msPerSec >= 50) id = "hz1";
+    else if (r.msPerSec >= 15) id = "hz2";
+    else if (r.msPerSec >= 5) id = "quarter";
+    if (r.policy === id) continue;
+    if (govSetPolicy(r.key, id)) applied.push(`${r.name} → ${GOV_POLICY_BY_ID.get(id).label}`);
+  }
+  return applied;
+}
+
+function govReset() {
+  for (const src of GOV.sources.values()) {
+    src.policy = "full";
+    src.policySetAt = 0;
+    src.firesAtPolicySet = 0;
+  }
+  Object.assign(GOV.controls, {
+    budgetMs: 12,
+    rafMode: "off",
+    rafMinHz: 20,
+    coalesce: false,
+    inputGuard: true,
+    adaptiveSkipMax: 3,
+    traceMinMs: 50,
+    traceCap: 40,
+  });
+  GOV.rafSkippedInARow = 0;
+  GOV.redraw = null;
+  govSave();
+}
+
+function govSave() {
+  try {
+    if (typeof localStorage === "undefined" || !localStorage) return;
+    const policies = {};
+    for (const src of GOV.sources.values()) {
+      if (src.policy !== "full") policies[govDisplayKey(src)] = src.policy;
+    }
+    GOV.savedPolicies = policies;
+    localStorage.setItem(GOV_PERSIST_KEY, JSON.stringify({ controls: GOV.controls, policies }));
+  } catch (e) {
+    /* storage unavailable: tuning just does not survive a reload */
+  }
+}
+
+function govLoad() {
+  let data = null;
+  try {
+    if (typeof localStorage === "undefined" || !localStorage) return;
+    const raw = localStorage.getItem(GOV_PERSIST_KEY);
+    if (!raw) return;
+    data = JSON.parse(raw);
+  } catch (e) {
+    return;
+  }
+  if (!data) return;
+  if (data.controls) {
+    for (const key in GOV.controls) {
+      if (data.controls[key] === undefined) continue;
+      GOV.controls[key] = data.controls[key];
+    }
+  }
+  if (data.policies && typeof data.policies === "object") {
+    GOV.savedPolicies = {};
+    for (const [key, id] of Object.entries(data.policies)) {
+      if (!GOV_POLICY_BY_ID.has(id)) {
+        warnOnce(`gov-policy-${key}`, `Saved limit for "${key}" was not applied: unknown policy "${id}".`);
+        continue;
+      }
+      GOV.savedPolicies[key] = id;
+      govSetPolicy(key, id);
+    }
+  }
+}
+
+// -------------------------------------------------------------- metrics ----
+
+function govRows() {
+  const now = nowMs();
+  const observedMs = Math.max(1000, Math.min(WINDOW_MS, Math.max(now - S.startedAt, 1000)));
+  const groups = new Map();
+  for (const src of GOV.sources.values()) {
+    const key = govDisplayKey(src);
+    let g = groups.get(key);
+    if (!g) {
+      g = {
+        key,
+        kind: src.kind,
+        name: src.name,
+        file: src.file,
+        line: src.line,
+        provisional: true,
+        ours: true,
+        requestedMs: src.requestedMs,
+        registrations: 0,
+        members: 0,
+        fires: 0,
+        ms: 0,
+        worst: 0,
+        skipped: 0,
+        deferred: 0,
+        sink: [],
+        policySrc: src,
+      };
+      groups.set(key, g);
+    }
+    g.members++;
+    g.registrations += src.registrations || 1;
+    g.fires += src.fires;
+    g.ms += src.ms;
+    if (src.worst > g.worst) g.worst = src.worst;
+    g.skipped += src.skipped;
+    g.deferred += src.deferred;
+    g.provisional = g.provisional && src.provisional;
+    g.ours = g.ours && src.ours;
+    g.sink.push(src);
+  }
+  const rows = [];
+  for (const g of groups.values()) {
+    // Windowed cost: only sources that ran inside the window are walked, so an
+    // idle registry costs nothing to summarise.
+    let winN = 0;
+    let winMs = 0;
+    for (const src of g.sink) {
+      if (!src.ring.n) continue;
+      if (!(src.ring.lastT() >= now - WINDOW_MS)) continue;
+      const agg = src.ring.aggregate(now - WINDOW_MS);
+      winN += agg.n;
+      winMs += agg.sum;
+    }
+    const src = g.policySrc;
+    const pol = GOV_POLICY_BY_ID.get(src.policy) || GOV_POLICY_BY_ID.get("full");
+    const row = {
+      key: g.key,
+      label: g.name + (g.file ? ` @ ${g.file}${g.line ? `:${g.line}` : ""}` : ""),
+      name: g.name,
+      file: g.file || "",
+      line: g.line || "",
+      kind: g.kind,
+      kindLabel: GOV_KIND_LABEL[g.kind] || g.kind,
+      requestedMs: g.requestedMs,
+      effectiveMs: pol.id === "full" ? Math.round(g.requestedMs || GOV_RAF_REQUESTED_MS) : govEffectiveMs(src),
+      policy: pol.id,
+      policyLabel: pol.label,
+      ours: g.ours,
+      provisional: g.provisional,
+      registrations: g.registrations,
+      fires: g.fires,
+      worst: g.worst,
+      skipped: g.skipped,
+      deferred: g.deferred,
+      runsPerSec: winN > 0 ? (winN / observedMs) * 1000 : 0,
+      msPerSec: winMs > 0 ? (winMs / observedMs) * 1000 : 0,
+      perRunMs: g.fires > 0 ? g.ms / g.fires : NaN,
+      savedMsPerSec: 0,
+      sourceRateBefore: NaN,
+      sourceRateAfter: NaN,
+    };
+    if (pol.id !== "full" && !g.ours && g.fires > 0) {
+      // Estimate only: the ticks that did not run cannot be timed, so this is
+      // the skipped rate times the mean cost of the ticks that did run.
+      const lifetimeSec = Math.max(1, (now - src.firstSeen) / 1000);
+      row.savedMsPerSec = (g.skipped / lifetimeSec) * (g.ms / g.fires);
+      if (src.policySetAt) {
+        const beforeSec = Math.max(0.25, (src.policySetAt - src.firstSeen) / 1000);
+        const afterSec = Math.max(0.25, (now - src.policySetAt) / 1000);
+        row.sourceRateBefore = src.firesAtPolicySet / beforeSec;
+        row.sourceRateAfter = (src.fires - src.firesAtPolicySet) / afterSec;
+      }
+    }
+    rows.push(row);
+  }
+  rows.sort((a, b) => b.msPerSec - a.msPerSec || b.fires - a.fires);
+  return rows;
+}
+
+function govMetrics() {
+  const now = nowMs();
+  const rows = govRows();
+  const observedMs = Math.max(1000, Math.min(WINDOW_MS, Math.max(now - S.startedAt, 1000)));
+  const coalesced = GOV.coalescedRing.aggregate(now - WINDOW_MS).sum;
+  let throttled = 0;
+  let savedMsPerSec = 0;
+  for (const r of rows) {
+    if (r.policy !== "full" && !r.ours) throttled++;
+    savedMsPerSec += r.savedMsPerSec;
+  }
+  return {
+    installed: GOV.installed,
+    installError: GOV.installError,
+    sources: rows,
+    sourceCount: rows.length,
+    throttled,
+    registered: GOV.sources.size,
+    ours: rows.filter((r) => r.ours).length,
+    counters: { ...GOV.counters },
+    skippedPerSec: (GOV.skipRing.aggregate(now - WINDOW_MS).sum / observedMs) * 1000,
+    coalescedPerSec: (coalesced / observedMs) * 1000,
+    savedMsPerSec,
+    overheadMsPerSec: GOV.overheadPerSec,
+    overBudget: GOV.overBudget,
+    lastFrameGap: GOV.lastFrameGap,
+    controls: { ...GOV.controls },
+    worker: { ...GOV.worker },
+    traceCount: GOV.traces.length,
+    traceVersion: GOV.traceVersion,
+    selfTest: GOV.selfTest,
+    policies: GOV_POLICIES,
+  };
+}
+
+// ---------------------------------------------------------- frame traces ---
+// The question the Stalls tab cannot answer: "this 1.3-second frame was
+// attributed to renderFrame — but what else was in it?" A trace records, for
+// every long animation frame, the scripts the browser named (with forced layout
+// and invoker), which governed sources ran inside it with their measured cost,
+// and how many redraw requests arrived (and were merged) while it was blocked.
+
+function ringRange(ring, t0, t1) {
+  if (!ring || !ring.n) return { n: 0, sum: 0 };
+  const start = ring.aggregate(t0);
+  const end = ring.aggregate(t1);
+  return { n: start.n - end.n, sum: start.sum - end.sum };
+}
+
+function govRecordTrace(entry) {
+  if (S.paused || !(GOV.controls.traceMinMs > 0)) return;
+  const start = entry.startTime || 0;
+  const duration = entry.duration || 0;
+  if (duration < GOV.controls.traceMinMs) return;
+  const end = start + duration;
+  const scripts = [];
+  let layoutMs = 0;
+  for (const script of entry.scripts || []) {
+    const ms = script.duration || 0;
+    const forced = script.forcedStyleAndLayoutDuration || 0;
+    layoutMs += forced;
+    scripts.push({
+      fn: script.sourceFunctionName || "(anonymous)",
+      file: script.sourceURL ? shortUrl(script.sourceURL) : "(no url)",
+      url: script.sourceURL || "",
+      ms,
+      layoutMs: forced,
+      invoker: [script.invokerType, script.invoker].filter(Boolean).join(" ") || "",
+    });
+  }
+  scripts.sort((a, b) => b.ms - a.ms);
+
+  const ticks = [];
+  for (const src of GOV.sources.values()) {
+    if (!src.ring.n) continue;
+    const range = ringRange(src.ring, start, end);
+    if (!range.n) continue;
+    ticks.push({
+      key: govDisplayKey(src),
+      label: govSourceLabel(src),
+      kind: src.kind,
+      count: range.n,
+      ms: range.sum,
+      policy: src.policy,
+      ours: src.ours,
+    });
+  }
+  ticks.sort((a, b) => b.ms - a.ms);
+
+  // Who asked for the redraw inside this window. This is the answer to "what
+  // mutates state under the Vue render loop": the requests themselves are
+  // counted exactly, and their callers are sampled (~20/s), so this is the
+  // measured sample, not a guess.
+  const callers = [];
+  for (const c of S.callers.values()) {
+    const range = ringRange(c.ring, start, end);
+    if (!range.n) continue;
+    callers.push({ label: c.sig, file: c.file, count: range.n });
+  }
+  callers.sort((a, b) => b.count - a.count);
+  if (callers.length > 3) callers.length = 3;
+
+  const trace = {
+    id: GOV.traceVersion + 1,
+    start,
+    duration,
+    end,
+    blocking: Number.isFinite(entry.blockingDuration) ? entry.blockingDuration : Math.max(0, duration - 50),
+    layoutMs,
+    scripts,
+    ticks,
+    redraws: ringRange(S.invalidations, start, end).n,
+    coalesced: ringRange(GOV.coalescedRing, start, end).n,
+    callers,
+    limited: ticks.filter((t) => t.policy !== "full").map((t) => `${t.label} → ${(GOV_POLICY_BY_ID.get(t.policy) || {}).label || t.policy}`),
+    overBudget: GOV.overBudget,
+  };
+  GOV.traces.unshift(trace);
+  if (GOV.traces.length > Math.max(1, Number(GOV.controls.traceCap) || 40)) GOV.traces.length = Math.max(1, Number(GOV.controls.traceCap) || 40);
+  GOV.traceVersion++;
+}
+
+// ---------------------------------------------------------------- worker ---
+// Pure compute only, and only when the browser offers Worker + Blob. The worker
+// source is a plain string so it can be unit-tested under node (see
+// tests/governor.test.mjs) instead of taken on faith. Nothing here touches the
+// DOM, Vue or the canvas: see LIMITS for why that is not a limitation of this
+// implementation but of the platform.
+
+const GOV_WORKER_SRC = [
+  "// ANTs tracker governor worker: pure compute jobs only, no DOM, no Vue, no canvas.",
+  "var JOBS = {",
+  "  echo: function (arg) { return arg; },",
+  "  sum: function (arg) {",
+  "    var xs = arg || [];",
+  "    var s = 0;",
+  "    for (var i = 0; i < xs.length; i++) s += xs[i];",
+  "    return s;",
+  "  },",
+  "  selftest: function (arg) {",
+  "    // Deterministic workload: a seeded LCG into a big array, sorted, summed.",
+  "    // The main thread runs exactly the same function for comparison.",
+  "    var n = (arg && arg.n) || 120000;",
+  "    var seed = (arg && arg.seed) || 123456789;",
+  "    var xs = new Array(n);",
+  "    for (var i = 0; i < n; i++) {",
+  "      seed = (seed * 1103515245 + 12345) % 2147483648;",
+  "      xs[i] = seed;",
+  "    }",
+  "    xs.sort(function (a, b) { return a - b; });",
+  "    var sum = 0;",
+  "    for (var j = 0; j < n; j++) sum += xs[j];",
+  "    return { n: n, sum: sum, first: xs[0], last: xs[n - 1] };",
+  "  },",
+  "  run: function (arg) {",
+  "    var fn = (0, eval)('(' + arg.source + ')');",
+  "    return fn(arg.arg);",
+  "  },",
+  "};",
+  "self.onmessage = function (e) {",
+  "  var msg = e.data || {};",
+  "  var now = function () { return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now(); };",
+  "  var t0 = now();",
+  "  try {",
+  "    var job = JOBS[msg.job];",
+  "    if (!job) throw new Error('unknown job: ' + msg.job);",
+  "    var value = job(msg.arg);",
+  "    self.postMessage({ id: msg.id, ok: true, value: value, ms: now() - t0 });",
+  "  } catch (err) {",
+  "    self.postMessage({ id: msg.id, ok: false, error: (err && err.message) || String(err) });",
+  "  }",
+  "};",
+].join("\n");
+
+const GOV_SELFTEST_ARGS = { n: 120000, seed: 123456789 };
+
+// The identical workload, on the main thread, for an apples-to-apples number.
+function govSelfTestMainThread(arg) {
+  const n = (arg && arg.n) || GOV_SELFTEST_ARGS.n;
+  let seed = (arg && arg.seed) || GOV_SELFTEST_ARGS.seed;
+  const xs = new Array(n);
+  for (let i = 0; i < n; i++) {
+    seed = (seed * 1103515245 + 12345) % 2147483648;
+    xs[i] = seed;
+  }
+  xs.sort((a, b) => a - b);
+  let sum = 0;
+  for (let j = 0; j < n; j++) sum += xs[j];
+  return { n, sum, first: xs[0], last: xs[n - 1] };
+}
+
+// Feature-detect only: no worker thread is created until something actually
+// asks for off-thread work, because a profiler has no business spawning a
+// thread the page did not ask for.
+function govProbeWorker() {
+  let available = false;
+  let why = "no Worker/Blob/URL.createObjectURL in this environment (the lane stays on the main thread)";
+  try {
+    if (
+      typeof Worker === "function" &&
+      typeof Blob === "function" &&
+      typeof URL !== "undefined" &&
+      URL &&
+      typeof URL.createObjectURL === "function"
+    ) {
+      available = true;
+      why = "ready (the worker starts on first use)";
+    }
+  } catch (e) {
+    available = false;
+    why = e && e.message ? e.message : String(e);
+  }
+  GOV.worker.available = available;
+  GOV.worker.why = why;
+}
+
+function govWorkerReady() {
+  if (!GOV.worker.available) return false;
+  try {
+    if (!GOV.workerHandle) {
+      const url = URL.createObjectURL(new Blob([GOV_WORKER_SRC], { type: "text/javascript" }));
+      GOV.workerHandle = new Worker(url);
+    }
+  } catch (e) {
+    GOV.worker.available = false;
+    GOV.worker.why = `worker could not start: ${(e && e.message) || e}`;
+    GOV.workerHandle = null;
+    return false;
+  }
+  if (!GOV.workerPending) {
+    GOV.workerPending = new Map();
+    GOV.workerNextId = 1;
+    GOV.workerHandle.onmessage = (e) => {
+      const msg = (e && e.data) || {};
+      const pending = GOV.workerPending.get(msg.id);
+      if (!pending) return;
+      GOV.workerPending.delete(msg.id);
+      if (msg.ok) pending.resolve(msg);
+      else pending.reject(new Error(msg.error || "worker job failed"));
+    };
+    GOV.workerHandle.onerror = (e) => {
+      GOV.worker.lastError = (e && e.message) || "worker error";
+      for (const [, pending] of GOV.workerPending) pending.reject(new Error(GOV.worker.lastError));
+      GOV.workerPending.clear();
+    };
+  }
+  return true;
+}
+
+// Off-thread lane. Arguments and results must be structured-cloneable, and a
+// function passed here must be self-contained (no closures) — see LIMITS.
+// A missing worker is not an error: the lane falls back to the main thread and
+// says so, so a caller cannot silently get a different answer.
+function govOffload(job, arg) {
+  const isFn = typeof job === "function";
+  if (!govWorkerReady()) {
+    if (isFn) return Promise.resolve({ fellBack: true, value: job(arg), reason: GOV.worker.why });
+    if (job === "selftest") return Promise.resolve({ fellBack: true, value: govSelfTestMainThread(arg), reason: GOV.worker.why });
+    if (job === "echo") return Promise.resolve({ fellBack: true, value: arg, reason: GOV.worker.why });
+    if (job === "sum") {
+      const xs = arg || [];
+      let s = 0;
+      for (let i = 0; i < xs.length; i++) s += xs[i];
+      return Promise.resolve({ fellBack: true, value: s, reason: GOV.worker.why });
+    }
+    return Promise.reject(new Error(`off-thread lane unavailable: ${GOV.worker.why}`));
+  }
+  const payload = isFn ? { job: "run", arg: { source: String(job), arg } } : { job, arg };
+  const id = GOV.workerNextId++;
+  GOV.worker.jobs++;
+  const t0 = performance.now();
+  return new Promise((resolve, reject) => {
+    GOV.workerPending.set(id, {
+      resolve: (msg) => {
+        GOV.worker.mainMs += performance.now() - t0;
+        GOV.worker.offThreadMs += msg.ms || 0;
+        resolve(msg);
+      },
+      reject: (err) => {
+        GOV.worker.lastError = (err && err.message) || String(err);
+        reject(err);
+      },
+    });
+    GOV.workerHandle.postMessage(Object.assign({ id }, payload));
+  });
+}
+
+// The same deterministic workload on both threads, answers compared, so "the
+// off-thread lane works" is a measurement rather than a claim.
+async function govRunSelfTest() {
+  const t0 = performance.now();
+  const main = govSelfTestMainThread(GOV_SELFTEST_ARGS);
+  const mainMs = performance.now() - t0;
+  let off = null;
+  let error = null;
+  try {
+    const res = await govOffload("selftest", GOV_SELFTEST_ARGS);
+    if (res.fellBack) error = res.reason;
+    else off = res.value;
+  } catch (e) {
+    error = (e && e.message) || String(e);
+  }
+  const match = !!(off && off.sum === main.sum && off.n === main.n && off.first === main.first && off.last === main.last);
+  GOV.selfTest = {
+    at: new Date().toISOString(),
+    mainMs,
+    workerMs: off ? GOV.worker.offThreadMs : NaN,
+    match,
+    error,
+    available: GOV.worker.available,
+    n: main.n,
+  };
+  return GOV.selfTest;
+}
+
+govInstall();
 
 // ============================================================================
 // OVERLAY UI
@@ -1547,7 +2662,7 @@ function makeSorter(headers, getters, options) {
 // milliseconds (the Stalls tab will happily name this panel for it) and nobody
 // reads row 400 anyway. Tables render the most expensive N rows, say how many
 // are hidden, and offer "Show all" if you actually want the whole list.
-const rowCaps = { timing: 120, nodes: 60, stalls: 60 };
+const rowCaps = { timing: 120, nodes: 60, stalls: 60, governor: 60 };
 
 function makeRowCapper(container, capKey, noun, onChange) {
   const wrap = el("div", { class: "ants-note ants-more" });
@@ -1728,6 +2843,7 @@ function buildPanel() {
     ["connShare", "connections"],
     ["otherShare", "other"],
     ["overhead", "tracker"],
+    ["limiter", "limiter"],
   ]) {
     ui.pills[key] = pill(label);
     row2.appendChild(ui.pills[key].el);
@@ -1742,6 +2858,7 @@ function buildPanel() {
     ["timing", "Timing"],
     ["nodes", "Nodes"],
     ["stalls", "Stalls"],
+    ["governor", "Governor"],
     ["load", "Load"],
     ["memory", "Memory"],
     ["gpu", "GPU / VRAM"],
@@ -1853,6 +2970,13 @@ function renderSummary() {
   setPill(ui.pills.connShare, fm.ok ? fmtPct(fm.connShare) : "—");
   setPill(ui.pills.otherShare, fm.ok ? fmtPct(fm.otherShare) : "—", fm.otherShare > 0.2 ? "ants-warn" : null);
   setPill(ui.pills.overhead, `${fmtMs((sc.renderMsPerSec + sc.sweepMsPerSec) * 1000, 0)}µs/s`);
+  const gm = govMetrics();
+  setPill(
+    ui.pills.limiter,
+    gm.throttled ? `${gm.throttled} src · ${fmtRate(gm.skippedPerSec)}/s` : gm.sourceCount ? "off" : "—",
+    gm.throttled ? "ants-warn" : null
+  );
+
 
   const tips = ui.pills;
   tips.fps.el.title = "Canvas redraws per second of wall clock, over the last 10s (30s when a loose cap or an idle canvas gives fewer than 4 frames).";
@@ -2907,7 +4031,7 @@ function setSyntheticTick(ms) {
     syntheticTickTimer = null;
   }
   if (ms > 0) {
-    syntheticTickTimer = setInterval(() => {
+    syntheticTickTimer = govOwn(() => setInterval(() => {
       try {
         if (app.canvas && typeof app.canvas.setDirty === "function") app.canvas.setDirty(true, true);
         else if (app.canvas && typeof app.canvas.draw === "function") app.canvas.draw(true, true);
@@ -2915,7 +4039,7 @@ function setSyntheticTick(ms) {
       } catch (e) {
         warnOnce("synthetic-tick-error", `Forced redraw failed: ${e && e.message}`);
       }
-    }, ms);
+    }, ms));
   }
 }
 
@@ -3173,9 +4297,9 @@ function runScriptedPan(durationMs, slot) {
       finish();
       return;
     }
-    requestAnimationFrame(step);
+    govOwn(() => requestAnimationFrame(step));
   };
-  requestAnimationFrame(step);
+    govOwn(() => requestAnimationFrame(step));
 }
 
 function graphNodeCount() {
@@ -3187,6 +4311,497 @@ function graphNodeCount() {
   return NaN;
 }
 
+// --- Governor (the scheduler layer) ----------------------------------------
+// One tab, in this order: what the limiter is doing, the knobs, every tick
+// source the page schedules with what it costs and what it is allowed to do,
+// the off-thread lane, and the long frames with what was inside them. The
+// trace card is the answer to "renderFrame took 1.3s — what else was in it?",
+// and the table above it is what you can do about it.
+
+const GOV_BUDGET_PRESETS = [8, 12, 16, 24];
+const GOV_RAF_MIN_HZ = [60, 30, 20, 10];
+const GOV_TRACE_PRESETS = [
+  { ms: 30, label: "capture frames over 30 ms" },
+  { ms: 50, label: "capture frames over 50 ms (default)" },
+  { ms: 100, label: "capture frames over 100 ms" },
+  { ms: 0, label: "don't capture" },
+];
+
+function buildGovernorTab(container) {
+  const callout = el("div", { class: "ants-callout" });
+  const kv = el("table", { class: "ants-kv" });
+  const vals = {};
+  for (const [key, label] of [
+    ["state", "Scheduler layer"],
+    ["sources", "Tick sources seen"],
+    ["limited", "Sources under a limit"],
+    ["skipped", "Ticks skipped"],
+    ["deferred", "Callbacks deferred (not dropped)"],
+    ["merged", "Redraw requests merged (when merging is on)"],
+    ["saved", "Estimated ms/s kept off the main thread"],
+    ["overhead", "Governor's own bookkeeping"],
+    ["raf", "rAF governor"],
+  ]) {
+    const tr = el("tr");
+    tr.appendChild(td({ class: "ants-kv-label", text: label }));
+    const v = td({ class: "ants-kv-value" });
+    tr.appendChild(v);
+    kv.appendChild(tr);
+    vals[key] = v;
+  }
+  callout.appendChild(kv);
+  container.appendChild(callout);
+
+  const note = el("p", { class: "ants-note" });
+  note.textContent =
+    "Every setInterval / setTimeout / requestAnimationFrame the page registers after this module loads is measured by source and can be " +
+    "slowed down here — normal, ½ speed, ¼ speed, 2/s, 1/s, or paused. Two rules make it safe to use: a source on \"normal\" is measured " +
+    "and otherwise untouched (same call, same arguments, same ids, so clearInterval/clearTimeout keep working), and a limited source is " +
+    "slowed rather than silenced (a skipped interval tick is covered by the next one; a skipped one-shot or chained callback is " +
+    "re-scheduled for when its window opens). The tracker's own timers are exempt and are marked as such. This changes behaviour on " +
+    "purpose: a poll you limit runs less often. Nothing here can move Vue's render, the DOM or canvas drawing off the main thread — see " +
+    "the note at the bottom of this tab for what a worker lane can and cannot take.";
+  container.appendChild(note);
+
+  // --- controls -------------------------------------------------------------
+  const controls = el("div", { class: "ants-copyrow", style: { marginTop: "8px", gap: "10px" } });
+
+  function selectControl(label, options, read, onChange) {
+    const wrap = el("div", { style: { display: "flex", alignItems: "center", gap: "5px" } });
+    wrap.appendChild(el("span", { text: label, style: { color: "#8b8b96" } }));
+    const sel = el("select", { class: "ants-select", style: { width: "auto", maxWidth: "220px" } });
+    for (const o of options) {
+      const opt = el("option", { text: o.label });
+      opt.value = String(o.value);
+      sel.appendChild(opt);
+    }
+    sel.value = String(read());
+    sel.addEventListener("change", () => {
+      onChange(sel.value);
+      update();
+    });
+    wrap.appendChild(sel);
+    controls.appendChild(wrap);
+    return sel;
+  }
+
+  const selBudget = selectControl(
+    "frame budget",
+    GOV_BUDGET_PRESETS.map((ms) => ({ value: ms, label: `${ms} ms` })),
+    () => GOV.controls.budgetMs,
+    (v) => govSetControl("budgetMs", Number(v))
+  );
+  const selRafMode = selectControl(
+    "rAF governor",
+    [
+      { value: "off", label: "off (measure only)" },
+      { value: "adaptive", label: "adaptive (slow down when behind)" },
+    ],
+    () => GOV.controls.rafMode,
+    (v) => govSetControl("rafMode", v)
+  );
+  const selRafFloor = selectControl(
+    "rAF floor",
+    GOV_RAF_MIN_HZ.map((hz) => ({ value: hz, label: `${hz} Hz` })),
+    () => GOV.controls.rafMinHz,
+    (v) => govSetControl("rafMinHz", Number(v))
+  );
+  const selCoalesce = selectControl(
+    "merge redraw requests",
+    [
+      { value: "off", label: "off" },
+      { value: "on", label: "on (one redraw per frame)" },
+    ],
+    () => (GOV.controls.coalesce ? "on" : "off"),
+    (v) => govSetControl("coalesce", v === "on")
+  );
+  const selInputGuard = selectControl(
+    "input guard",
+    [
+      { value: "on", label: "on (never slow input)" },
+      { value: "off", label: "off" },
+    ],
+    () => (GOV.controls.inputGuard ? "on" : "off"),
+    (v) => govSetControl("inputGuard", v === "on")
+  );
+  const selTrace = selectControl(
+    "frame traces",
+    GOV_TRACE_PRESETS.map((p) => ({ value: p.ms, label: p.label })),
+    () => GOV.controls.traceMinMs,
+    (v) => govSetControl("traceMinMs", Number(v))
+  );
+  container.appendChild(controls);
+
+  const btnRow = el("div", { class: "ants-copyrow", style: { marginTop: "6px" } });
+  const suggestBtn = el("button", {
+    class: "ants-btn primary",
+    text: "Suggest limits from this session",
+    title: "Limit the sources this session actually measured burning milliseconds. Everything else is left alone, and nothing is applied twice.",
+  });
+  const resetBtn = el("button", { class: "ants-btn", text: "Reset to untouched", title: "Every policy back to normal, every control back to its default" });
+  const result = el("span", { class: "ants-note", style: { margin: "0" } });
+  btnRow.appendChild(suggestBtn);
+  btnRow.appendChild(resetBtn);
+  btnRow.appendChild(result);
+  container.appendChild(btnRow);
+
+  suggestBtn.addEventListener("click", () => {
+    const applied = govSuggest();
+    setText(result, applied.length ? `applied: ${applied.join(", ")}` : "nothing worth limiting right now (nothing is burning real time)");
+    update();
+  });
+  resetBtn.addEventListener("click", () => {
+    govReset();
+    setText(result, "all limits lifted; the page is back to untouched");
+    update();
+  });
+
+  // --- tick sources ---------------------------------------------------------
+  container.appendChild(el("div", { class: "ants-section-title", text: "Tick sources" }));
+  const table = makeTable([
+    { label: "Source", key: "label", text: true },
+    { label: "kind", key: "kind", text: true },
+    { label: "asked", right: true, key: "requested" },
+    { label: "allowed", right: true, key: "effective" },
+    { label: "runs/s", right: true, key: "runs" },
+    { label: "ms/s", right: true, key: "ms" },
+    { label: "ms/run", right: true, key: "perRun" },
+    { label: "worst", right: true, key: "worst" },
+    { label: "skipped", right: true, key: "skipped" },
+    { label: "limit", key: "limit", text: true },
+  ]);
+  const empty = el("div", { class: "ants-empty" });
+  empty.textContent =
+    "No tick sources have been seen yet. That is a finding in itself: this page schedules its work through something other than " +
+    "setInterval / setTimeout / requestAnimationFrame (microtasks, promise chains, or WebSocket events), and those cannot be governed " +
+    "from page JavaScript at all.";
+  container.appendChild(empty);
+  container.appendChild(table.table);
+  const capper = makeRowCapper(container, "governor", "tick sources", () => update());
+
+  const tableNote = el("p", { class: "ants-note" });
+  tableNote.textContent =
+    "\"asked\" is the delay the source registered with; \"allowed\" is the shortest gap its current limit permits. runs/s and ms/s are " +
+    "measured over the same 4-second window as the rest of the panel, so a source that just calmed down stops shouting. \"skipped\" is " +
+    "lifetime, and the estimated saving is exactly that: the ticks that did not run cannot be timed, so it is the skipped rate times the " +
+    "mean cost of the ticks that did run. A row with no file name has not been sampled yet — attribution costs a stack, so it is sampled " +
+    "rather than paid on every registration.";
+  container.appendChild(tableNote);
+
+  const sorter = makeSorter(
+    table.headers,
+    {
+      label: (r) => r.label,
+      kind: (r) => r.kindLabel,
+      requested: (r) => r.requestedMs,
+      effective: (r) => (Number.isFinite(r.effectiveMs) ? r.effectiveMs : Infinity),
+      runs: (r) => r.runsPerSec,
+      ms: (r) => r.msPerSec,
+      perRun: (r) => r.perRunMs,
+      worst: (r) => r.worst,
+      skipped: (r) => r.skipped,
+      limit: (r) => r.policyLabel,
+    },
+    {
+      defaultKey: "ms",
+      onChange: () => {
+        rows.deferReorder = false;
+        update();
+        rows.deferReorder = true;
+      },
+    }
+  );
+  sorter.attach(table.ths);
+
+  const rows = new RowSet(table.tbody, () => {
+    const tr = el("tr");
+    for (let i = 0; i < 10; i++) tr.appendChild(td({ class: i >= 2 && i <= 8 ? "ants-num" : null }));
+    const sel = el("select", { class: "ants-btn", style: { maxWidth: "120px" } });
+    for (const p of GOV_POLICIES) {
+      const opt = el("option", { text: p.label });
+      opt.value = p.id;
+      sel.appendChild(opt);
+    }
+    tr.children[9].appendChild(sel);
+    return { nodes: [tr], cells: tr.children, sel, lastKey: null };
+  });
+
+  // --- worker lane ----------------------------------------------------------
+  const workerCallout = el("div", { class: "ants-callout" });
+  const workerKv = el("table", { class: "ants-kv" });
+  const workerVals = {};
+  for (const [key, label] of [
+    ["state", "Off-thread lane"],
+    ["jobs", "Jobs run"],
+    ["off", "Measured off-thread"],
+    ["main", "Main-thread time spent (round trip included)"],
+    ["result", "Last sanity check"],
+  ]) {
+    const tr = el("tr");
+    tr.appendChild(td({ class: "ants-kv-label", text: label }));
+    const v = td({ class: "ants-kv-value" });
+    tr.appendChild(v);
+    workerKv.appendChild(tr);
+    workerVals[key] = v;
+  }
+  const sanityBtn = el("button", {
+    class: "ants-btn",
+    text: "Run off-thread sanity check",
+    title: "Runs one deterministic workload on both threads and compares the answers, so 'the worker lane works' is a measurement rather than a claim.",
+  });
+  workerCallout.appendChild(el("div", { class: "ants-section-title", text: "Off-thread lane" }));
+  workerCallout.appendChild(workerKv);
+  workerCallout.appendChild(sanityBtn);
+  workerCallout.appendChild(
+    el("p", {
+      class: "ants-note",
+      text:
+        "Only pure compute can leave the main thread: Vue's render, the DOM and canvas drawing are main-thread-only by specification, and " +
+        "OffscreenCanvas only helps an application that created its canvas that way (ComfyUI does not). Arguments and results have to be " +
+        "structured-cloneable and a function offloaded this way cannot capture closures. When the page has no Worker, the lane says so and " +
+        "answers on the main thread instead of pretending.",
+    })
+  );
+  container.appendChild(workerCallout);
+  sanityBtn.addEventListener("click", async () => {
+    setText(workerVals.result, "running…");
+    const res = await govRunSelfTest();
+    setText(
+      workerVals.result,
+      res.match
+        ? `identical answers (n=${res.n}): main thread ${fmtMs(res.mainMs, 1)}ms vs worker ${fmtMs(res.workerMs, 1)}ms`
+        : `not available: ${res.error || "unknown reason"}`
+    );
+    update();
+  });
+
+  // --- frame traces ---------------------------------------------------------
+  container.appendChild(el("div", { class: "ants-section-title", text: "Long-frame traces" }));
+  const traceTable = makeTable([
+    { label: "dur", right: true },
+    { label: "blocking", right: true },
+    { label: "forced layout", right: true },
+    { label: "worst script inside" },
+    { label: "governed ticks inside", right: true },
+    { label: "redraw requests", right: true },
+    { label: "", right: true },
+  ]);
+  const traceBody = traceTable.tbody;
+  const traceNote = el("p", { class: "ants-note" });
+  traceNote.textContent =
+    "One row per long animation frame, worst first for the frame it describes. This is the card that answers \"renderFrame burned 1.3 " +
+    "seconds — what else was in it?\": the scripts the browser named (with forced layout and the invoker that started them), which " +
+    "governed tick sources ran inside the frame with what they cost, and how many redraw requests arrived while it was blocked. If a " +
+    "source you limited stops appearing here, the limit is working. Expand a row for the per-script and per-source breakdown.";
+  const traceBtnRow = el("div", { class: "ants-copyrow", style: { marginTop: "6px" } });
+  const clearTraces = el("button", { class: "ants-btn", text: "Clear traces" });
+  const traceCount = el("span", { class: "ants-note", style: { margin: "0" } });
+  traceBtnRow.appendChild(clearTraces);
+  traceBtnRow.appendChild(traceCount);
+  container.appendChild(traceTable.table);
+  container.appendChild(traceBtnRow);
+  container.appendChild(traceNote);
+  clearTraces.addEventListener("click", () => {
+    GOV.traces.length = 0;
+    GOV.traceVersion++; // makes the renderer rebuild even though no new frame arrived
+    update();
+  });
+
+  const openTraces = new Set();
+  let renderedTraces = -1;
+
+  function renderTraces() {
+    if (GOV.traceVersion === renderedTraces) return;
+    renderedTraces = GOV.traceVersion;
+    // Traces only change when a long frame is captured (or when they are
+    // cleared), so a rebuild here cannot fight with the pointer the way a
+    // per-refresh innerHTML rebuild would.
+    while (traceBody.children.length) traceBody.removeChild(traceBody.children[0]);
+    const list = GOV.traces.slice(0, 12);
+    setText(traceCount, GOV.traces.length ? `${GOV.traces.length} captured (showing ${list.length})` : "none captured yet");
+    for (const tr of list) {
+      const open = openTraces.has(tr.id);
+      const row = el("tr", { class: "ants-row" });
+      row.appendChild(td({ class: "ants-num", text: `${fmtMs(tr.duration, 0)}ms` }));
+      row.appendChild(td({ class: "ants-num", text: `${fmtMs(tr.blocking, 0)}ms` }));
+      row.appendChild(td({ class: "ants-num", text: tr.layoutMs ? `${fmtMs(tr.layoutMs, 0)}ms` : "\u2014" }));
+      const top = tr.scripts[0];
+      const topCell = td({ text: top ? `${top.fn} @ ${top.file}` : "(no script attribution)" });
+      if (top && top.invoker) topCell.title = `started by: ${top.invoker}`;
+      row.appendChild(topCell);
+      const tickMs = tr.ticks.reduce((acc, t) => acc + t.ms, 0);
+      row.appendChild(
+        td({ class: "ants-num", text: tr.ticks.length ? `${tr.ticks.reduce((a, t) => a + t.count, 0)} (${fmtMs(tickMs, 0)}ms)` : "\u2014" })
+      );
+      row.appendChild(
+        td({ class: "ants-num", text: tr.coalesced ? `${tr.redraws} (${tr.coalesced} merged)` : String(tr.redraws) })
+      );
+      const caretCell = td({ class: "ants-num" });
+      const caret = el("span", { class: "ants-caret", text: open ? "\u25be" : "\u25b8" });
+      caretCell.appendChild(caret);
+      caretCell.title = "Expand for the per-script and per-source breakdown of this frame";
+      row.appendChild(caretCell);
+
+      const detailsRow = el("tr", { class: "ants-details" });
+      detailsRow.style.display = open ? "" : "none";
+      const cell = td();
+      detailsRow.appendChild(cell);
+      for (const s of tr.scripts) {
+        cell.appendChild(
+          el("div", {
+            text:
+              `${s.fn} @ ${s.file} \u2014 ${fmtMs(s.ms, 1)}ms` +
+              `${s.layoutMs ? `, ${fmtMs(s.layoutMs, 1)}ms forced layout` : ""}` +
+              `${s.invoker ? ` [${s.invoker}]` : ""}`,
+          })
+        );
+      }
+      if (tr.ticks.length) {
+        cell.appendChild(el("div", { style: { marginTop: "5px", color: "#8b8b96" }, text: "governed sources that ran inside this frame:" }));
+        for (const t of tr.ticks) {
+          cell.appendChild(
+            el("div", {
+              text:
+                `${t.label} \u2014 ran ${t.count}\u00d7, ${fmtMs(t.ms, 1)}ms total` +
+                `${t.policy !== "full" ? `, limit: ${(GOV_POLICY_BY_ID.get(t.policy) || {}).label}` : ""}`,
+            })
+          );
+        }
+      }
+      if (tr.callers && tr.callers.length) {
+        cell.appendChild(
+          el("div", {
+            style: { marginTop: "5px" },
+            text: `state was mutated / a redraw was asked for by: ${tr.callers.map((c) => `${c.label} ×${c.count}`).join(", ")}`,
+          })
+        );
+      }
+      cell.appendChild(
+        el("div", {
+          style: { marginTop: "5px", color: "#8b8b96" },
+          text:
+            `${tr.redraws} redraw request(s) arrived during it, ${tr.coalesced} were merged away` +
+            `${tr.limited.length ? `; limits active for: ${tr.limited.join("; ")}` : ""}` +
+            `${tr.overBudget ? "; the thread was already behind budget" : ""}`,
+        })
+      );
+      caret.addEventListener("click", () => {
+        if (openTraces.has(tr.id)) openTraces.delete(tr.id);
+        else openTraces.add(tr.id);
+        const nowOpen = openTraces.has(tr.id);
+        setText(caret, nowOpen ? "▾" : "▸");
+        detailsRow.style.display = nowOpen ? "" : "none";
+      });
+      traceBody.appendChild(row);
+      traceBody.appendChild(detailsRow);
+    }
+  }
+
+  container.appendChild(
+    el("p", {
+      class: "ants-note",
+      text:
+        "What this layer cannot do, so nobody has to reverse-engineer it: only callbacks that reach the page's own timer and rAF entry " +
+        "points can be governed (a microtask, a promise chain, browser layout/paint and a loop that never re-registers itself are out of " +
+        "reach); a limit changes behaviour by design; and the \"kept off the main thread\" figure is an estimate from the ticks that did " +
+        "run. The strongest card here is the combination: limit a source, then watch it disappear from the traces below.",
+    })
+  );
+
+  function syncSelect(sel, value) {
+    const v = String(value);
+    if (sel.value !== v) sel.value = v;
+  }
+
+  function update() {
+    const m = govMetrics();
+    syncSelect(selBudget, GOV.controls.budgetMs);
+    syncSelect(selRafMode, GOV.controls.rafMode);
+    syncSelect(selRafFloor, GOV.controls.rafMinHz);
+    syncSelect(selCoalesce, GOV.controls.coalesce ? "on" : "off");
+    syncSelect(selInputGuard, GOV.controls.inputGuard ? "on" : "off");
+    syncSelect(selTrace, GOV.controls.traceMinMs);
+    setText(vals.state, m.installed ? (m.installError ? `not installed: ${m.installError}` : "installed") : "not installed");
+    setText(vals.sources, `${m.sourceCount}${m.registered > m.sourceCount ? ` rows (${m.registered} registrations)` : ""}`);
+    setText(vals.limited, m.throttled ? `${m.throttled}` : "none");
+    setText(vals.skipped, `${m.counters.skipped} (${fmtRate(m.skippedPerSec)}/s)`);
+    setText(vals.deferred, String(m.counters.deferred));
+    setText(
+      vals.merged,
+      !m.controls.coalesce
+        ? "merging is off"
+        : `${m.counters.coalesced} of ${m.counters.coalesced + m.counters.redrawReqs} (${fmtRate(m.coalescedPerSec)}/s) — the rest added a flag the frame had not asked for yet`
+    );
+    setText(vals.saved, m.throttled ? `≈ ${fmtMs(m.savedMsPerSec)} ms/s` : "—");
+    setText(vals.overhead, `${fmtMs(m.overheadMsPerSec * 1000, 0)}µs/s`);
+    setText(
+      vals.raf,
+      m.controls.rafMode === "off"
+        ? "off (measuring only)"
+        : `${m.controls.rafMode}, ${m.controls.rafMinHz}Hz floor${m.overBudget ? " — thread behind budget" : ""}`
+    );
+
+    const visible = capper.apply(sorter.sort(m.sources));
+    rows.sync(
+      visible,
+      (r) => r.key,
+      (row, r) => {
+        const c = row.cells;
+        setText(c[0], r.ours ? `${r.name} (this tracker)` : r.name + (r.file ? ` @ ${r.file}${r.line ? `:${r.line}` : ""}` : " @ (not sampled yet)"));
+        c[0].title = r.ours
+          ? "This is the tracker's own timer: it is measured but can never be limited."
+          : `${r.kindLabel}${r.registrations > 1 ? `, ${r.registrations} registrations` : ""}${r.provisional ? "; attribution is sampled, so the file may appear shortly" : ""}`;
+        setText(c[1], r.kindLabel);
+        setText(c[2], `${fmtMs(r.requestedMs || GOV_RAF_REQUESTED_MS, r.requestedMs && r.requestedMs < 100 ? 1 : 0)}ms`);
+        setText(c[3], Number.isFinite(r.effectiveMs) ? `${fmtMs(r.effectiveMs, 0)}ms` : "never");
+        setText(c[4], r.runsPerSec ? fmtRate(r.runsPerSec) : "—");
+        setText(c[5], r.msPerSec ? fmtMs(r.msPerSec) : "—");
+        setText(c[6], Number.isFinite(r.perRunMs) ? fmtMs(r.perRunMs, 3) : "—");
+        setText(c[7], r.worst ? `${fmtMs(r.worst, 1)}ms` : "—");
+        setText(c[8], r.skipped ? String(r.skipped) : "—");
+        if (Number.isFinite(r.sourceRateBefore) && Number.isFinite(r.sourceRateAfter) && r.fires > 3) {
+          c[4].title = `${fmtRate(r.sourceRateBefore)}/s before the limit, ${fmtRate(r.sourceRateAfter)}/s since`;
+        }
+        const sel = row.sel;
+        const want = r.policy;
+        if (sel.value !== want) sel.value = want;
+        sel.disabled = r.ours;
+        sel.title = r.ours
+          ? "The tracker's own timers are exempt from every policy."
+          : `Limit ${r.name}: delay instead of skip, never silence — a skipped interval tick is covered by the next one and a skipped one-shot callback still runs.`;
+        if (row.lastKey !== r.key) {
+          row.lastKey = r.key;
+          sel.onchange = null;
+          sel.addEventListener("change", () => {
+            govSetPolicy(r.key, sel.value);
+            update();
+          });
+        }
+        const tr = row.nodes[0];
+        tr.className = r.policy !== "full" && !r.ours ? "ants-row ants-warm" : "ants-row";
+      }
+    );
+    empty.style.display = visible.length ? "none" : "";
+    table.table.style.display = visible.length ? "" : "none";
+
+    const w = m.worker;
+    setText(workerVals.state, w.available ? "available (Worker + Blob)" : `unavailable — ${w.why}`);
+    setText(workerVals.jobs, String(w.jobs));
+    setText(workerVals.off, w.jobs ? `${fmtMs(w.offThreadMs, 1)}ms` : "—");
+    setText(workerVals.main, w.jobs ? `${fmtMs(w.mainMs, 1)}ms` : "—");
+    if (GOV.selfTest && !workerVals.result.textContent) {
+      setText(
+        workerVals.result,
+        GOV.selfTest.match ? `identical answers: main ${fmtMs(GOV.selfTest.mainMs, 1)}ms vs worker ${fmtMs(GOV.selfTest.workerMs, 1)}ms` : `not available: ${GOV.selfTest.error || "unknown reason"}`
+      );
+    }
+
+    renderTraces();
+  }
+
+  ui.state.governor = { rowSet: rows, update, sorter };
+}
+
 // -------------------------------------------------------------- lifecycle --
 
 function buildTabContents() {
@@ -3194,6 +4809,7 @@ function buildTabContents() {
   buildTimingTab(ui.tabs.timing);
   buildNodesTab(ui.tabs.nodes);
   buildStallsTab(ui.tabs.stalls);
+  buildGovernorTab(ui.tabs.governor);
   buildLoadTab(ui.tabs.load);
   buildMemoryTab(ui.tabs.memory);
   buildGpuTab(ui.tabs.gpu);
@@ -3232,6 +4848,10 @@ function sweepStaleData() {
     for (const [sig, src] of S.stallSources) {
       if (now - src.lastSeen > 120000) S.stallSources.delete(sig);
     }
+    trimIfLive(GOV.skipRing, now - WINDOW_MS);
+    trimIfLive(GOV.coalescedRing, now - WINDOW_MS);
+    for (const govSrc of GOV.sources.values()) if (govSrc.ring.n) govSrc.ring.trimBefore(now - WINDOW_MS);
+    GOV.redraw = null;
   }
   selfCost.sweepAccum += performance.now() - t0;
   const now2 = nowMs();
@@ -3242,6 +4862,8 @@ function sweepStaleData() {
     selfCost.sweepMs = (selfCost.sweepAccum || 0) * perSecond;
     selfCost.renderAccum = 0;
     selfCost.sweepAccum = 0;
+    GOV.overheadPerSec = (GOV.overheadMs || 0) * perSecond;
+    GOV.overheadMs = 0;
     selfCost.lastRolloverAt = now2;
   }
 }
@@ -3275,9 +4897,9 @@ function startRefresh() {
     selfCost.renderAccum += cost;
     S.counters.renderCount++;
     uiRefreshMs = refreshIntervalFor(cost);
-    ui.refreshTimer = setTimeout(tick, uiRefreshMs);
+    ui.refreshTimer = govOwn(() => setTimeout(tick, uiRefreshMs));
   };
-  ui.refreshTimer = setTimeout(tick, uiRefreshMs);
+  ui.refreshTimer = govOwn(() => setTimeout(tick, uiRefreshMs));
 }
 
 function stopRefresh() {
@@ -3407,11 +5029,11 @@ function wireCornerButton(node) {
     startTop = rect.top;
     startLeft = rect.left;
     clearTimeout(pressTimer);
-    pressTimer = setTimeout(() => {
+    pressTimer = govOwn(() => setTimeout(() => {
       dragging = true;
       node.style.cursor = "grabbing";
       node.style.opacity = "0.85";
-    }, LONG_PRESS_MS);
+    }, LONG_PRESS_MS));
     if (e.preventDefault) e.preventDefault();
   });
 
@@ -3528,6 +5150,7 @@ function buildSnapshot() {
         }
       : null,
     self: selfCostMetrics(),
+    governor: govMetrics(),
     support: { ...S.env, performanceMemory: !!mem },
   };
 }
@@ -3629,6 +5252,48 @@ function buildTelemetryReport() {
   }
 
   lines.push("");
+  lines.push("-- SCHEDULER (governor: tick sources this page schedules) --");
+  const gv = s.governor;
+  if (!gv || !gv.installed) {
+    lines.push(gv && gv.installError ? `(not installed: ${gv.installError})` : "(not installed)");
+  } else {
+    lines.push(
+      `${gv.sourceCount} source(s), ${gv.throttled} limited | ${gv.counters.skipped} ticks skipped (${fmtRate(gv.skippedPerSec)}/s) | ` +
+        `${gv.counters.deferred} deferred | ${gv.counters.coalesced} redraw request(s) merged | rAF mode ${gv.controls.rafMode}` +
+        `${gv.controls.rafMode === "adaptive" ? ` at ${gv.controls.rafMinHz}Hz floor` : ""} | ` +
+        `estimated ${fmtMs(gv.savedMsPerSec)}ms/s kept off the main thread | governor's own overhead ${fmtMs(gv.overheadMsPerSec * 1000, 0)}µs/s`
+    );
+    for (const r of gv.sources.slice(0, 12)) {
+      if (!r.fires && !r.msPerSec) continue;
+      lines.push(
+        `  ${r.label}\t${r.kindLabel} every ${fmtMs(r.requestedMs || 16.7, 1)}ms\t${r.policyLabel}` +
+          `${r.policy !== "full" ? ` (limit ${fmtMs(r.effectiveMs, 0)}ms)` : ""}\t${fmtRate(r.runsPerSec)}/s\t${fmtMs(r.msPerSec)}ms/s\t` +
+          `${fmtMs(r.perRunMs, 3)}ms/run\t${fmtMs(r.worst)}ms worst\t${r.skipped} skipped` +
+          `${Number.isFinite(r.sourceRateBefore) && Number.isFinite(r.sourceRateAfter) ? `\twas ${fmtRate(r.sourceRateBefore)}/s before the limit, now ${fmtRate(r.sourceRateAfter)}/s` : ""}`
+      );
+    }
+    if (!gv.sources.length) lines.push("(no tick sources seen: the page registered none through the wrapped globals)");
+    lines.push(
+      `  traces: ${gv.traceCount} long frame(s) captured | worker lane: ${gv.worker.available ? "available" : `unavailable (${gv.worker.why})`}` +
+        `${gv.worker.jobs ? ` | ${gv.worker.jobs} job(s), ${fmtMs(gv.worker.offThreadMs)}ms off-thread, ${fmtMs(gv.worker.mainMs)}ms of main-thread time` : ""}`
+    );
+    for (const tr of GOV.traces.slice(0, 5)) {
+      const top = tr.scripts[0];
+      lines.push(
+        `  long frame ${fmtMs(tr.duration, 0)}ms (${fmtMs(tr.blocking, 0)}ms blocking, ${fmtMs(tr.layoutMs, 0)}ms forced layout)` +
+          `${top ? `: ${top.fn} @ ${top.file} ${fmtMs(top.ms, 0)}ms${top.invoker ? ` [${top.invoker}]` : ""}` : ": no script attribution"}`
+      );
+      if (tr.ticks.length) {
+        lines.push(`    inside it: ${tr.ticks.slice(0, 4).map((t) => `${t.label} ×${t.count} (${fmtMs(t.ms, 0)}ms)`).join(", ")}`);
+      }
+      if (tr.callers && tr.callers.length) {
+        lines.push(`    asked for by: ${tr.callers.map((c) => `${c.label} ×${c.count}`).join(", ")}`);
+      }
+      lines.push(`    ${tr.redraws} redraw request(s), ${tr.coalesced} merged away${tr.limited.length ? `, limits active: ${tr.limited.join("; ")}` : ""}`);
+    }
+  }
+
+  lines.push("");
   lines.push("-- BENCHMARK (scripted pan) --");
   const A = s.settings.benchmark && s.settings.benchmark.A;
   const B = s.settings.benchmark && s.settings.benchmark.B;
@@ -3651,7 +5316,7 @@ async function copyTelemetryReport(buttonEl) {
   const show = (label) => {
     if (!buttonEl) return;
     setText(buttonEl, label);
-    setTimeout(() => setText(buttonEl, original), 1600);
+    govOwn(() => setTimeout(() => setText(buttonEl, original), 1600));
   };
   try {
     if (!navigator.clipboard || !navigator.clipboard.writeText) throw new Error("clipboard API unavailable");
@@ -3696,10 +5361,10 @@ function ensureCanvasPatched() {
     return false;
   }
   if (!canvasRetryTimer) {
-    canvasRetryTimer = setTimeout(() => {
+    canvasRetryTimer = govOwn(() => setTimeout(() => {
       canvasRetryTimer = null;
       ensureCanvasPatched();
-    }, 250);
+    }, 250));
   }
   return false;
 }
@@ -3744,6 +5409,36 @@ function installDebugApi() {
       // Live row caps: lower them (or raise them) to trade panel render cost
       // against how much of a long list is on screen.
       rowCaps,
+      // The scheduler layer: set limits, tune the rAF governor, read what it
+      // measured, and use the off-thread lane. Everything here is also exposed
+      // in the Governor tab; the API exists so tests (and other extensions) do
+      // not have to reach into internals by name.
+      governor: {
+        get metrics() {
+          return govMetrics();
+        },
+        get sources() {
+          return govRows();
+        },
+        get traces() {
+          return GOV.traces.slice();
+        },
+        get state() {
+          return GOV;
+        },
+        get workerSource() {
+          return GOV_WORKER_SRC;
+        },
+        policy: (key, id) => govSetPolicy(key, id),
+        control: (key, value) => govSetControl(key, value),
+        suggest: () => govSuggest(),
+        reset: () => govReset(),
+        probeWorker: () => govProbeWorker(),
+        selfTest: () => govRunSelfTest(),
+        selfTestMain: (arg) => govSelfTestMainThread(arg),
+        offload: (job, arg) => govOffload(job, arg),
+        own: (fn) => govOwn(fn),
+      },
       // Internal state, for tests and for debugging the tracker itself.
       get _state() {
         return S;
@@ -3769,13 +5464,13 @@ app.registerExtension({
     installStallObserver();
     installRafMonitor();
     installMemorySampler();
-    setInterval(sweepStaleData, SWEEP_MS);
+    govOwn(() => setInterval(sweepStaleData, SWEEP_MS));
     // Node types keep arriving as packs register, so re-scan for hooks that
     // never went through this tool's beforeRegisterNodeDef wrapper.
-    setInterval(scanRegisteredTypes, 2000);
-    setInterval(() => {
+    govOwn(() => setInterval(scanRegisteredTypes, 2000));
+    govOwn(() => setInterval(() => {
       if (ui.built && ui.panel.classList.contains("open") && ui.active === "gpu") refreshGpu();
-    }, 2500);
+    }, 2500));
     console.info(
       `[ANTs Tracker] v${VERSION} running. Open the panel with the 🔧 button (or the node's Open Tracker widget); ` +
         "window.__antsTracker.snapshot / .report give the same data from the console."
@@ -3831,3 +5526,22 @@ app.registerExtension({
 //  * Muting changes what is drawn, by definition. A muted extension may also
 //    take a different code path on the next call (caches, internal state), so
 //    treat a muted/unmuted delta as an upper bound rather than an exact price.
+//  * The scheduler layer can only govern callbacks that reach the page's own
+//    setInterval / setTimeout / requestAnimationFrame: microtasks, promise
+//    chains, browser-internal work (style, layout, paint, the compositor's own
+//    threads) and callbacks registered before this module loaded on a loop that
+//    never re-registers are outside its reach. Attribution of a source is
+//    sampled at registration, so a source can be listed as a name only until a
+//    sample lands on it.
+//  * Limiting a source changes behaviour by design: a poll runs less often, and
+//    a "pause" policy stops it entirely. Every tick the panel could not time
+//    (because it never ran) means the "ms/s kept off the main thread" figure is
+//    an estimate built from the ticks that did run, not a measurement.
+//  * Only pure compute can leave the main thread. Vue's render, the DOM, and
+//    canvas drawing cannot: they are main-thread-only by specification, and
+//    OffscreenCanvas only helps an application that created its canvas that way
+//    (ComfyUI does not). The worker lane exists for the pure-math parts, and it
+//    says so when it falls back to the main thread.
+//  * Worker functions cannot capture closures, which is why the lane takes a
+//    job name (or a self-contained function source) plus structured-cloneable
+//    arguments and nothing else.

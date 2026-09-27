@@ -96,6 +96,17 @@ vm.runInContext(
   { filename: "http://localhost:8188/extensions/NastyBastards/js/status.js" }
 );
 
+// A heartbeat from an extension that burns real time on every tick, and forces
+// layout while it is at it — the pattern the Governor exists for, and the one
+// the report that prompted this layer actually found (`clamp` in a curve
+// equalizer extension, 3 seconds of forced style/layout over a session).
+h.sandbox.__antsCost = (ms) => h.busy(ms);
+vm.runInContext(
+  `setInterval(function clamp() { __antsCost(3.2); }, 20);`,
+  h.sandbox,
+  { filename: "http://localhost:8188/extensions/ANT_NODES/ant_loras_equalizer_curve.js" }
+);
+
 // ------------------------------------------------------------------- drive ---
 for (const ext of h.app.extensions) if (ext.setup) await ext.setup();
 await h.flush();
@@ -106,7 +117,10 @@ function run(wallMs) {
   const until = h.clock.now + wallMs;
   let i = 0;
   while (h.clock.now < until) {
-    if (i++ % 3 === 0) h.sandbox.__nastyTick(); // ~20 redraw requests/second
+    if (i++ % 3 === 0) {
+      h.sandbox.__nastyTick(); // ~20 redraw requests/second
+      h.sandbox.__nastyTick(); // and a second source asking for the same frame
+    }
     if (h.clock.now >= nextStallAt) {
       nextStallAt = h.clock.now + 1000;
       // one second of blocked main thread, from the same page script
@@ -116,6 +130,20 @@ function run(wallMs) {
           duration: 140,
           blockingDuration: 95,
           scripts: [
+            {
+              sourceURL: "http://localhost:8188/assets/settingStore-DDHzGrHr.js",
+              sourceFunctionName: "renderFrame",
+              invoker: "user-callback",
+              duration: 90,
+              forcedStyleAndLayoutDuration: 55,
+            },
+            {
+              sourceURL: "http://localhost:8188/extensions/ANT_NODES/ant_loras_equalizer_curve.js",
+              sourceFunctionName: "clamp",
+              invoker: "TimerHandler:setInterval",
+              duration: 42,
+              forcedStyleAndLayoutDuration: 30,
+            },
             {
               sourceURL: "http://localhost:8188/extensions/NastyBastards/js/status.js",
               sourceFunctionName: "refreshStatusBadge",
@@ -142,7 +170,18 @@ async function pump() {
   await new Promise((r) => setImmediate(r));
 }
 
-run(6000); // six seconds of realistic traffic
+run(6000); // six seconds of realistic traffic (everything untouched: "normal")
+await pump();
+
+// Then the scheduler layer does something about it: the extension heartbeat is
+// dropped to a quarter speed and redraw requests are merged, and the page runs
+// for two more seconds so the Governor tab below shows the same source measured
+// at a quarter of its runs, with the skipped ticks counted rather than hidden.
+const gov = h.tracker.governor;
+const clampSource = gov.sources.find((r) => r.name === "clamp");
+if (clampSource) gov.policy(clampSource.key, "quarter");
+gov.control("coalesce", true);
+run(2000);
 await pump();
 // ------------------------------------------------------------------- print ---
 const WIDTH = 100;
@@ -158,6 +197,7 @@ const pad = (d) => "  ".repeat(d);
 
 function textWithoutTables(node) {
   if (node.tagName === "TABLE") return "";
+  if (node.tagName === "SELECT") return node.value || "(unset)";
   return [node._text, ...node.children.map(textWithoutTables)].join(" ").replace(/\s+/g, " ").trim();
 }
 
@@ -207,13 +247,21 @@ await pump();
 bullets("SUMMARY BAR (always visible)");
 dump(h.document.getElementById("ants-tracker-summary"));
 
-const TABS = ["timing", "nodes", "stalls", "load", "memory", "gpu", "testing"];
+const TABS = ["timing", "nodes", "stalls", "governor", "load", "memory", "gpu", "testing"];
 const tabBar = h.document.getElementById("ants-tracker-tabs");
 const body = h.document.getElementById("ants-tracker-body");
 for (let i = 0; i < TABS.length; i++) {
   tabBar.children[i].click();
-  run(i === 5 ? 2600 : 700); // the GPU tab polls /system_stats every 2.5s while open
+  run(i === 6 ? 2600 : 700); // the GPU tab polls /system_stats every 2.5s while open
   await pump();
+  if (TABS[i] === "governor") {
+    // Collapsed detail rows are skipped by the printer, and the trace detail
+    // ("this frame's scripts, the ticks inside it, who asked for the redraw") is
+    // the point of the card, so open the first few here.
+    const carets = body.children[i].descendants().filter((n) => n._cls && n._cls.has("ants-caret"));
+    for (const caret of carets.slice(0, 3)) caret.click();
+    await pump();
+  }
   bullets(`${TABS[i].toUpperCase()} TAB`);
   dump(body.children[i]);
 }
@@ -226,7 +274,10 @@ bullets("TEXT REPORT (Copy button)");
 console.log(h.clipboardWrites[h.clipboardWrites.length - 1] || "(clipboard empty)");
 
 console.log(
-  "\nnote: in this simulation the clock only advances with h.advance(), so the tracker's own" +
+  "\nnote: the last two seconds of the run above have one limit applied (the extension's `clamp`" +
+    "\n      heartbeat at quarter speed) and redraw merging on, so the GOVERNOR TAB above shows a" +
+    "\n      source that was measured, then limited, with its skipped ticks counted." +
+    "\nnote: in this simulation the clock only advances with h.advance(), so the tracker's own" +
     "\n      per-render cost reads 0 — a real browser spends real time rendering the panel." +
     "\n      Everything else above is what web/tracker.js computes from the synthetic traffic."
 );
