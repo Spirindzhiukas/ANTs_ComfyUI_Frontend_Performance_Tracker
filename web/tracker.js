@@ -27,7 +27,7 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.1.9";
+const VERSION = "2.1.10";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
 const NODE_NAME = "ANTsNastyBastardsTracker";
 
@@ -874,22 +874,21 @@ const LOD = {
   thumbBytes: 0,
   thumbFailures: 0,
   zoom: 0,
-  // Zoomed-out detail. Past a zoom the user sets, links lose their outline and
-  // are stroked 1px wide, and the frontend is put into its own low-quality mode
-  // (no node shadows, no rounded corners, and widgets that asked to hide when
-  // zoomed out stay hidden). Curves are kept: what changes is how much ink is
-  // laid down, not the shape of the link.
-  detailZoom: 0.6, // below this zoom detail is reduced (0 = full detail)
-  // How links are drawn when the graph is being flattened.
-  //   "auto"     — straight lines while most of the graph is rectangles (the
-  //                v2.1.4 behaviour, kept as the default so nothing changes for
-  //                anyone who never touches it);
-  //   "spline"   — never straighten; keep every curve and let the thinning
-  //                setting above decide how much ink they use;
-  //   "straight" — always straight, for graphs drawn with straight links.
-  linkStyle: "auto",
+  // Link ink. Past a zoom the user sets, links are stroked 1px wide instead of 3
+  // and lose the dark outline drawn under them — a change to the *stroke*, made
+  // for the one call that draws that link, and to nothing else. Curves are kept,
+  // because straightening a link is a different decision (see linkStyle), and
+  // nothing here touches nodes, their widgets, or the frame's own quality flag.
+  detailZoom: 0.6, // below this zoom link ink is reduced (0 = full detail)
+  // Link shape, and only link shape. Two explicit answers:
+  //   "spline"   — ComfyUI's curves, always, whatever zoom and whatever the node
+  //                setting says (the default);
+  //   "straight" — straight lines, always, for graphs drawn that way.
+  // There is deliberately no "auto": a link's shape changing because the *node*
+  // setting crossed a threshold is the coupling that made the old mode look like
+  // it was flattening nodes on its own.
+  linkStyle: "spline",
   thinLinks: 0, // link segments stroked thin so far
-  lqMissing: false, // the frontend does not expose its low-quality flag
   domMarked: null, // Set of elements we are hiding right now
   domWidgets: null, // Map<widget, original hideOnZoom> for the ones we flipped
   domHidden: 0, // elements hidden because their node is a box
@@ -897,6 +896,7 @@ const LOD = {
   domStilled: 0, // widgets also taken out of the per-frame layout pass
   sweptZoom: NaN, // the zoom the DOM was last swept at
   sweptKey: "", // and the flat decision it was swept for
+  autoLinkCarried: false, // a v2.1.9 "auto" link setting was carried over
 };
 
 // The zoom below which every node is painted as a rectangle. A zoom, not a node
@@ -921,10 +921,11 @@ const LOD_THUMB_MAX_BYTES = 64 * 1024 * 1024; // and a byte budget, because 48 l
 // Zoom levels below which links and node detail are reduced.
 const LOD_DETAIL_ZOOMS = [0, 1, 0.8, 0.6, 0.4, 0.2];
 const LOD_LINK_WIDTH = 1; // graph units; LiteGraph's own default is 3
+const LOD_FULL_LINK_WIDTH = 3; // what ComfyUI draws when nothing is thinned
 const LOD_DOM_CLASS = "ants-lod-box"; // elements hidden while their node is a box
 const LOD_DOM_SWEEP_MS = 1000; // how often newly added nodes/widgets are picked up
 // Link drawing, as a setting rather than a side effect of the node threshold.
-const LOD_LINK_STYLES = ["auto", "spline", "straight"];
+const LOD_LINK_STYLES = ["spline", "straight"];
 // Settings survive a reload: they are the user's choice about their own page,
 // and re-picking four dropdowns after every ComfyUI restart is not a feature.
 const LOD_STORE_KEY = "ants.lowZoom.v1";
@@ -974,26 +975,17 @@ function lodDetailOn(canvas) {
   return z > 0 && z < LOD.detailZoom;
 }
 
-// Straight links are a *drawing* choice, and v2.1.4 tied it to the node
-// threshold: flatten most of the graph and links went straight with it. That is
-// wrong for a workflow built out of curves, so it is now its own setting, with
-// the old behaviour available as "auto" — which, since v2.1.9, means "while the
-// zoom has the graph flattened", the same trigger the node setting uses.
+// Link shape, and nothing else. This used to have an "auto" answer that followed
+// the node setting — flatten the graph and links went straight with it — which
+// meant a link changed shape because a *node* setting crossed a threshold. That
+// is exactly the coupling the three settings are supposed to not have, so it is
+// gone: straight lines happen when the user says so, and at no other time.
 function lodLinksStraight() {
-  if (LOD.linkStyle === "straight") return true;
-  if (LOD.linkStyle === "spline") return false;
-  return lodFlatOn();
+  return LOD.linkStyle === "straight";
 }
 
 function lodBoxifyOn(canvas) {
   return lodFlatOn(canvas);
-}
-
-// One frame drawn the cheap way — link outlines skipped, node detail reduced,
-// and (see lodSweepDom) the DOM content of boxed nodes out of the layout pass.
-// True when either setting asks for it.
-function lodCheapFrameOn(canvas) {
-  return lodDetailOn(canvas) || lodBoxifyOn(canvas);
 }
 
 function lodPreviewsOn(canvas) {
@@ -1077,9 +1069,9 @@ function lodPlanFrame(canvas) {
     plan.medPx = Math.round(widths[widths.length >> 1]);
   }
   plan.total = total;
-  // Links follow the same trigger as the nodes under "auto": if the graph is
-  // rectangles, straight lines cost less and say the same thing.
-  plan.links = lodFlatOn(canvas);
+  // Links are whatever the link setting says, at every zoom. This is reported so
+  // the readout can say which path they are on, not to decide it.
+  plan.links = lodLinksStraight();
   return plan;
 }
 
@@ -1302,28 +1294,6 @@ function lodInstallDrawImage() {
 // 4K screen at 10% zoom it may or may not have engaged; this brings the same
 // rendering forward to the zoom the user picked, for the duration of one frame.
 // Returns a function that puts the flag back, or null if there was nothing to do.
-function lodLowQualityFrame(canvas) {
-  try {
-    if (!canvas || !("_isLowQuality" in canvas)) {
-      LOD.lqMissing = true;
-      return null;
-    }
-    const prev = canvas._isLowQuality;
-    if (prev === true) return null; // the frontend is already drawing this way
-    canvas._isLowQuality = true;
-    return () => {
-      try {
-        canvas._isLowQuality = prev;
-      } catch (e) {
-        /* it was writable a moment ago; if that changed, the next frame fails open */
-      }
-    };
-  } catch (e) {
-    LOD.lqMissing = true;
-    return null;
-  }
-}
-
 // ------------------------------------------------------------- DOM boxes ----
 // A node whose visuals are DOM (a Vue node, or any node with a DOM widget: an
 // image preview, a video, a curve editor, a custom panel) keeps that DOM on top
@@ -1541,7 +1511,10 @@ function lodLoadSettings() {
       detailZoom: saved.detailZoom === undefined ? 0 : Number(saved.detailZoom) || 0,
       thumbZoom: saved.thumbZoom === undefined ? 0.6 : Number(saved.thumbZoom) || 0,
       idleCapMs: Number(saved.idleCapMs) || 0,
-      linkStyle: saved.linkStyle || "auto",
+      // Anything that is not an explicit "straight" means curves. A v2.1.9
+      // "auto" record becomes "spline" and raises the note above.
+      linkStyle: saved.linkStyle === "straight" ? "straight" : "spline",
+      autoLinkCarried: saved.linkStyle === "auto",
     });
     return true;
   } catch (e) {
@@ -1609,6 +1582,7 @@ function lodSet(opts) {
     if (o.legacyPx === undefined) LOD.legacyPx = 0; // the user has chosen; drop the note
   }
   if ("legacyPx" in o) LOD.legacyPx = Math.max(0, Number(o.legacyPx) || 0);
+  if ("autoLinkCarried" in o) LOD.autoLinkCarried = !!o.autoLinkCarried;
   // v1 and v2.1.8 scripts passed a pixel width. Kept working: translated.
   if ("minPx" in o) {
     const px = Math.max(0, Number(o.minPx) || 0);
@@ -1622,7 +1596,16 @@ function lodSet(opts) {
   if ("detailZoom" in o) LOD.detailZoom = Math.max(0, Math.min(1, Number(o.detailZoom) || 0));
   if ("linkStyle" in o) {
     const style = String(o.linkStyle);
-    LOD.linkStyle = LOD_LINK_STYLES.includes(style) ? style : "auto";
+    // "auto" from v2.1.9 and earlier meant "follow the node setting", which is
+    // exactly the coupling being removed: it becomes curves, and a note says
+    // what happened.
+    if (style === "auto") {
+      LOD.linkStyle = "spline";
+      if (o.autoLinkCarried === undefined) LOD.autoLinkCarried = true;
+    } else {
+      LOD.linkStyle = LOD_LINK_STYLES.includes(style) ? style : "spline";
+      if (o.autoLinkCarried === undefined) LOD.autoLinkCarried = false;
+    }
   }
   if (LOD.flatBelow > 0) lodInstallDomSweep();
   const now = lodOn();
@@ -1644,6 +1627,14 @@ function lodSet(opts) {
   lodSaveSettings();
   return now;
 }
+
+// (The frame-level low-quality borrow that used to live here is gone. Setting the
+// canvas's low-quality flag for a frame is not a link setting: it changes how
+// every *node* is painted (no shadows, no rounded corners) and it is the same
+// flag the frontend consults before placing widgets that asked to hide when
+// zoomed out. On a page whose zoom sits below the thinning threshold, that is
+// "nodes look half-flattened all the time" — reported from a real page, and the
+// right answer is that a link setting may only change link ink.)
 
 // ComfyUI has its own level-of-detail switch: `LiteGraph.Canvas.MinFontSizeForLOD`
 // (Settings -> LiteGraph, default 8px, and 0 switches its LOD off entirely),
@@ -1775,16 +1766,10 @@ function patchCanvasDraw() {
       // no node is being flattened.
       if (lodOn()) lodPlanFrame(this);
       drawDepth++;
-      // One frame drawn the way the frontend draws when it is zoomed far out:
-      // no node shadows, no rounded corners, no outline under every link. The
-      // flag is put back as soon as the frame is over, so nothing this tool did
-      // outlives the redraw it was for.
-      const restoreLq = lodCheapFrameOn(this) ? lodLowQualityFrame(this) : null;
       let ret;
       try {
         ret = originalDraw.apply(this, args);
       } finally {
-        if (restoreLq) restoreLq();
         drawDepth--;
         const dt = performance.now() - t0;
         S.counters.framesTotal++;
@@ -4842,7 +4827,6 @@ function buildTweaksTab(container) {
 
   const lodLinkSel = el("select", { class: "ants-select", style: { width: "auto", maxWidth: "260px" } });
   for (const [id, text] of [
-    ["auto", "links: straight while the graph is rectangles"],
     ["spline", "links: keep every curve"],
     ["straight", "links: always straight lines"],
   ]) {
@@ -4852,12 +4836,11 @@ function buildTweaksTab(container) {
   }
   lodLinkSel.value = LOD.linkStyle;
   lodLinkSel.title =
-    "What links are drawn as while the node setting above is flattening the graph. \"Straight while the graph is rectangles\" is how " +
-    "this worked from v2.1.4: once most of the sample is flat, links are replaced by straight lines, which is cheap but destroys the " +
-    "shape of a workflow drawn with curves. \"Keep every curve\" never straightens a link \u2014 combine it with the thinning setting " +
-    "below to pay less for the curves instead. \"Always straight lines\" is for graphs that were drawn with straight links to begin " +
-    "with. The three settings are independent: flattening decides what a node costs, this decides the shape of a link, and thinning " +
-    "decides how much ink that shape uses.";
+    "The shape of a link, and only that. \"Keep every curve\" draws links the way ComfyUI draws them, at every zoom, whatever the node " +
+    "setting is doing \u2014 combine it with the thinning setting below to pay less for the curves instead of losing their shape. " +
+    "\"Always straight lines\" is for graphs that were drawn with straight links to begin with. Nothing here touches nodes: the node " +
+    "setting decides what a node costs, this decides a link's shape, thinning decides how much ink that shape uses, and none of the " +
+    "three can change another's subject.";
   lodLinkSel.addEventListener("change", () => {
     lodSet({ linkStyle: lodLinkSel.value });
     lodUpdate();
@@ -4875,9 +4858,8 @@ function buildTweaksTab(container) {
   lodDetailSel.title =
     "Below this zoom, links are stroked 1px wide instead of 3 and lose the dark outline drawn under them (a second stroke 4 units " +
     "wider, which on a long link is most of the ink) \u2014 the curves are kept exactly as they are, because straight lines destroy " +
-    "the shape of a workflow built out of splines. Those frames are also drawn with the frontend's own low-quality mode on: no " +
-    "node shadows and no rounded corners. Neither change touches hit-testing, dragging or what a node actually is \u2014 and both " +
-    "are handed back as soon as the frame is drawn.";
+    "the shape of a workflow built out of splines. This setting changes link ink and nothing else: it does not flatten a node, does not " +
+    "hide a widget, and does not touch the frame's own quality flag. The two values are put back as soon as the link is drawn.";
   lodDetailSel.addEventListener("change", () => {
     lodSet({ detailZoom: Number(lodDetailSel.value) });
     lodUpdate();
@@ -4907,9 +4889,9 @@ function buildTweaksTab(container) {
     "Turn all of them off \u2014 flattening, link thinning, thumbnails and the redraw cap \u2014 and let ComfyUI draw the canvas " +
     "exactly as it wants, including any DOM content this tool was hiding.";
   lodOffBtn.addEventListener("click", () => {
-    lodSet({ flatBelow: 0, idleCapMs: 0, thumbZoom: 0, detailZoom: 0, linkStyle: "auto" });
+    lodSet({ flatBelow: 0, idleCapMs: 0, thumbZoom: 0, detailZoom: 0, linkStyle: "spline" });
     lodFlatSel.value = "0";
-    lodLinkSel.value = "auto";
+    lodLinkSel.value = "spline";
     lodDetailSel.value = "0";
     lodThumbSel.value = "0";
     lodIdleSel.value = "0";
@@ -4947,9 +4929,8 @@ function buildTweaksTab(container) {
         "still, and a per-node pixel rule then paints the same node flat on one frame and in full on the next. The link setting decides " +
         "the shape of a link: ComfyUI's curves, or straight lines. The thinning setting decides how much ink a curve uses \u2014 below " +
         "its zoom links are stroked 1px wide instead of 3 and lose the dark outline drawn under them, which on a long link is most of " +
-        "the pixels, and the curves stay exactly where they were. Those frames are drawn with the frontend's own low-quality mode on as " +
-        "well (no node shadows, no rounded corners). Everything here is remembered across sessions and handed back by \"Back to full " +
-        "drawing\".",
+        "the pixels, and the curves stay exactly where they were \u2014 link ink and nothing else, so a link setting never paints a node. " +
+        "Everything here is remembered across sessions and handed back by \"Back to full drawing\".",
     })
   );
 
@@ -5037,31 +5018,20 @@ function buildTweaksTab(container) {
         }
       }
       if (LOD.detailZoom > 0) {
-        if (lodDetailOn()) {
-          const frames = Math.max(1, since ? since.n : 1);
-          if (lodLinksStraight()) {
-            // Straight links used to be a side effect of the node threshold, so
-            // a panel that only said "most of the graph is rectangles" left the
-            // user guessing which setting to change. Name it.
-            bits2.push(
-              `zoomed out: ${LOD.links} link draw(s) on the straight-line path, because the link setting is ` +
-                (LOD.linkStyle === "straight" ? "\"always straight lines\"" : "\"straight while the graph is rectangles\"") +
-                ` \u2014 the thinning setting applies to links ComfyUI draws as curves, so switch the link setting to "keep every ` +
-                `curve" to pay less for the curves instead of losing their shape`
-            );
-          } else {
-            bits2.push(
-              `zoomed out: ${LOD.thinLinks} link segment(s) stroked 1px without their outline ` +
-                `(${(LOD.thinLinks / frames).toFixed(1)}/frame, curves kept)` +
-                (LOD.lqMissing
-                  ? " \u00b7 this frontend version does not expose its low-quality flag, so node shadows and rounded corners are unchanged"
-                  : " \u00b7 node shadows and rounded corners are off for the frame")
-            );
-          }
-        } else {
+        const frames = Math.max(1, since ? since.n : 1);
+        if (lodLinksStraight()) {
           bits2.push(
-            `zoomed in: links and node detail are drawn in full above ${Math.round(LOD.detailZoom * 100)}% zoom`
+            `${LOD.links} link draw(s) on the straight-line path (${(LOD.links / frames).toFixed(1)}/frame) \u2014 the link setting is ` +
+              `"always straight lines", so the thinning setting has nothing to thin. Nodes are not affected either way.`
           );
+        } else if (lodDetailOn()) {
+          bits2.push(
+            `below ${Math.round(LOD.detailZoom * 100)}% zoom: ${LOD.thinLinks} link segment(s) stroked ${LOD_LINK_WIDTH}px instead of ` +
+              `${LOD_FULL_LINK_WIDTH}px and without their outline (${(LOD.thinLinks / frames).toFixed(1)}/frame, curves kept). This changes ` +
+              `link ink and nothing else: nodes, their widgets and the frame's own quality flag are exactly as ComfyUI left them.`
+          );
+        } else {
+          bits2.push(`links drawn with full ink above ${Math.round(LOD.detailZoom * 100)}% zoom (${LOD.thinLinks} thinned so far)`);
         }
       }
       if (LOD.flatBelow > 0) {
@@ -5109,6 +5079,13 @@ function buildTweaksTab(container) {
           `${Math.round(LOD.flatBelow * 100)}% zoom" — every node below it is a rectangle, whatever size that node is. That is the fix for the ` +
           `nodes with JS or dynamic UIs: a node that hides or greys a widget changes its own size, and a per-node pixel rule then flips it in and ` +
           `out of the flat state while its neighbours stay detailed. Pick any value above to dismiss this note.`
+      );
+    }
+    if (LOD.autoLinkCarried) {
+      bits.push(
+        `waiting to be picked: your link setting was "straight while the graph is rectangles", which let the *node* setting decide a ` +
+          `link's shape. That answer is gone \u2014 links are "keep every curve" unless you ask for straight lines \u2014 so no setting here ` +
+          `changes anything but its own subject. Choose a link value to dismiss this note.`
       );
     }
     if (LOD.error) bits.push(`turned itself off after an error: ${LOD.error}`);
@@ -7169,7 +7146,7 @@ function buildTelemetryReport() {
     lines.push(
       `low-zoom drawing: ${
         lodOn()
-          ? `on (every node a rectangle below ${Math.round(LOD.flatBelow * 100)}% zoom${LOD.legacyPx ? `, carried over from "nodes under ${LOD.legacyPx}px"` : ""}, links ${LOD.plan.links ? "straight" : "as drawn"}, idle redraw cap ${LOD.idleCapMs || "off"}ms) ` +
+          ? `on (every node a rectangle below ${Math.round(LOD.flatBelow * 100)}% zoom${LOD.legacyPx ? `, carried over from "nodes under ${LOD.legacyPx}px"` : ""}, links ${lodLinksStraight() ? "straight (link setting)" : "as drawn"}, idle redraw cap ${LOD.idleCapMs || "off"}ms) ` +
             `— ${LOD.nodes} node draw(s) and ${LOD.links} link draw(s) simplified, ${LOD.capped} redraw(s) merged` +
             (LOD.thumbZoom > 0
               ? `, previews ${LOD.imgThumb}/${LOD.imgSeen} served from thumbnails (${LOD.thumbsBuilt} cached, ${fmtBytes(LOD.thumbBytes)}) below ${Math.round(LOD.thumbZoom * 100)}% zoom`
@@ -7458,8 +7435,10 @@ function installDebugApi() {
             belowZoom: LOD.detailZoom,
             thinLinks: LOD.thinLinks,
             linkWidth: LOD_LINK_WIDTH,
-            lowQualityForced: lodDetailOn() && !LOD.lqMissing,
-            lowQualityAvailable: !LOD.lqMissing,
+            // What the thinning setting may not touch, exposed so a test can
+            // hold it to that.
+            linkStyle: LOD.linkStyle,
+            straight: lodLinksStraight(),
           };
         },
         get dom() {
@@ -7501,10 +7480,11 @@ function installDebugApi() {
             graphNodes: LOD.plan.total,
             typicalNodePx: LOD.plan.medPx,
             carriedOverFromPx: LOD.legacyPx,
+            autoLinkCarried: LOD.autoLinkCarried,
           };
         },
         set: (opts) => lodSet(opts),
-        off: () => lodSet({ flatBelow: 0, idleCapMs: 0, thumbZoom: 0, detailZoom: 0 }),
+        off: () => lodSet({ flatBelow: 0, idleCapMs: 0, thumbZoom: 0, detailZoom: 0, linkStyle: "spline" }),
       },
       setSyntheticTick,
       benchmark: (ms, slot) => runScriptedPan(Number(ms) || 6000, slot || "A"),

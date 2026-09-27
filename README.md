@@ -536,6 +536,29 @@ patches `drawImage` there, the same way a browser exposes it), and
 `createImageBitmap` records the resize it was asked to perform instead of
 resizing anything.
 
+## What changed in v2.1.10
+
+- **Link thinning is a link setting, and nothing else.** It used to put the canvas
+  into the frontend's low-quality mode for the frame it was thinning: that skips
+  node shadows and rounded corners, and it is the same flag ComfyUI consults
+  before placing widgets that asked to hide when zoomed out. On a page whose zoom
+  sits below the thinning threshold, the visible result was *nodes looking
+  half-flattened all the time* — a link setting quietly repainting nodes. The
+  flag is no longer touched at all. The setting now changes exactly two things,
+  for the one call that draws a link: the stroke is 1px instead of 3, and the dark
+  outline under it is skipped. Both are put back immediately.
+- **Straight links are opt-in, and no longer follow the node setting.** The link
+  dropdown had an `auto` answer — "straight while the graph is rectangles" — which
+  meant the *node* setting decided the shape of a link. That is gone: the choices
+  are **keep every curve** (the default, and what ComfyUI draws) and **always
+  straight lines**. A saved `auto` becomes "keep every curve" and the panel says
+  the setting changed hands. So flattening never straightens a link, and thinning
+  never touches a node: each setting changes its own subject and nothing else.
+- The panel's readout for these settings now states that promise in words, and
+  the test suite holds it to it: nodes are asserted to be drawn by LiteGraph's
+  own path, outside any borrowed low-quality frame, with the canvas flag exactly
+  as ComfyUI left it, while links are thinned.
+
 ## What changed in v2.1.9
 
 - **The node threshold is a zoom now, not a node size.** "Nodes under 64px" asked

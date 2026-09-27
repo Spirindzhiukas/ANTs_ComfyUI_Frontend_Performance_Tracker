@@ -290,7 +290,7 @@ h.canvas.nodes[3].widgets = [
   { name: "model_file", type: "load3D", component: {}, options: {} },
 ];
 
-h.tracker.lowZoom.set({ flatBelow: 0.2, idleCapMs: 500, thumbZoom: 0.6, detailZoom: 0.6, linkStyle: "auto" });
+h.tracker.lowZoom.set({ flatBelow: 0.2, idleCapMs: 500, thumbZoom: 0.6, detailZoom: 0.6, linkStyle: "spline" });
 
 // One node with a 4096px image in it, drawn the way a preview/load/compare node
 // draws: the first frame paints the full bitmap, the next one is served from the
@@ -340,17 +340,23 @@ await pump();
 const s = h.tracker.lowZoom.state;
 console.log(
   `  zoom ${Math.round(s.zoom * 100)}% is below the 20% setting: ${s.plan.flat}/${s.plan.total} nodes painted as flat rectangles ` +
-    `(the decision is the zoom, not how big a node is — the widest node here is ${s.plan.medPx}px on screen), ` +
-    `links taken over by the straight-line path (${s.links} of them — link setting "auto" straightens links while the graph is rectangles)`
+    `(the decision is the zoom, not how big a node is — the widest node here is ${s.plan.medPx}px on screen)`
+);
+// The node setting is flattening the whole graph, and the links are still drawn
+// by ComfyUI's own renderer, as curves: nothing but the node setting's own
+// subject is affected.
+console.log(
+  `  and with the whole graph flattened, links still went through ComfyUI's renderer ${h.canvas.linkDraws} time(s) ` +
+    `(${h.canvas.ctx.ops.filter((o) => o[0] === "bezierCurveTo").length} bezier segment(s)) — the node setting does not touch links`
 );
 console.log(
   `  DOM content of a boxed node hidden: ${lodBoxed()} (${h.tracker.lowZoom.dom.hidden} element(s) of ${h.tracker.lowZoom.dom.nodes} boxed node(s),` +
     ` ${h.tracker.lowZoom.dom.stilled} widget(s) — an element widget and a Vue-component widget — out of the per-frame layout pass)` +
-    ` | low-quality frame handed to the frontend: ${h.tracker.lowZoom.detail.lowQualityForced}`
+    ` | frame quality flag touched: ${h.canvas._isLowQuality === false ? "no" : "yes"}`
 );
 
-// The link setting on its own: keep the curves, pay less for them. This is the
-// combination the node threshold alone used to make impossible.
+// Link ink on its own: curves kept, stroke paid for once. Nothing else changes —
+// the nodes are drawn in full and the canvas's quality flag is untouched.
 h.tracker.lowZoom.set({ flatBelow: 0, linkStyle: "spline" });
 h.canvas.linkSettings.length = 0;
 h.canvas.ctx.ops.length = 0;
@@ -360,10 +366,24 @@ run(500);
 await pump();
 const last = h.canvas.linkSettings[h.canvas.linkSettings.length - 1];
 console.log(
-  `  links only (flattening off): ${h.tracker.lowZoom.detail.thinLinks - thinBefore} link segment(s) stroked ${last && last.width}px with ` +
+  `  link ink only: ${h.tracker.lowZoom.detail.thinLinks - thinBefore} link segment(s) stroked ${last && last.width}px with ` +
     `border ${last && last.border}, bezier segments drawn: ${h.canvas.ctx.ops.filter((o) => o[0] === "bezierCurveTo").length} ` +
-    `(the splines are all still there), canvas setting back to ${h.canvas.connections_width}/${h.canvas.render_connections_border}`
+    `(the curves are all still there), canvas setting back to ${h.canvas.connections_width}/${h.canvas.render_connections_border}, ` +
+    `nodes drawn in full and not in low quality: ${h.canvas.nodeDraws > 0 && h.canvas._isLowQuality === false}`
 );
+
+// And the only way to get straight links: ask for them. The node setting plays
+// no part in it.
+h.tracker.lowZoom.set({ linkStyle: "straight" });
+h.canvas.ctx.ops.length = 0;
+frame(2);
+run(500);
+await pump();
+console.log(
+  `  links: always straight lines (asked for): ${h.canvas.ctx.ops.filter((o) => o[0] === "bezierCurveTo").length} bezier segment(s) ` +
+    `at ${h.tracker.lowZoom.state.zoom.toFixed(2)} zoom, node setting still off (${h.tracker.lowZoom.state.flatBelow})`
+);
+h.tracker.lowZoom.set({ linkStyle: "spline" });
 
 // And the same moment one zoom level up: nothing is degraded, the DOM element is
 // back on screen, the canvas object is exactly as ComfyUI left it. This is the
@@ -432,20 +452,20 @@ console.log(
     "\n      hand at quarter speed, and the repaint timer capped by the AUTOPILOT (target 150 ms/s, one" +
     "\n      round every 5s) — so the GOVERNOR TAB above shows both: a source limited by hand, and the" +
     "\n      autopilot's own line saying which source it capped, at what gap, and what it was costing." +
-    "\nnote: the LOW-ZOOM DRAWING section of the Nodes tab and the report line above are the other" +
+    "\nnote: the LOW-ZOOM DRAWING section of the Tweaks tab and the report line above are the other" +
     "\n      answer for this kind of page: every node is inside the viewport at zoom 0.10, so culling has" +
     "\n      nothing to remove and the cost is drawing a thousand nodes properly several times a second." +
-    "\n      The mode paints nodes that land a few pixels wide as one rectangle, straightens links, and" +
-    "\n      caps redraws while nobody is touching the page — opt-in, and off the moment you say so." +
+    "\n      The mode paints every node as one rectangle below the zoom you pick, and caps redraws while" +
+    "\n      nobody is touching the page — opt-in, and off the moment you say so." +
     "\n      Its preview setting is the other half: image, preview and compare nodes blit a full-resolution bitmap every" +
     "\n      redraw, so below the zoom you set (60% by default) those draws are served from a cached copy of about the" +
     "\n      resolution the screen can show — 64px on the long side at 10% zoom, 512px around 60% for a big node." +
-    "\nnote: the third setting degrades links instead of straightening them: below its zoom they are stroked 1px wide" +
-    "\n      instead of 3 and lose the dark outline ComfyUI draws under every link — the curves themselves are untouched," +
-    "\n      so a workflow built out of splines still reads as one. Below 100% the frontend's own low-quality mode is" +
-    "\n      switched on for the duration of the frame as well (no node shadows, no rounded corners), and the DOM content" +
-    "\n      of a node that is currently a rectangle — previews, curve editors, Vue and custom node UIs — is hidden with" +
-    "\n      the .ants-lod-box class until the node is drawn properly again. All three are opt-in and hand everything back." +
+    "\nnote: the three settings are independent, and each one only changes its own subject. The node setting decides what a" +
+    "\n      NODE costs; the link setting decides a LINK's shape (curves, or straight lines if you ask for them — nothing else" +
+    "\n      can turn a link straight); the thinning setting decides how much INK a curve uses (1px instead of 3, without the" +
+    "\n      dark outline ComfyUI draws under every link) and touches nothing else — no frame-level low-quality flag, no node" +
+    "\n      paint, no widget. The DOM content of a node that is currently a rectangle — previews, curve editors, Vue and" +
+    "\n      custom node UIs — is hidden with the .ants-lod-box class until that node is drawn properly again." +
     "\nnote: in this simulation the clock only advances with h.advance(), so the tracker's own" +
     "\n      per-render cost reads 0 — a real browser spends real time rendering the panel." +
     "\n      Everything else above is what web/tracker.js computes from the synthetic traffic."

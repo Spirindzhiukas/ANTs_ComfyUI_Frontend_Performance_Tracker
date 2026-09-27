@@ -117,24 +117,40 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     assertEqual(h.tracker.lowZoom.state.nodes, 40 * draws, "every one of those node draws was replaced");
     const rects = h.canvas.ctx.ops.filter((o) => o[0] === "fillRect").length;
     assertGreater(rects, 0, "with a flat rectangle");
-    const titles = h.canvas.ctx.ops.filter((o) => o[0] === "roundRect" || o[0] === "bezierCurveTo").length;
-    assertEqual(titles, 0, "and none of the chrome that makes a node readable at a zoom where it is not");
+    const chrome = h.canvas.ctx.ops.filter((o) => o[0] === "roundRect").length;
+    assertEqual(chrome, 0, "and none of the node chrome that makes a node readable at a zoom where it is not");
   });
 
-  test("links are drawn as straight lines while most of the graph is that small, and properly again when zoomed in", async () => {
+  test("straight links happen when the link setting asks for them, and at no other time", async () => {
     const h = await boot();
     h.canvas.costs = { background: 0.2, connections: 1.0, chrome: 0.5, link: 0.4 };
     bigGraph(h, 20, 0.1);
-    h.tracker.lowZoom.set({ flatBelow: 0.2 });
+
+    // The node setting is on — and links are still ComfyUI's curves, because a
+    // node setting has no say in how a link is drawn.
+    h.tracker.lowZoom.set({ flatBelow: 0.2, linkStyle: "spline" });
     const before = h.canvas.linkDraws;
     drawLoop(h, 0.2);
-    assertGreater(h.tracker.lowZoom.state.links, 0, "the cheap link path was used");
-    assertEqual(h.canvas.linkDraws, before, "and LiteGraph's own link renderer did not run");
+    assertEqual(h.tracker.lowZoom.state.links, 0, "the straight-line path was not used");
+    assertGreater(h.canvas.linkDraws, before, "LiteGraph drew the links, curves and all");
+    assertGreater(
+      h.canvas.ctx.ops.filter((o) => o[0] === "bezierCurveTo").length,
+      0,
+      "curves at 10% zoom with the graph flattened"
+    );
 
-    h.canvas.ds.scale = 1; // readable zoom: nodes are 200px wide now
+    // Same zoom, same node setting, only the link setting changed.
+    h.tracker.lowZoom.set({ linkStyle: "straight" });
+    const mid = h.canvas.linkDraws;
+    drawLoop(h, 0.2);
+    assertGreater(h.tracker.lowZoom.state.links, 0, "now the straight path draws them");
+    assertEqual(h.canvas.linkDraws, mid, "and LiteGraph's renderer did not run");
+
+    // And it stays straight when zoomed in, because that is what was asked for.
+    h.canvas.ds.scale = 1;
     const proper = h.canvas.linkDraws;
     drawLoop(h, 0.2);
-    assertGreater(h.canvas.linkDraws, proper, "zoomed in, links go back through LiteGraph's renderer");
+    assertEqual(h.canvas.linkDraws, proper, "still straight at 100% zoom");
   });
 
   test("the idle cap merges redraws while nothing is touched and gets out of the way instantly", async () => {
@@ -216,9 +232,9 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     const draws = drawLoop(h, 0.2);
     assertEqual(h.tracker.lowZoom.state.nodes, 8 * draws, "every node is a rectangle, including the 120px one");
     assertEqual(
-      h.canvas.ctx.ops.filter((o) => o[0] === "roundRect" || o[0] === "bezierCurveTo").length,
+      h.canvas.ctx.ops.filter((o) => o[0] === "roundRect").length,
       0,
-      "and none of the chrome that a size rule would have kept on the big node"
+      "and none of the node chrome that a size rule would have kept on the big node"
     );
     assert(h.tracker.lowZoom.limits.flatZoom.includes(0.5), "the ladder is zooms, and it goes to 50%");
     const plan = h.tracker.lowZoom.state.plan;
@@ -424,39 +440,53 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     assert(after.every((s) => s.width === 3 && s.border === true), "and drawn the way ComfyUI draws them");
     assertEqual(h.tracker.lowZoom.detail.on, false, "the panel says so");
 
-    // With flattening on and most of the graph rectangles, links are taken over
-    // by the straight-line path — which is a different thing from the thinning
-    // setting doing nothing, and the panel has to say so.
+    // With the node setting flattening the graph as well, the links are still
+    // curves and the readout still describes the thinning as ink only: the two
+    // settings do not reach into each other's subject any more.
     h.canvas.ds.scale = 0.1;
     h.tracker.lowZoom.set({ flatBelow: 0.2 });
     drawLoop(h, 0.1);
     drawLoop(h, 0.1);
     await openTweaksTab(h);
     const text = panelText(h);
-    assertIncludes(text, "straight-line path", "the panel names the path links are actually on");
-    assertIncludes(text, "the thinning setting applies", "and says how to see the thinning instead");
+    assertIncludes(text, "changes link ink and nothing else", "the panel describes the thinning by what it changes");
+    assert(!text.includes("straight-line path"), "and never mentions a path the node setting used to be able to switch on");
   });
 
-  test("the frontend's own low-quality rendering is borrowed for the frame, then handed back", async () => {
+  test("link thinning changes link ink and nothing else about the frame", async () => {
     const h = await boot();
+    h.window.devicePixelRatio = 1;
     bigGraph(h, 4, 0.1);
-    h.canvas._isLowQuality = false;
-    h.tracker.lowZoom.set({ detailZoom: 0.6 });
+    h.tracker.lowZoom.set({ detailZoom: 1, flatBelow: 0 }); // ink only: every node drawn in full
     h.canvas.nodeLowQuality.length = 0;
-    drawLoop(h, 0.1);
-    assertGreater(h.canvas.nodeLowQuality.length, 0, "nodes were drawn");
-    assert(h.canvas.nodeLowQuality.every((v) => v === true), "each one inside the low-quality frame");
-    assertEqual(h.canvas._isLowQuality, false, "and the flag is back where the frontend left it");
-    assertEqual(h.tracker.lowZoom.detail.lowQualityForced, true, "the panel says the low-quality path is in use");
+    h.canvas.linkSettings.length = 0;
+    h.canvas.ctx.ops.length = 0;
+    drawLoop(h, 0.2);
 
-    // A frontend that does not expose the flag is reported, not assumed.
-    const h2 = await boot();
-    bigGraph(h2, 4, 0.1);
-    delete h2.canvas._isLowQuality;
-    h2.tracker.lowZoom.set({ detailZoom: 0.6 });
-    drawLoop(h2, 0.1);
-    assertEqual(h2.tracker.lowZoom.detail.lowQualityAvailable, false, "this frontend cannot be put in that mode");
-    assertGreater(h2.canvas.linkSettings.length, 0, "links are still degraded, which does not need the flag");
+    assertGreater(h.canvas.linkSettings.length, 0, "links were drawn");
+    assert(
+      h.canvas.linkSettings.every((s) => s.width === 1 && s.border === false),
+      "thinner, without their outline: the one thing this setting is for"
+    );
+    assertGreater(h.canvas.nodeLowQuality.length, 0, "nodes were drawn by LiteGraph's own path");
+    assert(
+      h.canvas.nodeLowQuality.every((v) => v === false),
+      "and not one of them inside a borrowed low-quality frame — the flag that paints nodes half-flat is not this setting's to touch"
+    );
+    assertEqual(h.canvas._isLowQuality, false, "the canvas flag itself is exactly as ComfyUI left it");
+    assertEqual(h.tracker.lowZoom.state.nodes, 0, "nothing was flattened");
+    assertEqual(h.tracker.lowZoom.dom.hidden, 0, "and no DOM content was hidden");
+    assertGreater(h.canvas.nodeDraws, 0, "LiteGraph's own node path ran for every node");
+    assertGreater(h.canvas.ctx.ops.filter((o) => o[0] === "bezierCurveTo").length, 0, "and the curves are still curves");
+
+    // And the readout says so, in those words.
+    h.advance(FRAME_MS);
+    h.canvas.setDirty(true, true);
+    h.canvas.draw();
+    await openTweaksTab(h);
+    const text = panelText(h);
+    assertIncludes(text, "changes link ink and nothing else", "the panel makes the promise explicit");
+    assertIncludes(text, "exactly as ComfyUI left them", "and spells out what it does not touch");
   });
 
   test("the DOM content of a boxed node is hidden, and comes back when it is not a box", async () => {
@@ -578,17 +608,34 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     assertEqual(h.canvas.ctx.ops.filter((o) => o[0] === "bezierCurveTo").length, 0, "no curves when straight is asked for");
     assertGreater(h.tracker.lowZoom.state.links, 0, "the straight path did the drawing");
 
-    // "auto" is the old behaviour: straight only because most of the graph is flat.
+    // The old "auto" answer is gone: asking for it means curves, and the panel
+    // says the setting changed hands rather than silently reinterpreting it.
     h.tracker.lowZoom.set({ linkStyle: "auto" });
-    h.canvas.ctx.ops.length = 0;
-    drawLoop(h, 0.1);
-    assertEqual(h.canvas.ctx.ops.filter((o) => o[0] === "bezierCurveTo").length, 0, "auto goes straight while the graph is rectangles");
-    // With flattening off there is nothing to be straightened for.
+    assertEqual(h.tracker.lowZoom.state.linkStyle, "spline", "an \"auto\" link setting becomes \"keep every curve\"");
+    assertEqual(h.tracker.lowZoom.flat.autoLinkCarried, true, "and it is flagged for the panel");
+    await openTweaksTab(h); // opens the panel and builds the tab
+    h.advance(600);
+    await h.flush();
+    h.canvas.setDirty(true, true);
+    h.canvas.draw();
+    assertIncludes(panelText(h), "waiting to be picked", "the panel explains it");
+    // Picking a value is what dismisses it.
+    h.tracker.lowZoom.set({ linkStyle: "spline" });
+    assertEqual(h.tracker.lowZoom.flat.autoLinkCarried, false, "choosing dismisses it");
+    // The panel refreshes its own readout on a timer; let it run once.
+    h.advance(600);
+    await h.flush();
+    h.canvas.setDirty(true, true);
+    h.canvas.draw();
+    assert(!panelText(h).includes("waiting to be picked"), "and the note is gone");
+
+    // With flattening off, curves are what you get, and nothing about that
+    // changes because the node setting moved.
     h.tracker.lowZoom.set({ flatBelow: 0 });
     h.canvas.ctx.ops.length = 0;
     h.canvas.linkSettings.length = 0;
     drawLoop(h, 0.1);
-    assertGreater(h.canvas.ctx.ops.filter((o) => o[0] === "bezierCurveTo").length, 0, "and curves come back with the threshold at 0");
+    assertGreater(h.canvas.ctx.ops.filter((o) => o[0] === "bezierCurveTo").length, 0, "curves with the node setting off");
   });
 
   test("a Vue-component widget (a 3D viewport) is boxed too, without needing an element handle", async () => {
