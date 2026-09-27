@@ -760,3 +760,94 @@ suite("governor: fail open, and the way back", () => {
     assertIncludes(report, "TURNED OFF", "and the copied report leads with it instead of listing limits that no longer exist");
   });
 });
+
+suite("governor: relays, not a scapegoat", () => {
+  test("the saved timer functions are called with the page's global as receiver", async () => {
+    // Chrome throws "Illegal invocation" when setTimeout/clearTimeout are called
+    // with `this` set to anything but the global object. The layer calls them as
+    // methods of its own bookkeeping object, which is how it switched itself off
+    // on a real page (3 dispatch errors, then fail-open). This shim behaves like
+    // Chrome so the deferral path is exercised for real.
+    const h = createHarness({ strictTimers: true });
+    for (const ext of h.app.extensions) if (ext.setup) await ext.setup();
+    await h.flush();
+
+    let runs = 0;
+    const chain = () => {
+      runs++;
+      h.busy(0.5);
+      h.sandbox.setTimeout(chain, 10);
+    };
+    h.sandbox.setTimeout(chain, 10);
+    h.advance(60);
+    const r = row(h, "chain");
+    h.tracker.governor.policy(r.key, "half"); // >= 33ms gap, so the chain gets deferred
+    h.advance(300);
+    assertGreater(row(h, "chain").deferred, 0, "the deferral path was exercised");
+    assertEqual(h.tracker.governor.state.counters.errors, 0, "no internal error from calling the timer functions");
+    assertEqual(h.tracker.governor.metrics.disabled, false, "so the layer is still on");
+    assertGreater(runs, 8, "and the chain keeps running");
+  });
+
+  test("a frame relaying through the layer blames the source that ran inside it", async () => {
+    const h = await boot();
+    h.sandbox.__antsCost = (ms) => h.busy(ms);
+    vm.runInContext(`setInterval(function packHeartbeat() { __antsCost(2); }, 20);`, h.sandbox, {
+      filename: "http://localhost:8188/extensions/SomePack/js/main.js",
+    });
+    h.advance(200);
+    const start = h.clock.now;
+    h.advance(120);
+    h.emitPerformance("long-animation-frame", [
+      {
+        startTime: start,
+        duration: 300,
+        blockingDuration: 260,
+        scripts: [
+          {
+            sourceURL: "http://localhost:8188/extensions/ANTs_ComfyUI_Frontend_Performance_Tracker/tracker.js",
+            sourceFunctionName: "(anonymous)",
+            invokerType: "user-callback",
+            invoker: "TimerHandler:setTimeout",
+            duration: 300,
+            forcedStyleAndLayoutDuration: 200,
+          },
+        ],
+      },
+    ]);
+    await h.flush();
+    const rows = h.tracker.snapshot.stalls.sources;
+    const relayed = rows.find((r) => r.sig.includes("packHeartbeat"));
+    assert(relayed, `the extension that ran inside the frame is named (${JSON.stringify(rows.map((r) => r.sig))})`);
+    assertIncludes(relayed.sig, "SomePack/js/main.js", "by the file that registered it");
+    assertIncludes(relayed.sig, "pass-through", "and the row says it was relayed, not that it was the offender");
+    assert(!rows.some((r) => r.sig.includes("tracker.js")), "the profiler is not named as the offender");
+  });
+
+  test("with nothing measurable inside, it says so instead of claiming the time", async () => {
+    const h = await boot();
+    h.emitPerformance("long-animation-frame", [
+      {
+        startTime: h.clock.now - 900, // a window before any of this page's timers ran
+        duration: 100,
+        blockingDuration: 180,
+        scripts: [
+          {
+            sourceURL: "http://localhost:8188/extensions/ANTs_ComfyUI_Frontend_Performance_Tracker/tracker.js",
+            sourceFunctionName: "(anonymous)",
+            invokerType: "user-callback",
+            invoker: "TimerHandler:setInterval",
+            duration: 200,
+          },
+        ],
+      },
+    ]);
+    await h.flush();
+    const rows = h.tracker.snapshot.stalls.sources;
+    const row0 = rows.find((r) => r.sig.includes("(pass-through timer)"));
+    assert(row0, `the row is marked as a relay with no measurable source (${JSON.stringify(rows.map((r) => r.sig))})`);
+    assertEqual(row0.ours, true, "it is flagged as coming from this tool's own wrapper");
+    assert(!/^\(anonymous\)/.test(row0.sig), "and is never shown as an anonymous offender in the tracker's file");
+    assertEqual(row0.blockingMs, 200, "while still carrying the blocking time it caused");
+  });
+});

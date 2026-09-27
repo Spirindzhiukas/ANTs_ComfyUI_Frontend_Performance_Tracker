@@ -27,7 +27,7 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.1.1";
+const VERSION = "2.1.2";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
 const NODE_NAME = "ANTsNastyBastardsTracker";
 
@@ -988,6 +988,15 @@ const SELF_HINT = (() => {
 
 const PLUMBING = /(setDirtyCanvas|setDirty|dirty_canvas|dirty_bgcanvas|__ants|govWrapperFrame)/;
 
+// A URL that is this file. The install folder may be renamed (the README suggests
+// a `0000_` prefix), so the file name is the stable part; SELF_HINT covers the
+// harness and any bundle that renames it.
+function isSelfUrl(url) {
+  if (!url) return false;
+  const s = String(url);
+  return s.includes(SELF_HINT) || /(^|\/)tracker\.js(\?|$)/.test(s);
+}
+
 // Pure + exported for tests: turn a stack string into a caller signature.
 function parseCallerStack(stack) {
   if (!stack) return null;
@@ -1138,7 +1147,19 @@ function recordStall(entry, kind) {
     }, blocking, duration, 0);
     return;
   }
+  // Split out this tool's own frames. Chrome attributes a script frame's
+  // duration inclusively, so a pass-through wrapper that merely calls the page's
+  // callback inherits that callback's whole cost: on a real page, 891 frames and
+  // 300 seconds of blocking were attributed to `(anonymous) @ tracker.js` when
+  // the time belonged to the extensions whose timers were being relayed.
+  const selfFrames = [];
+  const realFrames = [];
   for (const script of scripts) {
+    const url = script.sourceURL || "";
+    if (isSelfUrl(url)) selfFrames.push(script);
+    else realFrames.push(script);
+  }
+  for (const script of realFrames) {
     const url = script.sourceURL || "";
     const fn = script.sourceFunctionName || "(anonymous)";
     const invoker = [script.invokerType, script.invoker].filter(Boolean).join(" ") || "";
@@ -1150,6 +1171,48 @@ function recordStall(entry, kind) {
       script.duration || 0,
       script.forcedStyleAndLayoutDuration || 0
     );
+  }
+  if (selfFrames.length && !realFrames.length) {
+    const worstSelf = selfFrames.reduce((a, b) => ((b.duration || 0) > (a.duration || 0) ? b : a));
+    const invoker = [worstSelf.invokerType, worstSelf.invoker].filter(Boolean).join(" ") || kind || "task";
+    const cost = worstSelf.duration || blocking;
+    const blame = govBlameInFrame(entry.startTime || 0, (entry.startTime || 0) + duration);
+    if (blame) {
+      // The governor measured what ran inside the frame, so name that instead of
+      // naming the wrapper: this is the same answer the trace card gives.
+      bumpStallSource(
+        {
+          sig: `${govSourceLabel(blame.src)}${invoker ? ` [${invoker}]` : ""} (via the tracker's pass-through)`,
+          pack: packFromUrl(blame.src.file || ""),
+          invoker,
+          file: blame.src.file || "",
+          fn: blame.src.name,
+          url: "",
+          ours: !!blame.src.ours,
+        },
+        cost,
+        cost,
+        worstSelf.forcedStyleAndLayoutDuration || 0
+      );
+    } else {
+      // Nothing measurable ran inside it: say that, rather than claiming the time
+      // as this tool's own. A frame the tracker really spent its own time in
+      // still shows up as its own source (marked ours), from the governed rows.
+      bumpStallSource(
+        {
+          sig: `(pass-through timer) @ ${shortUrl(worstSelf.sourceURL || "")}${invoker ? ` [${invoker}]` : ""}`,
+          pack: null,
+          invoker,
+          file: "",
+          fn: "(pass-through)",
+          url: "",
+          ours: true,
+        },
+        cost,
+        cost,
+        0
+      );
+    }
   }
 }
 
@@ -1605,13 +1668,21 @@ function govInstall() {
       g = null;
     }
     if (!g || typeof g.setTimeout !== "function") return;
+    // Bound to the page's global. Chrome throws "Illegal invocation" if
+    // setTimeout/clearTimeout are called with `this` set to anything but the
+    // global object, and this layer calls them as methods of its own bookkeeping
+    // object - which is exactly how it switched itself off on a real page
+    // (three dispatch errors, then fail-open). Chrome allows the unbound form
+    // only when `this` is undefined, so the wrapped calls still pass the page's
+    // own `this` through untouched.
+    const bound = (fn) => (typeof fn === "function" ? fn.bind(g) : null);
     GOV.orig = {
-      setTimeout: g.setTimeout,
-      clearTimeout: g.clearTimeout,
-      setInterval: g.setInterval,
-      clearInterval: g.clearInterval,
-      requestAnimationFrame: typeof g.requestAnimationFrame === "function" ? g.requestAnimationFrame : null,
-      cancelAnimationFrame: typeof g.cancelAnimationFrame === "function" ? g.cancelAnimationFrame : null,
+      setTimeout: bound(g.setTimeout),
+      clearTimeout: bound(g.clearTimeout),
+      setInterval: bound(g.setInterval),
+      clearInterval: bound(g.clearInterval),
+      requestAnimationFrame: bound(g.requestAnimationFrame),
+      cancelAnimationFrame: bound(g.cancelAnimationFrame),
     };
     const targets = [g];
     try {
@@ -2223,6 +2294,20 @@ function govMetrics() {
 // every long animation frame, the scripts the browser named (with forced layout
 // and invoker), which governed sources ran inside it with their measured cost,
 // and how many redraw requests arrived (and were merged) while it was blocked.
+
+// The heaviest governed source that ran inside a frame window. Used to attribute
+// a frame whose only named script is this layer's own pass-through wrapper: the
+// wrapper's inclusive duration is the page's cost, and this says whose it was.
+function govBlameInFrame(start, end) {
+  let best = null;
+  for (const src of GOV.sources.values()) {
+    if (!src.ring || !src.ring.n) continue;
+    const range = ringRange(src.ring, start, end);
+    if (!range.n) continue;
+    if (!best || range.sum > best.ms) best = { src, ms: range.sum, runs: range.n };
+  }
+  return best;
+}
 
 function ringRange(ring, t0, t1) {
   if (!ring || !ring.n) return { n: 0, sum: 0 };
@@ -3100,8 +3185,14 @@ function renderSummary() {
   const gm = govMetrics();
   setPill(
     ui.pills.limiter,
-    gm.throttled ? `${gm.throttled} src · ${fmtRate(gm.skippedPerSec)}/s` : gm.sourceCount ? "off" : "—",
-    gm.throttled ? "ants-warn" : null
+    gm.disabled
+      ? "turned off"
+      : gm.throttled
+        ? `${gm.throttled} src · ${fmtRate(gm.skippedPerSec)}/s`
+        : gm.sourceCount
+          ? "off"
+          : "—",
+    gm.disabled ? "ants-bad" : gm.throttled ? "ants-warn" : null
   );
 
 
@@ -5410,7 +5501,7 @@ function buildTelemetryReport() {
   if (!gv || !gv.installed) {
     lines.push(gv && gv.installError ? `(not installed: ${gv.installError})` : "(not installed)");
   } else if (gv.disabled) {
-    lines.push(`TURNED OFF — ${gv.offReason}. Nothing is being limited; the page's own timers are untouched.`);
+    lines.push(`TURNED OFF — ${gv.offReason}. Nothing is being limited; the page's own timers are untouched (reload to reinstall it).`);
     lines.push(`  ${gv.sourceCount} source(s) had been seen, ${gv.counters.skipped} tick(s) skipped, ${gv.counters.deferred} deferred before it stopped.`);
   } else {
     lines.push(

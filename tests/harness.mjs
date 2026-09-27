@@ -251,6 +251,27 @@ export function createHarness(options = {}) {
   sandbox.window.LiteGraph = LiteGraphShim;
   vm.createContext(sandbox);
 
+  // Opt-in: make the fake timer functions behave like Chrome's, which throws
+  // "Illegal invocation" when setTimeout/clearTimeout are called with `this` set
+  // to anything but the global object. Installed before the tracker runs, so the
+  // functions it saves and calls later are the strict ones.
+  if (opts.strictTimers) {
+    // The context's own global object: a bare `setTimeout(...)` call arrives with
+    // this as the receiver, and it is not the same object as the raw sandbox.
+    const ctxGlobal = vm.runInContext("globalThis", sandbox);
+    const strict = (fn, name) =>
+      function strictTimer(...args) {
+        if (this !== undefined && this !== ctxGlobal && this !== sandbox) {
+          throw new TypeError(`Illegal invocation (${name})`);
+        }
+        return fn.apply(sandbox, args);
+      };
+    sandbox.setTimeout = strict(sandbox.setTimeout, "setTimeout");
+    sandbox.clearTimeout = strict(sandbox.clearTimeout, "clearTimeout");
+    sandbox.setInterval = strict(sandbox.setInterval, "setInterval");
+    sandbox.clearInterval = strict(sandbox.clearInterval, "clearInterval");
+  }
+
   const source = fs.readFileSync(TRACKER_PATH, "utf8");
   if (!source.includes('import { app } from "/scripts/app.js";')) {
     throw new Error("web/tracker.js no longer starts from the expected import line — the test loader needs updating");

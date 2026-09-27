@@ -437,7 +437,7 @@ logged for DevTools.
 ## Development
 
 ```
-node tests/run-tests.mjs          # 79 tests, no dependencies, no browser
+node tests/run-tests.mjs          # 82 tests, no dependencies, no browser
 node tests/run-tests.mjs timing   # filter by name fragment
 python3 tests/test_init.py        # backend route parsing + graceful fallbacks
 node tests/demo.mjs               # print what the panel says, with no ComfyUI
@@ -463,7 +463,30 @@ worker lane's fallback when there is no `Worker` — plus a suite that
 exists to keep the layer from breaking the page it measures: nothing is
 skipped or deferred while nothing is limited, several chains sharing one
 row do not starve each other, and internal errors fail open and end in
-the layer turning itself off.
+the layer turning itself off — and a suite that keeps it from becoming
+the scapegoat: relayed frames are attributed to the source measured
+inside them, and the saved timer functions are called with a receiver
+Chrome accepts (the fake timers can be made Chrome-strict for that).
+
+## What changed in v2.1.2
+
+- **Fixed: relayed frames were blamed on this tool.** With every timer of
+  the page passing through the layer, Chrome attributed each of those
+  frames' *whole* cost to the wrapper in `tracker.js` (it reports a
+  script frame's duration inclusively) — on a real page: 891 frames and
+  300 s of blocking credited to `(anonymous) @ tracker.js` while the time
+  belonged to the extensions whose timers were being relayed. Frames whose
+  only named script is this file are now attributed to the source the
+  Governor measured *inside* that frame, labelled `(via the tracker's
+  pass-through)`; with nothing measurable inside, the row says
+  `(pass-through timer)` instead of claiming the time.
+- **Fixed: "Illegal invocation" switched the layer off.** The saved
+  originals were called as methods of the layer's own bookkeeping object,
+  and Chrome throws `Illegal invocation` for `setTimeout`/`clearTimeout`
+  called with any other receiver. The originals are now bound to the
+  page's global — the fail-open path did its job (the page kept working),
+  but it should never have been needed. The `limiter` pill and the copied
+  report now give the turned-off state its own wording.
 
 ## What changed in v2.1.1
 
