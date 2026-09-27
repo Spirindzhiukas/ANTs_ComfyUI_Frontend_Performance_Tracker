@@ -283,6 +283,15 @@ only looks like it does, and both came out of a real CPU-rendered page:
   while a runaway chain gets 1/s, because nothing milder is worth the
   behaviour change it costs a page whose extension owns that loop.
 
+**Low-zoom drawing** is the answer when the problem is not *when* the
+canvas draws but *what* it draws. At low zoom on a big graph, every node
+is inside the viewport (so a culling scan has nothing to remove), each
+one is a few dozen pixels wide (so its title, slots, widgets and preview
+are invisible anyway), and a redraw costs hundreds of milliseconds — at
+which point there is nothing to schedule: the cost is the drawing itself.
+The mode paints those nodes as a flat rectangle, straightens the links,
+and rate-limits redraws while nobody is touching the page.
+
 **Redraw merging** is the other half of the same idea. `setDirty`
 requests were already counted exactly (and the Testing tab's cap can
 delay them); with merging on, requests inside one frame are combined:
@@ -305,7 +314,11 @@ sanity check that runs the same seeded sort-and-sum on both threads and
 compares the answer. The boundary is worth being blunt about: Vue's
 render, the DOM and canvas drawing cannot leave the main thread — no
 scheduler can move them, and `OffscreenCanvas` only helps an application
-that created its canvas that way (ComfyUI does not). What a scheduler
+that created its canvas that way (ComfyUI does not). That is why the
+answer to a 280ms redraw is not a thread but *less drawing*: see
+**low-zoom drawing** in the Nodes tab, which paints nodes that are too
+small to read as one rectangle and rate-limits redraws while nobody is
+touching the page. What a scheduler
 layer *can* do is serialise and rate-limit the main thread's competing
 tick sources, which is what this tab is for.
 
@@ -480,7 +493,7 @@ logged for DevTools.
 ## Development
 
 ```
-node tests/run-tests.mjs          # 91 tests, no dependencies, no browser
+node tests/run-tests.mjs          # 97 tests, no dependencies, no browser
 node tests/run-tests.mjs timing   # filter by name fragment
 python3 tests/test_init.py        # backend route parsing + graceful fallbacks
 node tests/demo.mjs               # print what the panel says, with no ComfyUI
@@ -514,6 +527,41 @@ a suite for the parts that have to target the *right* source: a
 suggestion for a slow, expensive chain has to be a cap that can bite it,
 a cheap heartbeat still gets the mildest limit, and the autopilot has to
 leave rAF loops and the tracker's own timers alone.
+
+## What changed in v2.1.4
+
+- **New: low-zoom drawing** (Nodes tab, off by default). The frame budget
+  on a big graph at low zoom is not a scheduling problem — it is a
+  thousand nodes being drawn properly several times a second, and at
+  zoom 0.10 the whole graph is inside the viewport, so culling has
+  nothing to remove. Three levers, one switch, all of them reversible
+  and all of them measured by the same wrapping of `drawNode` /
+  `drawConnections` that produced the numbers they change:
+  - nodes that land under N px on screen are painted as one flat
+    rectangle (N = 8/12/16/24/32, or off),
+  - links are painted as straight lines while most of the graph is that
+    small, and go back to LiteGraph's renderer the moment you zoom in,
+  - and while no pointer, wheel or key event has arrived for a moment,
+    redraws are rate-limited (4/s, 2/s, 1/s, or off) — a rate limit, not
+    data loss: the last request of a burst still gets one trailing
+    redraw, and the first touch lifts the cap instantly.
+  Anything that throws inside the cheap path switches the whole mode off
+  and falls back to the original draw call, with the reason printed in
+  the panel: a rendering change a tool cannot explain must never be left
+  half-applied on somebody's canvas.
+- **The frontend's own LOD is shown next to ours.** ComfyUI has a
+  `LiteGraph.Canvas.MinFontSizeForLOD` setting (default 8px, `0`
+  switches it off) that flips `canvas.low_quality` below a zoom
+  threshold — and when it is on, it still only skips shadows and
+  rounded corners, it does not draw fewer nodes. The block reads the
+  canvas and says which state it is in, because *"my frames are slow
+  with LOD on"* deserves an answer rather than a shrug.
+- **New: a culling reality check.** The same block reports how many nodes
+  are inside the viewport at the current zoom and how wide they land on
+  screen, and says the quiet part out loud when ~all of them are visible:
+  *"the whole graph is on screen, so culling cannot save anything here"*.
+  That is the answer to "why does my culling extension not help my
+  frames?" — and it is measured, not assumed.
 
 ## What changed in v2.1.3
 

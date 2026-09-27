@@ -160,21 +160,70 @@ export function createHarness(options = {}) {
     graph: { _nodes: [], links: new Map() },
   };
 
+  // A 2D context stub that records the calls a draw path made: enough to tell a
+  // cheap rectangle from LiteGraph's own chrome, and a straight line from a
+  // bezier spline, without a real canvas.
+  function makeStubCtx() {
+    const ops = [];
+    const push = (name) => (...a) => ops.push([name, ...a]);
+    return {
+      ops,
+      globalAlpha: 1,
+      shadowColor: "",
+      fillStyle: "",
+      strokeStyle: "",
+      lineWidth: 1,
+      font: "",
+      fillRect: push("fillRect"),
+      strokeRect: push("strokeRect"),
+      beginPath: push("beginPath"),
+      moveTo: push("moveTo"),
+      lineTo: push("lineTo"),
+      bezierCurveTo: push("bezierCurveTo"),
+      arc: push("arc"),
+      rect: push("rect"),
+      roundRect: push("roundRect"),
+      clip: push("clip"),
+      fill: push("fill"),
+      stroke: push("stroke"),
+      save: push("save"),
+      restore: push("restore"),
+      translate: push("translate"),
+      scale: push("scale"),
+      clearRect: push("clearRect"),
+    };
+  }
+
   class FakeLGraphCanvas {
     constructor() {
       this.ds = { offset: new Float32Array([0, 0]), scale: 1 };
       this.canvas = { width: 1600, height: 900 };
       this.nodes = [];
+      this.links = [];
+      this.nodeDraws = 0;
+      this.linkDraws = 0;
       // Per-frame costs in ms, tunable per test.
-      this.costs = { background: 0.3, connections: 1.5, chrome: 0.25 };
+      this.costs = { background: 0.3, connections: 1.5, chrome: 0.25, link: 0.05 };
       this.drawCalls = 0;
       this.dirtyCalls = 0;
-      this.ctx = {};
+      this.ctx = makeStubCtx();
     }
     drawConnections() {
       busy(this.costs.connections);
+      for (const link of this.links) {
+        this.renderLink(this.ctx, link.from, link.to, link, false, 0, link.color, 0, 0, {});
+      }
+    }
+    renderLink(ctx, a, b) {
+      this.linkDraws++;
+      busy(this.costs.link || 0);
+      ctx.beginPath();
+      ctx.moveTo(a[0], a[1]);
+      ctx.bezierCurveTo(a[0] + 40, a[1], b[0] - 40, b[1], b[0], b[1]);
+      ctx.stroke();
     }
     drawNode(node) {
+      this.nodeDraws++;
       busy(this.costs.chrome);
       if (node && typeof node.onDrawForeground === "function") node.onDrawForeground(this.ctx);
       if (node && typeof node.onDrawBackground === "function") node.onDrawBackground(this.ctx);
@@ -190,6 +239,7 @@ export function createHarness(options = {}) {
     }
   }
   const canvas = new FakeLGraphCanvas();
+  canvas.graph = app.graph; // LiteGraph keeps the graph on the canvas, and so does this fake
   app.canvas = canvas;
 
   const LiteGraphShim = { registered_node_types: {}, LGraphCanvas: FakeLGraphCanvas };

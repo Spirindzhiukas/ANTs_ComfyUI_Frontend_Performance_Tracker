@@ -258,6 +258,24 @@ for (const tr of rowsToOpen) {
 }
 await pump();
 
+// ------------------------------------------------------- low-zoom drawing ---
+// The other half of the answer for a big graph: at zoom 0.10 every node is on
+// screen (so culling cannot remove anything) and the frame is dominated by
+// drawing them properly. Six nodes that land ~20px wide, links between them, and
+// the mode switched on — the Nodes tab and the report below then show the frame
+// budget with the cheap path in it.
+h.canvas.ds.scale = 0.1;
+h.canvas.nodes = [];
+h.canvas.links = [];
+for (let i = 0; i < 6; i++) {
+  h.canvas.nodes.push({ type: "KSampler", pos: [i * 240, 0], size: [200, 100], selected: false });
+  h.canvas.links.push({ color: "#888888", from: [i * 240, 0], to: [i * 240 + 200, 100] });
+}
+h.app.graph._nodes = h.canvas.nodes; // in ComfyUI the graph the canvas draws is canvas.graph
+h.tracker.lowZoom.set({ minPx: 24, idleCapMs: 500 });
+run(500);
+await pump();
+
 bullets("SUMMARY BAR (always visible)");
 dump(h.document.getElementById("ants-tracker-summary"));
 
@@ -292,6 +310,11 @@ console.log(
     "\n      hand at quarter speed, and the repaint timer capped by the AUTOPILOT (target 150 ms/s, one" +
     "\n      round every 5s) — so the GOVERNOR TAB above shows both: a source limited by hand, and the" +
     "\n      autopilot's own line saying which source it capped, at what gap, and what it was costing." +
+    "\nnote: the LOW-ZOOM DRAWING section of the Nodes tab and the report line above are the other" +
+    "\n      answer for this kind of page: every node is inside the viewport at zoom 0.10, so culling has" +
+    "\n      nothing to remove and the cost is drawing a thousand nodes properly several times a second." +
+    "\n      The mode paints nodes that land a few pixels wide as one rectangle, straightens links, and" +
+    "\n      caps redraws while nobody is touching the page — opt-in, and off the moment you say so." +
     "\nnote: in this simulation the clock only advances with h.advance(), so the tracker's own" +
     "\n      per-render cost reads 0 — a real browser spends real time rendering the panel." +
     "\n      Everything else above is what web/tracker.js computes from the synthetic traffic."

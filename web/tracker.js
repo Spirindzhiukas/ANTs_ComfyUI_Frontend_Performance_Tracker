@@ -27,7 +27,7 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.1.3";
+const VERSION = "2.1.4";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
 const NODE_NAME = "ANTsNastyBastardsTracker";
 
@@ -832,6 +832,276 @@ function maybeWrapInstanceHooks(node) {
 // --- 3. canvas-level patches: frame total, per-node-type cost, draw stages,
 //        and the redraw-request funnel --------------------------------------
 
+// --------------------------------------------------------- low-zoom drawing ---
+// The measurement this block exists for: a 1040-node graph at zoom 0.10 spent
+// ~235 of every 280ms frame inside drawNode() and drawConnections() and redrew
+// several times a second, with the whole graph on screen. Culling cannot help a
+// graph that is entirely visible and no timer limit touches a draw, so what is
+// left is drawing less per frame:
+//   * a node that lands a dozen pixels wide is painted as one flat rectangle
+//     instead of LiteGraph's border, gradient, title, slots, widgets and
+//     previews;
+//   * links are painted as straight lines while most nodes are that small;
+//   * and while nobody is touching the page the redraw rate is capped, because
+//     the frame nobody is looking at is the cheapest frame on the page.
+// All three are opt-in and off by default. Any exception turns the mode back off
+// with the reason in the panel: a rendering change this tool cannot explain
+// would be worse than a slow frame.
+const LOD = {
+  minPx: 0, // simplify nodes narrower than this on screen (0 = off)
+  idleCapMs: 0, // while untouched, at most one redraw per this many ms (0 = off)
+  nodes: 0, // node draws replaced by a rectangle
+  links: 0, // link draws replaced by a straight line
+  ms: 0, // time spent inside the simplified paths
+  capped: 0, // redraws merged away by the idle cap
+  error: "",
+  baseline: null, // the frame budget as it was when the mode went on
+  plan: { links: false, tiny: 0, sampled: 0, total: 0, at: 0 },
+};
+
+const LOD_MIN_PX = [0, 8, 12, 16, 24, 32];
+const LOD_IDLE_CAP_MS = [0, 250, 500, 1000];
+const LOD_IDLE_INPUT_MS = 400; // how long one touch keeps the cap lifted
+const LOD_LINK_SHARE = 0.6; // "most nodes are tiny" => links can be too
+
+function lodOn() {
+  return LOD.minPx > 0 || LOD.idleCapMs > 0;
+}
+
+// This frontend can render nodes as Vue DOM overlays, in which case LiteGraph
+// draws no node chrome at all — painting rectangles for them would put the
+// canvas *behind* the DOM nodes it is meant to replace.
+function lodVueNodesMode() {
+  try {
+    const LG =
+      (typeof globalThis !== "undefined" && globalThis.LiteGraph) ||
+      (typeof window !== "undefined" && window.LiteGraph) ||
+      null;
+    return !!(LG && LG.vueNodesMode);
+  } catch (e) {
+    return false;
+  }
+}
+
+// The draw loop's own node list, whichever of the three places this frontend
+// version keeps it in.
+function lodGraphNodes(canvas) {
+  const cands = [
+    canvas && canvas.graph && canvas.graph._nodes,
+    typeof app !== "undefined" && app && app.graph && app.graph._nodes,
+    canvas && canvas.nodes,
+  ];
+  for (const c of cands) if (c && c.length) return c;
+  return cands[0] || cands[2] || null;
+}
+
+// How wide a node lands on screen, in pixels — which is what decides whether
+// anything it draws can be seen at all.
+function lodNodePx(node, canvas) {
+  const scale = (canvas && canvas.ds && Number(canvas.ds.scale)) || 1;
+  const size = node && (node.renderingSize || node.size);
+  if (!size) return Infinity;
+  const w = Math.abs(Number(size[0])) || 0;
+  const h = Math.abs(Number(size[1])) || 0;
+  return Math.max(w, h) * scale;
+}
+
+// Once per frame: are the nodes too small to be worth drawing properly, and is
+// that true of the graph as a whole? (Links have no size of their own, so the
+// zoom has to stand in for it.)
+function lodPlanFrame(canvas) {
+  const plan = LOD.plan;
+  plan.at = nowMs();
+  plan.links = false;
+  plan.tiny = 0;
+  plan.sampled = 0;
+  plan.total = 0;
+  if (!(LOD.minPx > 0)) return plan;
+  const nodes = lodGraphNodes(canvas);
+  if (!nodes || !nodes.length) return plan;
+  const total = nodes.length;
+  const stride = Math.max(1, Math.floor(total / 64)); // 64 samples is plenty for a share
+  for (let i = 0; i < total; i += stride) {
+    if (lodNodePx(nodes[i], canvas) < LOD.minPx) plan.tiny++;
+    plan.sampled++;
+  }
+  plan.total = total;
+  plan.links = plan.tiny / Math.max(1, plan.sampled) >= LOD_LINK_SHARE;
+  return plan;
+}
+
+// The cheap stand-in for a node. The caller has already translated the context
+// to the node's origin, which is why this paints at 0,0.
+function lodPaintNode(node, canvas, ctx) {
+  const size = (node && (node.renderingSize || node.size)) || [0, 0];
+  const w = Math.abs(Number(size[0])) || 0;
+  const h = Math.abs(Number(size[1])) || 0;
+  const fill = node.renderingBgColor || node.bgcolor || node.renderingColor || node.color || "#4a4a4a";
+  const scale = (canvas && canvas.ds && Number(canvas.ds.scale)) || 1;
+  ctx.globalAlpha = 1;
+  ctx.shadowColor = "transparent";
+  ctx.fillStyle = fill;
+  ctx.fillRect(0, 0, w, h);
+  if (node.selected) {
+    ctx.strokeStyle = "#ffb300";
+    ctx.lineWidth = 1 / scale;
+    ctx.strokeRect(0, 0, w, h);
+  }
+}
+
+function lodPaintLink(ctx, a, b, color) {
+  ctx.beginPath();
+  ctx.moveTo(a[0], a[1]);
+  ctx.lineTo(b[0], b[1]);
+  ctx.strokeStyle = color || "#9a9a9a";
+  ctx.lineWidth = 1;
+  ctx.stroke();
+}
+
+// The redraw cap. A hard cap would make dragging feel broken, so it is only in
+// force while nobody has touched the page for a moment; any pointer, wheel or
+// key event lifts it instantly (the scheduler layer already watches for those).
+function lodDrawCapMs(t) {
+  if (LOD.idleCapMs > 0 && !govInputRecently(t, LOD_IDLE_INPUT_MS)) return LOD.idleCapMs;
+  return drawThrottleMs > 0 ? drawThrottleMs : 0;
+}
+
+function lodAbort(err) {
+  LOD.error = (err && err.message) || String(err);
+  LOD.minPx = 0;
+  LOD.idleCapMs = 0;
+  LOD.baseline = null;
+  try {
+    warnOnce("lod-abort", `low-zoom drawing turned itself off after an error: ${LOD.error}`);
+  } catch (e) {
+    /* nothing useful left to do */
+  }
+}
+
+// What the frames drawn *since the mode was switched on* cost, which is the
+// question a user is asking. The frame budget the tracker reports elsewhere is a
+// 10s window, so reading it seconds after a switch shows the old path mixed in.
+function lodSinceSwitch() {
+  if (!LOD.baseline || !LOD.baseline.at) return null;
+  const from = LOD.baseline.at;
+  const n = S.frames.aggregate(from).n;
+  if (!n) return null;
+  return {
+    n,
+    nodeMsPerFrame: S.frameNodeStage.aggregate(from).sum / n,
+    connMsPerFrame: S.frameConnStage.aggregate(from).sum / n,
+    meanFrameMs: S.frames.aggregate(from).sum / n,
+  };
+}
+
+function lodCaptureBaseline() {
+  try {
+    const fm = frameMetrics();
+    LOD.baseline = {
+      at: nowMs(),
+      nodeMsPerFrame: fm.ok ? fm.nodeMsPerFrame : NaN,
+      connMsPerFrame: fm.ok ? fm.connMsPerFrame : NaN,
+      meanFrameMs: fm.ok ? fm.meanFrameMs : NaN,
+      fps: fm.ok ? fm.fps : NaN,
+    };
+  } catch (e) {
+    LOD.baseline = null;
+  }
+}
+
+function lodSet(opts) {
+  const o = opts || {};
+  const was = lodOn();
+  if ("minPx" in o) LOD.minPx = Math.max(0, Number(o.minPx) || 0);
+  if ("idleCapMs" in o) LOD.idleCapMs = Math.max(0, Number(o.idleCapMs) || 0);
+  const now = lodOn();
+  if (now) LOD.error = "";
+  if (now && !was) lodCaptureBaseline();
+  if (!now && was) LOD.baseline = null;
+  if (LOD.idleCapMs > 0) govInstallInputGuard();
+  return now;
+}
+
+// ComfyUI has its own level-of-detail switch: `LiteGraph.Canvas.MinFontSizeForLOD`
+// (Settings -> LiteGraph, default 8px, and 0 switches its LOD off entirely),
+// which flips `canvas.low_quality` on below a zoom threshold and then only skips
+// shadows and rounded corners. Worth showing next to ours, because "my frames are
+// still slow with LOD on" is a fair question and the answer is that this LOD
+// changes shapes, not how many nodes get drawn.
+function lodFrontendLod(canvas) {
+  try {
+    const c = canvas || (typeof app !== "undefined" && app && app.canvas) || null;
+    if (!c) return null;
+    const min = Number(c.min_font_size_for_lod);
+    return {
+      minFontSize: Number.isFinite(min) ? min : null,
+      lowQuality: !!c.low_quality,
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+// Is the whole graph on screen? If it is, culling cannot save anything, and the
+// levers left are cheaper per-node drawing (above) and fewer redraws — which is
+// the answer to "why does a culling scan not help my frames?".
+function lodVisibility(canvas) {
+  try {
+    const c = canvas || (typeof app !== "undefined" && app && app.canvas) || null;
+    const el = c && (c.canvas || c);
+    const nodes = lodGraphNodes(c);
+    if (!c || !nodes || !nodes.length) return null;
+    const ds = c.ds || {};
+    const scale = Number(ds.scale) || 1;
+    const off = ds.offset || [0, 0];
+    const dpr = (typeof window !== "undefined" && Number(window.devicePixelRatio)) || 1;
+    // The backing store is sized in device pixels; the world span is in CSS px
+    // per unit of scale, like LiteGraph's own visible-area maths.
+    const width = ((el && Number(el.width)) || 0) / (dpr > 1 ? dpr : 1);
+    const height = ((el && Number(el.height)) || 0) / (dpr > 1 ? dpr : 1);
+    let x0;
+    let y0;
+    let x1;
+    let y1;
+    const va = ds.visible_area;
+    if (va && Number.isFinite(Number(va[0])) && Number.isFinite(Number(va[2]))) {
+      x0 = Number(va[0]);
+      y0 = Number(va[1]);
+      x1 = Number(va[2]);
+      y1 = Number(va[3]);
+    } else {
+      x0 = -Number(off[0] || 0);
+      y0 = -Number(off[1] || 0);
+      x1 = x0 + width / scale;
+      y1 = y0 + height / scale;
+    }
+    let visible = 0;
+    let sumPx = 0;
+    for (const n of nodes) {
+      const size = n && (n.renderingSize || n.size);
+      if (!size) continue;
+      const w = Math.abs(Number(size[0])) || 0;
+      const h = Math.abs(Number(size[1])) || 0;
+      const pos = (n && n.pos) || [0, 0];
+      const nx = Number(pos[0]) || 0;
+      const ny = Number(pos[1]) || 0;
+      sumPx += Math.max(w, h) * scale;
+      if (nx + w >= x0 && nx <= x1 && ny + h >= y0 && ny <= y1) visible++;
+    }
+    const total = nodes.length;
+    return {
+      total,
+      visible,
+      share: total ? visible / total : 0,
+      meanPx: total ? sumPx / total : 0,
+      scale,
+      zoomedOut: scale < 0.35,
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
 let canvasPatched = false;
 let canvasRetries = 0;
 
@@ -851,14 +1121,18 @@ function patchCanvasDraw() {
     const originalDraw = proto.draw;
     const wrappedDraw = function (...args) {
       const t0 = performance.now();
-      if (drawThrottleMs > 0) {
+      // The Testing tab's hard cap, or the low-zoom idle cap — which only counts
+      // as idle until somebody touches the page again.
+      const capMs = lodDrawCapMs(t0);
+      if (capMs > 0) {
         const gap = t0 - lastRealDrawAt;
-        if (gap < drawThrottleMs) {
+        if (gap < capMs) {
           S.counters.capped++;
+          if (LOD.idleCapMs > 0 && capMs === LOD.idleCapMs) LOD.capped++;
           // v1 dropped this redraw permanently — the canvas could sit on stale
           // pixels until the next unrelated tick. Schedule exactly one trailing
           // redraw instead, so a cap becomes a rate limit, not data loss.
-          scheduleTrailingDraw(this, drawThrottleMs - gap);
+          scheduleTrailingDraw(this, capMs - gap);
           return undefined;
         }
       }
@@ -867,6 +1141,7 @@ function patchCanvasDraw() {
       curNodeStageMs = 0;
       curConnStageMs = 0;
       curAttrMs = 0;
+      if (LOD.minPx > 0) lodPlanFrame(this);
       drawDepth++;
       let ret;
       try {
@@ -893,6 +1168,24 @@ function patchCanvasDraw() {
     const originalDrawNode = proto.drawNode;
     const wrappedDrawNode = function (node, ctx, ...rest) {
       maybeWrapInstanceHooks(node);
+      if (ctx && LOD.minPx > 0 && !lodVueNodesMode() && lodNodePx(node, this) < LOD.minPx) {
+        const lt0 = performance.now();
+        try {
+          this.current_node = node;
+          lodPaintNode(node, this, ctx);
+        } catch (err) {
+          lodAbort(err);
+          return originalDrawNode.call(this, node, ctx, ...rest);
+        }
+        const ldt = performance.now() - lt0;
+        LOD.nodes++;
+        LOD.ms += ldt;
+        // Counted as node rendering, because that is what it replaces: the frame
+        // budget then shows the saving instead of hiding it. Per-node-type
+        // averages are left alone — they are about LiteGraph's own drawing.
+        if (!S.paused) curNodeStageMs += ldt;
+        return undefined;
+      }
       const t0 = performance.now();
       const ret = originalDrawNode.call(this, node, ctx, ...rest);
       const dt = performance.now() - t0;
@@ -930,6 +1223,36 @@ function patchCanvasDraw() {
     };
     wrappedDrawConnections.__antsWrapped = true;
     proto.drawConnections = wrappedDrawConnections;
+  }
+
+  if (typeof proto.renderLink === "function" && !proto.renderLink.__antsWrapped) {
+    const originalRenderLink = proto.renderLink;
+    const wrappedRenderLink = function (...args) {
+      const ctx = args[0];
+      const a = args[1];
+      const b = args[2];
+      const link = args[3];
+      if (ctx && a && b && LOD.minPx > 0 && LOD.plan.links) {
+        const lt0 = performance.now();
+        try {
+          lodPaintLink(ctx, a, b, args[6] || (link && link.color) || null);
+        } catch (err) {
+          lodAbort(err);
+          return originalRenderLink.apply(this, args);
+        }
+        LOD.links++;
+        LOD.ms += performance.now() - lt0;
+        return undefined;
+      }
+      return originalRenderLink.apply(this, args);
+    };
+    wrappedRenderLink.__antsWrapped = true;
+    proto.renderLink = wrappedRenderLink;
+  } else if (typeof proto.renderLink !== "function") {
+    warnOnce(
+      "no-renderlink",
+      "LGraphCanvas.prototype.renderLink not found — low-zoom mode can simplify nodes but not links on this frontend version."
+    );
   }
 
   if (typeof proto.setDirty === "function" && !proto.setDirty.__antsWrapped) {
@@ -2068,7 +2391,10 @@ function govCancelDeferral(id) {
 // Adaptive mode may only slow things down when nobody is typing, dragging or
 // wheeling: input latency is the one cost a smoother graph may not pay for.
 
+let govInputGuardInstalled = false;
+
 function govInstallInputGuard() {
+  if (govInputGuardInstalled) return;
   try {
     if (typeof window === "undefined" || !window || typeof window.addEventListener !== "function") return;
     const note = () => {
@@ -2080,14 +2406,16 @@ function govInstallInputGuard() {
     for (const type of ["pointerdown", "pointermove", "mousedown", "mousemove", "keydown", "wheel", "touchstart"]) {
       window.addEventListener(type, note, { passive: true });
     }
+    govInputGuardInstalled = true;
   } catch (e) {
     /* an embedder without window events just means the guard stays off */
   }
 }
 
-function govInputRecently(t) {
+function govInputRecently(t, windowMs) {
   if (!GOV.inputSeen) return false;
-  return t - GOV.lastInputAt < GOV_IDLE_MS;
+  const ms = windowMs > 0 ? windowMs : GOV_IDLE_MS;
+  return t - GOV.lastInputAt < ms;
 }
 
 // ------------------------------------------------- redraw request merging ---
@@ -3770,6 +4098,126 @@ function buildNodesTab(container) {
     "heavy node, a low ms/call with a high calls/frame is many cheap nodes.";
 
   container.appendChild(budgetCallout);
+  // ------------------------------------------------------ low-zoom drawing ---
+  // Opt-in, because it changes what the canvas paints. It exists because the
+  // budget above is usually not a scheduling problem: on a big graph at low
+  // zoom, the cost is a thousand nodes drawn properly several times a second,
+  // and culling cannot remove a node that is inside the viewport.
+  container.appendChild(el("div", { class: "ants-section-title", text: "Low-zoom drawing (experiment)" }));
+
+  const lodPxSel = el("select", { class: "ants-select", style: { width: "auto", maxWidth: "240px" } });
+  for (const px of LOD_MIN_PX) {
+    const opt = el("option", { text: px === 0 ? "draw every node in full" : `nodes under ${px}px — one flat rectangle` });
+    opt.value = String(px);
+    lodPxSel.appendChild(opt);
+  }
+  lodPxSel.value = String(LOD.minPx);
+  lodPxSel.title =
+    "Nodes that land smaller than this on screen are painted as their background colour only: no border, title, slots, " +
+    "widgets or previews. Nothing about the graph changes — only how it is painted, and only for nodes too small to read.";
+  lodPxSel.addEventListener("change", () => {
+    lodSet({ minPx: Number(lodPxSel.value) });
+    lodUpdate();
+  });
+
+  const lodIdleSel = el("select", { class: "ants-select", style: { width: "auto", maxWidth: "240px" } });
+  for (const ms of LOD_IDLE_CAP_MS) {
+    const opt = el("option", { text: ms === 0 ? "redraw as often as asked" : `${Math.round(1000 / ms)}/s while nothing is touched` });
+    opt.value = String(ms);
+    lodIdleSel.appendChild(opt);
+  }
+  lodIdleSel.value = String(LOD.idleCapMs);
+  lodIdleSel.title =
+    "While no pointer, wheel or key event has arrived for a moment, redraws are rate-limited to this — a rate limit, not " +
+    "data loss: the last request of a burst still gets one trailing redraw. Touch the page and the cap is lifted instantly.";
+  lodIdleSel.addEventListener("change", () => {
+    lodSet({ idleCapMs: Number(lodIdleSel.value) });
+    lodUpdate();
+  });
+
+  const lodOffBtn = el("button", { class: "ants-btn", text: "Back to full drawing" });
+  lodOffBtn.title = "Turn both off and let ComfyUI draw the canvas exactly as it wants.";
+  lodOffBtn.addEventListener("click", () => {
+    lodSet({ minPx: 0, idleCapMs: 0 });
+    lodPxSel.value = "0";
+    lodIdleSel.value = "0";
+    lodUpdate();
+  });
+
+  const lodRow = el("div", { style: { display: "flex", flexWrap: "wrap", gap: "10px", alignItems: "center", margin: "4px 0" } });
+  lodRow.appendChild(lodPxSel);
+  lodRow.appendChild(lodIdleSel);
+  lodRow.appendChild(lodOffBtn);
+  container.appendChild(lodRow);
+  const lodLine = el("div", { class: "ants-note", style: { whiteSpace: "pre-wrap" } });
+  container.appendChild(lodLine);
+  container.appendChild(
+    el("p", {
+      class: "ants-note",
+      text:
+        "Why this exists: a timer limit (the Governor tab) can only make a source run less often, and on a graph that is entirely " +
+        "inside the viewport a culling scan has nothing to remove either. What is left is the cost of one redraw — this block " +
+        "attacks that directly. It is off by default, it never edits the graph, it is lifted the moment you click \"Back to full " +
+        "drawing\", and if any part of it throws it switches itself off rather than leave the canvas in a state this tool cannot " +
+        "explain. Compare the ms/frame numbers above before and after switching it on: they are measured by the same wrapping of " +
+        "drawNode/drawConnections that produced them, not by a stopwatch held next to the screen.",
+    })
+  );
+
+  function lodUpdate() {
+    const fm = frameMetrics();
+    const bits = [];
+    const vis = lodVisibility(app.canvas);
+    if (vis && vis.total) {
+      bits.push(
+        `nodes ${vis.total} · on screen ${vis.visible} (${fmtPct(vis.share)}) at zoom ${vis.scale.toFixed(2)} · ` +
+          `~${vis.meanPx.toFixed(0)}px wide each (estimate)`
+      );
+      if (vis.share >= 0.9 && vis.zoomedOut) {
+        bits.push(
+          "the whole graph is on screen, so culling cannot save anything here — the only levers left are cheaper drawing per " +
+            "node (below) and fewer redraws (the cap)"
+        );
+      }
+      const theirLod = lodFrontendLod(app.canvas);
+      if (theirLod && theirLod.minFontSize === 0) {
+        bits.push(
+          "frontend LOD is switched off (Settings → LiteGraph → \"Zoom Node Level of Detail\" = 0): turning it up to " +
+            "24px brings ComfyUI's own low-quality node rendering in sooner — it skips shadows and rounded corners, not nodes"
+        );
+      } else if (theirLod && theirLod.minFontSize === null) {
+        bits.push("frontend LOD: this frontend version does not expose its LOD threshold on the canvas, so there is nothing to read here");
+      } else if (theirLod) {
+        bits.push(
+          `frontend LOD threshold ${theirLod.minFontSize}px — ComfyUI's own low-quality rendering is ` +
+            `${theirLod.lowQuality ? "active" : "not active"} at this zoom (it changes how a node is painted, not whether it is)`
+        );
+      }
+    }
+    if (lodOn()) {
+      const b = LOD.baseline;
+      const bits2 = [`simplified ${LOD.nodes} node draw(s) and ${LOD.links} link draw(s) so far`];
+      if (LOD.capped) bits2.push(`${LOD.capped} redraw(s) merged by the idle cap`);
+      if (b && b.at) {
+        const since = lodSinceSwitch();
+        const ago = Math.max(0, Math.round((nowMs() - b.at) / 1000));
+        if (since) {
+          bits2.push(
+            `since the switch (${since.n} frame(s) in ${ago}s): node drawing ${fmtMs(b.nodeMsPerFrame)} → ${fmtMs(since.nodeMsPerFrame)} ms/frame · ` +
+              `links ${fmtMs(b.connMsPerFrame)} → ${fmtMs(since.connMsPerFrame)} · whole frame ${fmtMs(b.meanFrameMs)} → ${fmtMs(since.meanFrameMs)} ms`
+          );
+        } else {
+          bits2.push(`switched on ${ago}s ago — no frame has been drawn since, so there is nothing to compare yet`);
+        }
+      }
+      bits.push(bits2.join(" · "));
+    } else {
+      bits.push("off — the canvas is drawn exactly as ComfyUI draws it");
+    }
+    if (LOD.error) bits.push(`turned itself off after an error: ${LOD.error}`);
+    lodLine.textContent = bits.join("\n");
+  }
+
   container.appendChild(el("div", { class: "ants-section-title", text: "Who is asking for redraws" }));
   container.appendChild(invLine);
   container.appendChild(invTable.table);
@@ -3878,6 +4326,7 @@ function buildNodesTab(container) {
       }
       rateLine.textContent = bits.join(" · ");
     }
+    lodUpdate();
 
     const inv = invalidationMetrics();
     const invBits = [`${fmtRate(inv.perSec)} redraw requests/s`];
@@ -5741,6 +6190,17 @@ function buildTelemetryReport() {
       `display ${Number.isFinite(fm.displayHz) ? fm.displayHz.toFixed(1) + "Hz" : "?"} | ${Number.isFinite(fm.drawsPerRaf) ? fm.drawsPerRaf.toFixed(2) : "?"} redraws per displayed frame`
     );
     lines.push(
+      `low-zoom drawing: ${
+        lodOn()
+          ? `on (nodes < ${LOD.minPx}px as one rectangle, links ${LOD.plan.links ? "straight" : "as drawn"}, idle redraw cap ${LOD.idleCapMs || "off"}ms) ` +
+            `— ${LOD.nodes} node draw(s) and ${LOD.links} link draw(s) simplified, ${LOD.capped} redraw(s) merged` +
+            (() => {
+              const since = lodSinceSwitch();
+              if (!since || !LOD.baseline) return "";
+              return `; since the switch (${since.n} frames): node drawing ${fmtMs(LOD.baseline.nodeMsPerFrame)} → ${fmtMs(since.nodeMsPerFrame)} ms/frame, links ${fmtMs(LOD.baseline.connMsPerFrame)} → ${fmtMs(since.connMsPerFrame)}, frame ${fmtMs(LOD.baseline.meanFrameMs)} → ${fmtMs(since.meanFrameMs)} ms`;
+            })()
+          : "off (the canvas is drawn exactly as ComfyUI draws it)"
+      }${LOD.error ? ` [turned itself off after an error: ${LOD.error}]` : ""} | ` +
       `budget per frame: drawNode ${fmtMs(fm.nodeMsPerFrame)}ms (${fmtPct(fm.nodeShare)}) ` +
         `[hooks ${fmtMs(fm.attrMsPerFrame)}ms ${fmtPct(fm.attrShare)}, litgraph chrome ${fmtMs(fm.chromeMsPerFrame)}ms ${fmtPct(fm.chromeShare)}] | ` +
         `drawConnections ${fmtMs(fm.connMsPerFrame)}ms (${fmtPct(fm.connShare)}) | everything else ${fmtMs(fm.otherMsPerFrame)}ms (${fmtPct(fm.otherShare)})`
@@ -5980,6 +6440,24 @@ function installDebugApi() {
       reset: () => resetAllStats(),
       setCap: (ms) => {
         drawThrottleMs = Number(ms) || 0;
+      },
+      // Low-zoom drawing: the opt-in that makes the canvas cheaper per frame
+      // instead of less frequent. Also driven from the Nodes tab.
+      lowZoom: {
+        get state() {
+          return LOD;
+        },
+        get visibility() {
+          return lodVisibility(app.canvas);
+        },
+        get limits() {
+          return { minPx: LOD_MIN_PX.slice(), idleCapMs: LOD_IDLE_CAP_MS.slice() };
+        },
+        get frontendLod() {
+          return lodFrontendLod(app.canvas);
+        },
+        set: (opts) => lodSet(opts),
+        off: () => lodSet({ minPx: 0, idleCapMs: 0 }),
       },
       setSyntheticTick,
       benchmark: (ms, slot) => runScriptedPan(Number(ms) || 6000, slot || "A"),

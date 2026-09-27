@@ -9,6 +9,7 @@ import { runTests } from "./framework.mjs";
 import "./core.test.mjs";
 import "./panel.test.mjs";
 import "./governor.test.mjs";
+import "./drawing.test.mjs";
 
 const filter = process.argv[2];
 process.exitCode = await runTests({ filter });
