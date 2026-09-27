@@ -4,58 +4,11 @@ A frontend-side profiler for ComfyUI. Answers "which extension is
 actually costing me FPS while panning this graph?" without needing
 Chrome DevTools open, and without restarting ComfyUI to bisect.
 
-## Testing tab
-
-Two opt-in overrides, both off by default, neither persisting across a
-reload:
-
-- **Canvas redraw rate cap** — skips any real redraw arriving sooner
-  than the chosen interval, regardless of what's asking for it. The
-  `fps` number in the summary bar should drop to roughly match your
-  pick; that's it working, not a bug. This doubles as a genuine, low-risk
-  mitigation for huge graphs, not just a diagnostic — if a workflow
-  feels fine capped at 15fps, that's real, immediate relief with zero
-  node-code changes.
-- **Synthetic forced-tick generator** — forces an extra full redraw at
-  a fixed, known interval, independent of everything else, so you have
-  a controlled reference point to compare against whatever organic tick
-  the Nodes tab's shared-tick detector finds. It shares the same redraw
-  path as the cap above, so an active cap will throttle these forced
-  ticks too — set the cap to Off first to measure an uncapped
-  synthetic tick's real cost.
-
-## Hook-wrap counter
-
-The Timing tab's empty state now says how many (extension, hook) pairs
-were ever actually wrapped this session. `0 hooks wrapped` means no
-extension in this session overrides `onDrawForeground` and friends
-directly — check the Nodes tab instead. A nonzero count with nothing
-firing recently means something that used to draw via a hook may have
-been refactored to draw a different way (a custom widget's own
-`draw()`, or a centralized heartbeat) — this resolves that ambiguity
-permanently instead of requiring a fresh investigation each time.
-
-## Known fixed bug: stale data across tab/graph switches
-
-Earlier versions kept accumulating stats per extension/node-type
-forever once a type stopped being drawn (e.g. you switched to a
-different ComfyUI tab) — a bucket's rolling window only trimmed on its
-own next write, so a type that goes idle would sit frozen at its old
-numbers indefinitely instead of aging out after 4 seconds like
-everything else. This is fixed two ways: a periodic sweep (every
-second) trims every bucket by wall-clock time regardless of activity,
-and an `afterConfigureGraph` hook clears everything instantly on an
-actual workflow load. If you still see a node type that clearly isn't
-in your current graph lingering for more than a few seconds after
-switching, that's worth reporting.
-
-## Copy button
-
-The 📋 **Copy** button in the panel header dumps a full plain-text
-snapshot of all tabs (Timing, Nodes, Load, Memory, the shared-tick
-banner if active) to your clipboard in one go — meant for pasting into
-a chat or bug report instead of a screenshot, which is both faster for
-you and cheaper in tokens on the other end.
+Version 2.0. This is a rewrite: the semantics changed (costs are now per
+drawn frame, not per 4-second window), five new tabs exist, and a
+handful of v1 bugs that could make the panel lie are fixed. If you are
+coming from v1, read **"What changed in v2"** at the bottom.
+`REVIEW.md` in this repo documents the v1 defects with line references.
 
 ## Install
 
@@ -73,13 +26,15 @@ in order to catch every other extension's `registerExtension` call.
 Don't rename it unless you also rename it to something that still
 sorts first.
 
-Restart ComfyUI. No dependencies, nothing to `pip install`.
+Restart ComfyUI. No dependencies, nothing to `pip install`, no build
+step. Nothing is persisted server-side; the only thing written to disk
+anywhere is the panel button's screen position (browser `localStorage`).
 
 ## Use
 
-The tracker starts recording automatically the moment the page loads
-— you don't need to place any node for it to work. Two ways to open
-the panel:
+The tracker starts recording automatically the moment the page loads —
+you don't need to place any node for it to work. Two ways to open the
+panel:
 
 1. A small 🔧 button appears pinned to the screen at all times. A
    quick click opens/closes the panel. Press and hold it for a moment,
@@ -92,86 +47,296 @@ the panel:
    `ANTs/debug`) and click its **Open Tracker** button. The node does
    nothing else — no inputs, no outputs, never executes.
 
+Panel header buttons:
+
+- **📋 Copy** — dumps a plain-text snapshot of every tab to the
+  clipboard in one go, meant for pasting into a chat or bug report
+  instead of a screenshot.
+- **⏸ Pause** — freezes sampling. Drawing keeps happening; it just
+  stops being timed, so a jumpy table holds still long enough to read.
+  Meters are marked stale while paused.
+- **⟲ Reset** — clears every recorded sample. Mutes, the redraw cap
+  and the panel's own position are kept, so you can reset between
+  experiments without redoing your setup.
+
+## Reading the numbers
+
+Every cost in the Timing and Nodes tabs is given in **four units**, and
+the first is the one to reason with:
+
+| Unit | Meaning |
+| --- | --- |
+| `ms/frame` | milliseconds of work added to the average drawn frame |
+| `% fr` | that cost as a share of the average frame in the same window |
+| `ms/call` | cost of one invocation (spikes vs. steady load) |
+| `calls/fr` | how often it runs per displayed frame |
+
+`ms/frame` and `% fr` are what let you compare a row to the 16.6ms
+budget of a 60fps frame, to another graph, or to the same graph a
+minute ago. They do not change if you pan faster; v1's window sums did.
+
+Rates (`fps`, `requests/s`, stalls/s) are wall-clock and say so.
+
+Windows, if you need them: hook and node-type costs cover the last 4
+seconds. Frame statistics cover 10 seconds, and automatically widen to
+30 seconds when a redraw cap leaves fewer than 4 frames in the window —
+so a 1 fps or 5-second cap still produces meaningful `fps` and p95
+numbers instead of `0`. The panel prints which window it used.
+
 ### Timing tab
 
-Pan/zoom your heavy graph for a few seconds with the panel open. Each
-row is one *other* extension, sorted by how much draw time it's
-burned in the last few seconds. Red = hot, orange = warm. Hit **Mute**
-on a suspect to fully skip its draw hooks live — watch the fps number
-in the summary bar change in real time. That's your bisection tool;
-no folder-shuffling or restarts needed.
+Rows are *other* extensions (this tracker never lists itself).
+Columns: `ms/frame`, `% fr`, `ms/call`, `calls/fr`, plus `off-frame ms`
+— hook time that ran outside a canvas draw (from `onExecuted`, a timer,
+a DOM event). Off-frame time is real cost but it is not part of a
+frame, so it is kept out of the budget instead of being silently folded
+into the next frame the way v1 did.
 
-**Unattributed** (in the summary bar) is canvas draw time that isn't
-accounted for by any tracked extension. If that number is large, some
-node pack is patching LiteGraph's canvas/node prototypes directly
-instead of going through the sanctioned `beforeRegisterNodeDef` hook
-— this tool can tell you *that it's happening* but not *who's doing
-it* without a manual DevTools trace, since it never went through the
-door this tool is watching.
+Red = above 15% of the frame, orange = above 5%, both relative to the
+frame budget rather than an absolute millisecond count.
+
+Expand a row (▸) for the per-hook breakdown: which hook
+(`onDrawForeground`, `onDrawBackground`, `onDrawCollapsed`,
+`onBounding`), per-hook `ms/frame`, calls, and off-frame numbers.
+
+Node types that assign their **own** `this.onDrawForeground = ...`
+inside `onNodeCreated` — a common pattern, invisible to v1 — are adopted
+while drawing and listed as `(unattributed) <Type> · instance hook`
+(named after the extension when that can be inferred). Hooks that were
+already present on a node prototype before this extension loaded are
+adopted too, and labelled `(pre-existing) <Type>`.
 
 ### Nodes tab
 
-A second, independent measurement lane from the Timing tab. This times
-LiteGraph's own `drawNode()` call in full, per node *type* — borders,
-title bar, slots, widgets, embedded preview bitmaps, everything —
-which **includes** whatever the Timing tab already reports for that
-node's own extension hooks as a subset. Don't add the two tabs
-together; they answer different questions.
+Where the frame actually went, measured around LiteGraph's own calls
+rather than through extension hooks:
 
-In practice, this is usually where most of "unattributed" time in the
-summary bar actually lives. It's rarely a rogue extension — it's
-LiteGraph's own per-node chrome-drawing cost, multiplied by however
-many nodes of that type are visible. A node type with an image-preview
-widget sitting at the top of this list is worth checking first:
-redrawing large embedded bitmaps every frame while panning is
-expensive and has nothing to do with any custom node's JS.
+- **drawNode** — per-node chrome: title bar, borders, slots, widgets,
+  embedded preview bitmaps. Split into `wrapped hooks` (the part the
+  Timing tab already accounts for) and `LiteGraph chrome` (everything
+  else in `drawNode`).
+- **drawConnections** — link rendering, usually negligible on a big
+  graph and usually a surprise when it isn't.
+- **everything else** — the rest of the frame. If this line is big,
+  the cost is in a canvas method this tool does not wrap, a widget's
+  own `draw()`, or a Nodes-2.0/Vue component; the Stalls tab is the
+  next place to look.
+
+A per-node-type table follows (cost per *drawn* node of that type, so a
+type used 50 times is not penalised for existing), plus a sampled
+`canvas.setDirty()` caller table — see Stalls below.
+
+### Stalls tab
+
+Frame cost is not the only way to lose FPS, so this tab reports
+main-thread blocking *outside* the draw path, from Long Animation
+Frames (Chrome 123+) with a `longtask` fallback:
+
+- **blocking ms/s** and **stalls/s**, the honest headline numbers.
+- **where** — script URL, function name, source line, and the
+  extension pack when the script lives under `/extensions/`.
+- **invoker** — e.g. `TimerHandler:setInterval`, which names the
+  mechanism behind a heartbeat.
+- **forced layout ms** — style/layout time inside the long frame,
+  which is the signature of a DOM-thrashing extension.
+- **redraw requests/s by caller** — `canvas.setDirty()` wrapped
+  exactly (the request rate is precise) and its call stack sampled
+  ~20×/second to say *who* is asking for redraws. A rogue heartbeat
+  shows up here by name instead of as "something is ticking".
 
 ### Load tab
 
-Startup/page-load cost per extension pack (from the browser's own
-Resource Timing data) — separate from runtime draw cost. A pack can
-be heavy to load but cheap to run, or the other way around.
+Page-load cost per extension pack from the browser's own Resource
+Timing data, reported as a **span** (first request → last response, so
+parallel fetches are not summed into an impossible number the way v1
+did) with file count, slowest file, and cache-served count. A pack can
+be heavy to load and cheap to run, or the other way around.
 
 ### Memory tab
 
-JS heap snapshot (Chromium only — Firefox doesn't expose
-`performance.memory` to page JS at all, by design). No per-extension
-breakdown is possible here; use "Set baseline" + mute a suspect +
-compare the delta to bisect a memory hog manually.
+JS heap (Chromium only — Firefox does not expose
+`performance.memory` to page JS at all, by design). Set a baseline,
+then mute a suspect and watch the trend — **MB/min** and a sparkline,
+so you can see whether a muting experiment changed the slope instead of
+comparing two noisy snapshots. No per-extension breakdown is possible
+here; that is a browser boundary, not a missing feature.
 
 ### GPU / VRAM tab
 
-Deliberately honest: this is not obtainable from page JavaScript in
-any browser, full stop — it's a sandbox boundary, not a missing
-feature. The tab explains the closest workaround (an external
-`nvidia-smi` poll run alongside ComfyUI, eyeballed against a
-mute/unmute test's timestamp) rather than faking a number.
+Genuinely unobtainable from page JavaScript: *per-extension* VRAM.
+That is stated in the tab rather than faked. What the tab does show,
+all of it real:
+
+- Per-device VRAM totals and free space, and the VRAM headroom
+  percentage (turns red under 10%), from ComfyUI's own `/system_stats`.
+- Torch's allocated/reserved view next to the driver's numbers; a large
+  gap between them is normal caching, a growing `reserved` with flat
+  `allocated` is fragmentation.
+- Optional nvidia-smi side-channel: utilization, temperature, power,
+  and per-process VRAM, via the `/ants_tracker/gpu` route added by this
+  extension (see below). If nvidia-smi is missing, the tab says why
+  instead of showing nothing.
+
+## Optional backend route
+
+`__init__.py` registers one read-only route:
+
+```
+GET /ants_tracker/gpu
+```
+
+It runs `nvidia-smi` (2-second in-process cache, 5-second timeout) and
+returns either
+
+```json
+{"available": true, "gpus": [...], "processes": [...]}
+```
+
+or `{"available": false, "reason": "..."}` — no NVIDIA tooling, a
+timeout, or no GPUs are all reported as a reason, never as a crash.
+Absolute paths and `[N/A]` fields are handled; unparseable numbers
+become `null` instead of `NaN` or a fabricated 0. `/system_stats` is
+used first and always works even when this route does not, so the tab
+degrades field by field.
+
+## Testing tab
+
+Four tools, all opt-in, none persisted across a reload:
+
+- **Canvas redraw rate cap** (Off … 1 redraw / 10s) — delays any real
+  redraw arriving sooner than the chosen interval, regardless of what
+  asked for it. Unlike v1, a capped redraw is **deferred, not
+  dropped**: exactly one trailing redraw is scheduled so the canvas
+  cannot be left showing stale pixels, and the Testing tab counts
+  capped vs. deferred redraws so you can see the mechanism working.
+  The fps number in the summary bar should settle near your pick; that
+  is it working, not a bug. This doubles as a genuine, low-risk
+  mitigation for huge graphs — if a workflow feels fine capped at
+  15fps, that is immediate relief with no node-code changes.
+- **Synthetic forced-tick generator** — forces a full redraw at a
+  fixed, known interval. It shares the redraw path above, so an active
+  cap throttles these ticks too; set the cap to Off first if you want
+  to measure the raw cost of a tick.
+- **Scripted pan benchmark (A/B)** — the honest way to answer "did that
+  change help?". It pans the real canvas along a fixed sine path for
+  3/6/10 seconds, forces the redraws itself, and reports mean ms/frame,
+  p95, fps and attributed share **over exactly that span**, so two runs
+  are comparable even though your hand is not. Run A (current state),
+  mute something, run B, and the delta line says how many fps and
+  ms/frame you gained — with a warning if A and B were not captured
+  under the same mutes. The graph is restored to its original offset
+  and the node count is recorded with each run.
+- **Mute list / clear** — everything currently muted, with one-click
+  unmute, plus the live count of node types being drawn.
+
+## Muting: what it does and does not do
+
+**Mute** on a Timing row skips that extension's draw hooks outright —
+`return undefined`, no timing, nothing drawn by those hooks. This is
+the bisection tool: mute a suspect and watch the fps number change.
+
+- Muted owners keep their row (marked `muted`, with a **skipped N
+  calls** counter) even if they go completely idle, so a mute can
+  always be undone. v1 could delete a muted extension's row after 4
+  seconds of silence, leaving the hooks permanently skipped with no
+  visible way to unmute short of a page reload.
+- Muting changes what is drawn by definition, and an extension can take
+  a different code path afterwards (caches, internal state). Treat a
+  muted/unmuted delta as an upper bound on that extension's cost, not
+  an exact price list. The scripted benchmark records the mute set for
+  exactly this reason.
+- Mute state is per page load. Nothing is written to disk.
 
 ## What this can't catch
 
-Only draw-ish hooks reachable through `beforeRegisterNodeDef`
-(`onDrawForeground`, `onDrawBackground`, `onDrawCollapsed`,
-`onBounding`) are attributed by name. An extension that:
-
-- patches `LGraphCanvas.prototype` / `LGraphNode.prototype` directly
-  at top-level script load, or
-- does its expensive work somewhere other than these four hooks
-  (e.g. inside `onExecuted`, a `setInterval`, or a Vue component for
-  a Nodes-2.0-style widget)
-
-...won't show up by name. Its cost will still show up as a gap
-between "frame" and "attributed" in the summary bar, which at least
-tells you there's something to go hunting for with a full DevTools
-Performance trace.
+- Anything drawn by a widget's own `draw()`, by a Vue/HTML node (the
+  Nodes 2.0 style frontend), or by a canvas method this tool does not
+  wrap is not attributed *by name*. It still lands in the Nodes tab's
+  "everything else" line, and if it blocks the main thread it lands in
+  Stalls with a file and function. It just cannot be named by extension.
+- Per-extension GPU memory. Not obtainable in any browser; the GPU tab
+  does not invent it.
+- `fps` and frame cost here are JS/canvas cost. Compositor and GPU time
+  are not visible from the page.
+- Redraw callers are sampled (~20/s), so a source that requests
+  redraws in rare bursts can be missed between samples. The total
+  request *rate* is exact.
+- Firefox exposes neither `performance.memory` nor long tasks; the
+  Memory and Stalls tabs say so rather than showing zeroes.
+- A hook's share of frame is a share of the *mean* frame in the same
+  window, not of the specific frame it ran in.
 
 ## Compatibility note
 
 This assumes the classic LiteGraph canvas frontend
-(`app.canvas.constructor.prototype.draw` and `.drawNode`,
-`nodeType.prototype.onDraw*`). If a future ComfyUI frontend version
-changes these internals, the browser console will log an
-`[ANTs Tracker]` warning explaining what it couldn't find, rather than
-failing silently. Each patch point degrades independently: losing
-`draw` costs you the frame-total/unattributed numbers, losing
-`drawNode` costs you the Nodes tab, and per-extension hook timing
-(Timing tab) works regardless of either.
+(`app.canvas.constructor.prototype.draw`, `.drawNode`,
+`.drawConnections`, `.setDirty`, and `nodeType.prototype.onDraw*`). If a
+ComfyUI frontend version changes these internals, each patch point
+degrades on its own *and the panel says which one failed*:
+
+- losing `draw` costs you frame totals, fps, the budget and unattributed
+  time,
+- losing `drawNode`/`drawConnections` costs you the Nodes tab's split,
+- losing `setDirty` costs you redraw-caller attribution,
+- per-extension hook timing keeps working regardless of any of them.
+
+Canvas patching is retried for ~20 seconds after load (v1 tried once and
+gave up if the canvas was not ready), and a console warning is still
+logged for DevTools.
+
+## Development
+
+```
+node tests/run-tests.mjs          # 36 tests, no dependencies, no browser
+node tests/run-tests.mjs timing   # filter by name fragment
+python3 tests/test_init.py        # backend route parsing + graceful fallbacks
+```
+
+The JS suite loads `web/tracker.js` into a fake browser and a fake
+ComfyUI/LiteGraph with a controllable clock, then asserts the numbers
+(per-frame attribution, budget additivity, mute semantics, cap
+deferral, fps under loose caps, instance/pre-existing hook adoption,
+stall and redraw attribution, panel row identity, and the A/B
+benchmark) rather than only the code paths.
+
+## What changed in v2
+
+Fixed (all of these had regression tests written against the v1
+behaviour first; see `REVIEW.md` for line references):
+
+- **Muting could permanently hide an extension.** v1 deleted a
+  silent extension's stats bucket after a few seconds; wrapped hooks
+  kept writing into the orphaned bucket, so the row — and the Unmute
+  button with it — was gone for the rest of the session while the hooks
+  stayed skipped.
+- **Hook time outside a frame was attributed to the next frame**, could
+  make "attributed" exceed "frame", and could force "unattributed" to
+  clamp at 0.00ms. Off-frame time is now its own column.
+- **The unit was milliseconds per 4 seconds**, so every row's number
+  scaled with how fast you panned and could not be compared to a frame
+  budget. Now `ms/frame` and `% of frame`, with window sums only in the
+  detail view and the text report.
+- **`fps` was 0 or wrong under the loose caps the Testing tab offers.**
+  Now computed from intervals over a 10s window that widens to 30s.
+- **The panel rebuilt itself via `innerHTML` every 500ms** — scroll
+  position reset, rows moved under the pointer, focused controls were
+  destroyed. Rows are now updated in place.
+- **The redraw cap dropped frames** instead of deferring them; one
+  trailing redraw is now guaranteed.
+- **The canvas patch was attempted once**; now retried, and failures
+  are reported in the panel.
+- **The shared-tick detector guessed** a period from call-count
+  multiples. Replaced by measurement: exact `setDirty` request rate
+  plus sampled call stacks and Long Animation Frame invokers.
+- **Load times summed concurrent fetches**, which could exceed the page
+  load itself. Now a span.
+- **Instance hooks and pre-existing hooks were invisible.** Now adopted
+  and labelled.
+- **No percentiles, no stalls lane, no self-cost check, no pause.**
+  All present now: p50/p95/p99 frame time, the Stalls tab, the
+  tracker's own footprint (wrapped hooks, ring memory, panel cost per
+  second) in the report, and Pause/Reset.
+
+Also new: ring buffers are typed arrays written in place instead of
+allocating one object per hook call and shifting arrays, so the profiler
+is cheaper while profiling than it was.
