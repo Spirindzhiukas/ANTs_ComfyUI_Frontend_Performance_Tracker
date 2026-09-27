@@ -1782,6 +1782,8 @@ function buildPanel() {
 }
 
 function setTab(name) {
+  // Deliberately unchanged refresh cadence: switching tabs just shows a
+  // different prebuilt body.
   if (ui.active === name) return;
   const body = listBody();
   if (body) ui.prevScroll[ui.active] = body.scrollTop || 0;
@@ -2623,7 +2625,11 @@ function buildMemoryTab(container) {
     const sc = selfCostMetrics();
     setText(selfVals.buckets, sc.buckets);
     setText(selfVals.rings, fmtBytes(sc.ringBytes));
-    setText(selfVals.render, `${fmtMs(sc.renderMsPerSec * 1000, 0)} µs/second (${S.counters.renderCount} panel renders so far)`);
+    setText(
+      selfVals.render,
+      `${fmtMs(sc.renderMsPerSec * 1000, 0)} µs/second (${S.counters.renderCount} panel renders so far` +
+        `${uiRefreshMs > UI_REFRESH_MS ? `, refresh slowed to every ${(uiRefreshMs / 1000).toFixed(1)}s to stay out of the way` : ""})`
+    );
     setText(selfVals.sweep, `${fmtMs(sc.sweepMsPerSec * 1000, 0)} µs/second`);
     setText(selfVals.hooks, `${sc.wrappedHooks} wrapped — each adds two performance.now() calls and one ring write per invocation`);
     selfVals.rings.title = "Typed-array ring buffers behind every metric. Buckets grow under load and are never deleted while a wrapped hook still points at them.";
@@ -3240,9 +3246,23 @@ function sweepStaleData() {
   }
 }
 
+// How often to redraw the panel, decided from what the last pass actually cost.
+// A graph that produces hundreds of rows can make one full update cost more than
+// a frame, and a profiler that causes the stalls it reports is worse than one
+// that updates half as often. Tiers rather than a formula, so the behaviour is
+// obvious and testable: half of a 60fps frame is where it starts backing off.
+function refreshIntervalFor(renderMs) {
+  if (!Number.isFinite(renderMs)) return UI_REFRESH_MS;
+  if (renderMs > 12) return 2000;
+  if (renderMs > 6) return 1000;
+  return UI_REFRESH_MS;
+}
+
+let uiRefreshMs = UI_REFRESH_MS;
+
 function startRefresh() {
   stopRefresh();
-  ui.refreshTimer = setInterval(() => {
+  const tick = () => {
     const t0 = performance.now();
     try {
       renderSummary();
@@ -3251,14 +3271,19 @@ function startRefresh() {
       warnOnce("render-fail", `Panel render failed: ${e && e.message}`);
       console.error(e);
     }
-    selfCost.renderAccum += performance.now() - t0;
+    const cost = performance.now() - t0;
+    selfCost.renderAccum += cost;
     S.counters.renderCount++;
-  }, UI_REFRESH_MS);
+    uiRefreshMs = refreshIntervalFor(cost);
+    ui.refreshTimer = setTimeout(tick, uiRefreshMs);
+  };
+  ui.refreshTimer = setTimeout(tick, uiRefreshMs);
 }
 
 function stopRefresh() {
-  if (ui.refreshTimer) clearInterval(ui.refreshTimer);
+  if (ui.refreshTimer) clearTimeout(ui.refreshTimer);
   ui.refreshTimer = null;
+  uiRefreshMs = UI_REFRESH_MS;
 }
 
 function togglePanel(force) {
@@ -3715,6 +3740,7 @@ function installDebugApi() {
       setSyntheticTick,
       benchmark: (ms, slot) => runScriptedPan(Number(ms) || 6000, slot || "A"),
       parseCallerStack,
+      refreshIntervalFor,
       // Live row caps: lower them (or raise them) to trade panel render cost
       // against how much of a long list is on screen.
       rowCaps,

@@ -109,6 +109,11 @@ the cap for that tab. The caps live on `window.__antsTracker.rowCaps`
 (`{ timing, nodes, stalls }`), so a console can lower them further — the
 Stalls tab will happily show you what this panel costs if you get greedy.
 
+The panel also measures its own refresh and backs off when a pass costs
+real time: over 6ms per pass it refreshes every second, over 12ms every
+two seconds, and it speeds back up when the list gets short again. The
+Memory tab's "tracker's own footprint" line says when this is happening.
+
 ### Timing tab
 
 Rows are *other* extensions (this tracker never lists itself).
@@ -337,7 +342,7 @@ logged for DevTools.
 ## Development
 
 ```
-node tests/run-tests.mjs          # 45 tests, no dependencies, no browser
+node tests/run-tests.mjs          # 46 tests, no dependencies, no browser
 node tests/run-tests.mjs timing   # filter by name fragment
 python3 tests/test_init.py        # backend route parsing + graceful fallbacks
 node tests/demo.mjs               # print what the panel says, with no ComfyUI

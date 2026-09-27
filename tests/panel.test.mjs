@@ -464,6 +464,23 @@ suite("panel", () => {
     assert(types()[0][0].includes("CheapThing"), "A→Z is available too (CheapThing < HeavyThing)");
   });
 
+  test("the panel slows its own refresh down when a pass costs real time", async () => {
+    const h = await boot();
+    const interval = h.sandbox.window.__antsTracker.refreshIntervalFor;
+    assertEqual(interval(0.4), 500, "cheap pass keeps the normal cadence");
+    assertEqual(interval(7), 1000, "half a frame per pass halves the refresh rate");
+    assertEqual(interval(30), 2000, "a pass that costs more than a frame backs off further");
+    assertEqual(interval(NaN), 500, "unknown cost does not change anything");
+    // The refresh is a self-scheduling timeout, so the real risk is the chain
+    // dying; a frozen panel would be worse than a slow one.
+    h.tracker.open();
+    const state = h.sandbox.window.__antsTracker._state;
+    const before = state.counters.renderCount;
+    h.advance(3000);
+    await h.flush();
+    assertGreater(state.counters.renderCount - before, 3, "the panel keeps refreshing on its own");
+  });
+
   test("node widget button opens the panel", async () => {
     const h = await boot();
     const ext = h.app.extensions.find((e) => e.name === "ANTs.NastyBastardsTracker.Core");
