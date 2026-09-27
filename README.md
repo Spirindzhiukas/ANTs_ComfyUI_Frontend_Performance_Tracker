@@ -289,8 +289,10 @@ is inside the viewport (so a culling scan has nothing to remove), each
 one is a few dozen pixels wide (so its title, slots, widgets and preview
 are invisible anyway), and a redraw costs hundreds of milliseconds — at
 which point there is nothing to schedule: the cost is the drawing itself.
-The mode paints those nodes as a flat rectangle, straightens the links,
-and rate-limits redraws while nobody is touching the page.
+The mode paints every node as a flat rectangle below a zoom you pick,
+degrades the links (thinner strokes, curves kept), hides the DOM content
+of the nodes it boxed, and rate-limits redraws while nobody is touching
+the page.
 
 **Redraw merging** is the other half of the same idea. `setDirty`
 requests were already counted exactly (and the Testing tab's cap can
@@ -316,8 +318,8 @@ render, the DOM and canvas drawing cannot leave the main thread — no
 scheduler can move them, and `OffscreenCanvas` only helps an application
 that created its canvas that way (ComfyUI does not). That is why the
 answer to a 280ms redraw is not a thread but *less drawing*: see
-**low-zoom drawing** in the Tweaks tab, which paints nodes that are too
-small to read as one rectangle, thins links instead of straightening
+**low-zoom drawing** in the Tweaks tab, which paints every node as one
+rectangle below the zoom you pick, thins links instead of straightening
 them, hides the DOM content of the nodes it boxed, and rate-limits
 redraws while nobody is touching the page. What a scheduler
 layer *can* do is serialise and rate-limit the main thread's competing
@@ -494,7 +496,7 @@ logged for DevTools.
 ## Development
 
 ```
-node tests/run-tests.mjs          # 111 tests, no dependencies, no browser
+node tests/run-tests.mjs          # 113 tests, no dependencies, no browser
 node tests/run-tests.mjs timing   # filter by name fragment
 python3 tests/test_init.py        # backend route parsing + graceful fallbacks
 node tests/demo.mjs               # print what the panel says, with no ComfyUI
@@ -533,6 +535,37 @@ installed as the sandbox's `CanvasRenderingContext2D` (the preview ladder
 patches `drawImage` there, the same way a browser exposes it), and
 `createImageBitmap` records the resize it was asked to perform instead of
 resizing anything.
+
+## What changed in v2.1.9
+
+- **The node threshold is a zoom now, not a node size.** "Nodes under 64px" asked
+  the wrong question. A node's size on screen is not a property of the camera: a
+  JS node that hides, greys or adds a widget while you work changes its own size,
+  so a pixel rule paints the same node flat on one frame and draws it in full on
+  the next — and the nodes that move are exactly the ones with dynamic UIs, whose
+  widgets are the thing you were looking at. The setting is now **flat nodes below
+  N% zoom** (5% to 50%, off by default): one decision per frame, taken from the
+  camera, applied to every node the same way, and nothing at all is touched above
+  the zoom. A node being small can no longer flatten anything on its own. The
+  zoom rule also removes the sampling: the panel can say exactly how many nodes
+  are rectangles instead of estimating a share from 64 samples.
+- **Links follow the same trigger.** `auto` (the default) means "straight while
+  the graph is rectangles" — the v2.1.4 behaviour, now tied to the same zoom
+  instead of to a sample of node widths, so the link style and the node style
+  cannot disagree about whether the graph is being flattened.
+- **Collapsed nodes and this tool's own node are never flattened**, and the node
+  you have selected keeps its outline, so a rectangle at 10% zoom still tells you
+  what is selected.
+- **A pixel setting carries over once, and says so.** If `localStorage` holds a
+  v2.1.8 record, its `minPx` is translated to the nearest zoom below (64px on a
+  typical 350px node is 18%, so 20%), and the panel explains the change with the
+  old number quoted until you pick a value yourself. Nothing else about the mode
+  changes, and an install with no saved record behaves exactly as before.
+- **The whole-graph note names what is still walking the graph.** When the graph
+  is fully on screen — so culling has nothing to remove — the panel now lists any
+  periodic source whose worst run is over 120 ms by name, with its worst time and
+  rate, because a scan that costs 800 ms in one go is worth capping even when its
+  average looks small.
 
 ## What changed in v2.1.8
 

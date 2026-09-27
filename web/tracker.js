@@ -27,7 +27,7 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.1.8";
+const VERSION = "2.1.9";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
 const NODE_NAME = "ANTsNastyBastardsTracker";
 
@@ -838,17 +838,18 @@ function maybeWrapInstanceHooks(node) {
 // several times a second, with the whole graph on screen. Culling cannot help a
 // graph that is entirely visible and no timer limit touches a draw, so what is
 // left is drawing less per frame:
-//   * a node that lands a dozen pixels wide is painted as one flat rectangle
+//   * below a zoom the user picks, every node is painted as one flat rectangle
 //     instead of LiteGraph's border, gradient, title, slots, widgets and
-//     previews;
-//   * links are painted as straight lines while most nodes are that small;
+//     previews — and the DOM content of those nodes goes with it;
+//   * links are painted as straight lines while the graph is rectangles;
 //   * and while nobody is touching the page the redraw rate is capped, because
 //     the frame nobody is looking at is the cheapest frame on the page.
 // All three are opt-in and off by default. Any exception turns the mode back off
 // with the reason in the panel: a rendering change this tool cannot explain
 // would be worse than a slow frame.
 const LOD = {
-  minPx: 0, // simplify nodes narrower than this on screen (0 = off)
+  flatBelow: 0, // paint every node as a rectangle below this zoom (0 = off)
+  legacyPx: 0, // a v2.1.8 "nodes under Npx" setting, carried over, shown once
   idleCapMs: 0, // while untouched, at most one redraw per this many ms (0 = off)
   nodes: 0, // node draws replaced by a rectangle
   links: 0, // link draws replaced by a straight line
@@ -856,7 +857,7 @@ const LOD = {
   capped: 0, // redraws merged away by the idle cap
   error: "",
   baseline: null, // the frame budget as it was when the mode went on
-  plan: { links: false, tiny: 0, sampled: 0, total: 0, at: 0 },
+  plan: { links: false, flat: 0, total: 0, medPx: 0, at: 0 },
   // Preview bitmaps. A 4096px image drawn into a 40px box on screen costs the
   // full-size upload and blit every redraw; past the zoom you set, the draw is
   // served from a cached copy of about the resolution the screen can show.
@@ -895,16 +896,22 @@ const LOD = {
   domNodes: 0, // nodes whose DOM content is hidden
   domStilled: 0, // widgets also taken out of the per-frame layout pass
   sweptZoom: NaN, // the zoom the DOM was last swept at
-  sweptPx: -1, // and the threshold
+  sweptKey: "", // and the flat decision it was swept for
 };
 
-// Sizes a node can land at on screen. The upper half of this ladder exists for
-// 4K: at zoom 0.10 with 200-unit nodes, "under 32px" catches almost nothing and
-// the expensive nodes are still painted in full.
-const LOD_MIN_PX = [0, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256];
+// The zoom below which every node is painted as a rectangle. A zoom, not a node
+// size: a node whose own UI hides, greys or adds a widget changes its size while
+// you are looking at it, so a per-node pixel rule classifies the same node
+// differently from one frame to the next — and the ones that move are exactly the
+// JS-UI and dynamic-UI nodes, which then get flattened while their neighbours stay
+// detailed. A zoom is a property of the camera: every node is treated the same
+// way, one decision per frame, and the flips happen when *you* change the zoom.
+const LOD_FLAT_ZOOM = [0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5];
+// A v1 setting was a pixel width. Carrying one over needs a node width to divide
+// by; this is the median node on a 4K ComfyUI workflow (measured, not invented).
+const LOD_TYPICAL_NODE_PX = 350;
 const LOD_IDLE_CAP_MS = [0, 250, 500, 1000];
 const LOD_IDLE_INPUT_MS = 400; // how long one touch keeps the cap lifted
-const LOD_LINK_SHARE = 0.6; // "most nodes are tiny" => links can be too
 // Zoom levels at which previews may be served from a thumbnail.
 const LOD_THUMB_ZOOMS = [0, 1, 0.8, 0.6, 0.4, 0.2];
 const LOD_THUMB_LADDER = [64, 128, 256, 512, 1024, 2048]; // longest side, px
@@ -923,39 +930,76 @@ const LOD_LINK_STYLES = ["auto", "spline", "straight"];
 const LOD_STORE_KEY = "ants.lowZoom.v1";
 
 function lodOn() {
-  return LOD.minPx > 0 || LOD.idleCapMs > 0 || LOD.thumbZoom > 0 || LOD.detailZoom > 0;
+  return LOD.flatBelow > 0 || LOD.idleCapMs > 0 || LOD.thumbZoom > 0 || LOD.detailZoom > 0;
 }
 
-function lodDetailOn() {
-  return LOD.detailZoom > 0 && LOD.zoom > 0 && LOD.zoom < LOD.detailZoom;
+// The zoom as the canvas has it *now*. LOD.zoom is the value the last drawn
+// frame recorded, which is not the same thing: a setting change, or the once-a-
+// second DOM sweep, can land between two frames, and a decision that read the
+// stale number would do nothing until something else asked for a redraw.
+function lodZoomOf(canvas) {
+  try {
+    const c = canvas || (typeof app !== "undefined" && app && app.canvas) || null;
+    const z = c && c.ds ? Number(c.ds.scale) : NaN;
+    if (Number.isFinite(z) && z > 0) return z;
+  } catch (e) {
+    /* fall through to the recorded zoom */
+  }
+  return LOD.zoom;
 }
 
-// Something on screen is being drawn as a rectangle this frame. The plan is
-// sampled at the top of the frame, so this is the current frame's answer, not
-// last frame's.
+function lodFlatOn(canvas) {
+  if (!(LOD.flatBelow > 0)) return false;
+  const z = lodZoomOf(canvas);
+  return z > 0 && z < LOD.flatBelow;
+}
+
+// Is this node painted as a rectangle right now? Exempt: a collapsed node is
+// already a small box (LiteGraph draws the title only), the tool's own node so
+// the panel always stays reachable, and anything at all while this frontend is
+// drawing nodes as Vue DOM overlays — there LiteGraph draws no node chrome, so a
+// rectangle would land *behind* the thing it is meant to replace.
+function lodFlatNode(node, canvas) {
+  if (!lodFlatOn(canvas)) return false;
+  if (!node) return false;
+  if (node.flags && node.flags.collapsed) return false;
+  if (node.type === NODE_NAME) return false;
+  if (lodVueNodesMode()) return false;
+  return true;
+}
+
+function lodDetailOn(canvas) {
+  if (!(LOD.detailZoom > 0)) return false;
+  const z = lodZoomOf(canvas);
+  return z > 0 && z < LOD.detailZoom;
+}
+
 // Straight links are a *drawing* choice, and v2.1.4 tied it to the node
 // threshold: flatten most of the graph and links went straight with it. That is
 // wrong for a workflow built out of curves, so it is now its own setting, with
-// the old behaviour available as "auto".
+// the old behaviour available as "auto" — which, since v2.1.9, means "while the
+// zoom has the graph flattened", the same trigger the node setting uses.
 function lodLinksStraight() {
   if (LOD.linkStyle === "straight") return true;
   if (LOD.linkStyle === "spline") return false;
-  return LOD.minPx > 0 && LOD.plan.links;
+  return lodFlatOn();
 }
 
-function lodBoxifyOn() {
-  return LOD.minPx > 0 && LOD.plan.tiny > 0;
+function lodBoxifyOn(canvas) {
+  return lodFlatOn(canvas);
 }
 
 // One frame drawn the cheap way — link outlines skipped, node detail reduced,
 // and (see lodSweepDom) the DOM content of boxed nodes out of the layout pass.
 // True when either setting asks for it.
-function lodCheapFrameOn() {
-  return lodDetailOn() || lodBoxifyOn();
+function lodCheapFrameOn(canvas) {
+  return lodDetailOn(canvas) || lodBoxifyOn(canvas);
 }
 
-function lodPreviewsOn() {
-  return LOD.thumbZoom > 0 && LOD.zoom > 0 && LOD.zoom < LOD.thumbZoom;
+function lodPreviewsOn(canvas) {
+  if (!(LOD.thumbZoom > 0)) return false;
+  const z = lodZoomOf(canvas);
+  return z > 0 && z < LOD.thumbZoom;
 }
 
 // This frontend can render nodes as Vue DOM overlays, in which case LiteGraph
@@ -985,8 +1029,9 @@ function lodGraphNodes(canvas) {
   return cands[0] || cands[2] || null;
 }
 
-// How wide a node lands on screen, in pixels — which is what decides whether
-// anything it draws can be seen at all.
+// How wide a node lands on screen, in pixels. Only reported now — what decides
+// the flat state is the zoom (see LOD_FLAT_ZOOM), because a node's own UI can
+// change its size while the camera stands still.
 function lodNodePx(node, canvas) {
   const scale = (canvas && canvas.ds && Number(canvas.ds.scale)) || 1;
   const size = node && (node.renderingSize || node.size);
@@ -1003,10 +1048,10 @@ function lodPlanFrame(canvas) {
   const plan = LOD.plan;
   plan.at = nowMs();
   LOD.zoom = (canvas && canvas.ds && Number(canvas.ds.scale)) || 0;
-  // Which nodes are boxes changes with the zoom, so does the set of DOM
-  // elements that belong to them. Sweeping on the change (and not every frame)
-  // keeps this at the cost of a zoom, not of a redraw.
-  if (LOD.minPx > 0 && (LOD.zoom !== LOD.sweptZoom || LOD.minPx !== LOD.sweptPx)) {
+  // Which nodes are rectangles changes only with the zoom (and with nodes
+  // arriving), so the DOM sweep runs on that change rather than every frame:
+  // this stays at the cost of a zoom, not of a redraw.
+  if (LOD.flatBelow > 0 && LOD.zoom !== LOD.sweptZoom) {
     try {
       lodSweepDom(canvas);
     } catch (e) {
@@ -1014,36 +1059,27 @@ function lodPlanFrame(canvas) {
     }
   }
   plan.links = false;
-  plan.tiny = 0;
-  plan.sampled = 0;
+  plan.flat = 0;
   plan.total = 0;
   plan.medPx = 0;
-  plan.needPx = 0;
-  if (!(LOD.minPx > 0)) return plan;
+  if (!(LOD.flatBelow > 0)) return plan;
   const nodes = lodGraphNodes(canvas);
   if (!nodes || !nodes.length) return plan;
   const total = nodes.length;
-  const stride = Math.max(1, Math.floor(total / 64)); // 64 samples is plenty for a share
+  const stride = Math.max(1, Math.floor(total / 64)); // 64 samples is plenty for a median
   const widths = [];
-  for (let i = 0; i < total; i += stride) {
-    const px = lodNodePx(nodes[i], canvas);
-    if (px < LOD.minPx) plan.tiny++;
-    widths.push(px);
-    plan.sampled++;
+  for (let i = 0; i < total; i++) {
+    if (lodFlatNode(nodes[i], canvas)) plan.flat++;
+    if (i % stride === 0) widths.push(lodNodePx(nodes[i], canvas));
   }
   if (widths.length) {
     widths.sort((a, b) => a - b);
     plan.medPx = Math.round(widths[widths.length >> 1]);
-    // The setting that would flatten the typical node at this zoom, taken from
-    // the same ladder the user picks from. What counts as "tiny" is a property
-    // of the zoom, not of the graph, and this is the number that makes it
-    // obvious: at 10% on a 4K screen it is 48 or 64, not 32.
-    for (const v of LOD_MIN_PX) {
-      if (v > 0 && v >= plan.medPx) { plan.needPx = v; break; }
-    }
   }
   plan.total = total;
-  plan.links = plan.tiny / Math.max(1, plan.sampled) >= LOD_LINK_SHARE;
+  // Links follow the same trigger as the nodes under "auto": if the graph is
+  // rectangles, straight lines cost less and say the same thing.
+  plan.links = lodFlatOn(canvas);
   return plan;
 }
 
@@ -1217,7 +1253,7 @@ function lodInstallDomSweep() {
     lodDomSweepTimer = govOwn(() =>
       setInterval(() => {
         try {
-          if (LOD.minPx > 0) lodSweepDom(app.canvas);
+          if (LOD.flatBelow > 0) lodSweepDom(app.canvas);
         } catch (e) {
           /* never fatal */
         }
@@ -1339,12 +1375,19 @@ function lodStillWidget(widget, want) {
     if (want) {
       if (map.has(widget)) return false; // already taken out by an earlier sweep
       if (opts.hideOnZoom === true) return false; // already its own answer, not our doing
-      map.set(widget, opts.hideOnZoom);
+      map.set(widget, {
+        had: Object.prototype.hasOwnProperty.call(opts, "hideOnZoom"),
+        on: opts.hideOnZoom,
+      });
       opts.hideOnZoom = true;
       return true;
     }
     if (!map.has(widget)) return false;
-    opts.hideOnZoom = map.get(widget);
+    const rec = map.get(widget);
+    // Hand back exactly what was there: a widget that never had the option gets
+    // it removed, not set to undefined.
+    if (rec && rec.had) opts.hideOnZoom = rec.on;
+    else delete opts.hideOnZoom;
     map.delete(widget);
     return true;
   } catch (e) {
@@ -1386,9 +1429,9 @@ function lodSweepDom(canvas) {
   const keep = new Set();
   let nodes = 0;
   try {
-    if (canvas && LOD.minPx > 0) {
+    if (canvas && lodFlatOn(canvas)) {
       for (const node of lodGraphNodes(canvas) || []) {
-        if (!node || !(lodNodePx(node, canvas) < LOD.minPx)) continue;
+        if (!lodFlatNode(node, canvas)) continue;
         let any = false;
         for (const t of lodDomTargets(node)) {
           if (t.el) {
@@ -1404,7 +1447,7 @@ function lodSweepDom(canvas) {
         const id = el && typeof el.getAttribute === "function" ? el.getAttribute("data-node-id") : null;
         if (id === null || id === undefined) continue;
         const node = lodNodeById(canvas, id);
-        if (!node || !(lodNodePx(node, canvas) < LOD.minPx)) continue;
+        if (!lodFlatNode(node, canvas)) continue;
         if (el.classList) {
           el.classList.add(LOD_DOM_CLASS);
           keep.add(el);
@@ -1415,14 +1458,14 @@ function lodSweepDom(canvas) {
   } catch (e) {
     /* hiding DOM is a courtesy: if the page's DOM is not what we expect, skip it */
   }
-  // Widgets whose node is no longer a box go back to asking for their own
-  // placement on the next frame.
-  if (LOD.domWidgets && LOD.domWidgets.size) {
-    for (const node of lodGraphNodes(canvas) || []) {
-      const box = !!node && LOD.minPx > 0 && lodNodePx(node, canvas) < LOD.minPx;
-      if (box) continue;
-      for (const w of node.widgets || []) if (LOD.domWidgets.has(w)) lodStillWidget(w, false);
-    }
+  // The way back: while the zoom is below the setting every node is a box, so
+  // every widget we touched is still one and stays touched. Above it, all of
+  // them go back to asking for their own placement on the next drawn frame.
+  // (Deciding this from the zoom rather than from each widget's node is also
+  // what makes it work for widgets that carry no `node` back reference — the
+  // component widgets the core 3D nodes are built from.)
+  if (LOD.domWidgets && LOD.domWidgets.size && !lodFlatOn(canvas)) {
+    for (const w of [...LOD.domWidgets.keys()]) lodStillWidget(w, false);
   }
   let changed = keep.size !== marked.size;
   for (const el of keep) if (!marked.has(el)) changed = true;
@@ -1440,7 +1483,7 @@ function lodSweepDom(canvas) {
   LOD.domNodes = nodes;
   LOD.domStilled = LOD.domWidgets ? LOD.domWidgets.size : 0;
   LOD.sweptZoom = LOD.zoom;
-  LOD.sweptPx = LOD.minPx;
+  LOD.sweptKey = lodFlatOn(canvas) ? "flat" : "full";
   return changed;
 }
 
@@ -1458,7 +1501,7 @@ function lodSaveSettings() {
     localStorage.setItem(
       LOD_STORE_KEY,
       JSON.stringify({
-        minPx: LOD.minPx,
+        flatBelow: LOD.flatBelow,
         detailZoom: LOD.detailZoom,
         thumbZoom: LOD.thumbZoom,
         idleCapMs: LOD.idleCapMs,
@@ -1473,6 +1516,15 @@ function lodSaveSettings() {
 // Called once at startup, before the panel is built, so the selects show what is
 // actually in effect. Nothing is enabled that the user did not enable: this
 // restores their own last choice, and an untouched install has nothing saved.
+// A v1 record held "nodes under Npx". The rule is a zoom now, so the old number
+// is translated once — divided by the width of a typical node — and the panel
+// says so until the user picks a value themselves.
+function lodZoomForPx(px) {
+  const want = Number(px) / LOD_TYPICAL_NODE_PX;
+  for (const z of LOD_FLAT_ZOOM) if (z > 0 && z >= want) return z;
+  return LOD_FLAT_ZOOM[LOD_FLAT_ZOOM.length - 1];
+}
+
 function lodLoadSettings() {
   try {
     if (typeof localStorage === "undefined" || !localStorage) return false;
@@ -1480,8 +1532,12 @@ function lodLoadSettings() {
     if (!raw) return false;
     const saved = JSON.parse(raw);
     if (!saved || typeof saved !== "object") return false;
+    const legacyPx = saved.flatBelow === undefined ? Number(saved.minPx) || 0 : 0;
     lodSet({
-      minPx: Number(saved.minPx) || 0,
+      flatBelow: saved.flatBelow === undefined
+        ? (legacyPx > 0 ? lodZoomForPx(legacyPx) : 0)
+        : Number(saved.flatBelow) || 0,
+      legacyPx,
       detailZoom: saved.detailZoom === undefined ? 0 : Number(saved.detailZoom) || 0,
       thumbZoom: saved.thumbZoom === undefined ? 0.6 : Number(saved.thumbZoom) || 0,
       idleCapMs: Number(saved.idleCapMs) || 0,
@@ -1495,7 +1551,7 @@ function lodLoadSettings() {
 
 function lodAbort(err) {
   LOD.error = (err && err.message) || String(err);
-  LOD.minPx = 0;
+  LOD.flatBelow = 0;
   LOD.idleCapMs = 0;
   LOD.detailZoom = 0;
   LOD.baseline = null;
@@ -1545,7 +1601,19 @@ function lodCaptureBaseline() {
 function lodSet(opts) {
   const o = opts || {};
   const was = lodOn();
-  if ("minPx" in o) LOD.minPx = Math.max(0, Number(o.minPx) || 0);
+  if ("flatBelow" in o) {
+    const z = Math.max(0, Math.min(1, Number(o.flatBelow) || 0));
+    // Snap to the ladder: a value that is not on it came from somewhere else
+    // (a saved record, a script), and the panel has to agree with the state.
+    LOD.flatBelow = z === 0 ? 0 : LOD_FLAT_ZOOM.reduce((best, v) => (Math.abs(v - z) < Math.abs(best - z) ? v : best), LOD_FLAT_ZOOM[0]) || z;
+    if (o.legacyPx === undefined) LOD.legacyPx = 0; // the user has chosen; drop the note
+  }
+  if ("legacyPx" in o) LOD.legacyPx = Math.max(0, Number(o.legacyPx) || 0);
+  // v1 and v2.1.8 scripts passed a pixel width. Kept working: translated.
+  if ("minPx" in o) {
+    const px = Math.max(0, Number(o.minPx) || 0);
+    LOD.flatBelow = px > 0 ? lodZoomForPx(px) : 0;
+  }
   if ("idleCapMs" in o) LOD.idleCapMs = Math.max(0, Number(o.idleCapMs) || 0);
   if ("thumbZoom" in o) {
     LOD.thumbZoom = Math.max(0, Math.min(1, Number(o.thumbZoom) || 0));
@@ -1556,7 +1624,7 @@ function lodSet(opts) {
     const style = String(o.linkStyle);
     LOD.linkStyle = LOD_LINK_STYLES.includes(style) ? style : "auto";
   }
-  if (LOD.minPx > 0) lodInstallDomSweep();
+  if (LOD.flatBelow > 0) lodInstallDomSweep();
   const now = lodOn();
   if (now) LOD.error = "";
   // The first change is the moment worth measuring from, whether or not the mode
@@ -1711,7 +1779,7 @@ function patchCanvasDraw() {
       // no node shadows, no rounded corners, no outline under every link. The
       // flag is put back as soon as the frame is over, so nothing this tool did
       // outlives the redraw it was for.
-      const restoreLq = lodCheapFrameOn() ? lodLowQualityFrame(this) : null;
+      const restoreLq = lodCheapFrameOn(this) ? lodLowQualityFrame(this) : null;
       let ret;
       try {
         ret = originalDraw.apply(this, args);
@@ -1738,7 +1806,7 @@ function patchCanvasDraw() {
     const originalDrawNode = proto.drawNode;
     const wrappedDrawNode = function (node, ctx, ...rest) {
       maybeWrapInstanceHooks(node);
-      if (ctx && LOD.minPx > 0 && !lodVueNodesMode() && lodNodePx(node, this) < LOD.minPx) {
+      if (ctx && lodFlatNode(node, this)) {
         const lt0 = performance.now();
         try {
           this.current_node = node;
@@ -1826,7 +1894,7 @@ function patchCanvasDraw() {
       // stroke 4 units wider, so on a long link the outline is most of the ink).
       // Both live on the canvas object, so they are set for this one call and
       // put straight back — hit-testing, dragging and the panel never see them.
-      if (ctx && a && b && lodDetailOn() && LOD.linkStyle !== "straight") {
+      if (ctx && a && b && lodDetailOn(this) && LOD.linkStyle !== "straight") {
         let restore = null;
         try {
           const width = this.connections_width;
@@ -3338,6 +3406,19 @@ function govLoad() {
 
 // -------------------------------------------------------------- metrics ----
 
+// Sources whose worst run is big enough to be felt, whatever their average is.
+// A scan that walks every node on an interval is cheap most of the time and
+// terrible sometimes; the average hides it, the worst run does not.
+function govSpikySources(minWorstMs, minRuns) {
+  try {
+    return govRows()
+      .filter((r) => !r.ours && !r.display && r.fires >= (minRuns || 3) && Number(r.worst) >= (minWorstMs || 120))
+      .sort((a, b) => b.worst - a.worst);
+  } catch (e) {
+    return [];
+  }
+}
+
 function govRows() {
   const now = nowMs();
   const observedMs = Math.max(1000, Math.min(WINDOW_MS, Math.max(now - S.startedAt, 1000)));
@@ -4722,18 +4803,25 @@ function buildTweaksTab(container) {
   // and culling cannot remove a node that is inside the viewport.
   container.appendChild(el("div", { class: "ants-section-title", text: "Low-zoom drawing (experiment)" }));
 
-  const lodPxSel = el("select", { class: "ants-select", style: { width: "auto", maxWidth: "240px" } });
-  for (const px of LOD_MIN_PX) {
-    const opt = el("option", { text: px === 0 ? "draw every node in full" : `nodes under ${px}px — one flat rectangle` });
-    opt.value = String(px);
-    lodPxSel.appendChild(opt);
+  const lodFlatSel = el("select", { class: "ants-select", style: { width: "auto", maxWidth: "240px" } });
+  for (const z of LOD_FLAT_ZOOM) {
+    const opt = el("option", {
+      text: z === 0 ? "draw every node in full" : `flat nodes below ${Math.round(z * 100)}% zoom`,
+    });
+    opt.value = String(z);
+    lodFlatSel.appendChild(opt);
   }
-  lodPxSel.value = String(LOD.minPx);
-  lodPxSel.title =
-    "Nodes that land smaller than this on screen are painted as their background colour only: no border, title, slots, " +
-    "widgets or previews. Nothing about the graph changes — only how it is painted, and only for nodes too small to read.";
-  lodPxSel.addEventListener("change", () => {
-    lodSet({ minPx: Number(lodPxSel.value) });
+  lodFlatSel.value = String(LOD.flatBelow);
+  lodFlatSel.title =
+    "Below this zoom every node is painted as its background colour only: no border, title, slots, widgets or previews — and " +
+    "anything DOM-shaped on those nodes (image previews, curve editors, 3D viewports, custom node UIs) is hidden with them. " +
+    "It is a zoom, not a node size, on purpose: a node whose own UI hides, greys or adds a widget changes its size while you are " +
+    "looking at it, so a per-node pixel rule flattens the same node on one frame and draws it in full on the next, and the nodes " +
+    "that move are exactly the dynamic-UI ones. A zoom is a property of the camera — every node is classified the same way, once " +
+    "per frame — and nothing at all is touched above it. Collapsed nodes and this tool's own node are never flattened. Nothing " +
+    "about the graph changes; only how it is painted.";
+  lodFlatSel.addEventListener("change", () => {
+    lodSet({ flatBelow: Number(lodFlatSel.value) });
     lodUpdate();
   });
 
@@ -4819,8 +4907,8 @@ function buildTweaksTab(container) {
     "Turn all of them off \u2014 flattening, link thinning, thumbnails and the redraw cap \u2014 and let ComfyUI draw the canvas " +
     "exactly as it wants, including any DOM content this tool was hiding.";
   lodOffBtn.addEventListener("click", () => {
-    lodSet({ minPx: 0, idleCapMs: 0, thumbZoom: 0, detailZoom: 0, linkStyle: "auto" });
-    lodPxSel.value = "0";
+    lodSet({ flatBelow: 0, idleCapMs: 0, thumbZoom: 0, detailZoom: 0, linkStyle: "auto" });
+    lodFlatSel.value = "0";
     lodLinkSel.value = "auto";
     lodDetailSel.value = "0";
     lodThumbSel.value = "0";
@@ -4829,7 +4917,7 @@ function buildTweaksTab(container) {
   });
 
   const lodRow = el("div", { style: { display: "flex", flexWrap: "wrap", gap: "10px", alignItems: "center", margin: "4px 0" } });
-  lodRow.appendChild(lodPxSel);
+  lodRow.appendChild(lodFlatSel);
   lodRow.appendChild(lodLinkSel);
   lodRow.appendChild(lodDetailSel);
   lodRow.appendChild(lodThumbSel);
@@ -4852,9 +4940,11 @@ function buildTweaksTab(container) {
         "into whatever box the node occupies, and at low zoom that box is a few dozen pixels \u2014 the thumbnail ladder follows the " +
         "screen (about 512px around 60% zoom down to 64px around 10%), so what changes is how much image data is uploaded per " +
         "redraw, not what the node shows. " +
-        "The three settings are independent and meant to be used together. The node setting decides what a node costs \u2014 below it, " +
-        "a node is one flat rectangle, and everything that lives on top of that node (image and video previews, curve editors, 3D " +
-        "viewports, custom Vue or JS node UIs) is hidden with it and taken out of the per-frame layout pass. The link setting decides " +
+        "The three settings are independent and meant to be used together. The node setting decides what a node costs \u2014 below that " +
+        "zoom, a node is one flat rectangle, and everything that lives on top of that node (image and video previews, curve editors, 3D " +
+        "viewports, custom Vue or JS node UIs) is hidden with it and taken out of the per-frame layout pass. It is a zoom rather than a " +
+        "node size because nodes with JS or dynamic UIs hide, grey or add widgets as you work: their size changes while the camera stands " +
+        "still, and a per-node pixel rule then paints the same node flat on one frame and in full on the next. The link setting decides " +
         "the shape of a link: ComfyUI's curves, or straight lines. The thinning setting decides how much ink a curve uses \u2014 below " +
         "its zoom links are stroked 1px wide instead of 3 and lose the dark outline drawn under them, which on a long link is most of " +
         "the pixels, and the curves stay exactly where they were. Those frames are drawn with the frontend's own low-quality mode on as " +
@@ -4873,9 +4963,21 @@ function buildTweaksTab(container) {
           `~${vis.meanPx.toFixed(0)}px wide each (estimate)`
       );
       if (vis.share >= 0.9 && vis.zoomedOut) {
+        // Culling has nothing to remove, so a periodic scan that walks every
+        // node is pure cost. Name it, with its numbers, instead of leaving the
+        // user to match a function name against a stall table.
+        const spiky = govSpikySources(120, 3);
+        const named = spiky
+          .slice(0, 2)
+          .map((r) => `\u201c${r.name}\u201d (worst ${fmtMs(r.worst, 0)} ms, ${fmtRate(r.runsPerSec)}/s)`);
         bits.push(
           "the whole graph is on screen, so culling cannot save anything here — the only levers left are cheaper drawing per " +
-            "node (below) and fewer redraws (the cap)"
+            "node (below) and fewer redraws (the cap)" +
+            (named.length
+              ? ` · but ${spiky.length === 1 ? "a periodic source is" : `${spiky.length} periodic sources are`} still walking the whole ` +
+                `graph: ${named.join(", ")} \u2014 a scan like that has nothing to find while everything is visible, so capping it in the ` +
+                `Governor tab (or switching it off in the pack that owns it) removes it from the frame budget entirely`
+              : "")
         );
       }
       const theirLod = lodFrontendLod(app.canvas);
@@ -4909,25 +5011,28 @@ function buildTweaksTab(container) {
           bits2.push(`switched on ${ago}s ago — no frame has been drawn since, so there is nothing to compare yet`);
         }
       }
-      // How much of the graph the node setting actually catches, and whether it
-      // is catching anything that costs money. Both numbers come from the same
-      // per-frame sample the drawing uses.
-      if (LOD.minPx > 0 && LOD.plan.sampled) {
-        const share = LOD.plan.tiny / Math.max(1, LOD.plan.sampled);
-        bits2.push(
-          `≈${Math.round(share * 100)}% of the graph (${LOD.plan.tiny}/${LOD.plan.sampled} sampled, ${LOD.plan.total} nodes) is painted flat ` +
-            `at this zoom with "nodes under ${LOD.minPx}px"`
-        );
-        if (LOD.plan.needPx > LOD.minPx) {
+      // The flat state is one decision per frame, so this is exact: either the
+      // zoom is below the setting and every node is a rectangle, or nothing is.
+      if (LOD.flatBelow > 0) {
+        const pct = (z) => `${(z * 100).toFixed(z < 0.1 ? 1 : 0)}%`;
+        if (lodFlatOn()) {
           bits2.push(
-            `the typical node is ${LOD.plan.medPx}px wide on screen at this zoom, so "nodes under ${LOD.plan.needPx}px" is the setting ` +
-              `that would flatten most of the graph`
+            `zoom ${pct(LOD.zoom)} is below your ${pct(LOD.flatBelow)} setting: ${LOD.plan.flat} of ${LOD.plan.total} node(s) painted as flat rectangles` +
+              (LOD.plan.total > LOD.plan.flat
+                ? ` (the other ${LOD.plan.total - LOD.plan.flat} are collapsed boxes or this tool's own node, which are never flattened)`
+                : "") +
+              (LOD.plan.medPx ? ` · the typical node is ≈${LOD.plan.medPx}px on screen here` : "")
+          );
+        } else {
+          bits2.push(
+            `zoom ${pct(LOD.zoom)} is above your ${pct(LOD.flatBelow)} setting: every node is drawn in full` +
+              (LOD.plan.medPx ? ` (the typical node is ≈${LOD.plan.medPx}px on screen here)` : "")
           );
         }
-        if (since && share > 0.2 && Number.isFinite(b.nodeMsPerFrame) && b.nodeMsPerFrame > 0 && since.nodeMsPerFrame > b.nodeMsPerFrame * 0.9) {
+        if (since && LOD.plan.flat > 0 && Number.isFinite(b.nodeMsPerFrame) && b.nodeMsPerFrame > 0 && since.nodeMsPerFrame > b.nodeMsPerFrame * 0.9) {
           bits2.push(
-            `and node drawing has not moved (${fmtMs(b.nodeMsPerFrame)} → ${fmtMs(since.nodeMsPerFrame)} ms/frame): what is left is in the ` +
-              `nodes this setting does not catch — raise it and watch this line`
+            `and node drawing has not moved (${fmtMs(b.nodeMsPerFrame)} → ${fmtMs(since.nodeMsPerFrame)} ms/frame): the flat rectangles ` +
+              `are already the cheap part, so what is left is outside drawNode — the Connections and Other figures above say where`
           );
         }
       }
@@ -4959,7 +5064,7 @@ function buildTweaksTab(container) {
           );
         }
       }
-      if (LOD.minPx > 0) {
+      if (LOD.flatBelow > 0) {
         if (LOD.domHidden) {
           bits2.push(
             `${LOD.domHidden} DOM element(s) of ${LOD.domNodes} boxed node(s) hidden ` +
@@ -4969,8 +5074,8 @@ function buildTweaksTab(container) {
                 : "") +
               ` \u2014 they come back the moment the node does`
           );
-        } else if (LOD.plan.tiny > 0) {
-          bits2.push("no DOM content to hide on the nodes this setting catches (their visuals are canvas-drawn)");
+        } else if (lodFlatOn() && LOD.plan.flat > 0) {
+          bits2.push("the nodes painted flat at this zoom have no DOM content to hide (their visuals are canvas-drawn)");
         }
       }
       if (LOD.thumbZoom > 0) {
@@ -4993,11 +5098,19 @@ function buildTweaksTab(container) {
     } else {
       bits.push("off — the canvas is drawn exactly as ComfyUI draws it");
     }
-      if (!LOD.minPx && !LOD.idleCapMs && LOD.thumbZoom > 0) {
+      if (!LOD.flatBelow && !LOD.idleCapMs && LOD.thumbZoom > 0) {
         bits.push(
           "nothing but the previews is switched on: they are the part that helps at every zoom, and \"Back to full drawing\" turns them off too"
         );
       }
+    if (LOD.legacyPx) {
+      bits.push(
+        `carried over from v2.1.8: your setting was "nodes under ${LOD.legacyPx}px". The rule is a zoom now, so it is "flat nodes below ` +
+          `${Math.round(LOD.flatBelow * 100)}% zoom" — every node below it is a rectangle, whatever size that node is. That is the fix for the ` +
+          `nodes with JS or dynamic UIs: a node that hides or greys a widget changes its own size, and a per-node pixel rule then flips it in and ` +
+          `out of the flat state while its neighbours stay detailed. Pick any value above to dismiss this note.`
+      );
+    }
     if (LOD.error) bits.push(`turned itself off after an error: ${LOD.error}`);
     lodLine.textContent = bits.join("\n");
   }
@@ -7056,7 +7169,7 @@ function buildTelemetryReport() {
     lines.push(
       `low-zoom drawing: ${
         lodOn()
-          ? `on (nodes < ${LOD.minPx}px as one rectangle, links ${LOD.plan.links ? "straight" : "as drawn"}, idle redraw cap ${LOD.idleCapMs || "off"}ms) ` +
+          ? `on (every node a rectangle below ${Math.round(LOD.flatBelow * 100)}% zoom${LOD.legacyPx ? `, carried over from "nodes under ${LOD.legacyPx}px"` : ""}, links ${LOD.plan.links ? "straight" : "as drawn"}, idle redraw cap ${LOD.idleCapMs || "off"}ms) ` +
             `— ${LOD.nodes} node draw(s) and ${LOD.links} link draw(s) simplified, ${LOD.capped} redraw(s) merged` +
             (LOD.thumbZoom > 0
               ? `, previews ${LOD.imgThumb}/${LOD.imgSeen} served from thumbnails (${LOD.thumbsBuilt} cached, ${fmtBytes(LOD.thumbBytes)}) below ${Math.round(LOD.thumbZoom * 100)}% zoom`
@@ -7331,7 +7444,7 @@ function installDebugApi() {
         },
         get limits() {
           return {
-            minPx: LOD_MIN_PX.slice(),
+            flatZoom: LOD_FLAT_ZOOM.slice(),
             idleCapMs: LOD_IDLE_CAP_MS.slice(),
             thumbZoom: LOD_THUMB_ZOOMS.slice(),
             thumbLadder: LOD_THUMB_LADDER.slice(),
@@ -7377,8 +7490,21 @@ function installDebugApi() {
         get frontendLod() {
           return lodFrontendLod(app.canvas);
         },
+        get flat() {
+          return {
+            on: lodFlatOn(),
+            belowZoom: LOD.flatBelow,
+            zoom: lodZoomOf(),
+            // What the setting would have been under the old per-node pixel
+            // rule, for anyone comparing a v2.1.8 snapshot with a new one.
+            flatNodes: LOD.plan.flat,
+            graphNodes: LOD.plan.total,
+            typicalNodePx: LOD.plan.medPx,
+            carriedOverFromPx: LOD.legacyPx,
+          };
+        },
         set: (opts) => lodSet(opts),
-        off: () => lodSet({ minPx: 0, idleCapMs: 0, thumbZoom: 0, detailZoom: 0 }),
+        off: () => lodSet({ flatBelow: 0, idleCapMs: 0, thumbZoom: 0, detailZoom: 0 }),
       },
       setSyntheticTick,
       benchmark: (ms, slot) => runScriptedPan(Number(ms) || 6000, slot || "A"),

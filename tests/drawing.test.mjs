@@ -90,7 +90,7 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     const h = await boot();
     bigGraph(h, 12);
     drawLoop(h, 0.2);
-    assertEqual(h.tracker.lowZoom.state.minPx, 0, "nothing is simplified until it is switched on");
+    assertEqual(h.tracker.lowZoom.state.flatBelow, 0, "nothing is simplified until it is switched on");
     assertEqual(h.tracker.lowZoom.previews.belowZoom, 0.6, "previews are the one part that is on, below 60% zoom");
     assertEqual(h.tracker.lowZoom.state.idleCapMs, 0, "and no redraw cap");
     assertEqual(h.tracker.lowZoom.state.nodes, 0);
@@ -110,7 +110,7 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
 
     h.tracker.reset();
     h.canvas.ctx.ops.length = 0; // only what happens from here is the cheap path
-    h.tracker.lowZoom.set({ minPx: 24 }); // 20px < 24px
+    h.tracker.lowZoom.set({ flatBelow: 0.2 }); // zoom 0.1 is below it: every node is a rectangle
     const draws = drawLoop(h, 0.2);
     const f = h.tracker.snapshot.frame;
     assertLess(f.nodeMsPerFrame, 6, `the frame budget drops (${f.nodeMsPerFrame.toFixed(2)} ms/frame)`);
@@ -125,7 +125,7 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     const h = await boot();
     h.canvas.costs = { background: 0.2, connections: 1.0, chrome: 0.5, link: 0.4 };
     bigGraph(h, 20, 0.1);
-    h.tracker.lowZoom.set({ minPx: 24 });
+    h.tracker.lowZoom.set({ flatBelow: 0.2 });
     const before = h.canvas.linkDraws;
     drawLoop(h, 0.2);
     assertGreater(h.tracker.lowZoom.state.links, 0, "the cheap link path was used");
@@ -162,7 +162,7 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
   test("an error in the cheap path switches the mode off instead of leaving the canvas half-drawn", async () => {
     const h = await boot();
     bigGraph(h, 4, 0.1);
-    h.tracker.lowZoom.set({ minPx: 24 });
+    h.tracker.lowZoom.set({ flatBelow: 0.2 });
     let boom = true;
     h.canvas.ctx = new Proxy(
       {},
@@ -176,7 +176,7 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     );
     drawLoop(h, 0.2);
     assertIncludes(h.tracker.lowZoom.state.error, "the context was lost", "the reason is recorded for the panel");
-    assertEqual(h.tracker.lowZoom.state.minPx, 0, "and the mode turned itself off");
+    assertEqual(h.tracker.lowZoom.state.flatBelow, 0, "and the mode turned itself off");
     boom = false;
     const before = h.canvas.nodeDraws;
     drawLoop(h, 0.2);
@@ -187,7 +187,7 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     const h = await boot();
     bigGraph(h, 4, 0.1);
     h.window.LiteGraph.vueNodesMode = true; // LiteGraph draws no node chrome in this mode
-    h.tracker.lowZoom.set({ minPx: 24 });
+    h.tracker.lowZoom.set({ flatBelow: 0.2 });
     const fillRects = () => h.canvas.ctx.ops.filter((o) => o[0] === "fillRect").length;
     const before = fillRects();
     drawLoop(h, 0.2);
@@ -196,35 +196,108 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
   });
 
 
-  test("the node threshold reaches far enough for a 4K screen", async () => {
+  test("the rule is a zoom, not a node size: a huge node and a tiny one get the same answer", async () => {
     const h = await boot();
     h.window.devicePixelRatio = 1;
-    // 1200 world units wide at zoom 0.10 = 120px on screen: unreadable, and at
-    // 4K it is also far from the smallest thing on the canvas.
-    bigGraph(h, 4, 0.1);
-    h.canvas.nodes.forEach((n) => {
-      n.size = [1200, 600];
-    });
-    const stretch = 120; // h.canvas.ds.scale is 0.1, so this is 120px on screen
-    h.tracker.lowZoom.set({ minPx: 96 });
+    // One node 1200 units wide, one 40 units wide, both at zoom 0.10 — 120px and
+    // 4px on screen. Under a per-node pixel rule these are two different
+    // decisions; under a zoom rule they are the same node.
+    bigGraph(h, 8, 0.1);
+    h.canvas.nodes[0].size = [1200, 600];
+    h.canvas.nodes[1].size = [40, 20];
+
+    h.tracker.lowZoom.set({ flatBelow: 0.05 }); // below the zoom: nothing is flat
     h.canvas.ctx.ops.length = 0;
     drawLoop(h, 0.2);
-    assertEqual(h.tracker.lowZoom.state.nodes, 0, "below the threshold a 120px node is still drawn in full");
-    h.tracker.lowZoom.set({ minPx: 128 });
-    drawLoop(h, 0.2);
-    assertGreater(h.tracker.lowZoom.state.nodes, 0, `above it the same node is a rectangle (${stretch}px on screen)`);
-    assert(h.tracker.lowZoom.limits.minPx.includes(256), "and the ladder goes to 256px, not just 32");
-    const plan = h.tracker.lowZoom.state.plan;
-    assertEqual(plan.medPx, 120, "the panel also measures what this zoom makes of a typical node");
-    assertEqual(plan.needPx, 128, "and names the setting that would flatten it");
+    assertEqual(h.tracker.lowZoom.state.nodes, 0, "at zoom 0.10 with the setting at 5%, not even the 4px node is flattened");
 
-    // The setting that is too low for the screen has to say so, by name.
-    h.tracker.lowZoom.set({ minPx: 96 });
+    h.tracker.lowZoom.set({ flatBelow: 0.2 }); // above it: everything is
+    h.canvas.ctx.ops.length = 0;
+    const draws = drawLoop(h, 0.2);
+    assertEqual(h.tracker.lowZoom.state.nodes, 8 * draws, "every node is a rectangle, including the 120px one");
+    assertEqual(
+      h.canvas.ctx.ops.filter((o) => o[0] === "roundRect" || o[0] === "bezierCurveTo").length,
+      0,
+      "and none of the chrome that a size rule would have kept on the big node"
+    );
+    assert(h.tracker.lowZoom.limits.flatZoom.includes(0.5), "the ladder is zooms, and it goes to 50%");
+    const plan = h.tracker.lowZoom.state.plan;
+    assertEqual(plan.total, 8, "the plan counts the graph");
+    assertEqual(plan.flat, 8, "and how much of it is flat — no sampling, it is one decision per frame");
+    assertGreater(plan.medPx, 0, "while still reporting what a typical node measures on screen here");
+    assertEqual(h.tracker.lowZoom.flat.belowZoom, 0.2, "the API says which zoom the flat state starts below");
+    assertEqual(h.tracker.lowZoom.flat.on, true, "and that it is on");
+
+    // The panel says it in the same terms.
     h.advance(FRAME_MS);
     h.canvas.setDirty(true, true);
     h.canvas.draw();
     await openTweaksTab(h);
-    assertIncludes(panelText(h), "the typical node is 120px wide on screen", "the panel points at the setting that would catch it");
+    assertIncludes(panelText(h), "is below your 20% setting", "the panel names the zoom and the setting");
+    assertIncludes(panelText(h), "flat nodes below 20% zoom", "and the control reads as a zoom");
+  });
+
+  test("a node that changes its own size cannot flicker in and out of the flat state", async () => {
+    const h = await boot();
+    h.window.devicePixelRatio = 1;
+    // What a JS node with dynamic UI does: it greys or hides a widget and its
+    // own size changes — from 500 units wide to 60 — while the camera stands
+    // still. A pixel threshold sees a different node after the change; the zoom
+    // does not move, so neither does the decision.
+    bigGraph(h, 4, 0.5); // 200 units x 0.5 = 100px on screen
+    h.canvas.nodes[0].widgets = [
+      { name: "inactive", element: h.document.createElement("div"), options: {} },
+    ];
+    h.tracker.lowZoom.set({ flatBelow: 0.2 }); // zoom 0.5 is above it: full detail
+    drawLoop(h, 0.2);
+    assertEqual(h.tracker.lowZoom.state.nodes, 0, "drawing in full at this zoom");
+
+    h.canvas.nodes[0].size = [60, 30]; // the node's own UI just shrank itself to 30px on screen
+    h.advance(1100); // let the once-a-second DOM sweep run over the changed node
+    drawLoop(h, 0.2);
+    assertEqual(h.tracker.lowZoom.state.nodes, 0, "and it stays in full: the zoom did not cross the setting");
+    assertEqual(h.tracker.lowZoom.dom.hidden, 0, "its DOM content is not hidden either");
+    assertEqual(h.canvas.nodes[0].widgets[0].options.hideOnZoom, undefined, "and its widget's own setting is untouched");
+
+    // Zoom out past the setting and everything flips, once.
+    h.canvas.ds.scale = 0.1;
+    const before = h.tracker.lowZoom.state.nodes;
+    const out = drawLoop(h, 0.2);
+    assertEqual(h.tracker.lowZoom.state.nodes - before, 4 * out, "below the setting every node is flat, whatever it measures");
+    assertEqual(h.tracker.lowZoom.flat.on, true);
+    // And back.
+    h.canvas.ds.scale = 0.5;
+    const flatCount = h.tracker.lowZoom.state.nodes;
+    drawLoop(h, 0.2);
+    assertEqual(h.tracker.lowZoom.state.nodes, flatCount, "and zooming back in restores every node");
+  });
+
+  test("a v2.1.8 pixel setting is carried over once, and the panel says why", async () => {
+    const h = await boot();
+    // A record in the shape v2.1.8 wrote: minPx, no flatBelow.
+    h.localStorage.setItem("ants.lowZoom.v1", JSON.stringify({ minPx: 64, detailZoom: 0.6, thumbZoom: 0.6, idleCapMs: 500, linkStyle: "auto" }));
+    const h2 = await boot({ storage: h.localStorage });
+    assertEqual(h2.tracker.lowZoom.state.flatBelow, 0.2, "64px on a typical 350px node is 18% of the zoom, so 20%");
+    assertEqual(h2.tracker.lowZoom.state.detailZoom, 0.6, "the rest of the record carried over untouched");
+    assertEqual(h2.tracker.lowZoom.state.idleCapMs, 500);
+    assertEqual(h2.tracker.lowZoom.flat.carriedOverFromPx, 64, "and the old number is kept for the note");
+
+    bigGraph(h2, 4, 0.1);
+    drawLoop(h2, 0.2);
+    await openTweaksTab(h2);
+    const text = panelText(h2);
+    assertIncludes(text, "carried over from v2.1.8", "the panel explains itself rather than silently changing a setting");
+    assertIncludes(text, "nodes under 64px", "quoting the old setting");
+    assertIncludes(text, "dynamic UIs", "and why the rule changed");
+
+    // Choosing a value is what dismisses the note.
+    h2.tracker.lowZoom.set({ flatBelow: 0.15 });
+    assertEqual(h2.tracker.lowZoom.state.flatBelow, 0.15, "a setting off the ladder is snapped to the nearest zoom");
+    assertEqual(h2.tracker.lowZoom.flat.carriedOverFromPx, 0, "and the note is gone");
+    h2.advance(600); // the open panel refreshes on its own timer
+    await h2.flush();
+    await openTweaksTab(h2);
+    assert(!panelText(h2).includes("carried over from v2.1.8"), "the panel no longer mentions it");
   });
 
   test("a big preview is served from a thumbnail, and the resolution follows the zoom", async () => {
@@ -355,7 +428,7 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     // by the straight-line path — which is a different thing from the thinning
     // setting doing nothing, and the panel has to say so.
     h.canvas.ds.scale = 0.1;
-    h.tracker.lowZoom.set({ minPx: 32 });
+    h.tracker.lowZoom.set({ flatBelow: 0.2 });
     drawLoop(h, 0.1);
     drawLoop(h, 0.1);
     await openTweaksTab(h);
@@ -406,7 +479,7 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     h.app.graph._nodes = h.canvas.nodes;
 
     assertEqual(h.tracker.lowZoom.dom.hidden, 0, "nothing is hidden while nothing is boxed");
-    h.tracker.lowZoom.set({ minPx: 32 });
+    h.tracker.lowZoom.set({ flatBelow: 0.2 });
     assertEqual(h.tracker.lowZoom.dom.hidden, 2, "both the widget and the Vue node are hidden");
     assertEqual(h.tracker.lowZoom.dom.nodes, 2, "belonging to two boxed nodes");
     assert(wrapper.classList.contains("ants-lod-box"), "the widget is hidden through its .dom-widget wrapper");
@@ -421,7 +494,7 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
 
     // And turning the mode off clears whatever is left.
     h.canvas.ds.scale = 0.1;
-    h.tracker.lowZoom.set({ minPx: 32, detailZoom: 0.6 });
+    h.tracker.lowZoom.set({ flatBelow: 0.2, detailZoom: 0.6 });
     drawLoop(h, 0.1);
     assertGreater(h.tracker.lowZoom.dom.hidden, 0, "boxed again");
     h.tracker.lowZoom.off();
@@ -444,7 +517,7 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     const widget = { name: "preview", element: inner, options: { hideOnZoom: false } };
     h.canvas.nodes[0].widgets = [widget];
 
-    h.tracker.lowZoom.set({ minPx: 32 });
+    h.tracker.lowZoom.set({ flatBelow: 0.2 });
     assertEqual(widget.options.hideOnZoom, true, "the store is told to skip it while its node is a rectangle");
     assertEqual(h.tracker.lowZoom.dom.stilled, 1, "and the panel counts it");
     assertEqual(h.tracker.lowZoom.dom.widgets.length, 1, "the widget itself is exposed, not just a count");
@@ -459,7 +532,7 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     const own = { name: "text", element: inner, options: { hideOnZoom: true } };
     h.canvas.nodes[0].widgets = [own];
     h.canvas.ds.scale = 0.1;
-    h.tracker.lowZoom.set({ minPx: 32 });
+    h.tracker.lowZoom.set({ flatBelow: 0.2 });
     drawLoop(h, 0.1);
     assertEqual(own.options.hideOnZoom, true, "unchanged while boxed");
     assertEqual(h.tracker.lowZoom.dom.stilled, 0, "and not claimed as work this tool did");
@@ -470,7 +543,7 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     // Switching the mode off hands everything back.
     h.canvas.ds.scale = 0.1;
     h.canvas.nodes[0].widgets = [widget];
-    h.tracker.lowZoom.set({ minPx: 32 });
+    h.tracker.lowZoom.set({ flatBelow: 0.2 });
     h.tracker.lowZoom.off();
     assertEqual(widget.options.hideOnZoom, false, "nothing of somebody else's widget options is left changed");
   });
@@ -480,7 +553,7 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     const h = await boot();
     h.window.devicePixelRatio = 1;
     bigGraph(h, 6, 0.1); // 20px nodes at zoom 0.1: everything is a rectangle
-    h.tracker.lowZoom.set({ minPx: 32, detailZoom: 0.6, linkStyle: "spline" });
+    h.tracker.lowZoom.set({ flatBelow: 0.2, detailZoom: 0.6, linkStyle: "spline" });
     h.canvas.ctx.ops.length = 0;
     h.canvas.linkSettings.length = 0;
     drawLoop(h, 0.1);
@@ -511,7 +584,7 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     drawLoop(h, 0.1);
     assertEqual(h.canvas.ctx.ops.filter((o) => o[0] === "bezierCurveTo").length, 0, "auto goes straight while the graph is rectangles");
     // With flattening off there is nothing to be straightened for.
-    h.tracker.lowZoom.set({ minPx: 0 });
+    h.tracker.lowZoom.set({ flatBelow: 0 });
     h.canvas.ctx.ops.length = 0;
     h.canvas.linkSettings.length = 0;
     drawLoop(h, 0.1);
@@ -527,7 +600,7 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     const viewer = { name: "model_file", type: "load3D", component: {}, options: {} };
     h.canvas.nodes[0].widgets = [viewer];
 
-    h.tracker.lowZoom.set({ minPx: 32 });
+    h.tracker.lowZoom.set({ flatBelow: 0.2 });
     assertEqual(viewer.options.hideOnZoom, true, "the widget is told to stand down while its node is a rectangle");
     assertEqual(h.tracker.lowZoom.dom.stilled, 1, "and it is counted, element or no element");
 
@@ -539,7 +612,7 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
 
   test("the drawing settings are the user's, and survive a reload", async () => {
     const h = await boot();
-    h.tracker.lowZoom.set({ minPx: 128, detailZoom: 0.4, thumbZoom: 0.8, idleCapMs: 500, linkStyle: "spline" });
+    h.tracker.lowZoom.set({ flatBelow: 0.3, detailZoom: 0.4, thumbZoom: 0.8, idleCapMs: 500, linkStyle: "spline" });
     const saved = h.localStorage.getItem("ants.lowZoom.v1");
     assert(saved, "the choice is written down");
     assertIncludes(saved, "\"spline\"");
@@ -547,7 +620,7 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     // A second page load with the same storage: the same settings are in effect
     // before anything draws, and the panel's controls show them.
     const h2 = await boot({ storage: h.localStorage });
-    assertEqual(h2.tracker.lowZoom.state.minPx, 128, "the node threshold came back");
+    assertEqual(h2.tracker.lowZoom.state.flatBelow, 0.3, "the zoom threshold came back");
     assertEqual(h2.tracker.lowZoom.state.detailZoom, 0.4, "so did the link thinning");
     assertEqual(h2.tracker.lowZoom.state.thumbZoom, 0.8, "and the previews");
     assertEqual(h2.tracker.lowZoom.state.idleCapMs, 500, "and the idle cap");
@@ -558,7 +631,7 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     // "Back to full drawing" is the way back to an untouched page.
     h2.tracker.lowZoom.off();
     const h3 = await boot({ storage: h2.localStorage });
-    assertEqual(h3.tracker.lowZoom.state.minPx, 0, "nothing is re-enabled after a reset");
+    assertEqual(h3.tracker.lowZoom.state.flatBelow, 0, "nothing is re-enabled after a reset");
     assertEqual(h3.tracker.lowZoom.state.thumbZoom, 0, "including the previews");
   });
 
@@ -578,7 +651,7 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
 
     h.canvas.ds.scale = 0.1;
     drawLoop(h, 0.2);
-    h.tracker.lowZoom.set({ minPx: 24 });
+    h.tracker.lowZoom.set({ flatBelow: 0.2 });
     drawLoop(h, 0.2);
     h.canvas.min_font_size_for_lod = 0; // the frontend's own LOD is switched off
     h.canvas.low_quality = false;
@@ -586,7 +659,7 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     const text = panelText(h);
     assertIncludes(text, "culling cannot save anything here", "the panel draws the conclusion, not just the number");
     assertIncludes(text, "frontend LOD is switched off", "and names the frontend's own LOD switch instead of leaving it hidden");
-    assertIncludes(text, "nodes under 24px", "and shows what the mode is set to");
+    assertIncludes(text, "flat nodes below 20% zoom", "and shows what the mode is set to");
     assertIncludes(text, "node draw", "with the saving measured by the tracker itself");
   });
 });

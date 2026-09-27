@@ -290,26 +290,37 @@ h.canvas.nodes[3].widgets = [
   { name: "model_file", type: "load3D", component: {}, options: {} },
 ];
 
-h.tracker.lowZoom.set({ minPx: 24, idleCapMs: 500, thumbZoom: 0.6, detailZoom: 0.6, linkStyle: "auto" });
+h.tracker.lowZoom.set({ flatBelow: 0.2, idleCapMs: 500, thumbZoom: 0.6, detailZoom: 0.6, linkStyle: "auto" });
 
 // One node with a 4096px image in it, drawn the way a preview/load/compare node
 // draws: the first frame paints the full bitmap, the next one is served from the
 // copy the ladder made for this zoom.
 const demoImg = { naturalWidth: 4096, naturalHeight: 4096 };
-// Big enough that the node itself is not flattened by the setting above — this
-// is about what happens to the image *inside* a node that is still drawn.
 h.canvas.nodes[0].size = [600, 300];
 h.canvas.nodes[0].img = demoImg;
 h.canvas.nodes[0].onDrawBackground = function (ctx) {
   ctx.drawImage(this.img, 0, 0, 400, 200);
 };
-for (let i = 0; i < 2; i++) {
+// The preview ladder above the flat setting: the node is drawn in full (25% is
+// above 20%) and the 4096px image is served from a copy made for the size it
+// actually covers on screen. Below the flat setting there is nothing to serve —
+// the node is a rectangle and never asks for the image at all.
+h.canvas.ds.scale = 0.25;
+h.tracker.lowZoom.set({ thumbZoom: 1 }); // thumbnails below 100% zoom
+for (let round = 0; round < 2; round++) {
   h.advance(FRAME_MS);
   h.canvas.setDirty(true, true);
   h.canvas.draw();
+  run(500);
+  await pump(); // the copy is made asynchronously, like createImageBitmap in a browser
 }
-run(500);
-await pump();
+const pv = h.tracker.lowZoom.previews;
+console.log(
+  `  previews at 25% zoom: ${pv.served} of ${pv.seen} image draw(s) served from a cached thumbnail (${pv.built} cached, ` +
+    `${h.imageBitmaps.length ? h.imageBitmaps[h.imageBitmaps.length - 1].width : "?"}px on its long side for a 100px box)`
+);
+h.canvas.ds.scale = 0.1;
+h.tracker.lowZoom.set({ flatBelow: 0.2, thumbZoom: 0.6 });
 
 bullets("LOW-ZOOM MODE: WHAT IT DID TO THIS PAGE");
 const frame = (n) => {
@@ -328,22 +339,19 @@ run(500);
 await pump();
 const s = h.tracker.lowZoom.state;
 console.log(
-  `  zoom 10%, everything on: ${s.plan.tiny}/${s.plan.total} nodes painted as rectangles, ` +
-    `links taken over by the straight-line path (${s.links} of them — link setting "auto" straightens links while most of the ` +
-    `graph is rectangles)`
+  `  zoom ${Math.round(s.zoom * 100)}% is below the 20% setting: ${s.plan.flat}/${s.plan.total} nodes painted as flat rectangles ` +
+    `(the decision is the zoom, not how big a node is — the widest node here is ${s.plan.medPx}px on screen), ` +
+    `links taken over by the straight-line path (${s.links} of them — link setting "auto" straightens links while the graph is rectangles)`
 );
 console.log(
   `  DOM content of a boxed node hidden: ${lodBoxed()} (${h.tracker.lowZoom.dom.hidden} element(s) of ${h.tracker.lowZoom.dom.nodes} boxed node(s),` +
     ` ${h.tracker.lowZoom.dom.stilled} widget(s) — an element widget and a Vue-component widget — out of the per-frame layout pass)` +
-    ` | low-quality frame handed to the frontend: ${h.tracker.lowZoom.detail.lowQualityForced}` +
-    ` | previews served from thumbnails: ${h.tracker.lowZoom.previews.served}/${h.tracker.lowZoom.previews.seen}`
+    ` | low-quality frame handed to the frontend: ${h.tracker.lowZoom.detail.lowQualityForced}`
 );
 
-// The link setting on its own, with the nodes left alone: the curves are kept,
-// the ink is not. This is the shape of a workflow the user actually zooms out of.
 // The link setting on its own: keep the curves, pay less for them. This is the
 // combination the node threshold alone used to make impossible.
-h.tracker.lowZoom.set({ minPx: 0, linkStyle: "spline" });
+h.tracker.lowZoom.set({ flatBelow: 0, linkStyle: "spline" });
 h.canvas.linkSettings.length = 0;
 h.canvas.ctx.ops.length = 0;
 const thinBefore = h.tracker.lowZoom.detail.thinLinks;
@@ -360,15 +368,30 @@ console.log(
 // And the same moment one zoom level up: nothing is degraded, the DOM element is
 // back on screen, the canvas object is exactly as ComfyUI left it. This is the
 // check that matters — the mode has to give the page back as it found it.
-h.tracker.lowZoom.set({ minPx: 24 });
+h.tracker.lowZoom.set({ flatBelow: 0.2 });
 h.canvas.ds.scale = 0.9;
 const thinBefore2 = h.tracker.lowZoom.detail.thinLinks;
 frame(2);
 run(500);
 await pump();
 console.log(
-  `  at 90% zoom: nodes flattened ${h.tracker.lowZoom.state.plan.tiny}, links thinned ${h.tracker.lowZoom.detail.thinLinks - thinBefore2} (none),` +
+  `  at 90% zoom (above the setting): nodes flattened ${h.tracker.lowZoom.state.plan.flat}, links thinned ${h.tracker.lowZoom.detail.thinLinks - thinBefore2} (none),` +
     ` DOM widget hidden ${lodBoxed()} (false), canvas link width ${h.canvas.connections_width}, border ${h.canvas.render_connections_border}`
+);
+
+// The point of a zoom rule: a node that is small on screen is left alone while
+// the camera is above the setting. Under the old per-node pixel rule a node this
+// size was flattened at any zoom.
+h.canvas.ds.scale = 0.25;
+h.canvas.nodes.forEach((n) => {
+  n.size = [60, 30];
+});
+frame(2);
+run(500);
+await pump();
+console.log(
+  `  at 25% zoom with 60-unit nodes (15px on screen): flattened ${h.tracker.lowZoom.state.plan.flat} of ` +
+    `${h.tracker.lowZoom.state.plan.total} — a node size can no longer flatten anything on its own`
 );
 h.canvas.ds.scale = 0.1;
 frame(2);
