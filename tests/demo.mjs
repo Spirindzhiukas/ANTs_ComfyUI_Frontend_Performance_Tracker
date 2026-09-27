@@ -272,7 +272,24 @@ for (let i = 0; i < 6; i++) {
   h.canvas.links.push({ color: "#888888", from: [i * 240, 0], to: [i * 240 + 200, 100] });
 }
 h.app.graph._nodes = h.canvas.nodes; // in ComfyUI the graph the canvas draws is canvas.graph
-h.tracker.lowZoom.set({ minPx: 24, idleCapMs: 500 });
+h.tracker.lowZoom.set({ minPx: 24, idleCapMs: 500, thumbZoom: 0.6 });
+
+// One node with a 4096px image in it, drawn the way a preview/load/compare node
+// draws: the first frame paints the full bitmap, the next one is served from the
+// copy the ladder made for this zoom.
+const demoImg = { naturalWidth: 4096, naturalHeight: 4096 };
+// Big enough that the node itself is not flattened by the setting above — this
+// is about what happens to the image *inside* a node that is still drawn.
+h.canvas.nodes[0].size = [600, 300];
+h.canvas.nodes[0].img = demoImg;
+h.canvas.nodes[0].onDrawBackground = function (ctx) {
+  ctx.drawImage(this.img, 0, 0, 400, 200);
+};
+for (let i = 0; i < 2; i++) {
+  h.advance(FRAME_MS);
+  h.canvas.setDirty(true, true);
+  h.canvas.draw();
+}
 run(500);
 await pump();
 
@@ -315,6 +332,9 @@ console.log(
     "\n      nothing to remove and the cost is drawing a thousand nodes properly several times a second." +
     "\n      The mode paints nodes that land a few pixels wide as one rectangle, straightens links, and" +
     "\n      caps redraws while nobody is touching the page — opt-in, and off the moment you say so." +
+    "\n      Its preview setting is the other half: image, preview and compare nodes blit a full-resolution bitmap every" +
+    "\n      redraw, so below the zoom you set (60% by default) those draws are served from a cached copy of about the" +
+    "\n      resolution the screen can show — 64px on the long side at 10% zoom, 512px around 60% for a big node." +
     "\nnote: in this simulation the clock only advances with h.advance(), so the tracker's own" +
     "\n      per-render cost reads 0 — a real browser spends real time rendering the panel." +
     "\n      Everything else above is what web/tracker.js computes from the synthetic traffic."

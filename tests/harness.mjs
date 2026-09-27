@@ -161,37 +161,57 @@ export function createHarness(options = {}) {
   };
 
   // A 2D context stub that records the calls a draw path made: enough to tell a
-  // cheap rectangle from LiteGraph's own chrome, and a straight line from a
-  // bezier spline, without a real canvas.
-  function makeStubCtx() {
-    const ops = [];
-    const push = (name) => (...a) => ops.push([name, ...a]);
-    return {
-      ops,
-      globalAlpha: 1,
-      shadowColor: "",
-      fillStyle: "",
-      strokeStyle: "",
-      lineWidth: 1,
-      font: "",
-      fillRect: push("fillRect"),
-      strokeRect: push("strokeRect"),
-      beginPath: push("beginPath"),
-      moveTo: push("moveTo"),
-      lineTo: push("lineTo"),
-      bezierCurveTo: push("bezierCurveTo"),
-      arc: push("arc"),
-      rect: push("rect"),
-      roundRect: push("roundRect"),
-      clip: push("clip"),
-      fill: push("fill"),
-      stroke: push("stroke"),
-      save: push("save"),
-      restore: push("restore"),
-      translate: push("translate"),
-      scale: push("scale"),
-      clearRect: push("clearRect"),
+  // cheap rectangle from LiteGraph's own chrome, a straight line from a bezier
+  // spline, and a full-size image from a thumbnail. It is a real class on
+  // purpose: the tracker patches CanvasRenderingContext2D.prototype.drawImage,
+  // which is also how a browser exposes it.
+  class FakeCanvasRenderingContext2D {
+    constructor() {
+      this.ops = [];
+      this.globalAlpha = 1;
+      this.shadowColor = "";
+      this.fillStyle = "";
+      this.strokeStyle = "";
+      this.lineWidth = 1;
+      this.font = "";
+    }
+    drawImage(...args) {
+      this.ops.push(["drawImage", ...args]);
+    }
+  }
+  for (const name of [
+    "fillRect",
+    "strokeRect",
+    "beginPath",
+    "moveTo",
+    "lineTo",
+    "bezierCurveTo",
+    "arc",
+    "rect",
+    "roundRect",
+    "clip",
+    "fill",
+    "stroke",
+    "save",
+    "restore",
+    "translate",
+    "scale",
+    "clearRect",
+  ]) {
+    FakeCanvasRenderingContext2D.prototype[name] = function (...args) {
+      this.ops.push([name, ...args]);
     };
+  }
+  const makeStubCtx = () => new FakeCanvasRenderingContext2D();
+
+  // createImageBitmap with the resize options, recording what was asked for.
+  const imageBitmaps = [];
+  function createImageBitmapStub(img, opts) {
+    const optsObj = opts || {};
+    const w = Number(optsObj.resizeWidth) || Number(img && (img.naturalWidth || img.width)) || 0;
+    const h = Number(optsObj.resizeHeight) || Number(img && (img.naturalHeight || img.height)) || 0;
+    imageBitmaps.push({ src: img, width: w, height: h, quality: optsObj.resizeQuality || null });
+    return Promise.resolve({ width: w, height: h, close() {}, __antsThumbOf: img });
   }
 
   class FakeLGraphCanvas {
@@ -299,6 +319,10 @@ export function createHarness(options = {}) {
   sandbox.globalThis = sandbox;
   sandbox.globalThis.LiteGraph = LiteGraphShim;
   sandbox.window.LiteGraph = LiteGraphShim;
+  sandbox.CanvasRenderingContext2D = FakeCanvasRenderingContext2D;
+  sandbox.window.CanvasRenderingContext2D = FakeCanvasRenderingContext2D;
+  sandbox.createImageBitmap = createImageBitmapStub;
+  sandbox.window.createImageBitmap = createImageBitmapStub;
   vm.createContext(sandbox);
 
   // Opt-in: make the fake timer functions behave like Chrome's, which throws
@@ -390,6 +414,7 @@ export function createHarness(options = {}) {
     FRAME_MS,
     app,
     canvas,
+    imageBitmaps,
     LiteGraph: LiteGraphShim,
     document,
     window: windowShim,

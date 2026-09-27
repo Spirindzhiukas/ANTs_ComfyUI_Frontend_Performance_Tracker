@@ -493,7 +493,7 @@ logged for DevTools.
 ## Development
 
 ```
-node tests/run-tests.mjs          # 97 tests, no dependencies, no browser
+node tests/run-tests.mjs          # 101 tests, no dependencies, no browser
 node tests/run-tests.mjs timing   # filter by name fragment
 python3 tests/test_init.py        # backend route parsing + graceful fallbacks
 node tests/demo.mjs               # print what the panel says, with no ComfyUI
@@ -526,7 +526,40 @@ Chrome accepts (the fake timers can be made Chrome-strict for that) — and
 a suite for the parts that have to target the *right* source: a
 suggestion for a slow, expensive chain has to be a cap that can bite it,
 a cheap heartbeat still gets the mildest limit, and the autopilot has to
-leave rAF loops and the tracker's own timers alone.
+leave rAF loops and the tracker's own timers alone. Two fakes exist because
+the drawing work needs them: `makeStubCtx()` is a *class* whose prototype is
+installed as the sandbox's `CanvasRenderingContext2D` (the preview ladder
+patches `drawImage` there, the same way a browser exposes it), and
+`createImageBitmap` records the resize it was asked to perform instead of
+resizing anything.
+
+## What changed in v2.1.5
+
+- **Nodes under N px now reaches 4K.** The ladder was 8/12/16/24/32px, which
+  assumed a node lands at 32px or less when the graph is zoomed out. On a 4K
+  screen at 10% zoom a node is around 43px wide, so the setting caught almost
+  nothing and the report looked like the mode had no effect. The ladder is now
+  0/8/12/16/24/32/48/64/96/128/192/256px, covering that case and the ones past
+  it. The panel also stops leaving you to guess: it reports what share of the
+  graph the current setting catches at the current zoom, and, when it catches
+  little, the width of a typical node and the setting that would flatten most
+  of the graph. *"Nodes under" is a property of the zoom, not of the graph* —
+  at 10% on a 4K screen the answer is 48 or 64, not 32.
+- **New: image previews are served from thumbnails** (on by default at 60%
+  zoom, one dropdown to change or switch off). Image, preview, load and compare
+  nodes blit a full-resolution bitmap into whatever box the node occupies —
+  a 4096px image into a 40px box, several times a second. Below the zoom you
+  set, those draws are served from a cached copy at about the resolution the
+  screen can show, taken from a ladder of 64/128/256/512/1024/2048px on the
+  long side: 64px at 10% zoom, 512px around 60% for a big node. So the same
+  image can have several copies, one per size the zoom asks for, and never a
+  copy of a copy. Only image draws that happen *inside* a node are touched
+  (the graph's own icons and grid are not), only when the destination is
+  smaller than the source, and only until the copy exists: the frame that
+  discovers a new image still draws the full one, so what you see never goes
+  blank. The cache holds at most 48 thumbnails and 64 MB (oldest first out), it
+  reports how many draws it served, how many it skipped and how much memory it
+  is holding, and eight failures switch it off rather than keep retrying.
 
 ## What changed in v2.1.4
 

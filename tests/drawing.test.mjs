@@ -72,12 +72,21 @@ async function openNodesTab(h) {
   return h.panel();
 }
 
+// One redraw, exactly, for the preview tests: a frame boundary and a paint.
+function oneFrame(h) {
+  h.advance(FRAME_MS);
+  h.canvas.setDirty(true, true);
+  h.canvas.draw();
+}
+
 suite("drawing: low-zoom mode paints less, and only when asked", () => {
-  test("off by default: every node and every link goes through LiteGraph's own drawing", async () => {
+  test("nothing is flattened by default: every node and every link goes through LiteGraph's own drawing", async () => {
     const h = await boot();
     bigGraph(h, 12);
     drawLoop(h, 0.2);
     assertEqual(h.tracker.lowZoom.state.minPx, 0, "nothing is simplified until it is switched on");
+    assertEqual(h.tracker.lowZoom.previews.belowZoom, 0.6, "previews are the one part that is on, below 60% zoom");
+    assertEqual(h.tracker.lowZoom.state.idleCapMs, 0, "and no redraw cap");
     assertEqual(h.tracker.lowZoom.state.nodes, 0);
     assertEqual(h.tracker.lowZoom.state.links, 0);
     assertGreater(h.canvas.nodeDraws, 0, "the original node draw path ran");
@@ -178,6 +187,133 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     drawLoop(h, 0.2);
     assertEqual(h.tracker.lowZoom.state.nodes, 0, "nothing is painted for nodes the canvas does not draw");
     assertEqual(fillRects(), before, "and no rectangles appear behind the DOM nodes");
+  });
+
+
+  test("the node threshold reaches far enough for a 4K screen", async () => {
+    const h = await boot();
+    h.window.devicePixelRatio = 1;
+    // 1200 world units wide at zoom 0.10 = 120px on screen: unreadable, and at
+    // 4K it is also far from the smallest thing on the canvas.
+    bigGraph(h, 4, 0.1);
+    h.canvas.nodes.forEach((n) => {
+      n.size = [1200, 600];
+    });
+    const stretch = 120; // h.canvas.ds.scale is 0.1, so this is 120px on screen
+    h.tracker.lowZoom.set({ minPx: 96 });
+    h.canvas.ctx.ops.length = 0;
+    drawLoop(h, 0.2);
+    assertEqual(h.tracker.lowZoom.state.nodes, 0, "below the threshold a 120px node is still drawn in full");
+    h.tracker.lowZoom.set({ minPx: 128 });
+    drawLoop(h, 0.2);
+    assertGreater(h.tracker.lowZoom.state.nodes, 0, `above it the same node is a rectangle (${stretch}px on screen)`);
+    assert(h.tracker.lowZoom.limits.minPx.includes(256), "and the ladder goes to 256px, not just 32");
+    const plan = h.tracker.lowZoom.state.plan;
+    assertEqual(plan.medPx, 120, "the panel also measures what this zoom makes of a typical node");
+    assertEqual(plan.needPx, 128, "and names the setting that would flatten it");
+
+    // The setting that is too low for the screen has to say so, by name.
+    h.tracker.lowZoom.set({ minPx: 96 });
+    h.advance(FRAME_MS);
+    h.canvas.setDirty(true, true);
+    h.canvas.draw();
+    await openNodesTab(h);
+    assertIncludes(panelText(h), "the typical node is 120px wide on screen", "the panel points at the setting that would catch it");
+  });
+
+  test("a big preview is served from a thumbnail, and the resolution follows the zoom", async () => {
+    const h = await boot();
+    h.window.devicePixelRatio = 1;
+    const img = { naturalWidth: 4096, naturalHeight: 3072 };
+    bigGraph(h, 1, 0.6);
+    h.canvas.links = [];
+    h.canvas.nodes[0].type = "LoadImage";
+    h.canvas.nodes[0].img = img;
+    h.canvas.nodes[0].onDrawBackground = function (ctx) {
+      ctx.drawImage(this.img, 0, 0, 400, 300);
+    };
+    h.canvas.costs.chrome = 0.01;
+    h.tracker.lowZoom.set({ thumbZoom: 1 }); // thumbnails below 100% zoom
+
+    h.canvas.ds.scale = 0.6; // 400 units x 0.6 = 240px on screen
+    oneFrame(h);
+    assertEqual(h.imageBitmaps.length, 1, "one thumbnail was asked for");
+    assertEqual(h.imageBitmaps[0].width, 256, "256px for a box that is 240px wide on screen at 60% zoom");
+    assertEqual(h.imageBitmaps[0].height, 192, "kept in proportion");
+    assertEqual(h.imageBitmaps[0].quality, "low", "resized cheaply, not with a good filter");
+    const firstFrame = h.canvas.ctx.ops.filter((o) => o[0] === "drawImage");
+    assertEqual(firstFrame[firstFrame.length - 1][1], img, "the first frame still drew the full image");
+
+    await h.flush(); // the copy resolves
+    h.canvas.ctx.ops.length = 0;
+    oneFrame(h);
+    const after = h.canvas.ctx.ops.filter((o) => o[0] === "drawImage");
+    assertEqual(after.length, 1, "and the next frame drew one image");
+    assert(after[0][1] !== img, "from the cached copy, not the source");
+    assertEqual(after[0][1].width, 256, "at the size the screen can show");
+    // this call is the five-argument form: ops are ["drawImage", src, dx, dy, dw, dh]
+    assertEqual(after[0][2], 0, "with the destination rectangle untouched");
+    assertEqual(after[0][4], 400, "including its width in graph units");
+    assertEqual(after[0][5], 300, "and its height");
+    assertEqual(h.tracker.lowZoom.previews.served, 1, "and the panel counts it");
+
+    // Zoomed further out the node covers fewer pixels, so the copy shrinks too.
+    h.canvas.ds.scale = 0.1;
+    h.tracker.lowZoom.set({ thumbZoom: 1 });
+    oneFrame(h);
+    const small = h.imageBitmaps[h.imageBitmaps.length - 1];
+    assertEqual(small.width, 64, "64px on the long side at 10% zoom: one source image, two sizes on demand");
+    assertEqual(h.tracker.lowZoom.previews.belowZoom, 1);
+    await h.flush();
+    h.canvas.ctx.ops.length = 0;
+    oneFrame(h);
+    const tiny = h.canvas.ctx.ops.filter((o) => o[0] === "drawImage");
+    assertEqual(tiny[0][1].width, 64, "and the frame now uses the smaller copy");
+    assertEqual(h.tracker.lowZoom.previews.built, 2, "two thumbnails cached, one per bucket");
+  });
+
+  test("readable zooms, small images and thumbnails themselves are left alone", async () => {
+    const h = await boot();
+    h.window.devicePixelRatio = 1;
+    const img = { naturalWidth: 4096, naturalHeight: 4096 };
+    const small = { naturalWidth: 128, naturalHeight: 128 };
+    bigGraph(h, 2, 1);
+    h.canvas.links = [];
+    h.canvas.nodes[0].img = img;
+    h.canvas.nodes[0].onDrawBackground = function (ctx) {
+      // the nine-argument form: a crop of the source into the node's box
+      ctx.drawImage(this.img, 1024, 768, 2048, 1536, 0, 0, 400, 400);
+    };
+    h.canvas.nodes[1].img = small;
+    h.canvas.nodes[1].onDrawBackground = function (ctx) {
+      ctx.drawImage(this.img, 0, 0, 100, 100);
+    };
+    h.canvas.costs.chrome = 0.01;
+    h.tracker.lowZoom.set({ thumbZoom: 0.6 });
+
+    h.canvas.ds.scale = 1; // readable: no thumbnail at all
+    oneFrame(h);
+    assertEqual(h.imageBitmaps.length, 0, "at full zoom every preview is drawn from its own image");
+
+    h.canvas.ds.scale = 0.1; // now the threshold is met
+    oneFrame(h);
+    await h.flush();
+    assertEqual(h.imageBitmaps.length, 1, "only the big image gets a copy");
+    assertGreater(h.tracker.lowZoom.previews.skipped, 0, "the 128px source is left alone: copying it would gain nothing");
+    h.canvas.ctx.ops.length = 0;
+    oneFrame(h);
+    const drawn = h.canvas.ctx.ops.filter((o) => o[0] === "drawImage");
+    assertEqual(drawn.length, 2, "both nodes still draw an image");
+    const sources = drawn.map((o) => o[1]);
+    assertIncludes(sources, small, "the 128px one from its own source");
+    const copy = sources.find((s) => s !== small && s !== img);
+    assert(copy, "the 4096px one from a copy");
+    assertEqual(copy.width, 64, "at the 64px bucket this zoom asks for");
+    const cropped = drawn.find((o) => o.length === 10);
+    assert(cropped, "the cropped call kept its nine-argument form");
+    assertEqual(cropped[2], 16, "with the source rectangle scaled into the copy (1024 of 4096 -> 16 of 64)");
+    assertEqual(cropped[5], 24, "height too (1536 of 4096 -> 24 of 64)");
+    assertEqual(cropped[9], 400, "and the destination untouched");
   });
 
   test("the panel says whether culling could help at this zoom, and what the mode is doing", async () => {

@@ -27,7 +27,7 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.1.4";
+const VERSION = "2.1.5";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
 const NODE_NAME = "ANTsNastyBastardsTracker";
 
@@ -857,15 +857,44 @@ const LOD = {
   error: "",
   baseline: null, // the frame budget as it was when the mode went on
   plan: { links: false, tiny: 0, sampled: 0, total: 0, at: 0 },
+  // Preview bitmaps. A 4096px image drawn into a 40px box on screen costs the
+  // full-size upload and blit every redraw; past the zoom you set, the draw is
+  // served from a cached copy of about the resolution the screen can show.
+  thumbZoom: 0.6, // substitute below this zoom (0 = never); 60% by default
+  inNode: false, // true only while a node is being drawn
+  imgSeen: 0, // drawImage calls for image-shaped sources inside a node
+  imgThumb: 0, // served from a cached thumbnail
+  imgFull: 0, // drawn full size because the thumbnail was not ready
+  imgSkipped: 0, // left alone (small source, or nothing to gain)
+  thumbs: null, // WeakMap<source, Map<bucket, record>>
+  produced: new WeakSet(), // bitmaps and canvases this ladder made
+  thumbQueue: [], // insertion order, for the size cap
+  thumbsBuilt: 0,
+  thumbBytes: 0,
+  thumbFailures: 0,
+  zoom: 0,
 };
 
-const LOD_MIN_PX = [0, 8, 12, 16, 24, 32];
+// Sizes a node can land at on screen. The upper half of this ladder exists for
+// 4K: at zoom 0.10 with 200-unit nodes, "under 32px" catches almost nothing and
+// the expensive nodes are still painted in full.
+const LOD_MIN_PX = [0, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256];
 const LOD_IDLE_CAP_MS = [0, 250, 500, 1000];
 const LOD_IDLE_INPUT_MS = 400; // how long one touch keeps the cap lifted
 const LOD_LINK_SHARE = 0.6; // "most nodes are tiny" => links can be too
+// Zoom levels at which previews may be served from a thumbnail.
+const LOD_THUMB_ZOOMS = [0, 1, 0.8, 0.6, 0.4, 0.2];
+const LOD_THUMB_LADDER = [64, 128, 256, 512, 1024, 2048]; // longest side, px
+const LOD_THUMB_MIN_SRC = 256; // sources smaller than this are not worth copying
+const LOD_THUMB_MAX = 48; // thumbnails kept before the oldest is dropped
+const LOD_THUMB_MAX_BYTES = 64 * 1024 * 1024; // and a byte budget, because 48 large copies are a lot of memory
 
 function lodOn() {
-  return LOD.minPx > 0 || LOD.idleCapMs > 0;
+  return LOD.minPx > 0 || LOD.idleCapMs > 0 || LOD.thumbZoom > 0;
+}
+
+function lodPreviewsOn() {
+  return LOD.thumbZoom > 0 && LOD.zoom > 0 && LOD.zoom < LOD.thumbZoom;
 }
 
 // This frontend can render nodes as Vue DOM overlays, in which case LiteGraph
@@ -912,18 +941,35 @@ function lodNodePx(node, canvas) {
 function lodPlanFrame(canvas) {
   const plan = LOD.plan;
   plan.at = nowMs();
+  LOD.zoom = (canvas && canvas.ds && Number(canvas.ds.scale)) || 0;
   plan.links = false;
   plan.tiny = 0;
   plan.sampled = 0;
   plan.total = 0;
+  plan.medPx = 0;
+  plan.needPx = 0;
   if (!(LOD.minPx > 0)) return plan;
   const nodes = lodGraphNodes(canvas);
   if (!nodes || !nodes.length) return plan;
   const total = nodes.length;
   const stride = Math.max(1, Math.floor(total / 64)); // 64 samples is plenty for a share
+  const widths = [];
   for (let i = 0; i < total; i += stride) {
-    if (lodNodePx(nodes[i], canvas) < LOD.minPx) plan.tiny++;
+    const px = lodNodePx(nodes[i], canvas);
+    if (px < LOD.minPx) plan.tiny++;
+    widths.push(px);
     plan.sampled++;
+  }
+  if (widths.length) {
+    widths.sort((a, b) => a - b);
+    plan.medPx = Math.round(widths[widths.length >> 1]);
+    // The setting that would flatten the typical node at this zoom, taken from
+    // the same ladder the user picks from. What counts as "tiny" is a property
+    // of the zoom, not of the graph, and this is the number that makes it
+    // obvious: at 10% on a 4K screen it is 48 or 64, not 32.
+    for (const v of LOD_MIN_PX) {
+      if (v > 0 && v >= plan.medPx) { plan.needPx = v; break; }
+    }
   }
   plan.total = total;
   plan.links = plan.tiny / Math.max(1, plan.sampled) >= LOD_LINK_SHARE;
@@ -956,6 +1002,167 @@ function lodPaintLink(ctx, a, b, color) {
   ctx.strokeStyle = color || "#9a9a9a";
   ctx.lineWidth = 1;
   ctx.stroke();
+}
+
+// ------------------------------------------------------------- previews -----
+// Which resolution does the screen need? A node draws in graph units, so the
+// destination rectangle has to be multiplied by the zoom and the device pixel
+// ratio before it means anything on screen.
+function lodBucketFor(px, sourceLong) {
+  for (const b of LOD_THUMB_LADDER) if (b >= px) return Math.min(b, sourceLong);
+  return sourceLong;
+}
+
+function lodImageSize(img) {
+  if (!img) return null;
+  const w = Number(img.naturalWidth || img.videoWidth || img.width) || 0;
+  const h = Number(img.naturalHeight || img.videoHeight || img.height) || 0;
+  if (!(w > 0) || !(h > 0)) return null;
+  return { w, h };
+}
+
+function lodDpr() {
+  try {
+    const dpr = Number(typeof window !== "undefined" && window.devicePixelRatio);
+    return Number.isFinite(dpr) && dpr > 0 ? dpr : 1;
+  } catch (e) {
+    return 1;
+  }
+}
+
+function lodEvictThumbs() {
+  while (LOD.thumbQueue.length > LOD_THUMB_MAX || LOD.thumbBytes > LOD_THUMB_MAX_BYTES) {
+    const old = LOD.thumbQueue.shift();
+    const per = LOD.thumbs && LOD.thumbs.get(old.src);
+    const rec = per && per.get(old.bucket);
+    if (rec && rec.ready) LOD.thumbBytes = Math.max(0, LOD.thumbBytes - (rec.bytes || 0));
+    if (per) per.delete(old.bucket);
+  }
+}
+
+function lodBuildThumb(img, size, bucket, rec, per) {
+  const k = Math.min(1, bucket / Math.max(size.w, size.h));
+  const tw = Math.max(1, Math.round(size.w * k));
+  const th = Math.max(1, Math.round(size.h * k));
+  const done = (bitmap) => {
+    rec.bitmap = bitmap;
+    rec.ready = true;
+    LOD.produced.add(bitmap);
+    rec.bytes = tw * th * 4;
+    LOD.thumbsBuilt++;
+    LOD.thumbBytes += rec.bytes;
+    lodEvictThumbs();
+  };
+  try {
+    if (typeof createImageBitmap === "function") {
+      Promise.resolve(createImageBitmap(img, { resizeWidth: tw, resizeHeight: th, resizeQuality: "low" }))
+        .then(done)
+        .catch(() => {
+          LOD.thumbFailures++;
+          per.delete(bucket);
+        });
+      return;
+    }
+  } catch (e) {
+    /* no createImageBitmap: fall through to the canvas path */
+  }
+  try {
+    const c = document.createElement("canvas");
+    c.width = tw;
+    c.height = th;
+    const cctx = c.getContext("2d");
+    if (!cctx) throw new Error("no 2d context for thumbnails");
+    cctx.drawImage(img, 0, 0, tw, th);
+    done(c);
+  } catch (e) {
+    LOD.thumbFailures++;
+    per.delete(bucket);
+  }
+}
+
+// The thumbnail for this source at this size, or null while it is being built.
+function lodThumbFor(img, size, bucket) {
+  if (!LOD.thumbs) LOD.thumbs = new WeakMap();
+  let per = LOD.thumbs.get(img);
+  if (!per) {
+    per = new Map();
+    LOD.thumbs.set(img, per);
+  }
+  const rec = per.get(bucket);
+  if (rec) return rec.ready ? rec.bitmap : null;
+  const pending = { ready: false, bitmap: null, bytes: 0, src: img, bucket };
+  per.set(bucket, pending);
+  LOD.thumbQueue.push({ src: img, bucket });
+  lodBuildThumb(img, size, bucket, pending, per);
+  return null;
+}
+
+// A drop-in replacement for one drawImage() call, or null to leave it alone.
+function lodThumbArgs(args) {
+  if (!lodPreviewsOn()) return null;
+  const img = args[0];
+  if (!img || typeof img !== "object") return null;
+  // Thumbnails of thumbnails are pointless: anything we produced is already the
+  // resolution the screen asked for.
+  if (LOD.produced && LOD.produced.has(img)) return null;
+  const size = lodImageSize(img);
+  if (!size) return null;
+  const long = Math.max(size.w, size.h);
+  if (long < LOD_THUMB_MIN_SRC) {
+    LOD.imgSkipped++;
+    return null;
+  }
+  const nine = args.length >= 9;
+  const dw = Number(nine ? args[7] : args[3]) || 0;
+  const dh = Number(nine ? args[8] : args[4]) || 0;
+  const need = Math.max(Math.abs(dw), Math.abs(dh)) * (LOD.zoom > 0 ? LOD.zoom : 1) * lodDpr();
+  const bucket = lodBucketFor(need, long);
+  if (!(bucket > 0) || bucket >= long) {
+    LOD.imgSkipped++;
+    return null;
+  }
+  LOD.imgSeen++;
+  const thumb = lodThumbFor(img, size, bucket);
+  if (!thumb) {
+    LOD.imgFull++;
+    return null;
+  }
+  LOD.imgThumb++;
+  if (nine) {
+    const k = thumb.width / Math.max(1, size.w);
+    return [thumb, args[1] * k, args[2] * k, args[3] * k, args[4] * k, args[5], args[6], dw, dh];
+  }
+  return [thumb, args[1], args[2], dw, dh];
+}
+
+let lodDrawImagePatched = false;
+
+// Only image draws that happen *inside* a node are touched: the graph's own
+// bitmaps (background grid, per-node-type icons) are already small and are not
+// what costs a frame. Installed once, and inert while the mode is off.
+function lodInstallDrawImage() {
+  if (lodDrawImagePatched) return true;
+  try {
+    const proto = typeof CanvasRenderingContext2D !== "undefined" && CanvasRenderingContext2D.prototype;
+    if (!proto || typeof proto.drawImage !== "function") return false;
+    const original = proto.drawImage;
+    proto.drawImage = function (...args) {
+      if (LOD.inNode && LOD.thumbZoom > 0) {
+        try {
+          const sub = lodThumbArgs(args);
+          if (sub) return original.apply(this, sub);
+        } catch (err) {
+          LOD.thumbFailures++;
+          if (LOD.thumbFailures > 8) lodSet({ thumbZoom: 0 });
+        }
+      }
+      return original.apply(this, args);
+    };
+    lodDrawImagePatched = true;
+    return true;
+  } catch (e) {
+    return false;
+  }
 }
 
 // The redraw cap. A hard cap would make dragging feel broken, so it is only in
@@ -1014,9 +1221,15 @@ function lodSet(opts) {
   const was = lodOn();
   if ("minPx" in o) LOD.minPx = Math.max(0, Number(o.minPx) || 0);
   if ("idleCapMs" in o) LOD.idleCapMs = Math.max(0, Number(o.idleCapMs) || 0);
+  if ("thumbZoom" in o) {
+    LOD.thumbZoom = Math.max(0, Math.min(1, Number(o.thumbZoom) || 0));
+    if (LOD.thumbZoom > 0) lodInstallDrawImage();
+  }
   const now = lodOn();
   if (now) LOD.error = "";
-  if (now && !was) lodCaptureBaseline();
+  // The first change is the moment worth measuring from, whether or not the mode
+  // was already partly on (previews are on by default).
+  if (now && !LOD.baseline) lodCaptureBaseline();
   if (!now && was) LOD.baseline = null;
   if (LOD.idleCapMs > 0) govInstallInputGuard();
   return now;
@@ -1141,7 +1354,9 @@ function patchCanvasDraw() {
       curNodeStageMs = 0;
       curConnStageMs = 0;
       curAttrMs = 0;
-      if (LOD.minPx > 0) lodPlanFrame(this);
+      // The plan also carries the zoom, which the preview ladder needs even when
+      // no node is being flattened.
+      if (lodOn()) lodPlanFrame(this);
       drawDepth++;
       let ret;
       try {
@@ -1187,7 +1402,14 @@ function patchCanvasDraw() {
         return undefined;
       }
       const t0 = performance.now();
-      const ret = originalDrawNode.call(this, node, ctx, ...rest);
+      const outerInNode = LOD.inNode;
+      LOD.inNode = true; // preview substitution is only for what a node draws
+      let ret;
+      try {
+        ret = originalDrawNode.call(this, node, ctx, ...rest);
+      } finally {
+        LOD.inNode = outerInNode;
+      }
       const dt = performance.now() - t0;
       if (!S.paused) {
         const typeName = (node && (node.type || (node.constructor && node.constructor.type))) || "unknown";
@@ -1275,6 +1497,8 @@ function patchCanvasDraw() {
         "Frame/hook timing is unaffected."
     );
   }
+
+  lodInstallDrawImage();
 
   canvasPatched = true;
   return true;
@@ -4135,17 +4359,38 @@ function buildNodesTab(container) {
     lodUpdate();
   });
 
+  const lodThumbSel = el("select", { class: "ants-select", style: { width: "auto", maxWidth: "240px" } });
+  for (const z of LOD_THUMB_ZOOMS) {
+    const opt = el("option", {
+      text: z === 0 ? "previews drawn full size" : `previews as thumbnails below ${Math.round(z * 100)}% zoom`,
+    });
+    opt.value = String(z);
+    lodThumbSel.appendChild(opt);
+  }
+  lodThumbSel.value = String(LOD.thumbZoom);
+  lodThumbSel.title =
+    "Image, preview and compare nodes keep a full-resolution bitmap on the canvas and blit it into a box that may be forty " +
+    "pixels wide. Below this zoom they are served from a cached copy of about the resolution the screen can show (64, 128, " +
+    "256, 512, 1024 or 2048px on the long side), scaled to the same rectangle. The graph is not touched — only the bitmap that " +
+    "gets uploaded per redraw, and the first frame after a zoom change still draws the full image while the copy is made.";
+  lodThumbSel.addEventListener("change", () => {
+    lodSet({ thumbZoom: Number(lodThumbSel.value) });
+    lodUpdate();
+  });
+
   const lodOffBtn = el("button", { class: "ants-btn", text: "Back to full drawing" });
   lodOffBtn.title = "Turn both off and let ComfyUI draw the canvas exactly as it wants.";
   lodOffBtn.addEventListener("click", () => {
-    lodSet({ minPx: 0, idleCapMs: 0 });
+    lodSet({ minPx: 0, idleCapMs: 0, thumbZoom: 0 });
     lodPxSel.value = "0";
+    lodThumbSel.value = "0";
     lodIdleSel.value = "0";
     lodUpdate();
   });
 
   const lodRow = el("div", { style: { display: "flex", flexWrap: "wrap", gap: "10px", alignItems: "center", margin: "4px 0" } });
   lodRow.appendChild(lodPxSel);
+  lodRow.appendChild(lodThumbSel);
   lodRow.appendChild(lodIdleSel);
   lodRow.appendChild(lodOffBtn);
   container.appendChild(lodRow);
@@ -4160,7 +4405,11 @@ function buildNodesTab(container) {
         "attacks that directly. It is off by default, it never edits the graph, it is lifted the moment you click \"Back to full " +
         "drawing\", and if any part of it throws it switches itself off rather than leave the canvas in a state this tool cannot " +
         "explain. Compare the ms/frame numbers above before and after switching it on: they are measured by the same wrapping of " +
-        "drawNode/drawConnections that produced them, not by a stopwatch held next to the screen.",
+        "drawNode/drawConnections that produced them, not by a stopwatch held next to the screen. " +
+        "The preview setting is separate and works on its own: image, preview and compare nodes blit a full-resolution bitmap " +
+        "into whatever box the node occupies, and at low zoom that box is a few dozen pixels \u2014 the thumbnail ladder follows the " +
+        "screen (about 512px around 60% zoom down to 64px around 10%), so what changes is how much image data is uploaded per " +
+        "redraw, not what the node shows.",
     })
   );
 
@@ -4198,8 +4447,8 @@ function buildNodesTab(container) {
       const b = LOD.baseline;
       const bits2 = [`simplified ${LOD.nodes} node draw(s) and ${LOD.links} link draw(s) so far`];
       if (LOD.capped) bits2.push(`${LOD.capped} redraw(s) merged by the idle cap`);
+      const since = lodSinceSwitch();
       if (b && b.at) {
-        const since = lodSinceSwitch();
         const ago = Math.max(0, Math.round((nowMs() - b.at) / 1000));
         if (since) {
           bits2.push(
@@ -4210,10 +4459,53 @@ function buildNodesTab(container) {
           bits2.push(`switched on ${ago}s ago — no frame has been drawn since, so there is nothing to compare yet`);
         }
       }
+      // How much of the graph the node setting actually catches, and whether it
+      // is catching anything that costs money. Both numbers come from the same
+      // per-frame sample the drawing uses.
+      if (LOD.minPx > 0 && LOD.plan.sampled) {
+        const share = LOD.plan.tiny / Math.max(1, LOD.plan.sampled);
+        bits2.push(
+          `≈${Math.round(share * 100)}% of the graph (${LOD.plan.tiny}/${LOD.plan.sampled} sampled, ${LOD.plan.total} nodes) is painted flat ` +
+            `at this zoom with "nodes under ${LOD.minPx}px"`
+        );
+        if (LOD.plan.needPx > LOD.minPx) {
+          bits2.push(
+            `the typical node is ${LOD.plan.medPx}px wide on screen at this zoom, so "nodes under ${LOD.plan.needPx}px" is the setting ` +
+              `that would flatten most of the graph`
+          );
+        }
+        if (since && share > 0.2 && Number.isFinite(b.nodeMsPerFrame) && b.nodeMsPerFrame > 0 && since.nodeMsPerFrame > b.nodeMsPerFrame * 0.9) {
+          bits2.push(
+            `and node drawing has not moved (${fmtMs(b.nodeMsPerFrame)} → ${fmtMs(since.nodeMsPerFrame)} ms/frame): what is left is in the ` +
+              `nodes this setting does not catch — raise it and watch this line`
+          );
+        }
+      }
+      if (LOD.thumbZoom > 0) {
+        const frames = Math.max(1, since ? since.n : 1);
+        if (lodPreviewsOn()) {
+          bits2.push(
+            `previews: ${LOD.imgThumb} of ${LOD.imgSeen} image draw(s) served from a cached thumbnail ` +
+              `(${(LOD.imgThumb / frames).toFixed(1)}/frame) · ${LOD.thumbsBuilt} cached, ≈${fmtBytes(LOD.thumbBytes)}` +
+              `${LOD.imgFull ? ` · ${LOD.imgFull} drawn full size while a thumbnail was made` : ""}` +
+              `${LOD.imgSkipped ? ` · ${LOD.imgSkipped} draw(s) left alone (source already small)` : ""}` +
+              `${LOD.thumbFailures ? ` · ${LOD.thumbFailures} failed` : ""}`
+          );
+        } else {
+          bits2.push(
+            `previews: drawn full size at this zoom (${LOD.zoom.toFixed(2)}) — thumbnails start below ${Math.round(LOD.thumbZoom * 100)}%`
+          );
+        }
+      }
       bits.push(bits2.join(" · "));
     } else {
       bits.push("off — the canvas is drawn exactly as ComfyUI draws it");
     }
+      if (!LOD.minPx && !LOD.idleCapMs && LOD.thumbZoom > 0) {
+        bits.push(
+          "nothing but the previews is switched on: they are the part that helps at every zoom, and \"Back to full drawing\" turns them off too"
+        );
+      }
     if (LOD.error) bits.push(`turned itself off after an error: ${LOD.error}`);
     lodLine.textContent = bits.join("\n");
   }
@@ -6194,6 +6486,9 @@ function buildTelemetryReport() {
         lodOn()
           ? `on (nodes < ${LOD.minPx}px as one rectangle, links ${LOD.plan.links ? "straight" : "as drawn"}, idle redraw cap ${LOD.idleCapMs || "off"}ms) ` +
             `— ${LOD.nodes} node draw(s) and ${LOD.links} link draw(s) simplified, ${LOD.capped} redraw(s) merged` +
+            (LOD.thumbZoom > 0
+              ? `, previews ${LOD.imgThumb}/${LOD.imgSeen} served from thumbnails (${LOD.thumbsBuilt} cached, ${fmtBytes(LOD.thumbBytes)}) below ${Math.round(LOD.thumbZoom * 100)}% zoom`
+              : "") +
             (() => {
               const since = lodSinceSwitch();
               if (!since || !LOD.baseline) return "";
@@ -6451,13 +6746,32 @@ function installDebugApi() {
           return lodVisibility(app.canvas);
         },
         get limits() {
-          return { minPx: LOD_MIN_PX.slice(), idleCapMs: LOD_IDLE_CAP_MS.slice() };
+          return {
+            minPx: LOD_MIN_PX.slice(),
+            idleCapMs: LOD_IDLE_CAP_MS.slice(),
+            thumbZoom: LOD_THUMB_ZOOMS.slice(),
+            thumbLadder: LOD_THUMB_LADDER.slice(),
+          };
+        },
+        get previews() {
+          return {
+            on: lodPreviewsOn(),
+            zoom: LOD.zoom,
+            belowZoom: LOD.thumbZoom,
+            served: LOD.imgThumb,
+            seen: LOD.imgSeen,
+            fullSize: LOD.imgFull,
+            skipped: LOD.imgSkipped,
+            built: LOD.thumbsBuilt,
+            bytes: LOD.thumbBytes,
+            failures: LOD.thumbFailures,
+          };
         },
         get frontendLod() {
           return lodFrontendLod(app.canvas);
         },
         set: (opts) => lodSet(opts),
-        off: () => lodSet({ minPx: 0, idleCapMs: 0 }),
+        off: () => lodSet({ minPx: 0, idleCapMs: 0, thumbZoom: 0 }),
       },
       setSyntheticTick,
       benchmark: (ms, slot) => runScriptedPan(Number(ms) || 6000, slot || "A"),
