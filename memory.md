@@ -330,7 +330,9 @@ The user's machine and reports, all of which drove priorities:
   test first where possible.
 - Where a picture was the only way to check a look, the look is generated from the
   real source (`tools/pill-preview.mjs`, `tools/box-preview.mjs`) rather than drawn
-  by hand, so it cannot drift from the extension.
+  by hand, so it cannot drift from the extension. `box-preview.mjs` reads
+  `LOD_SNAP_PAD`/`LOD_SNAP_TITLE_H` out of the source for its capture-geometry
+  panel, so even the one hand-drawn picture states the code's own numbers.
 - **Check the parent before committing** in a long-lived agent session: the local
   branch ref can be handed back at an older commit than the working tree (the
   objects and the remote are fine — it is the ref that resets). `git log --oneline

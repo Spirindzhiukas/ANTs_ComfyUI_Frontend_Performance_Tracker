@@ -615,6 +615,11 @@ resizing anything.
   paints boxes, with the reason in the panel's own error line; a fault in a
   capture blocks that node and, after five in a row, turns the feature off the
   same way.
+- **A picture of the box itself**, generated from the real paint path:
+  `preview/boxes.html` (open it in a browser) and `preview/boxes.png`, plus the
+  fourth panel showing what a snapshot bitmap covers — the body, LiteGraph's
+  30-unit title bar, 24 units of padding, and the frontend's own error stroke
+  landing inside that rectangle. Regenerate with `node tools/box-preview.mjs`.
 - **Honest limits, written down** (also in the LIMITS block at the bottom of
   `web/tracker.js`): a signature is re-checked every 100 ms, so a change can be
   shown stale for up to that long; a picture is the node at the moment it was

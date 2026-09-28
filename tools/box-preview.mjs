@@ -19,11 +19,22 @@
 // at 10% zoom — the zoom this mode exists for — a 200x100 node is 20x10 pixels on
 // screen. The captions say the magnification rather than pretending to be 1:1.
 
+import { readFileSync } from "node:fs";
 import { createHarness, FRAME_MS } from "../tests/harness.mjs";
+
+const SRC = readFileSync(new URL("../web/tracker.js", import.meta.url), "utf8");
 
 function die(msg) {
   console.error(`box-preview: ${msg}`);
   process.exit(1);
+}
+
+// A const out of web/tracker.js, by name. Used for the snapshot capture geometry:
+// a picture of the code's own numbers cannot drift from the code.
+function srcConst(name) {
+  const m = SRC.match(new RegExp(`^const ${name} = ([-0-9.]+);`, "m"));
+  if (!m) die(`could not find const ${name} in web/tracker.js`);
+  return Number(m[1]);
 }
 
 const h = createHarness();
@@ -176,7 +187,8 @@ const LABEL_H = 24;
 const UNITS_W = NODES.length * (SIZE[0] + GAP_X) - GAP_X;
 const ROW_H = CAPTION_H + (HEADROOM + SIZE[1] + LABEL_H / MAG) * MAG + MARGIN;
 const W = MARGIN * 2 + UNITS_W * MAG;
-const H = MARGIN + LEVELS.length * ROW_H;
+const SCHEMATIC_H = 210; // the capture-geometry row below the three real ones
+const H = MARGIN + LEVELS.length * ROW_H + SCHEMATIC_H;
 const SANS = "DejaVu Sans, Verdana, Geneva, ui-sans-serif, system-ui, sans-serif";
 const MONO = "DejaVu Sans Mono, Menlo, Consolas, ui-monospace, monospace";
 
@@ -215,6 +227,54 @@ LEVELS.forEach((level, row) => {
     );
   });
 });
+// ---------------------------------------------------------- the schematic ---
+// One more picture, and the only one that is not a recording: the *extent* of a
+// node snapshot. It has to be drawn by hand because the harness's canvas has no
+// pixels — a capture there is a list of operations, not an image — and the
+// rectangle a bitmap covers is worth seeing: it is what decides whether a node's
+// title bar, its error stroke and a hook that draws outside the body survive.
+{
+  const PAD = srcConst("LOD_SNAP_PAD");
+  const TITLE = srcConst("LOD_SNAP_TITLE_H");
+  const sample = { w: 200, h: 100 };
+  const y0 = MARGIN + LEVELS.length * ROW_H;
+  const bodyY = y0 + CAPTION_H + (TITLE + PAD) * MAG;
+  const bx = MARGIN + PAD * MAG;
+  const w = sample.w * MAG;
+  const h = sample.h * MAG;
+  const t = TITLE * MAG;
+  const p = PAD * MAG;
+  svgParts.push(
+    `<text x="${MARGIN}" y="${num(y0 + 16)}" fill="#e8e8ea" font-family="${SANS}" font-size="14">` +
+      `what a snapshot covers — the dashed rect is the bitmap: the body, LiteGraph's ${TITLE}-unit title bar above it, and ${PAD} units of ` +
+      `padding on every side</text>`
+  );
+  svgParts.push(
+    `<text x="${MARGIN}" y="${num(y0 + 34)}" fill="#9a9aa2" font-family="${SANS}" font-size="11">` +
+      `drawn to scale, in graph units. The padding is what keeps the frontend's own error stroke (12 units outside the node, 10 wide) inside ` +
+      `the picture; a capture that covered only the body would clip it</text>`
+  );
+  // the capture rect
+  svgParts.push(
+    `<rect x="${num(bx - p)}" y="${num(bodyY - t - p)}" width="${num(w + 2 * p)}" height="${num(h + t + 2 * p)}" fill="none" ` +
+      `stroke="#AE7719" stroke-width="1.5" stroke-dasharray="6 5"/>`
+  );
+  // the body and the title bar the node itself paints
+  svgParts.push(`<rect x="${num(bx)}" y="${num(bodyY)}" width="${num(w)}" height="${num(h)}" fill="#3a3a40"/>`);
+  svgParts.push(`<rect x="${num(bx)}" y="${num(bodyY - t)}" width="${num(w)}" height="${num(t)}" fill="#4a6f8f"/>`);
+  // the frontend's error stroke, where it lands relative to the capture rect
+  svgParts.push(
+    `<rect x="${num(bx - 12 * MAG)}" y="${num(bodyY - 12 * MAG)}" width="${num(w + 24 * MAG)}" height="${num(h + 24 * MAG)}" fill="none" ` +
+      `stroke="#E00" stroke-width="${num(10 * MAG)}"/>`
+  );
+  const cap = (x, y, text, anchor) =>
+    `<text x="${num(x)}" y="${num(y)}" text-anchor="${anchor || "start"}" fill="#9a9aa2" font-family="${MONO}" font-size="10">${esc(text)}</text>`;
+  svgParts.push(cap(bx + w / 2, bodyY + h / 2 + 4, "the node's own drawing", "middle"));
+  svgParts.push(cap(bx + w + p + 6, bodyY - t - p + 12, `padding ${PAD}`));
+  svgParts.push(cap(bx + w + p + 6, bodyY - t / 2 + 4, `title bar (${TITLE})`));
+  svgParts.push(cap(bx - 12 * MAG - 6, bodyY + h + 12 * MAG + 16, "error stroke: 10 wide, 12 out — inside the picture", "end"));
+}
+
 svgParts.push(`</svg>`);
 const svg = svgParts.join("\n");
 
