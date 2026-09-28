@@ -341,6 +341,10 @@ export function createHarness(options = {}) {
       // duration of one call can be caught doing it (and caught putting it back).
       this.connections_width = 3;
       this.render_connections_border = true;
+      // LiteGraph's own flag (LGraphCanvas.render_shadows, true by default): the
+      // node-snapshot capture compares it at reuse time, because another extension
+      // can flip it for the duration of a gesture.
+      this.render_shadows = true;
       this._isLowQuality = false;
       this.linkSettings = []; // what each link was rendered with
       this.nodeLowQuality = []; // what the canvas flag was for each node draw

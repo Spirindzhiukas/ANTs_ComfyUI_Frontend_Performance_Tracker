@@ -2005,20 +2005,144 @@ suite("drawing: node snapshots — a box that is a picture of the node", () => {
     assertEqual(snapApi(h).refused, 2, "the DOM widget and the function-valued property were refused");
   });
 
-  test("the budget releases the least recently used bitmaps, and the canvases go with them", async () => {
+  test("a full budget refuses captures instead of evicting what is on screen", async () => {
     const h = await boot();
-    snapGraph(h, 60); // at 3x, sixty of these do not fit in the smallest budget
-    h.tracker.lowZoom.set({ flatBelow: 0.2, snapshots: true, snapRatio: 3, snapMb: 32 });
+    // Big nodes at 3x: about 11 MB each, so the ladder's floor (256 MiB) fills
+    // after roughly twenty of them.
+    h.canvas.ds.scale = 0.1;
+    h.canvas.links = [];
+    const nodes = [];
+    for (let i = 0; i < 40; i++) {
+      const n = h.node({ type: "SnapThing", pos: [i * 700, 0], size: [600, 400] });
+      n.type = "SnapThing";
+      nodes.push(n);
+    }
+    h.canvas.nodes = nodes;
+    h.app.graph._nodes = nodes;
+    h.tracker.lowZoom.set({ flatBelow: 0.2, snapshots: true, snapRatio: 3, snapMb: 256 });
     draw(h, 1);
-    await idle(h, 12000);
+    await idle(h, 8000);
     const api = snapApi(h);
-    assertGreater(api.captured, 4, "several were captured");
-    assertGreater(api.evicted, 0, "and the budget released the ones that did not fit");
     const budget = api.budgetMb * 1024 * 1024;
+    assertGreater(api.captured, 10, `several were captured (${api.captured})`);
+    assertGreater(api.full, 0, "and the ones that did not fit were refused");
+    assertEqual(api.evicted, 0, "without taking a single bitmap off the screen");
     assertLess(api.bytes, budget + 1, `what is held stays inside the budget (${api.bytes} of ${budget} bytes)`);
-    assertEqual(api.budgetMb, 32, "the budget the API asked for is the one in force");
-    const dead = h.canvases.filter((c) => c.width === 0 && c.height === 0);
-    assertGreater(dead.length, 0, "a released bitmap's canvas is zeroed, so the pixels go back");
+    // And the refusal is stable: another pass of the lane changes nothing.
+    const captured = api.captured;
+    h.advance(3000);
+    await h.flush();
+    draw(h, 1);
+    await idle(h, 3000);
+    assertEqual(snapApi(h).captured, captured, "the lane does not spin on nodes it cannot hold");
+  });
+
+  test("bitmaps nobody is drawing any more are what makes room", async () => {
+    const h = await boot();
+    h.canvas.ds.scale = 0.1;
+    h.canvas.links = [];
+    const nodes = [];
+    for (let i = 0; i < 40; i++) {
+      const n = h.node({ type: "SnapThing", pos: [i * 700, 0], size: [600, 400] });
+      n.type = "SnapThing";
+      nodes.push(n);
+    }
+    h.canvas.nodes = nodes;
+    h.app.graph._nodes = nodes;
+    h.tracker.lowZoom.set({ flatBelow: 0.2, snapshots: true, snapRatio: 3, snapMb: 256 });
+    draw(h, 1);
+    await idle(h, 8000);
+    assertGreater(snapApi(h).full, 0, "the budget filled up");
+
+    // The same shape as panning away: most of the graph stops being drawn (here,
+    // collapsed nodes are exempt from the flat path), so their bitmaps are no
+    // longer in use and become the eviction pool.
+    for (let i = 0; i < 30; i++) nodes[i].flags = { collapsed: true };
+    // A refused node is retried when it is drawn again and its hold has expired —
+    // the same two conditions a real page meets on its next frame. The first
+    // attempt here lands while the collapsed bitmaps are still inside the guard
+    // window, so it is refused once more; the second lands after it.
+    h.advance(6000);
+    draw(h, 2);
+    await idle(h, 3000);
+    h.advance(6000);
+    draw(h, 1);
+    await idle(h, 6000);
+    const api = snapApi(h);
+    assertGreater(api.evicted, 0, `the cold bitmaps were released to make room (${api.evicted})`);
+    assertLess(api.bytes, api.budgetMb * 1024 * 1024 + 1, "and the budget still holds");
+    const live = h.canvases.filter((c) => c.width > 0).length;
+    assertGreater(live, 0, "with pictures still held for the nodes that are being drawn");
+  });
+
+  test("the budget ladder is 256 MiB to 2 GiB, and nothing below the floor survives", async () => {
+    const h = await boot();
+    const api = h.tracker.lowZoom;
+    assertEqual(api.limits.snapBudgets.join(","), "256,512,1024,2048", "the ladder, doubling to 2 GiB");
+    assertEqual(api.snapshots.budgetMb, 512, "with a 512 MiB default");
+    // A value below the floor — from a saved v2.3.0 record, or a script — is clamped
+    // up to it rather than honoured: below 256 MiB a large graph only thrashes.
+    api.set({ snapMb: 32 });
+    assertEqual(api.snapshots.budgetMb, 256, "32 MiB lands on the floor");
+    api.set({ snapMb: 8192 });
+    assertEqual(api.snapshots.budgetMb, 2048, "and the ceiling is 2 GiB");
+    api.set({ snapMb: 1000 });
+    assertEqual(api.snapshots.budgetMb, 1024, "a value between steps lands on the nearest one");
+    // The saved record is read back through the same clamp.
+    api.set({ snapshots: true, snapMb: 64, flatBelow: 0.2 });
+    const h2 = await boot({ storage: h.localStorage });
+    assertEqual(h2.tracker.lowZoom.snapshots.budgetMb, 256, "a saved sub-floor budget becomes the floor on the next load");
+    assertEqual(h2.tracker.lowZoom.snapshots.wanted, true, "and the feature is remembered");
+  });
+
+  test("a shadow-flag change pauses reuse without throwing the pictures away", async () => {
+    const h = await boot();
+    snapGraph(h, 2);
+    h.tracker.lowZoom.set({ flatBelow: 0.2, snapshots: true });
+    draw(h, 1);
+    await idle(h);
+    assertEqual(snapApi(h).captured, 2, "captured");
+    h.canvas.ctx.ops.length = 0;
+    draw(h, 1);
+    assertEqual(blits(h).length, 2, "and served from the pictures");
+
+    // Another extension turning shadows off for a gesture: the pictures were taken
+    // with shadows on, so the box is what the page is drawing right now.
+    h.canvas.render_shadows = false;
+    h.canvas.ctx.ops.length = 0;
+    draw(h, 1);
+    assertEqual(blits(h).length, 0, "no picture is used while the flag disagrees");
+    assertEqual(boxes(h).length, 2, "the boxes are painted instead");
+    assertEqual(snapApi(h).flagHeld, 2, "counted as held, not as a fault");
+    assertEqual(snapApi(h).captured, 2, "and nothing was recaptured");
+    assertEqual(snapApi(h).invalidated, 0, "nothing was dropped either");
+
+    // The gesture ends, the flag comes back, and the pictures are simply there.
+    h.canvas.render_shadows = true;
+    h.canvas.ctx.ops.length = 0;
+    draw(h, 1);
+    assertEqual(blits(h).length, 2, "reuse resumes with no recapture");
+    assertEqual(snapApi(h).captured, 2, "still two captures, not four");
+  });
+
+  test("the flicker counter measures a node switching between picture and box", async () => {
+    const h = await boot();
+    const nodes = snapGraph(h, 1);
+    nodes[0].widgets = [{ type: "number", name: "steps", value: 20 }];
+    h.tracker.lowZoom.set({ flatBelow: 0.2, snapshots: true });
+    draw(h, 1);
+    await idle(h);
+    h.canvas.ctx.ops.length = 0;
+    draw(h, 1);
+    assertEqual(blits(h).length, 1, "served from a picture");
+    assertEqual(snapApi(h).flips, 1, "the first paint of a picture counts as one switch (box → picture)");
+
+    nodes[0].widgets[0].value = 30; // the node changes: picture goes, box comes back
+    h.advance(SNAP_SIG_WINDOW_MS);
+    h.canvas.ctx.ops.length = 0;
+    draw(h, 1);
+    assertEqual(blits(h).length, 0, "the box is painted");
+    assertEqual(snapApi(h).flips, 2, "and that switch is counted — this is the number that would have been huge before");
   });
 
   test("off releases everything and paints exactly what it painted before", async () => {
@@ -2084,10 +2208,11 @@ suite("drawing: node snapshots — a box that is a picture of the node", () => {
     const text = panelText(h);
     assertIncludes(text, "boxes: pictures of the nodes (snapshots)", "the control offers it");
     assertIncludes(text, "capture 2x per graph unit", "with the ratio it will capture at");
-    assertIncludes(text, "bitmap budget 64 MiB", "and the budget");
+    assertIncludes(text, "bitmap budget 512 MiB", "and the budget");
     const api = h.tracker.lowZoom;
     assertEqual(api.snapshots.wanted, true, "the API says it is wanted");
     assertEqual(api.limits.snapRatios.join(","), "1,2,3", "and exposes the ladders");
+    assertEqual(api.limits.snapBudgets.join(","), "256,512,1024,2048", "including the budget ladder");
     assertEqual(api.snapshots.installed, true, "with the canvas seam in place");
     // A type the user excludes is refused like anything else the canvas cannot own.
     api.set({ snapExclude: ["SnapThing"] });

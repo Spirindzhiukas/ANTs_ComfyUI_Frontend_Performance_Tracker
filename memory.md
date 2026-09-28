@@ -4,7 +4,7 @@ A running record for whoever picks this up next (including me). `CLAUDE.md` is t
 rules for changing the code; `plan.md` is where it is going. This file is the past:
 what was built, what was rejected, and what the evidence was.
 
-Last updated at **v2.3.0**, 152 tests green, PR #1 on
+Last updated at **v2.3.1**, 156 tests green, PR #1 on
 `Spirindzhiukas/ANTs_ComfyUI_Frontend_Performance_Tracker`.
 
 ---
@@ -13,8 +13,8 @@ Last updated at **v2.3.0**, 152 tests green, PR #1 on
 
 | | |
 | --- | --- |
-| Version | 2.3.0 (`web/tracker.js` `VERSION`) |
-| Tests | 152 (`node tests/run-tests.mjs`), plus `tests/test_init.py` |
+| Version | 2.3.1 (`web/tracker.js` `VERSION`) |
+| Tests | 156 (`node tests/run-tests.mjs`), plus `tests/test_init.py` |
 | Frontend | `web/tracker.js`, ~9.5k lines, one ES module, no dependencies |
 | Backend | `__init__.py` — a no-op node + one optional read-only route |
 | Panel | 9 tabs: Tweaks, Timing, Nodes, Stalls, Governor, Load, Memory, GPU / VRAM, Testing |
@@ -36,6 +36,25 @@ something has to be drawn less or hit-tested less.
 ## 2. Version log
 
 The commit log is the full record; this is the "why", newest first.
+
+**v2.3.1 — the flicker was the eviction policy.** First real report after K1
+shipped: a 1,041-node graph at zoom 0.19, 256 MiB budget, 255.6 MB held, 7,040
+captures for 1,041 nodes, 156,393 draws served from pictures, and the user's words
+"box previews and the images flicker on and off constantly". The diagnosis is in
+the ratio: the cache was thrashing at its cap because LRU eviction on a graph that
+is entirely on screen evicts what is being looked at. Three changes: (a) "in use"
+is now a *frame* epoch, not a stopwatch — a bitmap is protected while its node is
+being drawn (a time window failed a test that mattered: while the page is idle no
+frames are drawn, so on-screen bitmaps aged out); (b) a full budget refuses new
+captures instead of evicting in-use ones, with a 5s retry hold per node so the lane
+cannot spin; (c) the ladder is 256 MiB → 2 GiB (doubling) with a 512 MiB default,
+and sub-256 values are clamped up, because nothing useful fit below that. Two bugs
+surfaced while testing: a refused/slow capture subtracted its own size from a total
+it was never added to, and a selection change invalidated a bitmap needlessly.
+A flicker counter (switches between picture and box) now makes this measurable.
+Also: `render_shadows` left the per-node signature and is compared at reuse time
+instead — another extension (NodeSnapshots) flips it per gesture, and hashing it
+threw the whole cache away twice a gesture.
 
 **v2.3.0 — a box can be a picture of its node (plan.md Track K1).** The snapshot
 engine, off by default, in the Tweaks tab: the nodes the flatten threshold turns
@@ -172,6 +191,23 @@ ComfyUI's execution highlighting is not a per-node field in this frontend (nothi
 in `LGraphNode`/`LGraphCanvas` carries it; `node.progress` is the only per-node
 execution state that exists), so inventing one would be inventing state. A node
 that says nothing gets no mark.
+
+**"In use" is a frame, not a clock.** Eviction protection is `snapFrame - rec.usedFrame
+< LOD_SNAP_GUARD_FRAMES`, where `snapFrame` counts drawn frames. A millisecond
+window was the first attempt and it was wrong in a way only a test caught: while
+the page sits idle nothing increments wall-clock usage, so bitmaps that were still
+on screen became evictable, and the user would come back to a recapture storm. The
+frame rule has the property that matters — the eviction pool is exactly the nodes
+that have stopped being drawn (off screen, or a graph switched away from) — and it
+costs one integer compare.
+
+**A full budget refuses; it does not evict in-use pictures.** Releasing a bitmap
+whose node is being drawn is what flicker is, and recapturing it later releases
+another one, so the failure mode is a loop. The stable answer is to stop capturing
+and let the extra nodes stay boxes, counted in the panel as refusals. It follows
+that on a graph larger than the budget the *set* of pictured nodes is fixed by
+draw order rather than rotating — stated here because "why is node X always a box"
+is a fair question with that answer.
 
 **A snapshot is only used where the box would have been.** The engine could
 reuse a picture at any zoom (upstream does), but that would make a zoom the tool

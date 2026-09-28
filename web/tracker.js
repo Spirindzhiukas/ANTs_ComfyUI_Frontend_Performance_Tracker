@@ -27,7 +27,7 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.3.0";
+const VERSION = "2.3.1";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
 const NODE_NAME = "ANTsNastyBastardsTracker";
 
@@ -884,7 +884,8 @@ const LOD = {
   // defined further down with the rest of this block's constants.
   snapOn: false, // opt-in; nothing is captured or blitted while off
   snapRatio: 2, // capture pixels per graph unit
-  snapMb: 64, // byte budget for stored bitmaps, least recently used evicted
+  snapMb: 512, // byte budget for stored bitmaps; the literal is LOD_SNAP_BUDGET_DEFAULT
+  snapFrame: 0, // drawn frames since load: what "in use" is measured in
   snaps: null, // Map<node, record> in reuse order (a Map iterates in insertion order)
   snapQueue: null, // Set<node> waiting for a capture, insertion order
   snapBytes: 0, // bytes held by stored bitmaps
@@ -900,6 +901,10 @@ const LOD = {
   snapRefused: 0, // nodes that can never be captured (DOM widgets, functions)
   snapPruned: 0, // records dropped because their node left the graph
   snapClears: 0, // whole-cache clears (theme change, off, threshold gone)
+  snapFull: 0, // captures skipped: the budget was full of bitmaps still in use
+  snapFlagHeld: 0, // boxes painted because the canvas's shadow flag changed since capture
+  snapFlips: 0, // times a node switched between picture and box — the flicker counter
+  snapModes: null, // WeakMap<node, "snap"|"box">, kept across records so a flip is seen
   snapFailStreak: 0,
   snapTheme: "",
   snapPumping: false,
@@ -1036,8 +1041,26 @@ const LOD_BOX_PROGRESS_PX = 3; // a bar is at least this tall in CSS pixels
 // (K3), and the numbers are in the panel rather than in a claim.
 const LOD_SNAP_RATIOS = [1, 2, 3]; // capture pixels per graph unit
 const LOD_SNAP_RATIO_DEFAULT = 2; // 2 keeps a 200% display sharp at 100% zoom
-const LOD_SNAP_BUDGETS = [32, 64, 128, 256]; // MiB held by stored bitmaps
-const LOD_SNAP_BUDGET_DEFAULT = 64;
+// The budget ladder starts at 256 MiB and doubles to 2 GiB. Below 256 was removed
+// after a real report: a 1,041-node graph at 256 MiB held 255.6 MB, and every new
+// capture evicted a bitmap that was on screen (7,040 captures for 1,041 nodes),
+// which is visible as boxes and pictures flickering on and off. The floor is now
+// the smallest number that can hold a large graph's worth of pictures at all.
+// The ceiling is 2 GiB: this memory is canvas surfaces outside the JS heap, which
+// the Memory tab cannot see, so it stays a number the user picks deliberately.
+const LOD_SNAP_BUDGETS = [256, 512, 1024, 2048]; // MiB held by stored bitmaps
+const LOD_SNAP_BUDGET_DEFAULT = 512;
+// "In use" is measured in drawn frames, not in milliseconds. A time window looked
+// right and failed a test that mattered: while the page is idle no frame is drawn
+// at all, so bitmaps that are still on screen aged out and became evictable the
+// moment the user came back. A frame counter cannot be fooled that way — a bitmap
+// is in use while the node it belongs to is being drawn, and a node that stops
+// being drawn (it went off screen, or the graph was switched) stops being
+// protected after a frame or two, which is precisely the eviction pool.
+const LOD_SNAP_GUARD_FRAMES = 2;
+// A node whose capture was refused because the budget was full of in-use bitmaps
+// waits this long before being tried again, so the lane cannot spin on it.
+const LOD_SNAP_HOLD_MS = 5000;
 const LOD_SNAP_PAD = 24; // graph units of margin around the node, so hooks that
 // draw outside the body (selection rings, glow) are not cut off
 const LOD_SNAP_TITLE_H = 30; // graph units above the body: LiteGraph's title bar
@@ -3127,7 +3150,11 @@ function lodSet(opts) {
     // Snapped to the ladder, so the panel and the state cannot disagree about a
     // number the user is looking at. Anything below the smallest step becomes it.
     LOD.snapMb = LOD_SNAP_BUDGETS.reduce((best, v) => (Math.abs(v - mb) < Math.abs(best - mb) ? v : best), LOD_SNAP_BUDGETS[0]);
-    lodSnapEvict(); // a smaller budget takes effect now, not at the next capture
+    // A budget the user has just picked takes effect now, in-use bitmaps included:
+    // they asked for the number. (Captures then stop until something goes cold,
+    // which is the stable outcome.) The clamp above is the ladder's own floor: a
+    // saved or scripted value below 256 MiB lands on 256.
+    lodSnapEvict(true);
   }
   if ("snapExclude" in o) {
     const list = Array.isArray(o.snapExclude) ? o.snapExclude : [];
@@ -3352,6 +3379,9 @@ function patchCanvasDraw() {
       }
       lastRealDrawAt = t0;
       S.counters.draws++;
+      // A drawn frame is the clock the snapshot store keeps time by: a bitmap is
+      // "in use" while its node is being drawn, and only a frame can say that.
+      if (S.enabled && LOD.snapOn) LOD.snapFrame++;
       curNodeStageMs = 0;
       curConnStageMs = 0;
       curLinkStageMs = 0;
@@ -3410,6 +3440,7 @@ function patchCanvasDraw() {
               lodSnapAbort(`reuse failed (${err && err.message ? err.message : String(err)})`);
               snapped = false;
             }
+            lodSnapNoteMode(node, snapped ? "snap" : "box");
           }
           if (!snapped) lodPaintNode(node, this, ctx);
         } catch (err) {
@@ -3728,7 +3759,10 @@ function lodSnapSignature(node, canvas) {
   str(node.boxcolor);
   flag(node.has_errors);
   num(node.progress);
-  flag(node.selected);
+  // `selected` is deliberately absent: a selection ring is transient state the
+  // live path draws, and this node is drawn live while it is selected anyway. In
+  // the signature it would mean dropping and recapturing a bitmap every time
+  // somebody clicked a node.
   // Connections, without walking them: a slot count changes when a link is added
   // or removed, and the count is the cheap part of that.
   num(node.inputs ? node.inputs.length : 0);
@@ -3756,24 +3790,18 @@ function lodSnapSignature(node, canvas) {
     }
   }
 
-  // The canvas's own render flags: they change how every node is painted, so a
-  // bitmap taken under one set cannot be trusted under another.
-  const c = canvas || null;
-  if (c) {
-    flag(c.render_shadows);
-    num(c.editor_alpha);
-  }
-  try {
-    if (typeof LiteGraph !== "undefined" && LiteGraph) {
-      num(LiteGraph.nodeOpacity);
-      num(LiteGraph.nodeLightness);
-      num(LiteGraph.NODE_TITLE_HEIGHT);
-      str(LiteGraph.NODE_DEFAULT_COLOR);
-      str(LiteGraph.NODE_DEFAULT_BGCOLOR);
-    }
-  } catch (e) {
-    /* a frontend without LiteGraph globals: the canvas flags above still count */
-  }
+  // What is deliberately NOT hashed here, and why:
+  //   * the canvas's own flags and the LiteGraph theme constants. They are not the
+  //     node's state, and another extension flips `render_shadows` around every
+  //     gesture (see NodeSnapshots' "simplify during navigation"), so hashing them
+  //     would invalidate every bitmap in the cache twice a gesture. A change that
+  //     matters is caught cheaply at reuse time instead (lodSnapPaint compares the
+  //     shadow flag and falls back to the box), and a real theme change clears the
+  //     whole cache once, from lodSnapThemeSig on the sweep.
+  //   * the camera: position, pan and zoom. A node does not change because you
+  //     looked at it from somewhere else, and a pan is exactly when these
+  //     pictures are worth having.
+  void canvas;
   return (h >>> 0).toString(36);
 }
 
@@ -3817,6 +3845,14 @@ function lodSnapThemeSig() {
   }
 }
 
+// Was this bitmap drawn in the last LOD_SNAP_GUARD_FRAMES frames? If so it is on
+// screen and must never be released to make room for something else.
+function lodSnapProtected(rec) {
+  const f = Number(rec && rec.usedFrame);
+  if (!Number.isFinite(f)) return false;
+  return LOD.snapFrame - f < LOD_SNAP_GUARD_FRAMES;
+}
+
 function lodSnapEnsure() {
   if (!LOD.snaps) LOD.snaps = new Map();
   if (!LOD.snapQueue) LOD.snapQueue = new Set();
@@ -3841,6 +3877,21 @@ function lodSnapRelease(rec) {
   rec.sig = "";
 }
 
+// A rendered bitmap that is *not* going to be stored: zero the canvas so the pixels
+// go back, and touch nothing else. `lodSnapRelease` is for a *record* — it also
+// subtracts the bytes from the budget, and calling it on something that was never
+// added (a freshly rendered capture) leaves the budget under-reporting itself.
+function lodSnapDiscard(made) {
+  if (!made || !made.canvas) return;
+  try {
+    made.canvas.width = 0;
+    made.canvas.height = 0;
+  } catch (e) {
+    /* dropping the reference is all that is left */
+  }
+  made.canvas = null;
+}
+
 function lodSnapDrop(node, why) {
   const rec = LOD.snaps && LOD.snaps.get(node);
   if (!rec) return null;
@@ -3861,19 +3912,42 @@ function lodSnapClear(reason) {
   if (reason) LOD.snapClears++;
 }
 
-function lodSnapEvict() {
+// Enforce the budget. `force` is for a user who has just lowered it: then the
+// number they picked wins, and even a bitmap in use is released (the node falls
+// back to its box, and captures stop until something goes cold). Without `force`
+// this only ever touches bitmaps nobody has looked at for LOD_SNAP_HOT_MS, which
+// is the whole point: evicting a picture that is on screen is what flicker is.
+function lodSnapEvict(force) {
   lodSnapEnsure();
   const budget = Math.max(1, Number(LOD.snapMb) || 1) * 1024 * 1024;
   if (LOD.snapBytes <= budget) return;
-  // Insertion order is reuse order: the front of the Map is the least recently
-  // used, which is the one to lose.
   for (const [node, rec] of LOD.snaps) {
     if (LOD.snapBytes <= budget) break;
     if (!rec.canvas) continue; // a record can exist before its bitmap does
+    if (!force && lodSnapProtected(rec)) continue; // in use: never released
     lodSnapRelease(rec);
     LOD.snaps.delete(node);
     LOD.snapEvicted++;
   }
+}
+
+// Is there room for `bytes` more? Frees cold bitmaps first (insertion order is
+// reuse order, so the front of the Map is the least recently *drawn*); if nothing
+// cold is available, the answer is no and the caller must not store anything.
+// Refusing a new capture is the stable outcome: the nodes already pictured keep
+// their pictures, and the ones that could not be captured simply stay boxes.
+function lodSnapMakeRoom(bytes) {
+  lodSnapEnsure();
+  const budget = Math.max(1, Number(LOD.snapMb) || 1) * 1024 * 1024;
+  for (const [node, rec] of LOD.snaps) {
+    if (LOD.snapBytes + bytes <= budget) return true;
+    if (!rec.canvas) continue;
+    if (lodSnapProtected(rec)) continue;
+    lodSnapRelease(rec);
+    LOD.snaps.delete(node);
+    LOD.snapEvicted++;
+  }
+  return LOD.snapBytes + bytes <= budget;
 }
 
 // The graph changes while the page is open; a record whose node is gone is dead
@@ -4013,13 +4087,27 @@ function lodSnapCaptureNode(node, canvas) {
     // expensive to run a second time, so it stays live for the session. Upstream
     // makes the same call at 32ms; the tooltip and memory.md say why this is 60.
     LOD.snapSlow++;
-    lodSnapRelease(made);
+    lodSnapDiscard(made);
     if (!rec) {
       rec = { sig: "", checkedAt: 0, bytes: 0, canvas: null };
       LOD.snaps.set(node, rec);
     }
     rec.blocked = true;
     rec.why = `slow capture (${Math.round(dt)}ms)`;
+    return false;
+  }
+  if (!lodSnapMakeRoom(made.bytes)) {
+    // The budget is full of bitmaps that are being looked at. Refusing is the
+    // honest answer: releasing one would take a picture off the screen, and
+    // recapturing it later would release another — which is exactly the flicker
+    // this guard exists to stop.
+    lodSnapDiscard(made);
+    LOD.snapFull++;
+    if (!rec) {
+      rec = { sig: "", checkedAt: 0, bytes: 0, canvas: null };
+      LOD.snaps.set(node, rec);
+    }
+    rec.budgetFullAt = nowMs();
     return false;
   }
   if (!rec) {
@@ -4036,13 +4124,18 @@ function lodSnapCaptureNode(node, canvas) {
   rec.sig = sig;
   rec.checkedAt = nowMs();
   rec.at = rec.checkedAt;
+  rec.usedFrame = LOD.snapFrame; // in use: the frame that asked for it
+  // The canvas's own shadow flag is remembered, not put in the signature: another
+  // extension (NodeSnapshots' "simplify during navigation") flips it around every
+  // gesture, and a signature that included it would throw every bitmap away
+  // twice a gesture. A mismatch only pauses reuse for that node.
+  rec.shadows = !!(canvas && canvas.render_shadows);
   rec.blocked = false;
   rec.failed = false;
   LOD.snaps.set(node, rec);
   LOD.snapBytes += rec.bytes;
   LOD.snapCaptured++;
   LOD.snapFailStreak = 0;
-  lodSnapEvict();
   return true;
 }
 
@@ -4111,6 +4204,9 @@ function lodSnapEnqueue(node, canvas) {
   lodSnapEnsure();
   const rec = LOD.snaps.get(node);
   if (rec && (rec.canvas || rec.blocked || rec.failed)) return;
+  // A node refused for budget waits: retrying it every slice would burn the lane
+  // and change nothing until something goes cold.
+  if (rec && Number.isFinite(rec.budgetFullAt) && nowMs() - rec.budgetFullAt < LOD_SNAP_HOLD_MS) return;
   if (LOD.snapQueue.has(node)) return;
   if (LOD.snapQueue.size >= LOD_SNAP_QUEUE_MAX) return;
   LOD.snapQueue.add(node);
@@ -4150,14 +4246,36 @@ function lodSnapPaint(node, canvas, ctx) {
       return false;
     }
   }
+  // The canvas's own shadow flag is compared, cheaply, on every reuse. If another
+  // extension has turned shadows off for the duration of a gesture, the picture
+  // (taken with them on) is not what the page is drawing right now: the box is
+  // honest, and the bitmap is kept rather than thrown away — so the gesture ends
+  // and the pictures are back without a single recapture.
+  if (rec.shadows !== !!(canvas && canvas.render_shadows)) {
+    LOD.snapFlagHeld++;
+    LOD.snapMisses++;
+    return false;
+  }
   ctx.shadowColor = "transparent"; // the image carries its own shadows
   ctx.globalAlpha = 1; // and its own alpha (a muted node was captured dimmed)
   ctx.drawImage(rec.canvas, rec.x, rec.y, rec.w, rec.h);
+  rec.usedFrame = LOD.snapFrame; // this frame is looking at it
   // Reuse order: the most recently used bitmap is the last to be evicted.
   LOD.snaps.delete(node);
   LOD.snaps.set(node, rec);
   LOD.snapDrawn++;
   return true;
+}
+
+// A node's picture came and went. Counted per node in a WeakMap rather than on the
+// record, so an eviction (which deletes the record) is still visible as the switch
+// it is: a high number here is the flicker a user reported, measured.
+function lodSnapNoteMode(node, mode) {
+  if (!node) return;
+  if (!LOD.snapModes) LOD.snapModes = new WeakMap();
+  const prev = LOD.snapModes.get(node);
+  if (prev && prev !== mode) LOD.snapFlips++;
+  LOD.snapModes.set(node, mode);
 }
 
 // --- 4. invalidation caller sampling ---------------------------------------
@@ -7175,7 +7293,9 @@ function buildTweaksTab(container) {
     "property, a very long string), for a node that is selected, hovered, broken, running or being dragged, and for a node whose own capture " +
     "took longer than " + LOD_SNAP_SLOW_MS + "ms — those stay live for the session. Anything that changes what a node draws changes its " +
     "signature, and a bitmap whose signature no longer matches is dropped, not shown. Panning and zooming deliberately do not invalidate " +
-    "anything: the camera moves, the node does not. Switching this off releases every stored bitmap immediately.";
+    "anything: the camera moves, the node does not. When the budget is full of pictures that are being drawn, new captures are refused " +
+    "rather than taking one of those away — the readout below counts both the refusals and any switch between picture and box, which is what " +
+    "visible flicker is. Switching this off releases every stored bitmap immediately.";
   snapSel.addEventListener("change", () => {
     lodSet({ snapshots: snapSel.value === "on" });
     lodUpdate();
@@ -7206,11 +7326,17 @@ function buildTweaksTab(container) {
   }
   snapMbSel.value = String(LOD.snapMb);
   snapMbSel.title =
-    "How much memory the stored bitmaps may hold. Least recently used pictures are released first, and releasing one zeroes the canvas it " +
-    "lives on, so the pixels go back to the browser rather than waiting for a collection. The readout below says what is actually held.";
+    "How much memory the stored bitmaps may hold. A picture that is being drawn is never released to make room: releasing one that is on " +
+    "screen is exactly what makes pictures and boxes flicker, so when the budget is full of pictures that are in use, new captures are " +
+    "simply refused (those nodes stay boxes) and the readout below counts them. What does get released are the pictures of nodes that have " +
+    "stopped being drawn for a couple of frames: nodes off screen, or a graph you have switched away from. Releasing zeroes the canvas, so " +
+    "the pixels go back to the browser rather than waiting for a collection. The ladder starts at 256 MiB because below that a large graph " +
+    "only thrashes (a 1,041-node graph at 256 MiB was measured capturing 7,040 times for 1,041 nodes, at the cap the whole time), and it " +
+    "stops at 2 GiB. What one picture costs: (node width + 48) x (node height + 78) x 4 bytes x ratio squared - a 200x100 node is about " +
+    "176 KB at 2x, a 1000x600 node about 4 MB - and this is canvas memory outside the JS heap, so the Memory tab, which reports the heap, " +
+    "cannot see it. The readout below says what is actually held.";
   snapMbSel.addEventListener("change", () => {
     lodSet({ snapMb: Number(snapMbSel.value) || 0 });
-    lodSnapEvict();
     lodUpdate();
   });
 
@@ -7584,6 +7710,21 @@ function buildTweaksTab(container) {
           if (LOD.snapLarge) parts.push(`${LOD.snapLarge} too large to capture`);
           if (LOD.snapInvalid) parts.push(`${LOD.snapInvalid} dropped after their node changed`);
           if (LOD.snapEvicted) parts.push(`${LOD.snapEvicted} released by the budget`);
+          if (LOD.snapFull) {
+            parts.push(
+              `${LOD.snapFull} capture(s) refused: the budget is full of bitmaps that are being looked at — releasing one of those is what ` +
+                `flicker looks like, so the lane stops instead (raise the budget for more pictures)`
+            );
+          }
+          if (LOD.snapFlagHeld) {
+            parts.push(`${LOD.snapFlagHeld} box(es) drawn while the canvas's shadow setting disagreed with the capture (reuse paused, pictures kept)`);
+          }
+          if (LOD.snapFlips > 0) {
+            parts.push(
+              `${LOD.snapFlips} switch(es) between picture and box so far — a high number here is visible flicker, and the reasons above say what ` +
+                `is causing it`
+            );
+          }
           if (LOD.snapRefused) parts.push(`${LOD.snapRefused} refused (DOM widget, function or very long string)`);
           if (LOD.snapPruned) parts.push(`${LOD.snapPruned} pruned (node left the graph)`);
           if (LOD.snapFailed) parts.push(`${LOD.snapFailed} capture(s) failed`);
@@ -10250,6 +10391,11 @@ function installDebugApi() {
             refused: LOD.snapRefused,
             pruned: LOD.snapPruned,
             clears: LOD.snapClears,
+            full: LOD.snapFull,
+            flagHeld: LOD.snapFlagHeld,
+            flips: LOD.snapFlips,
+            guardFrames: LOD_SNAP_GUARD_FRAMES,
+            frame: LOD.snapFrame,
             exclude: LOD.snapExclude.slice(),
             installed: lodSnapInstalled,
           };

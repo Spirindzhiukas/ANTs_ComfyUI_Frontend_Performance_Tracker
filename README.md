@@ -571,6 +571,52 @@ patches `drawImage` there, the same way a browser exposes it), and
 `createImageBitmap` records the resize it was asked to perform instead of
 resizing anything.
 
+## What changed in v2.3.1
+
+- **The flicker was the budget's eviction policy, and it is fixed.** A real report
+  from a 1,041-node graph showed 7,040 captures for 1,041 nodes with 255.6 MB held
+  of a 256 MiB budget — the cache thrashing at its cap. The old policy released
+  the *least recently used* bitmap; with the whole graph on screen every bitmap is
+  touched every frame, so "least recently used" meant "drawn earliest in this
+  frame", i.e. something visible. Each new capture therefore took a picture off
+  the screen, the node fell back to a box, got queued again, was captured, and
+  evicted another one. That loop is the flicker.
+- **A picture that is being drawn is now never released.** "In use" is measured in
+  *drawn frames*, not in milliseconds: a bitmap is in use while its node is being
+  drawn, and stops being protected a frame or two after it is not. When the budget
+  is full of in-use pictures, new captures are refused and the panel counts them
+  (`N capture(s) refused`); the nodes that could not be captured stay boxes, which
+  is stable. What makes room is pictures of nodes that have stopped being drawn —
+  off screen, or in a graph you switched away from.
+- **The budget ladder is 256 MiB → 2 GiB in the same doubling steps** (256, 512,
+  1024, 2048), with 512 MiB as the default. Everything below 256 MiB was removed:
+  nothing useful fit, and the thrashing above is what the old floor produced. A
+  saved or scripted value below the floor now lands on it. A budget you lower
+  yourself is enforced immediately, in-use pictures included — you asked for the
+  number. Note what this memory is: canvas surfaces outside the JS heap, which the
+  Memory tab (a heap report) cannot see, so the number stays one you pick.
+- **The canvas's own shadow flag left the per-node signature.** Another extension
+  (NodeSnapshots' "simplify live nodes during navigation") flips `render_shadows`
+  around every gesture, and hashing it meant throwing every bitmap in the cache
+  away twice a gesture. It is now compared cheaply at reuse time instead: a
+  mismatch pauses reuse for that node (the box is drawn, the picture kept), so
+  when the gesture ends the pictures are simply back, with no recapture.
+- **Two bugs found while fixing this, both by the new tests:** a refused or
+  too-slow capture subtracted its own size from the byte total it had never been
+  added to (the budget under-reported itself, and the slower path made it worse);
+  and a selection change used to invalidate a node's bitmap for no reason, since a
+  selected node is drawn live anyway.
+- **A flicker counter, so this is measurable rather than asserted.** The panel's
+  readout now counts every switch of a node between picture and box, plus the
+  refusals, the held-because-shadows-changed cases and what is held. A high
+  switch count is what the report above would have shown; after this change it
+  should stay near zero.
+- **New tests** (4): a full budget refuses captures instead of evicting what is on
+  screen, and does not spin; bitmaps nobody is drawing any more are what makes
+  room; the ladder is 256 MiB to 2 GiB with a floor that saved values land on; a
+  shadow-flag change pauses reuse and throws nothing away; and the flicker counter
+  counts a change of state.
+
 ## What changed in v2.3.0
 
 - **A flat box can now be a picture of the node it stands for.** New **node
@@ -605,12 +651,12 @@ resizing anything.
   there is input (pointer, wheel, key), and slice with a gap between them, so a
   thousand-node graph is captured over a second or two rather than in one
   visible pause. No second scheduler.
-- **Memory is bounded and given back.** The bitmap budget (default 64 MiB) is
-  enforced by least-recently-used eviction, and releasing a bitmap zeroes its
-  canvas so the pixels return to the browser. Bitmaps are also released when you
-  switch snapshots off, when the tool's master switch goes off, when the flatten
-  threshold goes to zero, when the graph's theme changes, and for nodes that
-  have left the graph.
+- **Memory is bounded and given back.** The bitmap budget (256 MiB to 2 GiB,
+  default 512 MiB since v2.3.1) is enforced by eviction, and releasing a bitmap
+  zeroes its canvas so the pixels return to the browser. Bitmaps are also
+  released when you switch snapshots off, when the tool's master switch goes off,
+  when the flatten threshold goes to zero, when the graph's theme changes, and
+  for nodes that have left the graph.
 - **Everything fails open.** A fault in the reuse path turns the feature off and
   paints boxes, with the reason in the panel's own error line; a fault in a
   capture blocks that node and, after five in a row, turns the feature off the
@@ -627,9 +673,10 @@ resizing anything.
   field shows that frozen frame; and zoomed in past the capture ratio a picture
   is softer than live drawing — which is why the ratio is a setting and why the
   nodes you are working with are never served from one.
-- The capture ratio (1x/2x/3x per graph unit) and the budget (32–256 MiB) are
-  provisional defaults: the next step measures hit rate, bytes and frame time on
-  real graphs and sets them from numbers (plan.md, Track K3).
+- The capture ratio (1x/2x/3x per graph unit) and the budget are provisional
+  defaults: the next step measures hit rate, bytes and frame time on real graphs
+  and sets them from numbers (plan.md, Track K3). The budget ladder changed in
+  v2.3.1, above, after the first real numbers arrived.
 - **New tests** (16): off by default (no captures, no canvases, no blits); an
   idle slice captures what was boxed and the next frame blits it, at the padded
   rect and the chosen ratio; nothing is captured while the page is being used;

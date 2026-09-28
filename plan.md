@@ -346,7 +346,12 @@ reuse fault path; the panel and API), plus a demo section and the `LIMITS`
 entries. The harness grew offscreen-canvas support for it (`createDocument({
 ctxFactory })`, `setTransform` recorded, `h.canvases`).
 
-**K2. Zoom-bucketed bitmaps, not a fixed capture scale (M) — NEXT.** The capture is
+**K2. Zoom-bucketed bitmaps, not a fixed capture scale (M) — NEXT.** Note from
+the first real report: at zoom 0.19 with everything on screen, per-zoom capture
+scaling matters less than getting *every* node a picture, and 2x already gives the
+page more detail than the frontend's own low-quality path at that zoom. K2's
+bucketing should be designed against that: it is about readable zooms (where the
+budget has room and the pictures are few), not about the ten-percent view. The capture is
 taken at the scale of the zoom bucket it will be used in, and reuse is one
 `drawImage` from that box to the on-screen one. At the flatten zooms a node is
 drawn into roughly a hundred by forty screen pixels, so a bitmap of that size is
@@ -361,8 +366,17 @@ accounting rather than adding a second cache with a second budget.
 *Numbers here are estimates to be confirmed by K3, not figures to put in the
 panel.*
 
-**K3. Prove it, then set the default (M).** The memory budget is a knob; the
-default comes from measurement on real workflows, as agreed. The panel reports
+**K3. Prove it, then set the default (M) — PARTLY DELIVERED in v2.3.1.** The
+first real report arrived after K1 shipped (1,041 nodes, zoom 0.19, 256 MiB
+budget): 7,040 captures for 1,041 nodes, 255.6 MB held at the cap, 156,393 draws
+served from pictures — and visible flicker, which the numbers identify as eviction
+churn. Fixed in v2.3.1 (frame-based "in use", refuse-don't-evict, ladder 256 MiB →
+2 GiB), and the panel now counts refusals and picture/box switches so the next
+report can confirm it instead of describing it. Still open for the rest of K3:
+hit rate against graph size, whether the ratio default should be 2, and the
+per-zoom frame-time A/B on a real graph (the report gives the shape but not the
+A/B: node drawing 2.06 ms/frame and connections 26.5 ms/frame at 0.19 zoom). The
+memory budget is a knob; the default comes from measurements like this one. The panel reports
 what the cache actually did, in the same units as everything else: reuse hit
 rate, misses by reason (no capture yet, signature changed, too slow, excluded
 type, over budget), bytes held, capture-time distribution — and the same A/B the

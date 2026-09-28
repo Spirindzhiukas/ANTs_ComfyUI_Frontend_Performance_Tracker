@@ -402,14 +402,15 @@ const blits = h.canvas.ctx.ops.filter((o) => o[0] === "drawImage").length;
 const snapsAfter = h.tracker.lowZoom.snapshots;
 const d2 = (k) => snapsAfter[k] - snaps[k]; // that one frame, not the whole run
 console.log(
-  `  node snapshots: ${d("captured")} node(s) captured off the frame clock, in ${d("captureMs").toFixed(1)}ms of this tool's own work ` +
+  `  node snapshots: ${snaps.refused} node(s) refused for good (a DOM widget or a function-valued property cannot be pictured), ` +
+    `${snaps.slow} blocked as too slow to capture; ${d("captured")} node(s) captured off the frame clock, in ${d("captureMs").toFixed(1)}ms of this tool's own work ` +
     `(a capture runs the packs' hooks but does not attribute their time to them), ${(snaps.bytes / 1024).toFixed(0)} KB held inside a ` +
     `${snaps.budgetMb} MiB budget at ${snaps.ratio}x per graph unit`
 );
 console.log(
   `  and the next frame: ${blits} of ${flatNodes} flat node(s) came back as one drawImage each — ${d2("drawn")} reuse(s) counted in it, ` +
-    `${d2("misses")} box(es) painted because no picture of that node was ready, ${snaps.refused} node(s) refused for good ` +
-    `(the canvas cannot own a DOM widget or a function-valued property), ${snaps.slow} blocked as too slow to capture`
+    `${d2("misses")} box(es) painted because no picture of that node was ready, ${d2("flips")} switch(es) between picture and box in that frame ` +
+    `(the flicker counter), ${d2("full")} capture(s) refused for budget`
 );
 h.tracker.lowZoom.set({ snapshots: false, idleCapMs: 500 });
 demoNodes[0].has_errors = false;
