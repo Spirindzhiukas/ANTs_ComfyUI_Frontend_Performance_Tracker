@@ -27,7 +27,7 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.3.1";
+const VERSION = "2.4.0";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
 const NODE_NAME = "ANTsNastyBastardsTracker";
 
@@ -895,10 +895,18 @@ const LOD = {
   snapMs: 0, // time spent inside captures — this tool's cost, kept out of the frame lanes
   snapSlow: 0, // nodes blocked because their own capture was too slow
   snapFailed: 0, // captures that threw
-  snapLarge: 0, // nodes skipped because the bitmap would be too big
+  snapLarge: 0, // nodes left as boxes: too big for a capture at any ratio
   snapEvicted: 0,
   snapInvalid: 0, // bitmaps dropped because the node changed
-  snapRefused: 0, // nodes that can never be captured (DOM widgets, functions)
+  snapKept: 0, // kept live on purpose: this tool's own node, a type you excluded
+  snapPartial: 0, // pictures that are the canvas part only (the browser draws the rest)
+  snapFit: 0, // captures made coarser than your ratio so they fit the size cap
+  snapCoarse: 0, // captures made coarser than your ratio because the budget was full
+  snapChurn: 0, // nodes left as boxes: they changed on every attempt
+  snapBlank: 0, // nodes whose own draw leaves the canvas empty: nothing to photograph
+  snapDrops: null, // WeakMap<node, drops since it was last drawn from a picture>
+  snapWhy: null, // [{type, title, why}] — the names behind those counters
+  snapWhySeen: null, // WeakSet<node>, so one node is named once
   snapPruned: 0, // records dropped because their node left the graph
   snapClears: 0, // whole-cache clears (theme change, off, threshold gone)
   snapFull: 0, // captures skipped: the budget was full of bitmaps still in use
@@ -1037,6 +1045,15 @@ const LOD_BOX_PROGRESS_PX = 3; // a bar is at least this tall in CSS pixels
 //     node's: the hooks run, but the attribution wrapper steps aside while
 //     `inCapture` is set. Otherwise a capture would show up in the Timing tab as
 //     the pack being slow, which would be a lie.
+//   * *every* node the canvas draws gets a picture, not just the ones upstream
+//     trusts (v2.4.0). A DOM widget or an image preview is drawn by the browser
+//     over the node, so the picture is the canvas part and the readout counts
+//     those pictures apart; a node that draws nothing into a canvas at all is
+//     caught by a five-patch ink probe and keeps its box, because a transparent
+//     picture would erase it. A tall node is captured at the largest ratio that
+//     fits the dimension cap instead of being skipped. A node whose drawing
+//     changes before every picture can be drawn keeps its box (the churn guard),
+//     and the readout names it — that name is the actionable part.
 // The ratio and the budget are provisional: the plan measures before fixing them
 // (K3), and the numbers are in the panel rather than in a claim.
 const LOD_SNAP_RATIOS = [1, 2, 3]; // capture pixels per graph unit
@@ -1064,7 +1081,7 @@ const LOD_SNAP_HOLD_MS = 5000;
 const LOD_SNAP_PAD = 24; // graph units of margin around the node, so hooks that
 // draw outside the body (selection rings, glow) are not cut off
 const LOD_SNAP_TITLE_H = 30; // graph units above the body: LiteGraph's title bar
-const LOD_SNAP_MAX_DIM = 2048; // px; a bigger capture is skipped, node stays live
+const LOD_SNAP_MAX_DIM = 2048; // px; a capture is fitted down to this, or the node stays a box
 const LOD_SNAP_SLOW_MS = 60; // a slower capture blocks that node for the session
 const LOD_SNAP_SIG_MS = 100; // a signature is re-checked at most this often
 const LOD_SNAP_IDLE_MS = 400; // input within this many ms stops the capture lane
@@ -1072,6 +1089,17 @@ const LOD_SNAP_GAP_MS = 200; // between capture slices
 const LOD_SNAP_QUEUE_MAX = 4096; // candidates remembered at once
 const LOD_SNAP_FAIL_MAX = 5; // capture failures in a row before the mode gives up
 const LOD_SNAP_TYPES_MAX = 64; // never-snapshot type list cap (a policy, not a dump)
+// A node whose picture is thrown away before it has ever been drawn from, again
+// and again, is a node whose drawing changes faster than the idle lane can
+// re-photograph it (a poller writing widget values, for instance). Three strikes
+// and it keeps its box for the session — and the readout names it, which is the
+// one thing a box cannot say for itself.
+const LOD_SNAP_CHURN_MAX = 3;
+// How many nodes the readout may name as "not pictured, and why".
+const LOD_SNAP_WHY_MAX = 6;
+// Images a node draws into itself are part of its picture; the walk is capped
+// because a node with a hundred of them is not worth a hundred field reads.
+const LOD_SNAP_IMGS_MAX = 8;
 const LOD_IDLE_CAP_MS = [0, 250, 500, 1000];
 const LOD_IDLE_INPUT_MS = 400; // how long one touch keeps the cap lifted
 // Zoom levels at which previews may be served from a thumbnail.
@@ -3673,43 +3701,138 @@ function lodSnapLive(node, canvas) {
   return false;
 }
 
-// Can this node ever be a bitmap? The honest answer is "not if the browser draws
-// part of it" — a DOM widget is an element, not canvas ink, and nothing here can
-// know when a function-valued widget or property changes what a node draws. This
-// is upstream's own conservative line, kept deliberately: the improvement is a
-// per-type override the user can set (snapExclude in reverse is not offered yet —
-// K3 measures which types are worth it), not cleverer guessing.
-function lodSnapCacheable(node) {
+// Can this node be photographed at all — and if not, why not? Only two answers
+// keep a node live on purpose now: this tool's own node, and a type the user asked
+// to keep live. Everything else the canvas draws is captured.
+//
+// This is deliberately *less* conservative than the tool this feature learned from
+// (ComfyUI-NodeSnapshots keeps a node with a DOM widget, a function-valued value
+// or a very long string live for good — and its own issue #1 is the report that
+// custom nodes then never get a picture). A DOM widget or an image preview is
+// drawn by the browser *over* the node, so the picture is the canvas part — the
+// frame, the title, the slots, and whatever the canvas still draws — and the
+// readout counts those pictures separately. A very long string only ever made the
+// signature dearer to hash, which is a hashing problem, not an honest reason to
+// keep a node live; and a `custom` widget is canvas ink by definition. What a node
+// does with a value somebody rewrites under us is the churn guard's business.
+function lodSnapKeepLive(node) {
   try {
-    if (!node) return false;
-    if (node.type === NODE_NAME) return false; // this tool's own node stays live
+    if (!node) return "";
+    if (node.type === NODE_NAME) return "this tool's own node";
     const type = node.type || node.comfyClass;
-    if (type && LOD.snapExclude.indexOf(String(type)) >= 0) return false;
-    const widgets = node.widgets;
-    if (widgets) {
-      for (let i = 0; i < widgets.length; i++) {
-        const w = widgets[i];
-        if (!w) continue;
-        if (w.element) return false; // rendered by the browser, not by the canvas
-        if (w.type === "dom" || w.type === "custom") return false;
-        const v = w.value;
-        if (typeof v === "function") return false;
-        if (typeof v === "string" && v.length > 4096) return false;
-      }
-    }
-    const props = node.properties;
-    if (props) {
-      for (const k in props) {
-        if (!Object.prototype.hasOwnProperty.call(props, k)) continue;
-        const v = props[k];
-        if (typeof v === "function") return false;
-        if (typeof v === "string" && v.length > 4096) return false;
-      }
-    }
-    return true;
+    if (type && LOD.snapExclude.indexOf(String(type)) >= 0) return `kept live by your list (${type})`;
   } catch (e) {
-    return false;
+    /* an unreadable node is captured, and fails there where the panel can count it */
   }
+  return "";
+}
+
+// Is part of this node drawn by the browser instead of the canvas? The picture is
+// then the canvas part only, and the readout says so out loud: a picture with a
+// blank where an image preview sits is still a better stand-in than a rectangle.
+function lodSnapPartial(node) {
+  const widgets = node && node.widgets;
+  if (!widgets) return false;
+  for (let i = 0; i < widgets.length; i++) {
+    const w = widgets[i];
+    if (!w) continue;
+    if (w.element) return true; // an element drawn over the node
+    if (w.type === "dom") return true; // the frontend's own DOM-widget marker
+  }
+  return false;
+}
+
+// The padded rectangle a capture covers, in graph units, and the body the node
+// itself reports. Position and zoom are deliberately absent: they are the camera,
+// not the node.
+function lodSnapGeometry(node) {
+  const size = node && (node.renderingSize || node.size);
+  if (!size) return null;
+  const w = Math.abs(Number(size[0])) || 0;
+  const h = Math.abs(Number(size[1])) || 0;
+  if (!(w > 0) || !(h > 0)) return null;
+  return {
+    x: -LOD_SNAP_PAD,
+    y: -LOD_SNAP_TITLE_H - LOD_SNAP_PAD,
+    w: w + LOD_SNAP_PAD * 2,
+    h: h + LOD_SNAP_TITLE_H + LOD_SNAP_PAD * 2,
+    bodyW: w,
+    bodyH: h,
+  };
+}
+
+// The largest ratio on the ladder that keeps the capture inside the dimension cap,
+// never more than the user asked for. A tall node used to be skipped outright
+// (upstream's behaviour, and this tool's until v2.3.1, where it was re-attempted
+// on every slice). At 10% zoom a node captured at 1x still has ten times the
+// pixels the screen shows, so fitting it is worth far more than skipping it, and
+// the readout counts how many were fitted. 0 means no ratio fits: too big.
+function lodSnapFitRatio(geom, want) {
+  const ratio = Math.max(1, Math.min(4, Number(want) || 1));
+  const longest = Math.max(geom.w, geom.h);
+  if (!(longest > 0)) return 0;
+  for (let i = LOD_SNAP_RATIOS.length - 1; i >= 0; i--) {
+    const r = LOD_SNAP_RATIOS[i];
+    if (r > ratio) continue;
+    if (Math.ceil(longest * r) <= LOD_SNAP_MAX_DIM) return r;
+  }
+  return 0;
+}
+
+function lodSnapBytesFor(geom, ratio) {
+  return Math.ceil(geom.w * ratio) * Math.ceil(geom.h * ratio) * 4;
+}
+
+// One record, marked so the node is never attempted again this session, plus the
+// reason. Six different answers end here, so they end here in one place.
+function lodSnapBlockNode(node, rec, why) {
+  let r = rec;
+  if (!r) {
+    r = { sig: "", checkedAt: 0, bytes: 0, canvas: null };
+    LOD.snaps.set(node, r);
+  }
+  r.blocked = true;
+  r.why = why;
+  return r;
+}
+
+// The names behind the "not pictured" counters. A count says how many; the name
+// says *which*, and at a thousand nodes that is the difference between a number
+// the user cannot act on and one they can.
+function lodSnapNoteWhy(node, why) {
+  try {
+    if (!LOD.snapWhySeen) LOD.snapWhySeen = new WeakSet();
+    if (!LOD.snapWhy) LOD.snapWhy = [];
+    if (LOD.snapWhySeen.has(node)) return;
+    LOD.snapWhySeen.add(node);
+    if (LOD.snapWhy.length >= LOD_SNAP_WHY_MAX) return;
+    LOD.snapWhy.push({
+      type: String(node.type || node.comfyClass || "?"),
+      title: String(node.title || ""),
+      why: String(why),
+    });
+  } catch (e) {
+    /* naming a node is never worth a fault */
+  }
+}
+
+// How much of what this mode remembered actually has a picture right now — the
+// number a user is really asking for when they ask how far it got. Walked on the
+// readout's own clock, never per frame.
+function lodSnapPictured() {
+  let n = 0;
+  if (LOD.snaps) {
+    for (const [, rec] of LOD.snaps) if (rec.canvas) n++;
+  }
+  return n;
+}
+
+// The names behind the counters, for the panel and the copied report.
+function lodSnapWhyText() {
+  if (!LOD.snapWhy || !LOD.snapWhy.length) return "";
+  const names = LOD.snapWhy.map((e) => `"${e.title || e.type}" (${e.why})`);
+  const more = LOD.snapWhy.length >= LOD_SNAP_WHY_MAX ? ", and the counters above have the rest" : "";
+  return `not pictured: ${names.join(", ")}${more}`;
 }
 
 // Everything that changes what a node draws, hashed without allocating. Upstream
@@ -3733,10 +3856,27 @@ function lodSnapSignature(node, canvas) {
     if (Number.isFinite(n)) mix(Math.round(n * 100));
     else mix(0);
   };
+  // A long string is hashed by its length and its two ends: the head because that
+  // is the part a node's canvas actually draws (a text widget is clipped to its
+  // row), and the tail because that is where a growing payload changes. Walking a
+  // 40 kB data URL or a serialized link graph in full on every re-check was the
+  // real reason this tool used to refuse such nodes outright; refusing was never
+  // about the picture.
   const str = (v) => {
     const s = v == null ? "" : String(v);
     mix(s.length);
-    for (let i = 0; i < s.length; i++) {
+    if (s.length <= 512) {
+      for (let i = 0; i < s.length; i++) {
+        h ^= s.charCodeAt(i);
+        h = Math.imul(h, 16777619);
+      }
+      return;
+    }
+    for (let i = 0; i < 256; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    for (let i = s.length - 64; i < s.length; i++) {
       h ^= s.charCodeAt(i);
       h = Math.imul(h, 16777619);
     }
@@ -3782,11 +3922,30 @@ function lodSnapSignature(node, canvas) {
       const v = w.value;
       if (typeof v === "number") num(v);
       else if (typeof v === "boolean") flag(v);
-      else if (typeof v === "string") str(v.length <= 256 ? v : v.slice(0, 256) + "…");
+      else if (typeof v === "string") str(v);
+      else if (typeof v === "function") str(Function.prototype.toString.call(v));
       else str(v === undefined || v === null ? "" : "[object]");
       flag(w.disabled);
       flag(w.hidden);
       str(w.options && w.options.values ? "enum" : "");
+    }
+  }
+
+  // Images a node draws into itself are not widget values, but they *are* what its
+  // picture shows: an image node photographed before its image loaded would keep
+  // an empty frame in the picture for as long as the signature matched. `complete`
+  // is the moment the drawing changes, and the source is hashed by its ends (a
+  // data URL is long, and its ends are what differ).
+  const imgs = node.imgs || node.images;
+  if (imgs && imgs.length) {
+    mix(imgs.length);
+    const imax = Math.min(imgs.length, LOD_SNAP_IMGS_MAX);
+    for (let i = 0; i < imax; i++) {
+      const im = imgs[i];
+      flag(im && im.complete);
+      num(im && (im.naturalWidth || im.width));
+      num(im && (im.naturalHeight || im.height));
+      str(im && (im.currentSrc || im.src));
     }
   }
 
@@ -3909,6 +4068,11 @@ function lodSnapClear(reason) {
   LOD.snapQueue.clear();
   LOD.snapBytes = 0;
   LOD.snapPumping = false;
+  // A cleared cache is a fresh start for the bookkeeping too: which nodes were
+  // left as boxes, and why, is about the bitmaps that no longer exist.
+  LOD.snapDrops = null;
+  LOD.snapWhy = null;
+  LOD.snapWhySeen = null;
   if (reason) LOD.snapClears++;
 }
 
@@ -3936,18 +4100,26 @@ function lodSnapEvict(force) {
 // cold is available, the answer is no and the caller must not store anything.
 // Refusing a new capture is the stable outcome: the nodes already pictured keep
 // their pictures, and the ones that could not be captured simply stay boxes.
-function lodSnapMakeRoom(bytes) {
+//
+// `dry` answers the same question without releasing anything, so the capture path
+// can decide *which size to draw* before drawing it: that is the difference
+// between a coarse picture and none at all, and the reason a node that cannot be
+// held at the user's ratio is still offered the coarsest one that does fit.
+function lodSnapMakeRoom(bytes, dry) {
   lodSnapEnsure();
   const budget = Math.max(1, Number(LOD.snapMb) || 1) * 1024 * 1024;
+  let held = Math.max(0, Number(LOD.snapBytes) || 0);
   for (const [node, rec] of LOD.snaps) {
-    if (LOD.snapBytes + bytes <= budget) return true;
+    if (held + bytes <= budget) return true;
     if (!rec.canvas) continue;
     if (lodSnapProtected(rec)) continue;
+    held -= Number(rec.bytes) || 0;
+    if (dry) continue;
     lodSnapRelease(rec);
     LOD.snaps.delete(node);
     LOD.snapEvicted++;
   }
-  return LOD.snapBytes + bytes <= budget;
+  return held + bytes <= budget;
 }
 
 // The graph changes while the page is open; a record whose node is gone is dead
@@ -3972,24 +4144,51 @@ function lodSnapPrune(canvas) {
 // touches the visible canvas, so there is no state to hand back afterwards — the
 // only shared state is the canvas object the node's draw code reads (its scale,
 // its quality flag), and that is put back in a `finally`.
-function lodSnapRender(node, canvas) {
-  if (!lodSnapOriginalDrawNode) return null;
-  const size = node.renderingSize || node.size;
-  if (!size) return null;
-  const w = Math.abs(Number(size[0])) || 0;
-  const h = Math.abs(Number(size[1])) || 0;
-  if (!(w > 0) || !(h > 0)) return null;
-  const ratio = Math.max(1, Math.min(4, Number(LOD.snapRatio) || 1));
-  const x = -LOD_SNAP_PAD;
-  const y = -LOD_SNAP_TITLE_H - LOD_SNAP_PAD;
-  const bw = w + LOD_SNAP_PAD * 2;
-  const bh = h + LOD_SNAP_TITLE_H + LOD_SNAP_PAD * 2;
-  const px = Math.ceil(bw * ratio);
-  const py = Math.ceil(bh * ratio);
-  if (px > LOD_SNAP_MAX_DIM || py > LOD_SNAP_MAX_DIM) {
-    LOD.snapLarge++;
-    return null;
+// Does this capture have anything in it? A node whose whole visual is a DOM
+// element can draw nothing at all into a canvas, and a transparent picture would
+// make that node *vanish* at the zoom where pictures are used — worse than the box
+// it replaces. Reading the bitmap back would cost megabytes and a walk over
+// millions of pixels per node, so this reads five small patches instead: the
+// corners of the body, its centre, and the title bar. Anything unmeasurable (no
+// getImageData, a tainted canvas, a probe that throws) answers "there is ink":
+// this probe must never be the reason a node disappears.
+function lodSnapInk(el, geom, ratio) {
+  try {
+    const cctx = el && typeof el.getContext === "function" ? el.getContext("2d") : null;
+    if (!cctx || typeof cctx.getImageData !== "function") return true;
+    const r = Math.max(1, Number(ratio) || 1);
+    const bodyX = -geom.x * r;
+    const bodyY = -geom.y * r;
+    const bodyW = geom.bodyW * r;
+    const bodyH = geom.bodyH * r;
+    const spots = [
+      [bodyX + 2, bodyY + 2],
+      [bodyX + Math.max(0, bodyW - 10), bodyY + 2],
+      [bodyX + Math.max(0, bodyW - 10), bodyY + Math.max(0, bodyH - 10)],
+      [bodyX + Math.max(0, bodyW / 2 - 4), bodyY + Math.max(0, bodyH / 2 - 4)],
+      [bodyX + Math.max(0, bodyW / 2 - 4), bodyY - LOD_SNAP_TITLE_H * r + 6],
+    ];
+    for (let i = 0; i < spots.length; i++) {
+      const x = Math.max(0, Math.round(spots[i][0]));
+      const y = Math.max(0, Math.round(spots[i][1]));
+      const data = cctx.getImageData(x, y, 8, 8);
+      const pix = data && data.data;
+      if (!pix) continue;
+      for (let p = 3; p < pix.length; p += 4) {
+        if (pix[p] > 8) return true;
+      }
+    }
+    return false;
+  } catch (e) {
+    return true;
   }
+}
+
+function lodSnapRender(node, canvas, geom, ratio) {
+  if (!lodSnapOriginalDrawNode || !geom) return null;
+  const r = Math.max(1, Number(ratio) || 1);
+  const px = Math.ceil(geom.w * r);
+  const py = Math.ceil(geom.h * r);
   const doc = typeof document !== "undefined" ? document : null;
   if (!doc || typeof doc.createElement !== "function") return null;
   const el = doc.createElement("canvas");
@@ -3998,10 +4197,10 @@ function lodSnapRender(node, canvas) {
   el.height = py;
   const cctx = el.getContext("2d");
   if (!cctx) return null;
-  if (typeof cctx.setTransform === "function") cctx.setTransform(ratio, 0, 0, ratio, -x * ratio, -y * ratio);
+  if (typeof cctx.setTransform === "function") cctx.setTransform(r, 0, 0, r, -geom.x * r, -geom.y * r);
   else if (typeof cctx.scale === "function") {
-    cctx.scale(ratio, ratio);
-    if (typeof cctx.translate === "function") cctx.translate(-x, -y);
+    cctx.scale(r, r);
+    if (typeof cctx.translate === "function") cctx.translate(-geom.x, -geom.y);
   }
 
   const ds = canvas && canvas.ds;
@@ -4025,7 +4224,7 @@ function lodSnapRender(node, canvas) {
     if (canvas && prevLow !== undefined && "_isLowQuality" in canvas) canvas._isLowQuality = prevLow;
     if (canvas && prevCurrent !== undefined) canvas.current_node = prevCurrent;
   }
-  return { canvas: el, x, y, w: bw, h: bh, bytes: px * py * 4 };
+  return { canvas: el, x: geom.x, y: geom.y, w: geom.w, h: geom.h, ratio: r, bytes: px * py * 4 };
 }
 
 function lodSnapAbort(reason) {
@@ -4051,22 +4250,61 @@ function lodSnapCaptureNode(node, canvas) {
   lodSnapEnsure();
   let rec = LOD.snaps.get(node);
   if (rec && (rec.canvas || rec.blocked || rec.failed)) return false;
-  if (!lodSnapCacheable(node)) {
+  const whyLive = lodSnapKeepLive(node);
+  if (whyLive) {
+    lodSnapBlockNode(node, rec, whyLive);
+    LOD.snapKept++;
+    lodSnapNoteWhy(node, whyLive);
+    return false;
+  }
+  if (lodSnapLive(node, canvas)) return false; // nothing to capture: it is being drawn live
+  const geom = lodSnapGeometry(node);
+  if (!geom) return false;
+  const want = Math.max(1, Math.min(4, Number(LOD.snapRatio) || 1));
+  const fit = lodSnapFitRatio(geom, want);
+  if (!fit) {
+    // No ratio on the ladder keeps this node inside the dimension cap: it is
+    // bigger than any picture this cache is allowed to hold. Blocked, so it is not
+    // re-attempted on every slice for the rest of the session, and named in the
+    // readout — a count of attempts told the user nothing about which node it was.
+    lodSnapBlockNode(node, rec, `too big for a ${LOD_SNAP_MAX_DIM}px capture`);
+    LOD.snapLarge++;
+    lodSnapNoteWhy(node, `too big (${Math.round(geom.bodyH)} units tall)`);
+    return false;
+  }
+  // Which ratio actually gets drawn: the one that fits the cap, and — if the
+  // budget cannot hold *that* — the coarsest one that does, rather than nothing. A
+  // refused capture still costs the node's whole draw and is then thrown away, so
+  // "coarser" is the cheaper answer as well as the more useful one. Only if even
+  // the coarsest cannot be held is the capture refused.
+  let ratio = fit;
+  let bytes = lodSnapBytesFor(geom, ratio);
+  let coarse = false;
+  if (!lodSnapMakeRoom(bytes, true) && ratio > LOD_SNAP_RATIOS[0]) {
+    const small = lodSnapBytesFor(geom, LOD_SNAP_RATIOS[0]);
+    if (lodSnapMakeRoom(small, true)) {
+      ratio = LOD_SNAP_RATIOS[0];
+      bytes = small;
+      coarse = true;
+    }
+  }
+  if (!lodSnapMakeRoom(bytes, true)) {
+    // The budget is full of bitmaps that are being looked at, and not even the
+    // coarsest copy fits. Refusing is still the honest answer: releasing a picture
+    // that is on screen is what flicker looks like.
+    LOD.snapFull++;
     if (!rec) {
       rec = { sig: "", checkedAt: 0, bytes: 0, canvas: null };
       LOD.snaps.set(node, rec);
     }
-    rec.blocked = true;
-    rec.why = "refused";
-    LOD.snapRefused++;
+    rec.budgetFullAt = nowMs();
     return false;
   }
-  if (lodSnapLive(node, canvas)) return false; // nothing to capture: it is being drawn live
   const sig = lodSnapSignature(node, canvas);
   const t0 = nowMs();
   let made = null;
   try {
-    made = lodSnapRender(node, canvas);
+    made = lodSnapRender(node, canvas, geom, ratio);
   } catch (err) {
     LOD.snapFailed++;
     LOD.snapFailStreak++;
@@ -4080,20 +4318,35 @@ function lodSnapCaptureNode(node, canvas) {
     return false;
   }
   const dt = nowMs() - t0;
-  LOD.snapMs += dt;
-  if (!made) return false; // too large, or no canvas support: counted where it happened
+  if (!made) {
+    LOD.snapMs += dt; // no canvas support in this environment: nothing to count
+    return false;
+  }
   if (dt > LOD_SNAP_SLOW_MS) {
+    LOD.snapMs += dt;
     // One slow capture is enough evidence: this node's own draw path is too
     // expensive to run a second time, so it stays live for the session. Upstream
     // makes the same call at 32ms; the tooltip and memory.md say why this is 60.
     LOD.snapSlow++;
     lodSnapDiscard(made);
-    if (!rec) {
-      rec = { sig: "", checkedAt: 0, bytes: 0, canvas: null };
-      LOD.snaps.set(node, rec);
-    }
-    rec.blocked = true;
-    rec.why = `slow capture (${Math.round(dt)}ms)`;
+    lodSnapBlockNode(node, rec, `slow capture (${Math.round(dt)}ms)`);
+    lodSnapNoteWhy(node, `too slow to photograph (${Math.round(dt)}ms)`);
+    return false;
+  }
+  // The probe is this tool's own cost like the draw is, so it lands in the same
+  // counter; it is deliberately *not* part of the slow-capture verdict above,
+  // which is a judgement about the node's draw path.
+  const ink = lodSnapInk(made.canvas, geom, ratio);
+  LOD.snapMs += nowMs() - t0;
+  if (!ink) {
+    // The node drew nothing the canvas can keep (its whole visual is a DOM
+    // element). A transparent picture would erase the node on screen, so the box
+    // — which at least draws the node's own rectangle — stays, and the readout
+    // says why.
+    lodSnapDiscard(made);
+    lodSnapBlockNode(node, rec, "drew nothing into the canvas");
+    LOD.snapBlank++;
+    lodSnapNoteWhy(node, "draws nothing into the canvas (all DOM)");
     return false;
   }
   if (!lodSnapMakeRoom(made.bytes)) {
@@ -4130,13 +4383,35 @@ function lodSnapCaptureNode(node, canvas) {
   // gesture, and a signature that included it would throw every bitmap away
   // twice a gesture. A mismatch only pauses reuse for that node.
   rec.shadows = !!(canvas && canvas.render_shadows);
+  rec.ratio = made.ratio;
   rec.blocked = false;
   rec.failed = false;
   LOD.snaps.set(node, rec);
   LOD.snapBytes += rec.bytes;
   LOD.snapCaptured++;
   LOD.snapFailStreak = 0;
+  if (coarse) LOD.snapCoarse++;
+  else if (made.ratio < want) LOD.snapFit++;
+  if (lodSnapPartial(node)) LOD.snapPartial++;
   return true;
+}
+
+// A picture thrown away because the node changed before it could be used. A node
+// that does this every single time is a node whose drawing is being rewritten
+// faster than the idle lane can photograph it — a poller writing widget values,
+// for instance — and it keeps its box instead of costing a capture per slice for
+// the rest of the session. The counter lives on the node, not on the record, so it
+// survives the record being dropped (it is reset by a successful reuse, which is
+// what "the lane is keeping up" looks like).
+function lodSnapNoteDrop(node) {
+  if (!LOD.snapDrops) LOD.snapDrops = new WeakMap();
+  const n = (Number(LOD.snapDrops.get(node)) || 0) + 1;
+  LOD.snapDrops.set(node, n);
+  return n;
+}
+
+function lodSnapNoteReuse(node) {
+  if (LOD.snapDrops && LOD.snapDrops.get(node)) LOD.snapDrops.set(node, 0);
 }
 
 function lodSnapSchedule(delay) {
@@ -4242,7 +4517,16 @@ function lodSnapPaint(node, canvas, ctx) {
       lodSnapDrop(node, "changed");
       LOD.snapInvalid++;
       LOD.snapMisses++;
-      lodSnapEnqueue(node, canvas); // and ask for a fresh one
+      if (lodSnapNoteDrop(node) >= LOD_SNAP_CHURN_MAX) {
+        // Three pictures in a row were out of date before anyone saw them: this
+        // node's drawing is being rewritten faster than the lane can photograph
+        // it, so it keeps its box and the readout names it.
+        lodSnapBlockNode(node, null, "changed before it was drawn, every time");
+        LOD.snapChurn++;
+        lodSnapNoteWhy(node, `kept changing (${LOD_SNAP_CHURN_MAX} pictures dropped)`);
+      } else {
+        lodSnapEnqueue(node, canvas); // and ask for a fresh one
+      }
       return false;
     }
   }
@@ -4264,6 +4548,7 @@ function lodSnapPaint(node, canvas, ctx) {
   LOD.snaps.delete(node);
   LOD.snaps.set(node, rec);
   LOD.snapDrawn++;
+  lodSnapNoteReuse(node); // it made it to the screen: the lane is keeping up
   return true;
 }
 
@@ -7288,14 +7573,17 @@ function buildTweaksTab(container) {
   snapSel.value = LOD.snapOn ? "on" : "off";
   snapSel.title =
     "Paint a flat box as a bitmap of the node it stands for, captured once while the page is idle, instead of a plain rectangle. It only ever " +
-    "replaces a box: the flatten setting above decides which nodes stop being drawn in full, and this can never change that. A snapshot is " +
-    "refused for any node whose drawing the page cannot hand over as canvas ink (a widget that is a DOM element, a function-valued widget or " +
-    "property, a very long string), for a node that is selected, hovered, broken, running or being dragged, and for a node whose own capture " +
-    "took longer than " + LOD_SNAP_SLOW_MS + "ms — those stay live for the session. Anything that changes what a node draws changes its " +
-    "signature, and a bitmap whose signature no longer matches is dropped, not shown. Panning and zooming deliberately do not invalidate " +
-    "anything: the camera moves, the node does not. When the budget is full of pictures that are being drawn, new captures are refused " +
-    "rather than taking one of those away — the readout below counts both the refusals and any switch between picture and box, which is what " +
-    "visible flicker is. Switching this off releases every stored bitmap immediately.";
+    "replaces a box: the flatten setting above decides which nodes stop being drawn in full, and this can never change that. Every node the " +
+    "canvas draws is captured, including the ones other tools refuse: a widget that is a DOM element, an image preview or a custom widget means " +
+    "the picture is the canvas part only (the browser draws the rest over the node), and the readout counts those. A node whose own draw leaves " +
+    "the canvas empty keeps its box instead — a transparent picture would erase it — as does a node that is selected, hovered, broken, " +
+    "running or being dragged, one whose own capture took longer than " + LOD_SNAP_SLOW_MS + "ms, one too big for a " + LOD_SNAP_MAX_DIM +
+    "px capture at any ratio, and one whose drawing changes before every picture can be drawn (the churn guard). The readout names them, which " +
+    "is more use than the count. Anything else that changes what a node draws changes its signature, and a bitmap whose signature no longer " +
+    "matches is dropped, not shown. Panning and zooming deliberately do not invalidate anything: the camera moves, the node does not. When the " +
+    "budget is full of pictures that are being drawn, a capture is made coarser (1x) if that fits, and only refused if it does not — taking " +
+    "one of those pictures away is what visible flicker is, and the readout counts both. Switching this off releases every stored bitmap " +
+    "immediately.";
   snapSel.addEventListener("change", () => {
     lodSet({ snapshots: snapSel.value === "on" });
     lodUpdate();
@@ -7311,7 +7599,10 @@ function buildTweaksTab(container) {
   snapRatioSel.title =
     "How many pixels each graph unit gets in a stored bitmap. At 2x a 200-unit node is 400 px wide, which stays sharp on a 200% display at " +
     "100% zoom; at 1x the bitmap is half that and costs a quarter of the memory. This changes only when a node is captured (or recaptured), " +
-    "never what the page draws live.";
+    "never what the page draws live. A node too big for the " + LOD_SNAP_MAX_DIM + "px cap at this ratio is captured at the largest lower " +
+    "ratio that fits instead of being skipped, and the readout counts those. Worth measuring, not assuming: at the zooms where nodes are " +
+    "flattened (below the threshold above) a picture is drawn at half size or less, so 1x already has more pixels than the screen shows — " +
+    "2x and 3x buy sharpness only for the foveated margin at a high zoom, and cost four and nine times the memory.";
   snapRatioSel.addEventListener("change", () => {
     lodSet({ snapRatio: Number(snapRatioSel.value) || 0 });
     if (LOD.snapOn) lodSnapClear("ratio"); // every stored bitmap is at the old ratio
@@ -7327,8 +7618,9 @@ function buildTweaksTab(container) {
   snapMbSel.value = String(LOD.snapMb);
   snapMbSel.title =
     "How much memory the stored bitmaps may hold. A picture that is being drawn is never released to make room: releasing one that is on " +
-    "screen is exactly what makes pictures and boxes flicker, so when the budget is full of pictures that are in use, new captures are " +
-    "simply refused (those nodes stay boxes) and the readout below counts them. What does get released are the pictures of nodes that have " +
+    "screen is exactly what makes pictures and boxes flicker, so when the budget is full of pictures that are in use, a new capture is made " +
+    "coarser (1x, a quarter of the memory) if that fits, and otherwise refused — those nodes stay boxes, and the readout below counts both " +
+    "the coarse pictures and the refusals, with the names of the nodes behind them. What does get released are the pictures of nodes that have " +
     "stopped being drawn for a couple of frames: nodes off screen, or a graph you have switched away from. Releasing zeroes the canvas, so " +
     "the pixels go back to the browser rather than waiting for a collection. The ladder starts at 256 MiB because below that a large graph " +
     "only thrashes (a 1,041-node graph at 256 MiB was measured capturing 7,040 times for 1,041 nodes, at the cap the whole time), and it " +
@@ -7699,21 +7991,45 @@ function buildTweaksTab(container) {
         // Every number here is a count of something that happened, and the two
         // that could be mistaken for a claim (bytes, capture time) are measured.
         if (lodSnapOn()) {
+          const pictured = lodSnapPictured();
           const parts = [
+            `${pictured} of ${LOD.snaps.size} remembered node(s) have a picture`,
             `${LOD.snapDrawn} draw(s) served from stored bitmaps`,
             `${LOD.snapCaptured} captured (${fmtBytes(LOD.snapBytes)} of ${LOD.snapMb} MiB held)`,
             `${LOD.snapMisses} box(es) painted while a picture was missing`,
           ];
           if (LOD.snapQueue && LOD.snapQueue.size) parts.push(`${LOD.snapQueue.size} waiting for the idle lane`);
           if (LOD.snapMs > 0) parts.push(`${fmtMs(LOD.snapMs)} spent capturing so far`);
-          if (LOD.snapSlow) parts.push(`${LOD.snapSlow} node(s) blocked: their own capture was slower than ${LOD_SNAP_SLOW_MS}ms, so they stay live`);
-          if (LOD.snapLarge) parts.push(`${LOD.snapLarge} too large to capture`);
+          if (LOD.snapPartial) {
+            parts.push(
+              `${LOD.snapPartial} picture(s) are the canvas part only: the browser draws the rest of that node (an image preview, a DOM widget), and no ` +
+                `bitmap of the canvas can hold what the browser draws`
+            );
+          }
+          if (LOD.snapFit) {
+            parts.push(
+              `${LOD.snapFit} picture(s) are coarser than your ratio so they would fit the ${LOD_SNAP_MAX_DIM}px cap: a tall node is fitted, not skipped`
+            );
+          }
+          if (LOD.snapCoarse) {
+            parts.push(`${LOD.snapCoarse} picture(s) are coarser than your ratio because the budget was full — coarser, not nothing`);
+          }
+          if (LOD.snapSlow) parts.push(`${LOD.snapSlow} node(s) stay live: their own capture was slower than ${LOD_SNAP_SLOW_MS}ms`);
+          if (LOD.snapLarge) parts.push(`${LOD.snapLarge} node(s) stay boxes: too big for a ${LOD_SNAP_MAX_DIM}px capture at any ratio`);
+          if (LOD.snapBlank) {
+            parts.push(
+              `${LOD.snapBlank} node(s) stay boxes: they draw nothing into a canvas at all (their whole visual is DOM), so a picture would erase them`
+            );
+          }
+          if (LOD.snapChurn) parts.push(`${LOD.snapChurn} node(s) stay boxes: their drawing changed before every picture could be drawn`);
+          if (LOD.snapKept) parts.push(`${LOD.snapKept} kept live on purpose (this tool's own node, or a type on your list)`);
           if (LOD.snapInvalid) parts.push(`${LOD.snapInvalid} dropped after their node changed`);
           if (LOD.snapEvicted) parts.push(`${LOD.snapEvicted} released by the budget`);
           if (LOD.snapFull) {
             parts.push(
-              `${LOD.snapFull} capture(s) refused: the budget is full of bitmaps that are being looked at — releasing one of those is what ` +
-                `flicker looks like, so the lane stops instead (raise the budget for more pictures)`
+              `${LOD.snapFull} capture(s) refused: the budget is full of bitmaps that are being looked at, and not even a ` +
+                `${LOD_SNAP_RATIOS[0]}x copy fits — releasing one of those is what flicker looks like, so the lane stops instead (raise the budget, ` +
+                `or capture at ${LOD_SNAP_RATIOS[0]}x: a quarter of the memory, four times the nodes)`
             );
           }
           if (LOD.snapFlagHeld) {
@@ -7725,10 +8041,11 @@ function buildTweaksTab(container) {
                 `is causing it`
             );
           }
-          if (LOD.snapRefused) parts.push(`${LOD.snapRefused} refused (DOM widget, function or very long string)`);
           if (LOD.snapPruned) parts.push(`${LOD.snapPruned} pruned (node left the graph)`);
           if (LOD.snapFailed) parts.push(`${LOD.snapFailed} capture(s) failed`);
           bits2.push(`snapshots: ${parts.join(", ")}`);
+          const named = lodSnapWhyText();
+          if (named) bits2.push(named);
           if (LOD.snapMs > 0 && since && since.n > 0) {
             bits2.push(
               `and the captures were run on the idle lane, not in a frame: their ${fmtMs(LOD.snapMs)} is this tool's own cost, ` +
@@ -10388,7 +10705,14 @@ function installDebugApi() {
             large: LOD.snapLarge,
             evicted: LOD.snapEvicted,
             invalidated: LOD.snapInvalid,
-            refused: LOD.snapRefused,
+            keptLive: LOD.snapKept,
+            partial: LOD.snapPartial,
+            fit: LOD.snapFit,
+            coarse: LOD.snapCoarse,
+            churn: LOD.snapChurn,
+            blank: LOD.snapBlank,
+            pictured: lodSnapPictured(),
+            why: (LOD.snapWhy || []).map((e) => ({ type: e.type, title: e.title, why: e.why })),
             pruned: LOD.snapPruned,
             clears: LOD.snapClears,
             full: LOD.snapFull,

@@ -1993,16 +1993,166 @@ suite("drawing: node snapshots — a box that is a picture of the node", () => {
     assertGreater(snapApi(h).captureMs, 0, "their cost is in the snapshot counter instead");
   });
 
-  test("a node the canvas cannot own is never captured", async () => {
+  // Upstream (NodeSnapshots) keeps any node with a DOM widget, a function-valued
+  // value or a long string live *forever*, and its own issue #1 is the user report
+  // that custom nodes then never get a picture. v2.4.0 draws the line where the
+  // canvas does instead: if the canvas can put ink on a surface for this node, it
+  // gets a picture, and the parts the browser draws over it are counted apart.
+  test("the browser's half of a node is not a reason to leave it a box", async () => {
     const h = await boot();
     const nodes = snapGraph(h, 3);
     nodes[0].addDOMWidget("preview", "image", h.document.createElement("div"), {});
     nodes[1].properties = { mode: () => "changing" };
+    nodes[2].widgets = [{ name: "payload", value: "x".repeat(20000), type: "string" }];
     h.tracker.lowZoom.set({ flatBelow: 0.2, snapshots: true });
     draw(h, 1);
     await idle(h);
-    assertEqual(snapApi(h).captured, 1, "only the node with nothing hidden in it was captured");
-    assertEqual(snapApi(h).refused, 2, "the DOM widget and the function-valued property were refused");
+    const api = snapApi(h);
+    assertEqual(api.captured, 3, "all three were captured: a DOM widget, a function and a 20 kB string");
+    assertEqual(api.keptLive, 0, "nothing was kept live on purpose");
+    assertEqual(api.partial, 1, "and the DOM-widget picture is marked as the canvas part only");
+    h.canvas.ctx.ops.length = 0;
+    draw(h, 1);
+    assertEqual(boxes(h).length, 0, "so the next frame is served from three pictures");
+
+    // A long string is hashed by its ends, so a change at the tail of one must
+    // still invalidate the picture (its head is what the canvas draws, its tail is
+    // where a growing payload moves).
+    nodes[2].widgets[0].value = "x".repeat(19999) + "y";
+    await idle(h);
+    h.canvas.ctx.ops.length = 0;
+    draw(h, 1);
+    assertGreater(snapApi(h).invalidated, 0, "and a change at the far end of it is still noticed");
+  });
+
+  test("a node too tall for the cap is fitted, not skipped", async () => {
+    const h = await boot();
+    const nodes = snapGraph(h, 2);
+    // 1,278 padded units tall: 2x would be 2,556 px, past the 2,048 px cap, so the
+    // picture is taken at 1x instead of the node being skipped (which is what both
+    // this tool and upstream did until v2.4.0 — at 10% zoom 1x is still ten times
+    // the pixels the screen shows).
+    nodes[0].size = [300, 1200];
+    h.tracker.lowZoom.set({ flatBelow: 0.2, snapshots: true });
+    draw(h, 1);
+    await idle(h);
+    const api = snapApi(h);
+    assertEqual(api.captured, 2, "the tall node was captured too");
+    assertEqual(api.large, 0, "nothing was skipped as too big");
+    assertEqual(api.fit, 1, "one capture is counted as fitted below the ratio");
+    const fitted = h.canvases.filter((c) => c.height === 1278);
+    assertEqual(fitted.length, 1, "at the size the cap allows");
+    const setT = fitted[0]._ctx.ops.filter((o) => o[0] === "setTransform")[0];
+    assertEqual(setT[1], 1, "drawn at graph scale 1, not the 2x that was asked for");
+    h.canvas.ctx.ops.length = 0;
+    draw(h, 1);
+    assertEqual(boxes(h).length, 0, "and it is served from its picture like any other node");
+  });
+
+  test("a node no ratio can fit keeps its box, and is tried once", async () => {
+    const h = await boot();
+    const nodes = snapGraph(h, 2);
+    nodes[0].size = [400, 2100]; // 2,178 padded units: past the cap at 1x already
+    h.tracker.lowZoom.set({ flatBelow: 0.2, snapshots: true });
+    draw(h, 1);
+    await idle(h);
+    const api = snapApi(h);
+    assertEqual(api.captured, 1, "only the node that fits was captured");
+    assertEqual(api.large, 1, "the too-big node is counted once, as a node");
+    assertEqual(h.canvases.length, 1, "and no canvas was ever made for it");
+    assert(api.why.some((e) => /2100 units tall/.test(e.why)), "with its size in the readout's reasons");
+    h.advance(600); // the panel refresh
+    await h.flush();
+    await openTweaksTab(h);
+    const text = panelText(h);
+    assertIncludes(text, "not pictured:", "the readout names what will not get a picture");
+    assertIncludes(text, "2100 units tall", "with the reason, and the node's own size");
+    // Time and drawing do not turn it into an attempt-per-slice: it is blocked, so
+    // the lane never spends another draw on it (v2.3.1 retried it every slice and
+    // the counter read like 375 nodes).
+    h.advance(10000);
+    draw(h, 3);
+    await idle(h, 3000);
+    assertEqual(snapApi(h).large, 1, "still one attempt, not one per slice");
+    assertEqual(h.canvases.length, 1, "and still no canvas");
+  });
+
+  test("a node whose own draw leaves the canvas empty keeps its box", async () => {
+    // A node whose whole visual is a DOM element can draw nothing into a canvas at
+    // all. A transparent picture would *erase* it at the zoom where pictures are
+    // used, so the probe catches that and the box stays.
+    const h = await boot({ ink: "none" });
+    snapGraph(h, 2);
+    h.tracker.lowZoom.set({ flatBelow: 0.2, snapshots: true });
+    draw(h, 1);
+    await idle(h);
+    const api = snapApi(h);
+    assertEqual(api.captured, 0, "nothing was stored");
+    assertEqual(api.blank, 2, "both nodes are counted as drawing nothing");
+    assertEqual(h.canvases[0].width, 0, "and the canvas they were drawn into was released");
+    h.canvas.ctx.ops.length = 0;
+    draw(h, 1);
+    assertEqual(boxes(h).length, 2, "the boxes stay, which is the honest stand-in");
+  });
+
+  test("a font of churn keeps a node a box instead of a capture per slice", async () => {
+    const h = await boot();
+    const nodes = snapGraph(h, 1);
+    h.tracker.lowZoom.set({ flatBelow: 0.2, snapshots: true });
+    draw(h, 1);
+    await idle(h);
+    assertEqual(snapApi(h).captured, 1, "captured once");
+    // Something rewrites a value the node draws, faster than the idle lane can
+    // keep up: the change lands after each capture and before each reuse, which is
+    // the shape a polling extension has.
+    for (let i = 0; i < 4; i++) {
+      h.advance(200); // past the signature re-check window: the lane may capture here
+      nodes[0].widgets = [{ name: "polled", value: `v${i}`, type: "string" }];
+      h.canvas.ctx.ops.length = 0;
+      draw(h, 1); // ...and the value changed again before this draw
+    }
+    const api = snapApi(h);
+    assertGreater(api.invalidated, 0, "pictures were dropped for changing");
+    assertEqual(api.churn, 1, "and the node is left as a box after three of them");
+    const before = api.captured;
+    h.advance(2000);
+    draw(h, 2);
+    await idle(h, 2000);
+    assertEqual(snapApi(h).captured, before, "the lane stops spending captures on it");
+    assertEqual(boxes(h).length > 0, true, "and the box is what the user sees");
+  });
+
+  test("when the budget cannot hold your ratio, a coarse picture beats none", async () => {
+    const h = await boot();
+    // 24 nodes of 600x400 at 3x (about 11 MB each) fill the 256 MiB floor to
+    // within a megabyte; the two small nodes that follow cannot be held at 3x, so
+    // they are taken at 1x (about 176 kB) rather than refused. One more big node
+    // then finds no room at either size and *is* refused.
+    h.canvas.ds.scale = 0.1;
+    h.canvas.links = [];
+    const nodes = [];
+    for (let i = 0; i < 25; i++) {
+      const n = h.node({ type: "SnapThing", pos: [i * 700, 0], size: [600, 400] });
+      n.type = "SnapThing";
+      nodes.push(n);
+    }
+    for (let i = 0; i < 2; i++) {
+      const n = h.node({ type: "SnapThing", pos: [20000 + i * 300, 0], size: [200, 100] });
+      n.type = "SnapThing";
+      nodes.push(n);
+    }
+    h.canvas.nodes = nodes;
+    h.app.graph._nodes = nodes;
+    h.tracker.lowZoom.set({ flatBelow: 0.2, snapshots: true, snapRatio: 3, snapMb: 256 });
+    draw(h, 1);
+    await idle(h, 8000);
+    const api = snapApi(h);
+    assertEqual(api.coarse, 2, "the two small nodes were captured coarser than the ratio asked for");
+    assertEqual(api.full, 1, "and the node that fitted at no size was refused");
+    assertEqual(api.evicted, 0, "nothing was taken off the screen for them");
+    assertEqual(api.pictured, 26, "so 26 of the 27 nodes have a picture, not 24");
+    const small = h.canvases.filter((c) => c.height === 178);
+    assertEqual(small.length, 2, "at the size the budget could hold");
   });
 
   test("a full budget refuses captures instead of evicting what is on screen", async () => {
@@ -2209,12 +2359,15 @@ suite("drawing: node snapshots — a box that is a picture of the node", () => {
     assertIncludes(text, "boxes: pictures of the nodes (snapshots)", "the control offers it");
     assertIncludes(text, "capture 2x per graph unit", "with the ratio it will capture at");
     assertIncludes(text, "bitmap budget 512 MiB", "and the budget");
+    assertIncludes(text, "remembered node(s) have a picture", "the readout leads with how much of the graph is pictured");
     const api = h.tracker.lowZoom;
     assertEqual(api.snapshots.wanted, true, "the API says it is wanted");
     assertEqual(api.limits.snapRatios.join(","), "1,2,3", "and exposes the ladders");
     assertEqual(api.limits.snapBudgets.join(","), "256,512,1024,2048", "including the budget ladder");
     assertEqual(api.snapshots.installed, true, "with the canvas seam in place");
-    // A type the user excludes is refused like anything else the canvas cannot own.
+    // A type the user excludes is kept live on purpose, and counted as such
+    // rather than as a failure (v2.4.0: this is now the *only* way a node the
+    // canvas can draw is left without a picture, besides the churn guard).
     api.set({ snapExclude: ["SnapThing"] });
     assertEqual(api.snapshots.exclude.join(","), "SnapThing", "the list is kept");
     api.set({ snapshots: false });

@@ -385,7 +385,9 @@ h.tracker.lowZoom.set({ boxDetail: "plain", idleCapMs: 500 });
 // Node snapshots: the same boxes, but a picture of each node instead of a fill.
 // Captured on the idle lane through the node's own draw path, reused as one
 // drawImage, and never for a node that is selected, hovered, broken, running or
-// being dragged — those keep their live drawing.
+// being dragged — those keep their live drawing. Every node the canvas can draw
+// gets a picture (v2.4.0): a DOM widget or an image preview means the picture is
+// the canvas part only, counted apart.
 const snapsBefore = h.tracker.lowZoom.snapshots;
 const flatNodes = h.tracker.lowZoom.flat.flatNodes;
 h.tracker.lowZoom.set({ snapshots: true, idleCapMs: 0 });
@@ -402,10 +404,12 @@ const blits = h.canvas.ctx.ops.filter((o) => o[0] === "drawImage").length;
 const snapsAfter = h.tracker.lowZoom.snapshots;
 const d2 = (k) => snapsAfter[k] - snaps[k]; // that one frame, not the whole run
 console.log(
-  `  node snapshots: ${snaps.refused} node(s) refused for good (a DOM widget or a function-valued property cannot be pictured), ` +
-    `${snaps.slow} blocked as too slow to capture; ${d("captured")} node(s) captured off the frame clock, in ${d("captureMs").toFixed(1)}ms of this tool's own work ` +
-    `(a capture runs the packs' hooks but does not attribute their time to them), ${(snaps.bytes / 1024).toFixed(0)} KB held inside a ` +
-    `${snaps.budgetMb} MiB budget at ${snaps.ratio}x per graph unit`
+  `  node snapshots: ${snaps.pictured} of ${snaps.records} remembered node(s) have a picture (${snaps.partial} of them are the canvas part only: the ` +
+    `browser draws the rest of that node), ${snaps.keptLive} kept live on purpose; ${snaps.slow} blocked as too slow to capture, ${snaps.large} too ` +
+    `big at any ratio, ${snaps.blank} drawing nothing into a canvas, ${snaps.churn} changing on every attempt; ${d("captured")} node(s) captured off ` +
+    `the frame clock, in ${d("captureMs").toFixed(1)}ms of this tool's own work (a capture runs the packs' hooks but does not attribute their time to ` +
+    `them), ${(snaps.bytes / 1024).toFixed(0)} KB held inside a ${snaps.budgetMb} MiB budget at ${snaps.ratio}x per graph unit, ` +
+    `${snaps.fit + snaps.coarse} picture(s) coarser than that`
 );
 console.log(
   `  and the next frame: ${blits} of ${flatNodes} flat node(s) came back as one drawImage each — ${d2("drawn")} reuse(s) counted in it, ` +

@@ -298,19 +298,21 @@ pieces, with a source note on the block naming upstream:
   zoom and subgraph entry are deliberately *not* in it, so pausing mid-pan never
   invalidates a capture. Longer reuse interval (~100 ms) while the user is
   interacting.
-- Never cache this node: any widget with an `element`, a widget of type
-  `dom`/`custom`, function-valued properties, strings over 4 kB. This is
-  NodeSnapshots' own conservative answer to "we cannot cheaply know when a custom
-  node changed", and it is the gap named in the request. The honest improvement is
-  not cleverer detection — nothing cheap can tell whether a custom draw callback
-  will keep drawing the same thing — but a **per-type override** on top of Track
-  D's policies: "this type is expensive and static, snapshot it anyway", chosen by
-  the user, with the failure mode (a node whose real content changes without the
-  signature changing) stated in the panel and README. Default stays: unknown
-  custom types are live.
-- A DOM-widget node cannot be snapshotted at all without baking the browser's own
-  rendering of that element, which is out of scope; those stay live and are
-  counted in K3's "misses by reason".
+- ~~Never cache this node: any widget with an `element`, a widget of type
+  `dom`/`custom`, function-valued properties, strings over 4 kB.~~ **This plan was
+  wrong and v2.4.0 replaced it** (see K1.1): the refusal list is upstream's
+  conservative guess, and the request's named gap was exactly the nodes on it. What
+  shipped instead is the canvas as the judge — every node `drawNode` can put ink on
+  a surface for is captured, the browser-drawn part of it is not in the picture and
+  is counted apart, and the honest limits that remain (nothing drawn into the
+  canvas, too big at any ratio, too slow, changing faster than it can be
+  photographed) are each *proved* by a measurement and named in the readout. A
+  per-type override (Track D) is still the right escape hatch for a type the user
+  wants kept live, and it now has one meaning: keep this type live on purpose.
+- A DOM-widget node's picture is the canvas part only — the browser's own rendering
+  of that element is deliberately not baked in (out of scope). Those pictures are
+  counted as "the canvas part only" in the readout rather than hidden in a
+  refusal.
 - Always live: selected, hovered, carrying an error, executing or queued,
   link-connector active, actively dragged; plus the user's per-type excludes
   (Track D) as first-class settings instead of a comma-separated text field.
@@ -366,17 +368,56 @@ accounting rather than adding a second cache with a second budget.
 *Numbers here are estimates to be confirmed by K3, not figures to put in the
 panel.*
 
-**K3. Prove it, then set the default (M) — PARTLY DELIVERED in v2.3.1.** The
+**K1.1 Coverage: every node the canvas can draw gets a picture (S) — DELIVERED in
+v2.4.0.** The second real report answered K1's first open question by itself: at
+zoom 0.10 with the whole graph on screen, 625,156 draws came from pictures, but the
+nodes the user noticed as empty boxes were exactly the 206 *refused* (a DOM widget,
+a function, a long string — upstream's conservative line) plus the ones behind a
+"375 too large" counter that was counting *attempts*, which hid the fact that only a
+couple of dozen nodes were involved. v2.4.0 moved the rule to where the canvas is
+(if `drawNode` can put ink on a surface, the node is photographed), kept a box only
+for what is provable (nothing drawn into the canvas — five 8x8 probes — too big at
+any ratio, too slow to capture, changing faster than the lane can photograph it, or
+on the user's own keep-live list), fitted tall nodes to the largest ratio that fits
+the cap instead of skipping them, and made a budget refusal try 1x first. The
+readout now leads with `N of M remembered node(s) have a picture` and *names* the
+nodes that will not get one. That last part is the point: the previous two reports
+were diagnosable only from counters, and this one was diagnosable from one bucket.
+
+**K3. Prove it, then set the default (M) — PARTLY DELIVERED in v2.3.1 and again in
+v2.4.0.** The
 first real report arrived after K1 shipped (1,041 nodes, zoom 0.19, 256 MiB
 budget): 7,040 captures for 1,041 nodes, 255.6 MB held at the cap, 156,393 draws
 served from pictures — and visible flicker, which the numbers identify as eviction
 churn. Fixed in v2.3.1 (frame-based "in use", refuse-don't-evict, ladder 256 MiB →
 2 GiB), and the panel now counts refusals and picture/box switches so the next
-report can confirm it instead of describing it. Still open for the rest of K3:
-hit rate against graph size, whether the ratio default should be 2, and the
-per-zoom frame-time A/B on a real graph (the report gives the shape but not the
-A/B: node drawing 2.06 ms/frame and connections 26.5 ms/frame at 0.19 zoom). The
-memory budget is a knob; the default comes from measurements like this one. The panel reports
+report can confirm it instead of describing it. v2.4.0 covered the
+coverage half of the question — the report's 1.7 GB of a 2 GiB budget at 2x, with
+1,041 nodes, says the ratio *is* the coverage knob on a graph this size (at 1x the
+same budget holds four times the pictures, and a flattened node is drawn at half
+size or less, so 1x still oversamples the screen). What is still open: hit rate
+against graph size, whether the ratio default should stay 2, and the per-zoom
+frame-time A/B on a real graph (the report gives the shape but not the A/B: node
+drawing 2.06 ms/frame and connections 26.5 ms/frame at 0.19 zoom). Measurement
+recipe, now that the readout carries the number: on the real workflow, switch 1x
+and 2x and read `N of M remembered node(s) have a picture` plus the report's
+`snapshots` line (bytes held, refusals, coarse pictures, flips) at 10% and 50%.
+The memory budget is a knob; the default comes from measurements like this one.
+A synthetic replica of the reported graph shape (1,041 nodes, ~11% heavy custom
+nodes, ~11% DOM-widget/image nodes, tall monsters; `tests/harness.mjs`, run in
+September 2026) says the shape of the answer: at 2x the same graph holds 1,039 of
+1,041 pictures for 1.1 GB, and at the *default* 512 MiB the same 2x setting
+pictures only 474 of 1,041 — while 1x holds all 1,039 for 291 MB, inside the
+default budget. So on a large graph the ratio is not a quality knob, it is the
+coverage knob. Not yet measured on the real workflow, and not a claim about it.
+
+One consequence of that measurement is already visible and is the next candidate:
+"coarser, not nothing" only fires when there is a gap in the budget. When the
+budget is full to the brim, a new node gets 1x *or* nothing — no room either way.
+A whole-cache re-resolution (persistent pressure down-shifts stored pictures
+instead of refusing incoming ones) is the cheaper-on-memory answer, and it is a
+cache-wide policy that needs its own measurement before it is built (K2/K3 share
+that work: K2's buckets are the same question asked per zoom). The panel reports
 what the cache actually did, in the same units as everything else: reuse hit
 rate, misses by reason (no capture yet, signature changed, too slow, excluded
 type, over budget), bytes held, capture-time distribution — and the same A/B the
@@ -487,7 +528,8 @@ version is stronger than the legal minimum, and the user asked for credit
 ## Suggested order
 
 0. **K + M, then L** — the current request (2026-09-28). **K4 delivered
-   (v2.2.0)** and **K1 delivered (v2.3.0)**; K2 → K3 next. M's notices wait for
+   (v2.2.0)**, **K1 delivered (v2.3.0)**, **K1.1 coverage delivered (v2.4.0)**;
+   K2 → K3 next, with the ratio-vs-coverage measurement K3 now spells out. M's notices wait for
    the user's decision on whether upstream code is kept at all (Q5): the K1
    implementation is this file's own, with the design credited in a comment, so
    nothing legally needs a notice yet. K5/K6 only after K2 has numbers. Track L

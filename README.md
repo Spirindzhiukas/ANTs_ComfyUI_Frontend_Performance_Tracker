@@ -530,7 +530,7 @@ open questions). The code follows the rules in `CLAUDE.md` deliberately; a chang
 that breaks one of them is a bug even if the tests pass.
 
 ```
-node tests/run-tests.mjs          # 131 tests, no dependencies, no browser
+node tests/run-tests.mjs          # 161 tests, no dependencies, no browser
 node tests/run-tests.mjs timing   # filter by name fragment
 python3 tests/test_init.py        # backend route parsing + graceful fallbacks
 node tests/demo.mjs               # print what the panel says, with no ComfyUI
@@ -570,6 +570,71 @@ installed as the sandbox's `CanvasRenderingContext2D` (the preview ladder
 patches `drawImage` there, the same way a browser exposes it), and
 `createImageBitmap` records the resize it was asked to perform instead of
 resizing anything.
+
+## What changed in v2.4.0
+
+- **Every node the canvas can draw gets a picture, not just the ones a
+  conservative guess trusts.** The refusal rule this feature was built with came
+  from the tool it learned from (ComfyUI-NodeSnapshots), whose own issue #1 is the
+  report that custom nodes then never get a picture: a widget that is a DOM
+  element, a `dom`/`custom` widget type, a function-valued value, a string over
+  4 kB — all of them were refused for the session. The line is now drawn where the
+  canvas is: if the node's own draw path can put ink on a surface for it, it is
+  captured. What the browser draws *over* the node (an image preview, a DOM
+  widget, a 3D viewport) cannot be in a bitmap of the canvas, so those pictures
+  are counted as **"the canvas part only"** — the node's frame, title, slots and
+  whatever the canvas still draws, which is what a box was standing in for anyway.
+- **A node that draws nothing into a canvas keeps its box.** A node whose whole
+  visual is a DOM element can leave a canvas transparent, and a transparent
+  picture would *erase* it at the zoom where pictures are used — worse than the
+  rectangle it replaced. Five 8x8 pixel probes of the capture (about a kilobyte of
+  reads, on the idle lane) decide that, the canvas is released again, and the
+  readout says how many nodes are like this. Anything unmeasurable answers "there
+  is ink": the probe must never be the reason a node disappears.
+- **A tall node is fitted, not skipped.** The dimension cap (2,048 px per side)
+  used to end a node's chances for the session, and — worse — the refusal was
+  re-attempted on every capture slice, so a real report's "375 too large to
+  capture" was a couple of dozen nodes tried many times. Now the largest ladder
+  ratio that fits the cap is used instead (1x for a node up to about 1,994 units
+  tall), those pictures are counted, and a node too big at *any* ratio is blocked
+  once and named in the readout with its height. At the zooms where nodes are
+  flattened a 1x picture still has more pixels than the screen shows, so fitting a
+  monster node is worth far more than skipping it.
+- **A node whose drawing changes faster than the idle lane can photograph it keeps
+  its box** — three pictures dropped before a single one was drawn — and the
+  readout names it. That is the honest answer for a node something rewrites every
+  frame (a polling extension): a fresh picture of it cannot exist, and capturing
+  it once per slice forever is work with nothing to show for it.
+- **When the budget cannot hold the ratio you asked for, a coarse picture beats
+  none.** A capture that the budget would refuse is re-tried at 1x (a quarter of
+  the memory) and only refused if even that does not fit. Refusing used to mean
+  running the node's whole draw and then throwing the result away, so coarse is
+  the cheaper answer as well as the more useful one — and the readout counts them
+  apart from the fits.
+- **The readout leads with the number that is actually being asked for**:
+  `N of M remembered node(s) have a picture`, then the reasons (too slow, too big,
+  nothing drawn, changing, kept live by your list, refusals for budget) and, for
+  the first time, the **names** of the nodes that will not get one. A node's
+  drawing also counts its own images in the signature now (an image node
+  photographed before its image loaded is re-photographed once it has), and long
+  strings are hashed by their ends, which is what made the old 4 kB refusal look
+  like a reason when it was only a cost.
+- **Worth knowing before choosing the ratio** (this is the measurement, not a
+  default): at the zooms where nodes are flattened a picture is drawn at half size
+  or less, so 1x already carries more pixels than the screen shows — 2x and 3x buy
+  sharpness only for a picture that is being reused in the foveated margin at a
+  high zoom, and cost four and nine times the memory. Since coverage is bounded by
+  the budget, the ratio is also what decides how much of a large graph can be
+  pictured at all; watch `have a picture` while switching 1x/2x on a real
+  workflow. That comparison is plan.md's K3.
+- **New tests** (5, 161 total): the browser's half of a node is not a reason to
+  leave it a box (a DOM widget, a function-valued property and a 20 kB string are
+  all captured, and a change at the far end of the long string still invalidates);
+  a node too tall for the cap is fitted, at the size the cap allows; a node no
+  ratio can fit keeps its box and is tried exactly once, with its height named; a
+  node whose own draw leaves the canvas empty keeps its box and gives the canvas
+  back; a font of churn leaves a node a box instead of a capture per slice; and a
+  full budget with room for a coarse copy produces coarse pictures, not refusals.
 
 ## What changed in v2.3.1
 
@@ -632,9 +697,15 @@ resizing anything.
   that is selected, hovered, carrying a validation error, running (`progress`),
   or being dragged stays live and is drawn by ComfyUI — a bitmap of a transient
   state cannot exist, because those nodes are not captured at all.
-- **A node the canvas cannot own is never captured.** A widget that is a DOM
-  element, a `dom`/`custom` widget type, a function-valued widget or property, a
-  string over 4 kB: refused for good, and the panel counts them.
+- **A node the canvas cannot own is never captured.** As shipped in v2.3.0 this
+  was upstream's line: a widget that is a DOM element, a `dom`/`custom` widget
+  type, a function-valued widget or property, or a string over 4 kB was refused
+  for good. **v2.4.0 moved that line to where the canvas is** — such nodes are
+  captured now, the browser-drawn part of them is not in the picture, those
+  pictures are counted as "the canvas part only", and what keeps a box is the
+  smaller, provable set of reasons (nothing drawn into the canvas, too big at any
+  ratio, too slow to capture, changing faster than it can be photographed, or a
+  type you put on the keep-live list).
 - **Staleness is bounded and stated.** A picture is only used while the node's
   signature — title, size, flags, mode, colours, connections, widget values,
   progress, error state, the canvas's own render flags, the theme — still
@@ -653,7 +724,10 @@ resizing anything.
   visible pause. No second scheduler.
 - **Memory is bounded and given back.** The bitmap budget (256 MiB to 2 GiB,
   default 512 MiB since v2.3.1) is enforced by eviction, and releasing a bitmap
-  zeroes its canvas so the pixels return to the browser. Bitmaps are also
+  zeroes its canvas so the pixels return to the browser. A picture that is being
+  drawn is never released to make room (v2.3.1), a capture that does not fit is
+  tried at 1x before being refused (v2.4.0), and the readout counts refusals,
+  coarse pictures, fits and releases separately. Bitmaps are also
   released when you switch snapshots off, when the tool's master switch goes off,
   when the flatten threshold goes to zero, when the graph's theme changes, and
   for nodes that have left the graph.
@@ -676,7 +750,10 @@ resizing anything.
 - The capture ratio (1x/2x/3x per graph unit) and the budget are provisional
   defaults: the next step measures hit rate, bytes and frame time on real graphs
   and sets them from numbers (plan.md, Track K3). The budget ladder changed in
-  v2.3.1, above, after the first real numbers arrived.
+  v2.3.1, above, after the first real numbers arrived, and v2.4.0 added the
+  fit-to-cap and coarse-instead-of-refused rules; the ratio question is now also a
+  coverage question, because how many nodes can hold a picture is the budget
+  divided by the pixels per picture.
 - **New tests** (16): off by default (no captures, no canvases, no blits); an
   idle slice captures what was boxed and the next frame blits it, at the padded
   rect and the chosen ratio; nothing is captured while the page is being used;

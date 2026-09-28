@@ -4,7 +4,7 @@ A running record for whoever picks this up next (including me). `CLAUDE.md` is t
 rules for changing the code; `plan.md` is where it is going. This file is the past:
 what was built, what was rejected, and what the evidence was.
 
-Last updated at **v2.3.1**, 156 tests green, PR #1 on
+Last updated at **v2.4.0**, 161 tests green, PR #1 on
 `Spirindzhiukas/ANTs_ComfyUI_Frontend_Performance_Tracker`.
 
 ---
@@ -13,8 +13,8 @@ Last updated at **v2.3.1**, 156 tests green, PR #1 on
 
 | | |
 | --- | --- |
-| Version | 2.3.1 (`web/tracker.js` `VERSION`) |
-| Tests | 156 (`node tests/run-tests.mjs`), plus `tests/test_init.py` |
+| Version | 2.4.0 (`web/tracker.js` `VERSION`) |
+| Tests | 161 (`node tests/run-tests.mjs`), plus `tests/test_init.py` |
 | Frontend | `web/tracker.js`, ~9.5k lines, one ES module, no dependencies |
 | Backend | `__init__.py` — a no-op node + one optional read-only route |
 | Panel | 9 tabs: Tweaks, Timing, Nodes, Stalls, Governor, Load, Memory, GPU / VRAM, Testing |
@@ -36,6 +36,34 @@ something has to be drawn less or hit-tested less.
 ## 2. Version log
 
 The commit log is the full record; this is the "why", newest first.
+
+**v2.4.0 — the picture is whatever the canvas draws, and the rest is named.**
+Second report after K1, from the same 1,041-node graph at zoom 0.10: 625,156
+draws served from pictures, 799 captures, 1.7 GB of a 2 GiB budget held — and
+"most of the empty (our legacy simple box) ones are either image load nodes or
+some of my nodes". The buckets in that report were the diagnosis: 206 *refused*
+(DOM widget, function, long string) and "375 too large" — which was not 375
+nodes, it was a couple of dozen tall nodes re-attempted on every single slice,
+because the refusal counted attempts and left no record to block on. Five changes:
+(a) the refusal rule is gone — a DOM/custom widget, a function-valued value or a
+long string are all capturable, because the first two are canvas ink or a
+browser-drawn overlay and the third was only ever a hashing cost; the pictures of
+nodes the browser partly draws are counted as "the canvas part only" and the
+readout says so. (b) A five-probe ink check (five 8x8 `getImageData` reads per
+capture) keeps a box for a node whose own draw leaves the canvas empty, because a
+transparent picture would erase it — the one new failure mode this coverage change
+could have introduced. (c) The dimension cap fits the capture to the largest
+ladder ratio instead of refusing (a node up to about 1,994 units tall gets a 1x
+picture), and a node too big at any ratio is blocked once and *named* with its
+height. (d) The churn guard: a node whose picture is dropped before it is drawn
+three times in a row keeps its box, and is named. (e) "Coarser, not nothing": a
+capture the budget would refuse is re-tried at 1x before being refused, since a
+refusal still costs the node's whole draw and then throws it away. The readout now
+leads with `N of M remembered node(s) have a picture` and lists names, which is
+what makes the *next* report actionable. Images a node draws into itself joined
+the signature (count, `complete`, size, source ends), so an image node photographed
+before its image loaded is re-photographed after it loads. 5 new tests; the test
+that pinned the old refusal rule became the test that pins the new coverage rule.
 
 **v2.3.1 — the flicker was the eviction policy.** First real report after K1
 shipped: a 1,041-node graph at zoom 0.19, 256 MiB budget, 255.6 MB held, 7,040
@@ -180,6 +208,27 @@ and a `skipped N` counter.
 **`normal` really is a normal call.** Same arguments, same `this`, the browser's
 own ids so `clearInterval`/`cancelAnimationFrame` keep working. The table can
 report "was 50/s, now 12/s" without having changed anything until asked.
+
+**A picture is whatever the canvas draws — no more, no less.** The rule for
+whether a node can be photographed is not a list of things that look scary (a DOM
+widget, a custom widget, a function, a long string — all of which upstream refuses)
+but the question "can `drawNode` put ink on a surface for this node?". Everything
+else follows from it: the browser-drawn part of a node is not in the picture and
+the readout counts those pictures apart; a node whose own draw leaves the canvas
+transparent keeps its box, because erasing a node is worse than the rectangle it
+replaced; a node too tall for the cap is fitted to a lower ratio rather than
+skipped; and a node that changes before every picture can be drawn keeps its box
+and gets its name in the readout. Two consequences worth keeping: a "too large"
+counter must count *nodes*, never attempts (v2.3.1's counter said 375 when the
+truth was a couple of dozen nodes tried repeatedly), and every reason a node has no
+picture must be attached to a named node, or the number is not actionable.
+
+**A refused capture is not free.** It runs the node's full draw path and then
+throws the canvas away, so "refuse when the budget is full" paid the expensive
+part and kept nothing. Hence "coarser, not nothing": try 1x before refusing, and
+keep the refusal for the case where even a quarter of the pixels do not fit. The
+1x picture is not much of a compromise where it is used: a flattened node is drawn
+at half size or less, so 1x still oversamples the screen.
 
 **The box-detail ladder reads fields, not names.** Node stand-in marks come from
 `has_errors`, `progress`, `mode` (2 = muted, 4 = bypassed), `flags.ghost` — the

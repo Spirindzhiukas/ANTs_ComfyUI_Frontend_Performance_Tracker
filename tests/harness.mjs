@@ -166,8 +166,9 @@ export function createHarness(options = {}) {
   // purpose: the tracker patches CanvasRenderingContext2D.prototype.drawImage,
   // which is also how a browser exposes it.
   class FakeCanvasRenderingContext2D {
-    constructor() {
+    constructor(ink) {
       this.ops = [];
+      this.ink = ink !== false; // opaque pixels unless a test asks for a blank draw
       this.globalAlpha = 1;
       this.shadowColor = "";
       this.fillStyle = "";
@@ -177,6 +178,14 @@ export function createHarness(options = {}) {
     }
     drawImage(...args) {
       this.ops.push(["drawImage", ...args]);
+    }
+    getImageData(x, y, w, h) {
+      // What the snapshot engine's ink probe reads. Opaque by default, so the
+      // probe's happy path runs in every test that captures anything; a test can
+      // boot with { ink: "none" } to make every capture look blank.
+      const data = new Uint8ClampedArray(w * h * 4);
+      if (this.ink) data.fill(255);
+      return { data, width: w, height: h };
     }
   }
   for (const name of [
@@ -203,7 +212,7 @@ export function createHarness(options = {}) {
       this.ops.push([name, ...args]);
     };
   }
-  const makeStubCtx = () => new FakeCanvasRenderingContext2D();
+  const makeStubCtx = () => new FakeCanvasRenderingContext2D(opts.ink !== "none");
 
   // createImageBitmap with the resize options, recording what was asked for.
   const imageBitmaps = [];
