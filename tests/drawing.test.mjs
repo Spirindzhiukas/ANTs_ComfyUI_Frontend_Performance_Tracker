@@ -1699,3 +1699,471 @@ suite("drawing: a flat box can say what it stands for, and only when asked", () 
     assertEqual(api.flat.boxDetail, "plain", "an unknown level falls back to the plain box");
   });
 });
+
+// Node snapshots: a flat box can be a picture of the node it stands for. The
+// engine is the interesting part, and these are its promises:
+//   1. off by default: nothing is captured, nothing is blitted, no canvas is made;
+//   2. a capture runs on the idle lane (never while somebody is touching the page),
+//      through the node's own draw path, into its own canvas, at graph scale;
+//   3. reuse is one drawImage of that canvas, and only for a node whose signature
+//      still matches;
+//   4. the nodes that must stay live stay live — selected, hovered, broken,
+//      running, dragged — and the nodes the canvas cannot own (a DOM widget, a
+//      function-valued property) are never captured at all;
+//   5. a capture that was slow blocks that node for the session;
+//   6. a capture's cost is this tool's, not the pack's: hooks run, attribution
+//      stands aside, and the time lands in the snapshot's own counter;
+//   7. off (or the flatten setting at zero) releases every bitmap and paints
+//      boxes again, byte for byte.
+suite("drawing: node snapshots — a box that is a picture of the node", () => {
+  // A graph whose nodes all go flat at the zoom under test, with one node type
+  // carrying an instrumented prototype hook (so the attribution tests have a
+  // bucket to look at).
+  const SNAP_SIG_WINDOW_MS = 100; // the tracker's own LOD_SNAP_SIG_MS: how long a bitmap may be trusted unchecked
+  const SnapThing = { type: "SnapThing", hookMs: 0 };
+  function snapGraph(h, count = 3, fields = {}) {
+    h.canvas.ds.scale = 0.1;
+    h.canvas.ds.offset[0] = 0;
+    h.canvas.ds.offset[1] = 0;
+    h.canvas.links = [];
+    const nodes = [];
+    for (let i = 0; i < count; i++) {
+      const n = h.node({ type: "SnapThing", pos: [i * 240, 0], size: [200, 100], widgets: [] });
+      n.type = "SnapThing";
+      Object.assign(n, fields);
+      nodes.push(n);
+    }
+    h.canvas.nodes = nodes;
+    h.app.graph._nodes = nodes;
+    return nodes;
+  }
+  function hookBlock(h) {
+    // The bucket for the wrapped prototype hook, if the type was registered.
+    const snap = h.tracker.snapshot();
+    return snap;
+  }
+  const draw = (h, n = 1) => {
+    for (let i = 0; i < n; i++) {
+      h.advance(FRAME_MS);
+      h.canvas.setDirty(true, true);
+      h.canvas.draw();
+    }
+  };
+  // The idle lane: a slice is scheduled with setTimeout and the harness clock
+  // drives it. Nothing else has to be faked.
+  const idle = async (h, ms = 1000) => {
+    h.advance(ms);
+    await h.flush();
+    h.advance(ms);
+    await h.flush();
+  };
+  const blits = (h) => h.canvas.ctx.ops.filter((o) => o[0] === "drawImage");
+  const boxes = (h) => h.canvas.ctx.ops.filter((o) => o[0] === "fillRect" && Number(o[3]) === 200);
+  const snapApi = (h) => h.tracker.lowZoom.snapshots;
+
+  test("off by default: no captures, no bitmaps, no canvases", async () => {
+    const h = await boot();
+    snapGraph(h, 4);
+    h.tracker.lowZoom.set({ flatBelow: 0.2 }); // boxes, with snapshots left alone
+    draw(h, 2);
+    await idle(h);
+    const api = snapApi(h);
+    assertEqual(api.wanted, false, "snapshots are off unless asked for");
+    assertEqual(api.captured, 0, "nothing was captured");
+    assertEqual(api.drawn, 0, "and nothing was served from a picture");
+    assertEqual(h.canvases.length, 0, "no offscreen canvas was even created");
+    assertEqual(blits(h).length, 0, "and the live canvas was never blitted into");
+    assertEqual(boxes(h).length, 4 * 2, "every node is the plain rectangle it was before");
+  });
+
+  test("an idle slice captures the nodes that were painted as boxes, and the next frame blits them", async () => {
+    const h = await boot();
+    const nodes = snapGraph(h, 3);
+    h.tracker.lowZoom.set({ flatBelow: 0.2, boxDetail: "plain", snapshots: true });
+    draw(h, 1);
+    assertEqual(h.canvases.length, 0, "nothing is captured during a frame");
+    assertEqual(snapApi(h).queue, 3, "the three boxed nodes are queued for the idle lane");
+    await idle(h);
+    const api = snapApi(h);
+    assertEqual(api.captured, 3, "and all three were captured while idle");
+    assertEqual(h.canvases.length, 3, "each capture got its own offscreen canvas");
+    assertGreater(api.bytes, 0, "with a byte cost that is counted");
+
+    // The capture drew the node: the offscreen context has the node's own body
+    // fill (the width/height the node reports), at graph scale 1 with the node's
+    // origin translated to the padded corner.
+    const off = h.canvases[0]._ctx;
+    // The harness's fake node draws nothing of its own, so the capture canvas is
+    // mostly empty — but the transform and the save/restore bookkeeping are the
+    // capture's, and the ops below prove the real draw path ran into *this*
+    // context rather than the visible one.
+    assert(off.ops.length > 0, "the capture drew into its own context");
+    const setT = off.ops.filter((o) => o[0] === "setTransform")[0];
+    assert(setT, "the capture sets the scale explicitly instead of inheriting the zoom");
+    assertEqual(setT[1], h.tracker.lowZoom.snapshots.ratio, "at the capture ratio");
+    assertEqual(h.canvas.ds.scale, 0.1, "and the live canvas is still at the zoom it was at");
+
+    // The next frame is served from the bitmaps: three blits, no boxes.
+    h.canvas.ctx.ops.length = 0;
+    draw(h, 1);
+    const blit = blits(h);
+    assertEqual(blit.length, 3, "one drawImage per node");
+    assertEqual(blit[0][1], h.canvases[0], "the image is the canvas that node was captured into");
+    assertEqual(blit[0][2], -24, "placed at the left of the padded rect");
+    assertEqual(blit[0][3], -54, "and above the body: the title bar and padding");
+    assertEqual(blit[0][4], 248, "as wide as the node plus its padding");
+    assertEqual(blit[0][5], 178, "and tall enough for the body, the title bar and the padding");
+    assertEqual(boxes(h).length, 0, "no rectangle was painted for any of them");
+    assertEqual(snapApi(h).drawn, 3, "and the reuse is counted");
+  });
+
+  test("nothing is captured while the page is being used", async () => {
+    const h = await boot();
+    snapGraph(h, 2);
+    h.tracker.lowZoom.set({ flatBelow: 0.2, snapshots: true });
+    draw(h, 1);
+    assertEqual(snapApi(h).queue, 2, "queued");
+    // Somebody moves the pointer: the lane must wait, not capture.
+    h.window.fire("pointermove");
+    h.advance(FRAME_MS);
+    await h.flush();
+    assertEqual(snapApi(h).captured, 0, "an input event keeps the capture lane shut");
+    // Once the page is quiet for the idle window, it proceeds.
+    await idle(h, 1000);
+    assertEqual(snapApi(h).captured, 2, "and it resumes when the page goes quiet");
+  });
+
+  test("the always-live set is never served from a bitmap", async () => {
+    const h = await boot();
+    const nodes = snapGraph(h, 6);
+    nodes[0].selected = true; // being worked on
+    nodes[1].mouseOver = {}; // under the pointer
+    nodes[2].has_errors = true; // broken
+    nodes[3].progress = 0.5; // running
+    nodes[4].progress = 0.001; // executing, however briefly
+    h.tracker.lowZoom.set({ flatBelow: 0.2, snapshots: true });
+    draw(h, 1);
+    await idle(h);
+    // Only the untouched node is a candidate; the others are refused at capture
+    // time as well as at reuse time, so no bitmap of a transient state can exist.
+    // A ghosted node is deliberately *not* in this set: ghosting only changes the
+    // drawing, so the captured bitmap already carries its dimming.
+    assertEqual(snapApi(h).captured, 1, "one of the six is a candidate at all");
+    h.canvas.ctx.ops.length = 0;
+    draw(h, 1);
+    assertEqual(blits(h).length, 1, "exactly one node is served from a picture");
+    assertEqual(boxes(h).length, 5, "the other five are drawn by the box path, live");
+
+    // A node that becomes selected after being captured must go back to live.
+    const drawnBefore = snapApi(h).drawn;
+    nodes[5].selected = true;
+    h.canvas.ctx.ops.length = 0;
+    draw(h, 1);
+    assertEqual(snapApi(h).drawn, drawnBefore, "a newly selected node is not served from its bitmap");
+    assertEqual(boxes(h).length, 6, "all six are boxes again, and the selection ring is drawn live");
+
+    // The ghost case on its own, on a fresh graph: a ghosted node *is* captured
+    // and served from its picture, because a ghost's dimming is part of the
+    // drawing that was captured.
+    const ghost = snapGraph(h, 1)[0];
+    ghost.flags = { ghost: true };
+    const capturedBefore = snapApi(h).captured;
+    draw(h, 1);
+    await idle(h);
+    assertEqual(snapApi(h).captured, capturedBefore + 1, "the ghost was captured");
+    h.canvas.ctx.ops.length = 0;
+    draw(h, 1);
+    assertEqual(blits(h).length, 1, "and is served from its own picture");
+    assertEqual(boxes(h).length, 0, "not painted as a box");
+  });
+
+  test("dragging nodes keeps them live, panning does not invalidate anything", async () => {
+    const h = await boot();
+    snapGraph(h, 2);
+    h.tracker.lowZoom.set({ flatBelow: 0.2, snapshots: true });
+    draw(h, 1);
+    await idle(h);
+    assertEqual(snapApi(h).captured, 2, "both captured");
+
+    h.canvas.isDragging = true; // a node is being dragged
+    h.canvas.ctx.ops.length = 0;
+    draw(h, 1);
+    assertEqual(blits(h).length, 0, "while dragging, nodes are drawn live");
+    h.canvas.isDragging = false;
+
+    // Panning and zooming are camera moves: the picture is still valid.
+    h.canvas.ds.offset[0] = -500;
+    h.canvas.ds.scale = 0.08;
+    h.canvas.ctx.ops.length = 0;
+    draw(h, 1);
+    assertEqual(blits(h).length, 2, "a pan and a zoom reuse every bitmap");
+    assertEqual(snapApi(h).invalidated, 0, "and invalidate nothing");
+  });
+
+  test("a node that changes is dropped, not shown stale", async () => {
+    const h = await boot();
+    const nodes = snapGraph(h, 1);
+    nodes[0].widgets = [{ type: "number", name: "steps", value: 20 }];
+    h.tracker.lowZoom.set({ flatBelow: 0.2, snapshots: true });
+    draw(h, 1);
+    await idle(h);
+    h.canvas.ctx.ops.length = 0;
+    draw(h, 1);
+    assertEqual(blits(h).length, 1, "served from the picture while nothing changes");
+
+    nodes[0].widgets[0].value = 30; // something that changes what the node draws
+    h.advance(SNAP_SIG_WINDOW_MS); // past the window in which the old signature would still be trusted
+    h.canvas.ctx.ops.length = 0;
+    draw(h, 1);
+    assertEqual(blits(h).length, 0, "the changed node is not served from the old picture");
+    assertEqual(snapApi(h).invalidated, 1, "the bitmap was dropped as stale");
+    assertEqual(snapApi(h).queue, 1, "and a fresh capture was asked for");
+    await idle(h);
+    assertEqual(snapApi(h).captured, 2, "which happened");
+  });
+
+  test("a capture that was slow blocks that node for the session", async () => {
+    const h = await boot();
+    const nodes = snapGraph(h, 3);
+    // One node whose own drawing is expensive: past the slow-capture cutoff it must
+    // never be captured again, while its neighbours still are.
+    nodes[1].onDrawBackground = () => h.busy(70);
+    h.tracker.lowZoom.set({ flatBelow: 0.2, snapshots: true });
+    draw(h, 1);
+    await idle(h);
+    const api = snapApi(h);
+    assertEqual(api.captured, 2, "the two cheap nodes were captured");
+    assertEqual(api.slow, 1, "the expensive one was measured and blocked");
+    assertEqual(h.canvases.filter((c) => c.width === 0).length, 1, "the bitmap it drew was released again");
+    assertEqual(api.bytes > 0, true, "and only the two cheap nodes are held");
+    await idle(h);
+    assertEqual(snapApi(h).captured, 2, "it is never retried");
+    h.canvas.ctx.ops.length = 0;
+    draw(h, 1);
+    assertEqual(boxes(h).length, 1, "that node keeps its box forever");
+  });
+
+  test("a capture's time is this tool's, not the pack's", async () => {
+    const h = await boot();
+    // The way a real pack installs a hook: through beforeRegisterNodeDef, which is
+    // where this tool wraps it. (Assigning the prototype method afterwards would
+    // install a hook the tracker never saw, which would make this test prove
+    // nothing at all.)
+    await h.registerExtension("SnapPack", {
+      beforeRegisterNodeDef(nodeType, nodeData) {
+        if (nodeData.name !== "SnapHookThing") return;
+        nodeType.prototype.onDrawBackground = function () {
+          h.busy(2);
+        };
+      },
+    });
+    const Thing = h.registerNodeType("SnapHookThing");
+    h.canvas.ds.scale = 0.1;
+    h.canvas.links = [];
+    const nodes = [h.makeNode(Thing), h.makeNode(Thing)];
+    for (const n of nodes) {
+      n.type = "SnapHookThing";
+      n.pos = [0, 0];
+      n.size = [200, 100];
+    }
+    h.canvas.nodes = nodes;
+    h.app.graph._nodes = nodes;
+
+    h.tracker.lowZoom.set({ snapshots: true });
+    draw(h, 3); // drawn live first, so the hook has attributed calls to protect
+    // The hook's bucket after three live frames' worth of attribution.
+    // The pack's row, as the Timing tab sees it: calls attributed inside frames,
+    // outside frames, and nested. A capture must move none of them.
+    const hookCalls = () => {
+      const rows = (h.tracker.snapshot.hooks || []).filter((r) => r.label === "SnapPack");
+      return rows.reduce(
+        (n, r) => n + (Number(r.insideCalls) || 0) + (Number(r.outsideCalls) || 0) + (Number(r.nestedCalls) || 0),
+        0
+      );
+    };
+    const before = hookCalls();
+    assertGreater(before, 0, "the live frames attributed the hook, as they should");
+    // Now the nodes become boxes with snapshots on: the captures will run the same
+    // hook, and it must not show up on the pack's row.
+    h.tracker.lowZoom.set({ flatBelow: 0.2 });
+    draw(h, 1);
+    await idle(h);
+    assertEqual(snapApi(h).captured, 2, "the two nodes were captured");
+    assertEqual(hookCalls(), before, "and the captures added no attributed calls to the pack's row");
+    assertGreater(snapApi(h).captureMs, 0, "their cost is in the snapshot counter instead");
+  });
+
+  test("a node the canvas cannot own is never captured", async () => {
+    const h = await boot();
+    const nodes = snapGraph(h, 3);
+    nodes[0].addDOMWidget("preview", "image", h.document.createElement("div"), {});
+    nodes[1].properties = { mode: () => "changing" };
+    h.tracker.lowZoom.set({ flatBelow: 0.2, snapshots: true });
+    draw(h, 1);
+    await idle(h);
+    assertEqual(snapApi(h).captured, 1, "only the node with nothing hidden in it was captured");
+    assertEqual(snapApi(h).refused, 2, "the DOM widget and the function-valued property were refused");
+  });
+
+  test("the budget releases the least recently used bitmaps, and the canvases go with them", async () => {
+    const h = await boot();
+    snapGraph(h, 60); // at 3x, sixty of these do not fit in the smallest budget
+    h.tracker.lowZoom.set({ flatBelow: 0.2, snapshots: true, snapRatio: 3, snapMb: 32 });
+    draw(h, 1);
+    await idle(h, 12000);
+    const api = snapApi(h);
+    assertGreater(api.captured, 4, "several were captured");
+    assertGreater(api.evicted, 0, "and the budget released the ones that did not fit");
+    const budget = api.budgetMb * 1024 * 1024;
+    assertLess(api.bytes, budget + 1, `what is held stays inside the budget (${api.bytes} of ${budget} bytes)`);
+    assertEqual(api.budgetMb, 32, "the budget the API asked for is the one in force");
+    const dead = h.canvases.filter((c) => c.width === 0 && c.height === 0);
+    assertGreater(dead.length, 0, "a released bitmap's canvas is zeroed, so the pixels go back");
+  });
+
+  test("off releases everything and paints exactly what it painted before", async () => {
+    const h = await boot();
+    snapGraph(h, 3);
+    h.tracker.lowZoom.set({ flatBelow: 0.2, snapshots: true });
+    draw(h, 1);
+    await idle(h);
+    assertEqual(snapApi(h).captured, 3, "captured");
+
+    h.tracker.lowZoom.set({ snapshots: false });
+    assertEqual(snapApi(h).bytes, 0, "switching off releases the memory");
+    assertEqual(h.canvases.filter((c) => c.width === 0).length, 3, "and zeroes every canvas");
+    h.canvas.ctx.ops.length = 0;
+    draw(h, 1);
+    assertEqual(blits(h).length, 0, "nothing is served from a picture any more");
+    assertEqual(boxes(h).length, 3, "and the plain rectangles are back");
+  });
+
+  test("the flatten setting going to zero puts the pictures away too", async () => {
+    const h = await boot();
+    snapGraph(h, 2);
+    h.tracker.lowZoom.set({ flatBelow: 0.2, snapshots: true });
+    draw(h, 1);
+    await idle(h);
+    assertGreater(snapApi(h).bytes, 0, "holding bitmaps");
+    h.tracker.lowZoom.set({ flatBelow: 0 });
+    assertEqual(snapApi(h).bytes, 0, "with no boxes to replace, they are released");
+    assertEqual(snapApi(h).wanted, true, "the setting the user chose is still on");
+    assertEqual(snapApi(h).on, false, "it is simply doing nothing, and says so");
+  });
+
+  test("a fault in the reuse path hands the page back instead of trying per node", async () => {
+    const h = await boot();
+    snapGraph(h, 2);
+    h.tracker.lowZoom.set({ flatBelow: 0.2, snapshots: true });
+    draw(h, 1);
+    await idle(h);
+    // Break the blit itself: the canvas refuses to draw the image.
+    const ctx = h.canvas.ctx;
+    const real = ctx.drawImage;
+    ctx.drawImage = function () {
+      throw new Error("nope");
+    };
+    draw(h, 1);
+    ctx.drawImage = real;
+    const api = snapApi(h);
+    assertEqual(api.wanted, false, "the mode turned itself off");
+    assertEqual(api.on, false, "and is doing nothing");
+    assertIncludes(h.tracker.lowZoom.state.error, "reuse failed", "with the reason in the panel's own error line");
+    assertEqual(api.bytes, 0, "and every bitmap released");
+  });
+
+  test("the panel and the API report what the engine did", async () => {
+    const h = await boot();
+    snapGraph(h, 3);
+    h.tracker.lowZoom.set({ flatBelow: 0.2, snapshots: true });
+    draw(h, 1);
+    await idle(h);
+    h.advance(600); // the panel refreshes on its own tick
+    await h.flush();
+    await openTweaksTab(h);
+    const text = panelText(h);
+    assertIncludes(text, "boxes: pictures of the nodes (snapshots)", "the control offers it");
+    assertIncludes(text, "capture 2x per graph unit", "with the ratio it will capture at");
+    assertIncludes(text, "bitmap budget 64 MiB", "and the budget");
+    const api = h.tracker.lowZoom;
+    assertEqual(api.snapshots.wanted, true, "the API says it is wanted");
+    assertEqual(api.limits.snapRatios.join(","), "1,2,3", "and exposes the ladders");
+    assertEqual(api.snapshots.installed, true, "with the canvas seam in place");
+    // A type the user excludes is refused like anything else the canvas cannot own.
+    api.set({ snapExclude: ["SnapThing"] });
+    assertEqual(api.snapshots.exclude.join(","), "SnapThing", "the list is kept");
+    api.set({ snapshots: false });
+    api.set({ snapshots: true });
+    await idle(h);
+    assertEqual(api.snapshots.captured, 3, "a fresh page state captures again");
+    h.tracker.lowZoom.set({ snapshots: false });
+  });
+});
+
+// The two ways a snapshot store can quietly go wrong on a long-lived page: memory
+// nobody is using any more, and a node that no longer exists. Both are handled by
+// machinery that already runs — the master switch and the once-a-second sweep —
+// so they are pinned here rather than left to a reading of the code.
+suite("drawing: node snapshots — what releases a bitmap besides the budget", () => {
+  function graph(h, count) {
+    h.canvas.ds.scale = 0.1;
+    h.canvas.links = [];
+    const nodes = [];
+    for (let i = 0; i < count; i++) {
+      const n = h.node({ type: "SnapThing", pos: [i * 240, 0], size: [200, 100] });
+      n.type = "SnapThing";
+      nodes.push(n);
+    }
+    h.canvas.nodes = nodes;
+    h.app.graph._nodes = nodes;
+    return nodes;
+  }
+  const idle = async (h, ms = 1000) => {
+    h.advance(ms);
+    await h.flush();
+    h.advance(ms);
+    await h.flush();
+  };
+  const api = (h) => h.tracker.lowZoom.snapshots;
+
+  test("the master switch hands the memory back with the page", async () => {
+    const h = await boot();
+    graph(h, 3);
+    h.tracker.lowZoom.set({ flatBelow: 0.2, snapshots: true });
+    h.advance(FRAME_MS);
+    h.canvas.setDirty(true, true);
+    h.canvas.draw();
+    await idle(h);
+    assertGreater(api(h).bytes, 0, "holding bitmaps while switched on");
+    assertEqual(h.tracker.lowZoom.setEnabled(false), false, "the switch goes off");
+    assertEqual(api(h).bytes, 0, "and the bitmaps go with it");
+    assertEqual(h.canvases.filter((c) => c.width === 0).length, 3, "every canvas zeroed");
+    assertEqual(h.tracker.lowZoom.setEnabled(true), true, "switched back on");
+    // A drawn frame is what puts nodes back in the queue — the same way the first
+    // capture happened.
+    h.advance(FRAME_MS);
+    h.canvas.setDirty(true, true);
+    h.canvas.draw();
+    await idle(h);
+    assertGreater(api(h).captured, 3, "and the next idle lane captures again");
+  });
+
+  test("a node that leaves the graph does not keep its bitmap alive", async () => {
+    const h = await boot();
+    const nodes = graph(h, 3);
+    h.tracker.lowZoom.set({ flatBelow: 0.2, snapshots: true });
+    h.advance(FRAME_MS);
+    h.canvas.setDirty(true, true);
+    h.canvas.draw();
+    await idle(h);
+    const before = api(h).bytes;
+    assertGreater(before, 0, "three bitmaps held");
+    // The node is deleted the way the frontend deletes one: out of the graph.
+    h.canvas.nodes = h.canvas.nodes.filter((n) => n !== nodes[0]);
+    h.app.graph._nodes = h.canvas.nodes;
+    h.advance(1200); // the sweep's own interval
+    await h.flush();
+    assertGreater(api(h).pruned, 0, "the sweep pruned the record");
+    assertLess(api(h).bytes, before, "and released its pixels");
+  });
+});

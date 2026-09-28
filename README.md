@@ -311,7 +311,16 @@ progress bar of the node that is running, and the dimming of a muted,
 bypassed or ghosted node. Every mark is read from the node's own fields
 (`has_errors`, `progress`, `mode`, `flags.ghost`), never guessed, and the
 panel counts them — each mark is one more rectangle call per node per
-frame, and the count is the honest price of it.
+frame, and the count is the honest price of it. One step further: **node
+snapshots** (off by default) paint a box as a *picture of the node* instead of
+a fill. Each picture is captured once while the page is idle, through the
+node's own draw path, reused as a single `drawImage`, and thrown away the
+moment the node it describes changes. It only ever replaces a box — the
+flatten threshold above it remains the only thing that decides which nodes
+stop being drawn in full — so this is a readability setting, not a speed
+setting; whether it can also pay for itself by replacing live nodes during
+movement is a question with a measurement attached (see the roadmap in
+plan.md).
 
 **Redraw merging** is the other half of the same idea. `setDirty`
 requests were already counted exactly (and the Testing tab's cap can
@@ -561,6 +570,76 @@ installed as the sandbox's `CanvasRenderingContext2D` (the preview ladder
 patches `drawImage` there, the same way a browser exposes it), and
 `createImageBitmap` records the resize it was asked to perform instead of
 resizing anything.
+
+## What changed in v2.3.0
+
+- **A flat box can now be a picture of the node it stands for.** New **node
+  snapshots** setting in the Tweaks tab (off by default): the nodes the flatten
+  threshold turns into rectangles are captured once while the page is idle —
+  drawn through their own draw path into their own offscreen canvas, at the
+  capture ratio you pick — and later frames blit that picture with one
+  `drawImage` instead of painting a fill. Panning and zooming keep reusing the
+  pictures on purpose: the camera moved, the node did not.
+- **It replaces boxes, never live nodes.** The flatten threshold is still the
+  only setting that decides which nodes stop being drawn in full, so snapshots
+  can never change what a zoom you have not already flattened looks like. A node
+  that is selected, hovered, carrying a validation error, running (`progress`),
+  or being dragged stays live and is drawn by ComfyUI — a bitmap of a transient
+  state cannot exist, because those nodes are not captured at all.
+- **A node the canvas cannot own is never captured.** A widget that is a DOM
+  element, a `dom`/`custom` widget type, a function-valued widget or property, a
+  string over 4 kB: refused for good, and the panel counts them.
+- **Staleness is bounded and stated.** A picture is only used while the node's
+  signature — title, size, flags, mode, colours, connections, widget values,
+  progress, error state, the canvas's own render flags, the theme — still
+  matches, re-checked at most every 100 ms per node. Anything the tool can see
+  cheaply is checked every frame instead. A node whose own capture took longer
+  than 60 ms is blocked for the session rather than stalling the page twice.
+- **A capture's cost is the tool's, not the pack's.** The capture runs the
+  node's real draw path, including other extensions' hooks, but attribution
+  steps aside while it runs and the time lands in the snapshot's own counter
+  (`captureMs`). Without that, a capture would show up in the Timing tab as the
+  pack being slow.
+- **The idle lane is the one this tool already had.** Captures are batched under
+  the same budget as everything else in the Governor tab, pause the moment
+  there is input (pointer, wheel, key), and slice with a gap between them, so a
+  thousand-node graph is captured over a second or two rather than in one
+  visible pause. No second scheduler.
+- **Memory is bounded and given back.** The bitmap budget (default 64 MiB) is
+  enforced by least-recently-used eviction, and releasing a bitmap zeroes its
+  canvas so the pixels return to the browser. Bitmaps are also released when you
+  switch snapshots off, when the tool's master switch goes off, when the flatten
+  threshold goes to zero, when the graph's theme changes, and for nodes that
+  have left the graph.
+- **Everything fails open.** A fault in the reuse path turns the feature off and
+  paints boxes, with the reason in the panel's own error line; a fault in a
+  capture blocks that node and, after five in a row, turns the feature off the
+  same way.
+- **Honest limits, written down** (also in the LIMITS block at the bottom of
+  `web/tracker.js`): a signature is re-checked every 100 ms, so a change can be
+  shown stale for up to that long; a picture is the node at the moment it was
+  captured, so a node whose live drawing animates without changing a signature
+  field shows that frozen frame; and zoomed in past the capture ratio a picture
+  is softer than live drawing — which is why the ratio is a setting and why the
+  nodes you are working with are never served from one.
+- The capture ratio (1x/2x/3x per graph unit) and the budget (32–256 MiB) are
+  provisional defaults: the next step measures hit rate, bytes and frame time on
+  real graphs and sets them from numbers (plan.md, Track K3).
+- **New tests** (16): off by default (no captures, no canvases, no blits); an
+  idle slice captures what was boxed and the next frame blits it, at the padded
+  rect and the chosen ratio; nothing is captured while the page is being used;
+  the always-live set is never served from a picture (and a ghosted node is,
+  because its dimming is part of the drawing); dragging keeps nodes live while
+  panning and zooming reuse everything; a changed widget drops the picture;
+  a slow capture blocks that node for good; a capture runs other extensions'
+  hooks without attributing their time to them; DOM-widget and
+  function-valued nodes are refused; the budget evicts and zeroes canvases;
+  switching off, zeroing the threshold and the master switch all release the
+  memory; a deleted node's record is pruned by the sweep; a fault in the reuse
+  path hands the page back with the reason in the panel.
+- Deliberately **not** built in this step: snapshots replacing *live* nodes
+  during movement. That is the version with a performance claim attached, and it
+  needs the measurement first (K3) rather than a promising default.
 
 ## What changed in v2.2.0
 

@@ -4,7 +4,7 @@ A running record for whoever picks this up next (including me). `CLAUDE.md` is t
 rules for changing the code; `plan.md` is where it is going. This file is the past:
 what was built, what was rejected, and what the evidence was.
 
-Last updated at **v2.2.0**, 136 tests green, PR #1 on
+Last updated at **v2.3.0**, 152 tests green, PR #1 on
 `Spirindzhiukas/ANTs_ComfyUI_Frontend_Performance_Tracker`.
 
 ---
@@ -13,8 +13,8 @@ Last updated at **v2.2.0**, 136 tests green, PR #1 on
 
 | | |
 | --- | --- |
-| Version | 2.2.0 (`web/tracker.js` `VERSION`) |
-| Tests | 136 (`node tests/run-tests.mjs`), plus `tests/test_init.py` |
+| Version | 2.3.0 (`web/tracker.js` `VERSION`) |
+| Tests | 152 (`node tests/run-tests.mjs`), plus `tests/test_init.py` |
 | Frontend | `web/tracker.js`, ~9.5k lines, one ES module, no dependencies |
 | Backend | `__init__.py` — a no-op node + one optional read-only route |
 | Panel | 9 tabs: Tweaks, Timing, Nodes, Stalls, Governor, Load, Memory, GPU / VRAM, Testing |
@@ -36,6 +36,24 @@ something has to be drawn less or hit-tested less.
 ## 2. Version log
 
 The commit log is the full record; this is the "why", newest first.
+
+**v2.3.0 — a box can be a picture of its node (plan.md Track K1).** The snapshot
+engine, off by default, in the Tweaks tab: the nodes the flatten threshold turns
+into boxes are captured once on the idle lane — drawn through their own draw path
+into their own offscreen canvas — and later frames blit that picture with one
+`drawImage`. Ported in design from ComfyUI-NodeSnapshots (SparknightLLC /
+EricBCoding, MIT) and re-implemented on this file's own seams, budget and idle
+lane; no upstream code, so the licence decision is still open (Track M). Three
+deliberate differences from upstream, all argued in the code: (a) a snapshot
+replaces a *flat box*, never a live node — the flatten threshold stays the only
+thing that decides which nodes stop being drawn in full, which keeps golden rule
+6 intact and keeps this a readability feature rather than a performance claim;
+(b) the capture draws into its own canvas instead of the visible one, so there is
+no canvas state to copy and restore; (c) a capture's time is counted as this
+tool's (`snapMs`) and attribution stands aside while `inCapture` is set, because
+otherwise the Timing tab would blame the pack whose hook the capture ran. The
+speed case — replacing *live* nodes during movement — is deliberately not built
+yet: it needs K3's measurement first.
 
 **v2.2.0 — the flat boxes say what they stand for.** The flatten path painted one
 grey rectangle per node, which removes the node's cost and its identity with it:
@@ -154,6 +172,23 @@ ComfyUI's execution highlighting is not a per-node field in this frontend (nothi
 in `LGraphNode`/`LGraphCanvas` carries it; `node.progress` is the only per-node
 execution state that exists), so inventing one would be inventing state. A node
 that says nothing gets no mark.
+
+**A snapshot is only used where the box would have been.** The engine could
+reuse a picture at any zoom (upstream does), but that would make a zoom the tool
+never touched look different, so it is gated on the flatten threshold: boxes in,
+pictures out. Consequences to keep in mind: this is a readability feature under
+the threshold, not a speed feature, and the numbers to decide whether it should
+also replace live nodes during movement do not exist yet (plan.md K3). The
+follow-on decision is a measurement, not a preference.
+
+**Two rate windows, stated rather than hidden.** Per frame, the cheap fields
+(selection, hover, error, progress, drag) are checked every draw and a node in
+any of those states is never served from a bitmap. The expensive check — the
+signature, ~30 field reads and a rolling hash — is rationed to once per
+`LOD_SNAP_SIG_MS` (100 ms) per node, which is the one accepted staleness window;
+it is in LIMITS and in the README. A node whose capture took longer than
+`LOD_SNAP_SLOW_MS` (60 ms, not upstream's 32 — their own issue recommends the
+raise for large custom nodes) is blocked for the session.
 
 **A limited source is slowed, never silenced.** Skipped interval ticks are covered
 by the next one; a skipped one-shot or chained callback is re-scheduled for when

@@ -30,6 +30,7 @@ python3 tests/test_init.py            # the Python side (route parsing, node con
 node tests/demo.mjs                   # prints what the panel says against a synthetic graph
 node tools/pill-preview.mjs > preview/pill.html   # regenerate the pill page (exit != 0 if it drifts)
 node tools/box-preview.mjs > preview/boxes.html   # flat boxes at each boxDetail level, from the real paint path
+                                                  # (node snapshots have no picture here: the harness canvas has no pixels)
 node tools/box-preview.mjs --svg > preview/boxes.svg   # the same picture as SVG, for a PNG render (resvg + Pillow, optional)
 ```
 
@@ -90,6 +91,7 @@ Read in this order to understand the file:
 | `--- 3. canvas-level patches` | `draw` frame total, per-node-type cost, the three draw stages. |
 | `--- low-zoom drawing` | `LOD`, every predicate (`lodOn`, `lodFlatOn`, …), the DOM registry/sweep, preview ladder, link ink. |
 | `--- previews` | The thumbnail ladder (`LOD.thumbs`, a WeakMap per source; `createImageBitmap` with a canvas fallback). |
+| `--- node snapshots` | The bitmap engine: signature, the always-live/refused sets, the capture into an offscreen canvas, the idle-lane pump, the LRU budget, and the reuse path called from the `drawNode` wrapper. Reads `LOD_SNAP_*` and the block comment above them first. |
 | `--- DOM boxes` | `view*`: the widget gate, the node-DOM registry, the event gate, fovea. |
 | `--- the event gate` | `LOD.blockSet` and the document-capture listener. |
 | `--- the node UI` | The pill: glyphs, `buildAntsNodeWidget`, `antsBuildTick`. |

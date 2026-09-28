@@ -207,7 +207,7 @@ class Node {
   }
 }
 
-export function createDocument() {
+export function createDocument(options = {}) {
   const doc = new Node("#document");
   const head = new Node("head");
   const body = new Node("body");
@@ -215,7 +215,30 @@ export function createDocument() {
   doc.appendChild(body);
   doc.head = head;
   doc.body = body;
-  doc.createElement = (tag) => new Node(tag);
+  // Canvases are the one element a test needs more from than a tag name: the
+  // tracker draws offscreen bitmaps (node snapshots), and a bitmap's *content* is
+  // produced by drawing into a context. `ctxFactory` is how the harness hands out
+  // its recording context, so a test can assert what a capture drew and what the
+  // reuse path blitted. Without a factory, `getContext` returns null and anything
+  // built on it fails open — which is also the contract a real page needs.
+  const ctxFactory = options.ctxFactory || null;
+  doc._canvases = [];
+  doc.createElement = (tag) => {
+    const node = new Node(tag);
+    if (String(tag).toLowerCase() === "canvas") {
+      node.width = 300;
+      node.height = 150;
+      node.getContext = (kind) => {
+        if (String(kind) !== "2d" || !ctxFactory) return null;
+        if (!node._ctx) {
+          node._ctx = ctxFactory(node);
+          doc._canvases.push(node);
+        }
+        return node._ctx;
+      };
+    }
+    return node;
+  };
   // SVG elements are built with a namespace in the real DOM; the tracker draws its
   // glyphs that way, so the shim has to answer the same question.
   doc.createElementNS = (ns, tag) => new Node(tag);

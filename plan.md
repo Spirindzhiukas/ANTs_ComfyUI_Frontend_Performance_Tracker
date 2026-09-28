@@ -278,8 +278,19 @@ nodes. Its own README and reports show the consequences (long warm-up, nodes lef
 live when the budget runs out). Our version keeps the engine, changes the storage
 strategy, and credits every byte of it (Track M).
 
-**K1. The capture engine, ported and credited (M).** Port these pieces as they
-are, with a source header on the file:
+**K1. The capture engine, ported and credited (M) — DELIVERED in v2.3.0.**
+Shipped as designed, with three decisions the code argues for and this file
+records: (a) a snapshot replaces a *flat box*, never a live node, so the flatten
+threshold stays the only thing that decides which nodes stop being drawn in full
+(golden rule 6) — which also means this step is a readability feature, and the
+performance case (replacing live nodes during movement) is a claim that still
+needs K3's numbers; (b) the capture draws into its own offscreen canvas rather
+than the visible one, so there is no sixteen-property canvas state to copy and
+restore; (c) a capture runs the packs' hooks but attribution stands aside while
+`inCapture` is set, so the time lands in `snapMs` instead of in the Timing tab's
+row for a pack that did nothing wrong. Panning and zooming deliberately reuse
+(the camera moved, the node did not); dragging a node does not. Ported these
+pieces, with a source note on the block naming upstream:
 
 - `node_signature()` — a JSON of everything that changes what a node draws:
   title, size, flags, mode, colours, shape, collapsed width, subgraph version,
@@ -327,12 +338,15 @@ visible context is only invisible because it happens while idle, and the idle
 lane can be pre-empted by a frame. Prefer a reusable offscreen canvas per capture
 size, and measure whether that costs more than their approach.
 
-*Verified by:* harness tests for signature stability (same node → same
-signature; a widget value change → different; a move → same), the reuse decision,
-the always-live set, the slow-capture block, and a `drawImage` counter on the
-fake canvas; the existing 131 tests unchanged with the feature off.
+*Delivered as:* 16 tests in `tests/drawing.test.mjs` (off by default; capture
+and blit; the idle lane waits for input to stop; the always-live set; drag vs
+pan; a changed widget drops the bitmap; the slow-capture block; no attribution
+during a capture; the refused set; budget eviction; every release path; the
+reuse fault path; the panel and API), plus a demo section and the `LIMITS`
+entries. The harness grew offscreen-canvas support for it (`createDocument({
+ctxFactory })`, `setTransform` recorded, `h.canvases`).
 
-**K2. Zoom-bucketed bitmaps, not a fixed capture scale (M).** The capture is
+**K2. Zoom-bucketed bitmaps, not a fixed capture scale (M) — NEXT.** The capture is
 taken at the scale of the zoom bucket it will be used in, and reuse is one
 `drawImage` from that box to the on-screen one. At the flatten zooms a node is
 drawn into roughly a hundred by forty screen pixels, so a bitmap of that size is
@@ -458,10 +472,12 @@ version is stronger than the legal minimum, and the user asked for credit
 
 ## Suggested order
 
-0. **K + M, then L** — the current request (2026-09-28). K1 → K2 → K3 in that
-   order, with M's notices in the same commits as K1; K4 first if the engine
-   stalls and something shippable is needed early; K5/K6 only after K2 has
-   numbers. Track L after K3, in the same round as agreed.
+0. **K + M, then L** — the current request (2026-09-28). **K4 delivered
+   (v2.2.0)** and **K1 delivered (v2.3.0)**; K2 → K3 next. M's notices wait for
+   the user's decision on whether upstream code is kept at all (Q5): the K1
+   implementation is this file's own, with the design credited in a comment, so
+   nothing legally needs a notice yet. K5/K6 only after K2 has numbers. Track L
+   after K3, in the same round as agreed.
 1. **A1 + A3** (verify page / startup line) — small, and they make everything after
    this checkable on the real machine. A2 needs one run from the user.
 2. **B1 + B2** (measure any setting / ledger) — turns nine knobs into evidence.

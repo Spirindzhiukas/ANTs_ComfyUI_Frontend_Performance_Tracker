@@ -107,7 +107,7 @@ export function createHarness(options = {}) {
   };
 
   // ---------------------------------------------------------------- DOM ----
-  const document = createDocument();
+  const document = createDocument({ ctxFactory: () => makeStubCtx() });
   const localStorage = opts.storage || createStorage();
   const clipboardWrites = [];
   const navigatorShim = {
@@ -181,6 +181,7 @@ export function createHarness(options = {}) {
   }
   for (const name of [
     "fillRect",
+    "setTransform",
     "strokeRect",
     "beginPath",
     "moveTo",
@@ -585,6 +586,7 @@ export function createHarness(options = {}) {
     FRAME_MS,
     app,
     canvas,
+    canvases: document._canvases, // offscreen canvases (node snapshots' bitmaps)
     imageBitmaps,
     LiteGraph: LiteGraphShim,
     document,
