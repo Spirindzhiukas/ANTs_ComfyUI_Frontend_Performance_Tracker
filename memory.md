@@ -329,5 +329,12 @@ The user's machine and reports, all of which drove priorities:
 - The test suite grows with the fix, not after it: a bug report becomes a failing
   test first where possible.
 - Where a picture was the only way to check a look, the look is generated from the
-  real source (`tools/pill-preview.mjs`) rather than drawn by hand, so it cannot
-  drift from the extension.
+  real source (`tools/pill-preview.mjs`, `tools/box-preview.mjs`) rather than drawn
+  by hand, so it cannot drift from the extension.
+- **Check the parent before committing** in a long-lived agent session: the local
+  branch ref can be handed back at an older commit than the working tree (the
+  objects and the remote are fine — it is the ref that resets). `git log --oneline
+  -2` before the commit; if the parent is wrong, `git reset --soft <last real
+  commit>` and commit again, then confirm `git diff --stat <old-sha> HEAD` is
+  empty. This happened once with v2.3.0 and cost nothing because the tree, not the
+  history, is the source of truth.
