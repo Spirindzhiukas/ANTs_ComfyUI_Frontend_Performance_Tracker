@@ -591,11 +591,25 @@ suite("scripted pan benchmark", () => {
     };
 
     h.tracker.benchmark(1000, "A");
-    drive();
+    let moved = 0;
+    const driveMoving = () => {
+      for (let i = 0; i < 220; i++) {
+        h.advance(FRAME_MS);
+        h.canvas.draw();
+        moved = Math.max(moved, Math.abs(h.canvas.ds.offset[0]), Math.abs(h.canvas.ds.offset[1]));
+      }
+    };
+    driveMoving();
     let bench = h.tracker.snapshot.settings.benchmark;
     assert(bench && bench.A, "run A recorded");
     assertGreater(bench.A.frames, 30, "A measured real frames");
     assertGreater(bench.A.meanFrameMs, 0.5, "A measured the real frame cost");
+    assertGreater(bench.A.travelX, 400, "the pan travels more than the old 40-unit fidget");
+    assertEqual(bench.A.screens, 1.5, "one screen plus the default half-screen margin");
+    assertEqual(bench.A.foveaOn, false, "foveation was off, and the result says so");
+    assertEqual(h.canvas.ds.offset[0], 0, "the view is put back");
+    assertEqual(h.canvas.ds.offset[1], 0, "both axes");
+    assertGreater(moved, 400, "the offset actually moved during the run, not only on paper");
 
     // Mute the expensive pack, reset samples, measure again: B must be cheaper.
     h.tracker.mute("BenchPack");

@@ -571,6 +571,10 @@ patches `drawImage` there, the same way a browser exposes it), and
 `createImageBitmap` records the resize it was asked to perform instead of
 resizing anything.
 
+## What changed in v2.4.1
+
+- **The scripted pan was a fidget, and it could not measure foveation.** It moved the view by ±40 by ±15 graph units — about 4 by 1.5 CSS pixels at zoom 0.10 — and put it back. A node never left the viewport, so the off-screen margin (half a screen by default) never came into it, and two runs of it could not show what that setting costs or saves. The sweep is now one screen plus the margin you have set, the result says how many screens it swept and the peak number of elements foveation hid, and the view is still put back where it started. Ten times the old fidget would still have been inside the margin. Run A and B with that setting the only thing changed between them.
+
 ## What changed in v2.4.0
 
 - **Every node the canvas can draw gets a picture, not just the ones a

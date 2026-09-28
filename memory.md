@@ -4,7 +4,7 @@ A running record for whoever picks this up next (including me). `CLAUDE.md` is t
 rules for changing the code; `plan.md` is where it is going. This file is the past:
 what was built, what was rejected, and what the evidence was.
 
-Last updated at **v2.4.0**, 161 tests green, PR #1 on
+Last updated at **v2.4.1**, 161 tests green, PR #1 on
 `Spirindzhiukas/ANTs_ComfyUI_Frontend_Performance_Tracker`.
 
 ---
@@ -13,7 +13,7 @@ Last updated at **v2.4.0**, 161 tests green, PR #1 on
 
 | | |
 | --- | --- |
-| Version | 2.4.0 (`web/tracker.js` `VERSION`) |
+| Version | 2.4.1 (`web/tracker.js` `VERSION`) |
 | Tests | 161 (`node tests/run-tests.mjs`), plus `tests/test_init.py` |
 | Frontend | `web/tracker.js`, ~9.5k lines, one ES module, no dependencies |
 | Backend | `__init__.py` — a no-op node + one optional read-only route |
@@ -36,6 +36,18 @@ something has to be drawn less or hit-tested less.
 ## 2. Version log
 
 The commit log is the full record; this is the "why", newest first.
+
+**v2.4.1 — the scripted pan was too short to see foveation.** A fresh-process
+report (browser and server restarted, rgthree fast toggles off, software
+rendering, same maximized window, zoom 0.10, 1040 nodes) confirmed the idle
+win is not leftover state: mean 4.10 ms, p95 3.70, display 112 Hz, `setDirty`
+0/s. The same paste's scripted pan was 175 ms/frame both runs, hooks 0%, and
+the two runs matched because nothing was changed between them — and because
+the pan only moved ±40 graph units, about 4 CSS pixels at that zoom. Foveation
+boxes a node past half a screen. That fidget never left the viewport. The
+sweep is now one screen plus the margin, and the result names the distance and
+the peak number of elements hidden, so the next A/B can actually be about that
+setting.
 
 **v2.4.0 — the picture is whatever the canvas draws, and the rest is named.**
 Second report after K1, from the same 1,041-node graph at zoom 0.10: 625,156

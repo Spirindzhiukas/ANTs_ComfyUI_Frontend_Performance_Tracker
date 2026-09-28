@@ -27,7 +27,7 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.4.0";
+const VERSION = "2.4.1";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
 const NODE_NAME = "ANTsNastyBastardsTracker";
 
@@ -9031,10 +9031,30 @@ function setSyntheticTick(ms) {
 
 function benchLine(r) {
   if (!r) return "not run yet";
+  let extra = "";
+  if (Number.isFinite(r.screens)) extra += ` · swept ${r.screens.toFixed(1)} screen(s)`;
+  if (r.foveaOn === true) extra += ` · fovea peak ${r.foveaPeak || 0} hidden`;
+  else if (r.foveaOn === false) extra += " · fovea off";
   return (
     `${r.frames} frames over ${(r.spanMs / 1000).toFixed(1)}s · mean ${fmtMs(r.meanFrameMs)} ms/frame · p95 ${fmtMs(r.p95)} ms · ` +
-    `${fmtMs(r.fps, 1)} fps · hooks ${fmtPct(r.attrShare)}`
+    `${fmtMs(r.fps, 1)} fps · hooks ${fmtPct(r.attrShare)}${extra}`
   );
+}
+
+// How far the scripted pan travels, in graph units. The old figure was ±40 by
+// ±15: at zoom 0.10 that is about 4 by 1.5 CSS pixels, and a node never leaves
+// the viewport, so foveation — which boxes a node only once it is more than
+// `foveaMargin` screens past the edge — cannot engage and cannot be measured.
+// Ten times that fidget is still inside the margin (about 40 CSS pixels against
+// a half-screen of roughly 960). A node that starts in the middle of the view
+// has to cross half a screen to the edge and then the margin before it counts
+// as far, so the sweep is one screen plus the margin, and the view is put back.
+function benchSpan(canvas) {
+  const vp = viewViewport(canvas);
+  const margin = Number(LOD.foveaMargin);
+  const screens = 1 + (Number.isFinite(margin) && margin > 0 ? margin : 0.5);
+  if (!vp || !(vp.w > 0) || !(vp.h > 0)) return { x: 400, y: 150, screens: NaN };
+  return { x: vp.w * screens, y: vp.h * screens, screens };
 }
 
 function buildTestingTab(container) {
@@ -9114,7 +9134,8 @@ function buildTestingTab(container) {
     "Hand measurement is not comparable between runs: how fast you dragged changes a per-4s sum by 4x, and a slow cap forces a " +
     "window-filling wait that a fast one does not. This runs an identical pan for a fixed number of seconds and reports mean ms/frame, " +
     "p95 and fps over exactly that span, so \"mute a suspect → run A, unmute → run B\" becomes a real before/after. It only moves the " +
-    "viewport (no graph mutation) and puts it back where it started.";
+    "viewport (no graph mutation) and puts it back where it started. The sweep is one screen plus your off-screen margin — a few " +
+    "dozen graph units never leaves the viewport, so it cannot show what foveation costs or saves. Change only that setting between A and B.";
   const benchRow = el("div", { class: "ants-copyrow" });
   const benchSelect = el("select", { class: "ants-select", style: { maxWidth: "190px" } });
   for (const p of BENCH_PRESETS) {
@@ -9239,6 +9260,8 @@ function runScriptedPan(durationMs, slot) {
   const t0 = nowMs();
   const x0 = ds.offset ? ds.offset[0] : 0;
   const y0 = ds.offset ? ds.offset[1] : 0;
+  const span = benchSpan(canvas);
+  let foveaPeak = 0;
   S.benchActive = { t0, durationMs };
   if (ui.state.testing) ui.state.testing.update();
 
@@ -9259,6 +9282,11 @@ function runScriptedPan(durationMs, slot) {
       fps: agg.span > 0 && agg.n > 1 ? ((agg.n - 1) * 1000) / agg.span : NaN,
       attrShare: mean > 0 ? attr.sum / agg.n / mean : NaN,
       muted: [...S.muted],
+      screens: span.screens,
+      travelX: span.x,
+      travelY: span.y,
+      foveaOn: !!LOD.fovea,
+      foveaPeak,
       capMs: drawThrottleMs,
       synthMs: syntheticTickMs,
       nodes: graphNodeCount(),
@@ -9274,9 +9302,10 @@ function runScriptedPan(durationMs, slot) {
     const elapsed = nowMs() - t0;
     if (ds.offset) {
       const phase = (elapsed / durationMs) * Math.PI * 2;
-      ds.offset[0] = x0 + Math.sin(phase) * 40;
-      ds.offset[1] = y0 + Math.sin(phase * 2) * 15;
+      ds.offset[0] = x0 + Math.sin(phase) * span.x;
+      ds.offset[1] = y0 + Math.sin(phase * 2) * span.y;
     }
+    if (LOD.foveaEls > foveaPeak) foveaPeak = LOD.foveaEls;
     if (typeof canvas.setDirty === "function") canvas.setDirty(true, true);
     else if (typeof canvas.draw === "function") canvas.draw(true, true);
     if (elapsed >= durationMs) {
