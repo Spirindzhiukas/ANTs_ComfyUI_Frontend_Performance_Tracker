@@ -27,7 +27,7 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.1.16";
+const VERSION = "2.2.0";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
 const NODE_NAME = "ANTsNastyBastardsTracker";
 
@@ -867,6 +867,13 @@ const LOD = {
   error: "",
   baseline: null, // the frame budget as it was when the mode went on
   plan: { links: false, flat: 0, total: 0, medPx: 0, at: 0 },
+  // What the flat boxes were allowed to say, and what they did say. Counters are
+  // per paint, like LOD.nodes, so the panel can price the marks it asked for.
+  boxDetail: "plain", // the default of the LOD_BOX_DETAIL ladder, which is defined with it below
+  boxTitles: 0, // title bars drawn on flat boxes
+  boxErrors: 0, // error strokes drawn on flat boxes
+  boxBars: 0, // progress bars drawn on flat boxes
+  boxMuted: 0, // boxes drawn dimmed (muted, bypassed or ghosted)
   // Preview bitmaps. A 4096px image drawn into a 40px box on screen costs the
   // full-size upload and blit every redraw; past the zoom you set, the draw is
   // served from a cached copy of about the resolution the screen can show.
@@ -950,6 +957,27 @@ const LOD_FLAT_ZOOM = [0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5];
 // A v1 setting was a pixel width. Carrying one over needs a node width to divide
 // by; this is the median node on a 4K ComfyUI workflow (measured, not invented).
 const LOD_TYPICAL_NODE_PX = 350;
+// A flat box that says nothing is a placeholder the user cannot read. This ladder
+// is how much a box may say. `plain` is exactly the v2.1.16 box — one rectangle
+// plus the selection ring — and every mark above it comes from a real field on
+// the node, the same ones the frontend's own rendering reads:
+//   * `title` — the node's own title-bar colour, drawn where LiteGraph draws the
+//     title bar (above the body, NODE_TITLE_HEIGHT tall), so a box reads as the
+//     node it stands for and carries that type's colour from the theme;
+//   * `state` — the frontend's own error stroke, its own progress bar, and its
+//     own alpha for a muted, bypassed or ghosted node.
+// This ladder can only change what an already-flat box looks like. It cannot
+// flatten a node that would otherwise be drawn in full: that is the zoom
+// setting's decision and nothing else's (golden rule 6).
+const LOD_BOX_DETAIL = ["plain", "title", "state"];
+const LOD_BOX_DETAIL_DEFAULT = "plain";
+const LOD_BOX_TITLE_H = 30; // graph units — LiteGraph's NODE_TITLE_HEIGHT
+const LOD_BOX_TITLE_MAX = 0.4; // never more than this share of the node's height
+const LOD_BOX_ERROR_COLOR = "#E00"; // LiteGraph's NODE_ERROR_COLOUR
+const LOD_BOX_ERROR_PAD = 12; // graph units, the frontend's own error padding
+const LOD_BOX_ERROR_WIDTH = 10; // graph units, the frontend's own error stroke
+const LOD_BOX_PROGRESS_COLOR = "green"; // the colour the frontend's own bar uses
+const LOD_BOX_PROGRESS_PX = 3; // a bar is at least this tall in CSS pixels
 const LOD_IDLE_CAP_MS = [0, 250, 500, 1000];
 const LOD_IDLE_INPUT_MS = 400; // how long one touch keeps the cap lifted
 // Zoom levels at which previews may be served from a thumbnail.
@@ -1398,23 +1426,78 @@ function lodPlanFrame(canvas) {
   return plan;
 }
 
+// Is a node muted, bypassed or ghosted, and by how much does the frontend dim it?
+// Its own numbers, read from its own fields (getNodeModeAlpha): ghost 0.3,
+// bypassed 0.2, muted 0.4. Never guessed from a colour.
+function lodBoxAlpha(node) {
+  try {
+    if (node && node.flags && node.flags.ghost) return 0.3;
+    const mode = Number(node && node.mode) || 0;
+    if (mode === 4) return 0.2; // LGraphEventMode.BYPASS
+    if (mode === 2) return 0.4; // LGraphEventMode.NEVER, "mute"
+  } catch (e) {
+    /* a node without a mode is a node in play */
+  }
+  return 1;
+}
+
 // The cheap stand-in for a node. The caller has already translated the context
-// to the node's origin, which is why this paints at 0,0.
+// to the node's origin, which is why this paints at 0,0. What it may paint is the
+// box-detail ladder above: the fill and the selection ring always, the title bar
+// and the state marks only when the user has asked for them.
 function lodPaintNode(node, canvas, ctx) {
   const size = (node && (node.renderingSize || node.size)) || [0, 0];
   const w = Math.abs(Number(size[0])) || 0;
   const h = Math.abs(Number(size[1])) || 0;
   const fill = node.renderingBgColor || node.bgcolor || node.renderingColor || node.color || "#4a4a4a";
   const scale = (canvas && canvas.ds && Number(canvas.ds.scale)) || 1;
-  ctx.globalAlpha = 1;
+  // The ladder is only ever consulted while the tool is on; switched off, nothing
+  // here runs at all (the flat path is one of the predicates that answers "no").
+  const detail = S.enabled ? LOD.boxDetail : LOD_BOX_DETAIL_DEFAULT;
+  // Dimming belongs to `state`. Below it every box looks like every other box,
+  // which is what v2.1.16 painted and what an off-by-default tool must keep.
+  const alpha = detail === LOD_BOX_DETAIL[2] ? lodBoxAlpha(node) : 1;
+  const drawable = w > 0 && h > 0;
   ctx.shadowColor = "transparent";
+  ctx.globalAlpha = alpha;
   ctx.fillStyle = fill;
   ctx.fillRect(0, 0, w, h);
+  if (drawable && detail !== LOD_BOX_DETAIL_DEFAULT) {
+    if (alpha < 1) LOD.boxMuted++;
+    // The title bar, where LiteGraph draws it: above the body, not inside it —
+    // and clamped so a short node does not become nothing but title.
+    const titleH = Math.min(LOD_BOX_TITLE_H, h * LOD_BOX_TITLE_MAX);
+    ctx.fillStyle = node.renderingColor || node.color || fill;
+    ctx.fillRect(0, -titleH, w, titleH);
+    LOD.boxTitles++;
+  }
+  if (drawable && detail === LOD_BOX_DETAIL[2]) {
+    // A node that is running: the frontend draws a green bar from the top-left
+    // corner, `progress` of the width wide (drawProgressBar). Same bar, with a
+    // CSS-pixel floor so it is still there at 10% zoom.
+    const progress = Number(node.progress) || 0;
+    if (progress > 0) {
+      const barH = Math.min(Math.max(6, LOD_BOX_PROGRESS_PX / scale), h * LOD_BOX_TITLE_MAX);
+      ctx.fillStyle = LOD_BOX_PROGRESS_COLOR;
+      ctx.fillRect(0, 0, w * Math.min(1, progress), barH);
+      LOD.boxBars++;
+    }
+    // A node with validation errors: the frontend's own stroke, at its own width
+    // and padding, so the mark looks the same here as it does in full detail.
+    if (node.has_errors) {
+      ctx.strokeStyle = LOD_BOX_ERROR_COLOR;
+      ctx.lineWidth = LOD_BOX_ERROR_WIDTH;
+      ctx.strokeRect(-LOD_BOX_ERROR_PAD, -LOD_BOX_ERROR_PAD, w + LOD_BOX_ERROR_PAD * 2, h + LOD_BOX_ERROR_PAD * 2);
+      LOD.boxErrors++;
+    }
+  }
   if (node.selected) {
+    ctx.globalAlpha = alpha;
     ctx.strokeStyle = "#ffb300";
     ctx.lineWidth = 1 / scale;
     ctx.strokeRect(0, 0, w, h);
   }
+  ctx.globalAlpha = 1;
 }
 
 function lodPaintLink(ctx, a, b, color) {
@@ -2730,6 +2813,7 @@ function lodSaveSettings() {
       LOD_STORE_KEY,
       JSON.stringify({
         flatBelow: LOD.flatBelow,
+        boxDetail: LOD.boxDetail,
         detailZoom: LOD.detailZoom,
         thumbZoom: LOD.thumbZoom,
         idleCapMs: LOD.idleCapMs,
@@ -2772,6 +2856,7 @@ function lodLoadSettings() {
         ? (legacyPx > 0 ? lodZoomForPx(legacyPx) : 0)
         : Number(saved.flatBelow) || 0,
       legacyPx,
+      boxDetail: saved.boxDetail === undefined ? LOD_BOX_DETAIL_DEFAULT : String(saved.boxDetail),
       detailZoom: saved.detailZoom === undefined ? 0 : Number(saved.detailZoom) || 0,
       thumbZoom: saved.thumbZoom === undefined ? 0.6 : Number(saved.thumbZoom) || 0,
       idleCapMs: Number(saved.idleCapMs) || 0,
@@ -2926,6 +3011,12 @@ function lodSet(opts) {
     if (o.legacyPx === undefined) LOD.legacyPx = 0; // the user has chosen; drop the note
   }
   if ("legacyPx" in o) LOD.legacyPx = Math.max(0, Number(o.legacyPx) || 0);
+  // What a flat box may say about the node it stands for. Anything not on the
+  // ladder falls back to the plain box, which is the do-nothing value.
+  if ("boxDetail" in o) {
+    const level = String(o.boxDetail);
+    LOD.boxDetail = LOD_BOX_DETAIL.includes(level) ? level : LOD_BOX_DETAIL_DEFAULT;
+  }
   if ("autoLinkCarried" in o) LOD.autoLinkCarried = !!o.autoLinkCarried;
   // v1 and v2.1.8 scripts passed a pixel width. Kept working: translated.
   if ("minPx" in o) {
@@ -6323,6 +6414,35 @@ function buildTweaksTab(container) {
     lodUpdate();
   });
 
+  // What those rectangles are allowed to say. It sits directly under the flatten
+  // control because it is about the same thing: the box a node becomes. It can
+  // never change *which* nodes become boxes — that stays a zoom — and every mark
+  // comes from a field on the node itself.
+  const lodBoxSel = el("select", { class: "ants-select", style: { width: "auto", maxWidth: "280px" } });
+  for (const [id, text] of [
+    ["plain", "boxes: plain fill (as before)"],
+    ["title", "boxes: + the node's title bar colour"],
+    ["state", "boxes: + title, error ring, progress bar, muted dim"],
+  ]) {
+    const opt = el("option", { text });
+    opt.value = id;
+    lodBoxSel.appendChild(opt);
+  }
+  lodBoxSel.value = LOD.boxDetail;
+  lodBoxSel.title =
+    "How much a flat box says about the node it stands for. Only ever affects a node that is already being painted as a box (so it does " +
+    "nothing while the setting above is off, and it can never flatten a node on its own). Every mark is read from the node itself, never " +
+    "guessed: the title bar uses the node's own title colour, drawn where LiteGraph draws it; the error ring is the frontend's own error " +
+    "stroke at its own width and padding; the progress bar is the frontend's own bar, green, `progress` wide, with a floor of a few screen " +
+    "pixels so it survives a low zoom; the dimming uses the frontend's own alphas for a muted (40%), bypassed (20%) or ghosted (30%) node. " +
+    "Each mark is one more rectangle call per node per frame, and the readout below counts them, so the extra calls are visible rather " +
+    "than assumed (the harness cannot price a fillRect, so no ms figure is claimed for them here). 'plain' is exactly what this tool " +
+    "painted before the setting existed.";
+  lodBoxSel.addEventListener("change", () => {
+    lodSet({ boxDetail: lodBoxSel.value });
+    lodUpdate();
+  });
+
   const lodIdleSel = el("select", { class: "ants-select", style: { width: "auto", maxWidth: "240px" } });
   for (const ms of LOD_IDLE_CAP_MS) {
     const opt = el("option", { text: ms === 0 ? "redraw as often as asked" : `${Math.round(1000 / ms)}/s while nothing is touched` });
@@ -6532,8 +6652,9 @@ function buildTweaksTab(container) {
     "Turn all of them off \u2014 flattening, link thinning, thumbnails and the redraw cap \u2014 and let ComfyUI draw the canvas " +
     "exactly as it wants, including any DOM content this tool was hiding.";
   lodOffBtn.addEventListener("click", () => {
-    lodSet({ flatBelow: 0, idleCapMs: 0, thumbZoom: 0, detailZoom: 0, linkStyle: "spline", inertBelow: 0, fovea: false });
+    lodSet({ flatBelow: 0, boxDetail: "plain", idleCapMs: 0, thumbZoom: 0, detailZoom: 0, linkStyle: "spline", inertBelow: 0, fovea: false });
     lodFlatSel.value = "0";
+    lodBoxSel.value = "plain";
     lodLinkSel.value = "spline";
     lodDetailSel.value = "0";
     lodThumbSel.value = "0";
@@ -6543,6 +6664,7 @@ function buildTweaksTab(container) {
 
   const lodRow = el("div", { style: { display: "flex", flexWrap: "wrap", gap: "10px", alignItems: "center", margin: "4px 0" } });
   lodRow.appendChild(lodFlatSel);
+  lodRow.appendChild(lodBoxSel);
   lodRow.appendChild(lodLinkSel);
   lodRow.appendChild(lodDetailSel);
   lodRow.appendChild(lodThumbSel);
@@ -6671,6 +6793,27 @@ function buildTweaksTab(container) {
             `zoom ${pct(LOD.zoom)} is above your ${pct(LOD.flatBelow)} setting: every node is drawn in full` +
               (LOD.plan.medPx ? ` (the typical node is ≈${LOD.plan.medPx}px on screen here)` : "")
           );
+        }
+        // What the boxes said, and what saying it cost: the counters are per
+        // paint, so "1,027 boxes × 2 marks" is the honest price of the ladder.
+        if (lodFlatOn()) {
+          if (LOD.boxDetail === "plain") {
+            bits2.push(
+              `the boxes are plain — the box-detail setting next to this one can put each node's own title colour, error ring, ` +
+                `progress bar and muted dimming on them (it never changes which nodes are boxes)`
+            );
+          } else {
+            const marks = [
+              LOD.boxTitles ? `${LOD.boxTitles} title bar(s)` : "",
+              LOD.boxErrors ? `${LOD.boxErrors} error ring(s)` : "",
+              LOD.boxBars ? `${LOD.boxBars} progress bar(s)` : "",
+              LOD.boxMuted ? `${LOD.boxMuted} dimmed` : "",
+            ].filter(Boolean);
+            bits2.push(
+              `box detail "${LOD.boxDetail}": drawn so far ${marks.length ? marks.join(", ") : "nothing"}` +
+                (marks.length ? ` — each mark is one more rectangle per node per frame` : "")
+            );
+          }
         }
         if (since && LOD.plan.flat > 0 && Number.isFinite(b.nodeMsPerFrame) && b.nodeMsPerFrame > 0 && since.nodeMsPerFrame > b.nodeMsPerFrame * 0.9) {
           bits2.push(
@@ -8912,7 +9055,7 @@ function buildTelemetryReport() {
     lines.push(
       `low-zoom drawing: ${
         lodOn()
-          ? `on (every node a rectangle below ${Math.round(LOD.flatBelow * 100)}% zoom${LOD.legacyPx ? `, carried over from "nodes under ${LOD.legacyPx}px"` : ""}, links ${lodLinksStraight() ? "straight (link setting)" : "as drawn"}, idle redraw cap ${LOD.idleCapMs || "off"}ms) ` +
+          ? `on (every node a rectangle below ${Math.round(LOD.flatBelow * 100)}% zoom${LOD.legacyPx ? `, carried over from "nodes under ${LOD.legacyPx}px"` : ""}, links ${lodLinksStraight() ? "straight (link setting)" : "as drawn"}, idle redraw cap ${LOD.idleCapMs ? LOD.idleCapMs + "ms" : "off"}, box detail ${LOD.boxDetail}) ` +
             `— ${LOD.nodes} node draw(s) and ${LOD.links} link draw(s) simplified, ${LOD.capped} redraw(s) merged` +
             (LOD.linkCalls > 0 && LOD.linkMs > 0
               ? `, link strokes ${fmtMs((LOD.linkMs / Math.max(1, LOD.linkCalls)) * 1000, 0)}\u00b5s each over ${LOD.linkCalls} call(s) ` +
@@ -9217,6 +9360,7 @@ function installDebugApi() {
             thumbZoom: LOD_THUMB_ZOOMS.slice(),
             thumbLadder: LOD_THUMB_LADDER.slice(),
             detailZoom: LOD_DETAIL_ZOOMS.slice(),
+            boxDetail: LOD_BOX_DETAIL.slice(),
             linkWidth: LOD_LINK_WIDTH,
           };
         },
@@ -9284,6 +9428,14 @@ function installDebugApi() {
             typicalNodePx: LOD.plan.medPx,
             carriedOverFromPx: LOD.legacyPx,
             autoLinkCarried: LOD.autoLinkCarried,
+            // What the boxes were allowed to say, and what they actually drew:
+            // per-paint counters, like LOD.nodes, so the price of a mark is
+            // visible rather than assumed.
+            boxDetail: LOD.boxDetail,
+            boxTitles: LOD.boxTitles,
+            boxErrors: LOD.boxErrors,
+            boxBars: LOD.boxBars,
+            boxMuted: LOD.boxMuted,
           };
         },
         set: (opts) => lodSet(opts),
@@ -9343,7 +9495,7 @@ function installDebugApi() {
             return false;
           }
         },
-        off: () => lodSet({ flatBelow: 0, idleCapMs: 0, thumbZoom: 0, detailZoom: 0, linkStyle: "spline", inertBelow: 0, fovea: false }),
+        off: () => lodSet({ flatBelow: 0, boxDetail: "plain", idleCapMs: 0, thumbZoom: 0, detailZoom: 0, linkStyle: "spline", inertBelow: 0, fovea: false }),
         // The master switch: the same one the checkbox on the tracker's own node
         // and the ⏻ button in the panel drive.
         get enabled() {

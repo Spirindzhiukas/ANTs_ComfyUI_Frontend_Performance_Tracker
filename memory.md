@@ -4,7 +4,7 @@ A running record for whoever picks this up next (including me). `CLAUDE.md` is t
 rules for changing the code; `plan.md` is where it is going. This file is the past:
 what was built, what was rejected, and what the evidence was.
 
-Last updated at **v2.1.16** (`07d8ae6`), 131 tests green, PR #1 on
+Last updated at **v2.2.0**, 136 tests green, PR #1 on
 `Spirindzhiukas/ANTs_ComfyUI_Frontend_Performance_Tracker`.
 
 ---
@@ -13,8 +13,8 @@ Last updated at **v2.1.16** (`07d8ae6`), 131 tests green, PR #1 on
 
 | | |
 | --- | --- |
-| Version | 2.1.16 (`web/tracker.js` `VERSION`) |
-| Tests | 131 (`node tests/run-tests.mjs`), plus 7 in `tests/test_init.py` |
+| Version | 2.2.0 (`web/tracker.js` `VERSION`) |
+| Tests | 136 (`node tests/run-tests.mjs`), plus `tests/test_init.py` |
 | Frontend | `web/tracker.js`, ~9.5k lines, one ES module, no dependencies |
 | Backend | `__init__.py` — a no-op node + one optional read-only route |
 | Panel | 9 tabs: Tweaks, Timing, Nodes, Stalls, Governor, Load, Memory, GPU / VRAM, Testing |
@@ -36,6 +36,17 @@ something has to be drawn less or hit-tested less.
 ## 2. Version log
 
 The commit log is the full record; this is the "why", newest first.
+
+**v2.2.0 — the flat boxes say what they stand for.** The flatten path painted one
+grey rectangle per node, which removes the node's cost and its identity with it:
+at 10% zoom a node with a validation error looked like a healthy one, a muted node
+looked live, and the user's own words for the result were "dumb semi useless
+boxes". A **box detail** ladder sits next to the flatten threshold: `plain` (what
+v2.1.16 painted), `title` (the node's own title-bar colour, drawn above the body
+where LiteGraph draws its title, at `NODE_TITLE_HEIGHT`), and `state` (error ring,
+progress bar, muted/bypassed/ghost dimming). This is the first half of plan.md
+Track K; the bitmaps (K1–K3) come next, and this ladder is also their fallback
+floor (K4), so the same user-visible vocabulary survives the change of engine.
 
 **v2.1.16 — the pill belongs on the floating button.** v2.1.15 had put the master
 switch on the node's DOM widget, which is a place the frontend can take away
@@ -132,6 +143,17 @@ and a `skipped N` counter.
 **`normal` really is a normal call.** Same arguments, same `this`, the browser's
 own ids so `clearInterval`/`cancelAnimationFrame` keep working. The table can
 report "was 50/s, now 12/s" without having changed anything until asked.
+
+**The box-detail ladder reads fields, not names.** Node stand-in marks come from
+`has_errors`, `progress`, `mode` (2 = muted, 4 = bypassed), `flags.ghost` — the
+same fields the frontend's own `drawNode`, `drawProgressBar` and `getNodeModeAlpha`
+read, at its own numbers (`#E00` error stroke 10 units wide and 12 units out, green
+progress bar, alphas 0.4/0.2/0.3). Two things follow from that rule: no mark is
+ever inferred from a node's name or colour, and there is no "executing" mark —
+ComfyUI's execution highlighting is not a per-node field in this frontend (nothing
+in `LGraphNode`/`LGraphCanvas` carries it; `node.progress` is the only per-node
+execution state that exists), so inventing one would be inventing state. A node
+that says nothing gets no mark.
 
 **A limited source is slowed, never silenced.** Skipped interval ticks are covered
 by the next one; a skipped one-shot or chained callback is re-scheduled for when

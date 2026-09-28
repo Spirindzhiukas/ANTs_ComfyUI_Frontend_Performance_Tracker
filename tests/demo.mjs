@@ -359,6 +359,32 @@ console.log(
   `  zoom ${Math.round(s.zoom * 100)}% is below the 20% setting: ${s.plan.flat}/${s.plan.total} nodes painted as flat rectangles ` +
     `(the decision is the zoom, not how big a node is — the widest node here is ${s.plan.medPx}px on screen)`
 );
+// A box that says nothing is a placeholder nobody can read: at this zoom a node
+// with a validation error, a node that is muted and a node that is running all
+// look like the same rectangle. The box-detail ladder puts those marks back, and
+// every mark comes from a field on the node itself (has_errors, mode, progress).
+const demoNodes = h.canvas.nodes; // the nodes this section draws (not the earlier ones)
+demoNodes[0].has_errors = true;
+demoNodes[1].mode = 2; // muted (LGraphEventMode.NEVER)
+demoNodes[2].progress = 0.5; // running
+const boxesBefore = h.tracker.lowZoom.flat;
+// The idle redraw cap is on in this scenario and would merge a single frame away,
+// so it is lifted for the one frame that is being counted and put straight back.
+h.tracker.lowZoom.set({ boxDetail: "state", idleCapMs: 0 });
+frame(1);
+const boxesAfter = h.tracker.lowZoom.flat;
+console.log(
+  `  box detail "state": one frame of ${boxesAfter.flatNodes} flat node(s) drew ` +
+    `${boxesAfter.boxTitles - boxesBefore.boxTitles} title bar(s), ${boxesAfter.boxErrors - boxesBefore.boxErrors} error ring(s), ` +
+    `${boxesAfter.boxBars - boxesBefore.boxBars} progress bar(s) and ${boxesAfter.boxMuted - boxesBefore.boxMuted} dimmed box(es) — ` +
+    `the same nodes are flat as before the ladder was touched (${boxesBefore.flatNodes === boxesAfter.flatNodes}), ` +
+    `and every mark is read from the node, not guessed`
+);
+h.tracker.lowZoom.set({ boxDetail: "plain", idleCapMs: 500 });
+demoNodes[0].has_errors = false;
+demoNodes[1].mode = 0;
+demoNodes[2].progress = 0;
+
 // The node setting is flattening the whole graph, and the links are still drawn
 // by ComfyUI's own renderer, as curves: nothing but the node setting's own
 // subject is affected.

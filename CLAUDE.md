@@ -16,6 +16,7 @@ this is going. Read the golden rules before the code.
 | `__init__.py` | The node class (does nothing, never executes) and one optional read-only route `GET /ants_tracker/gpu`. |
 | `tests/` | Zero-dependency test suite + a synthetic-browser harness + a demo. No npm, no jsdom, no browser. |
 | `tools/pill-preview.mjs` | Renders the pill into `preview/` straight from the real CSS and glyph builders. |
+| `tools/box-preview.mjs` | Renders the flat boxes at each `boxDetail` level into `preview/` by recording the real paint ops (`lodPaintNode`) and replaying them as SVG. |
 | `preview/` | Generated. Never hand-edit; regenerate. |
 | `README.md` | User-facing docs. Every release adds a "What changed in vX.Y.Z" section **at the top of the changelog**. |
 | `REVIEW.md` | The v1 defect review with line references and the v2 fix for each. Read it before touching attribution or muting. |
@@ -28,6 +29,8 @@ node tests/run-tests.mjs <substring>  # one suite/test, e.g. ... pill
 python3 tests/test_init.py            # the Python side (route parsing, node contract)
 node tests/demo.mjs                   # prints what the panel says against a synthetic graph
 node tools/pill-preview.mjs > preview/pill.html   # regenerate the pill page (exit != 0 if it drifts)
+node tools/box-preview.mjs > preview/boxes.html   # flat boxes at each boxDetail level, from the real paint path
+node tools/box-preview.mjs --svg > preview/boxes.svg   # the same picture as SVG, for a PNG render (resvg + Pillow, optional)
 ```
 
 There is no build step, no bundler, no dependency to install, and none may be

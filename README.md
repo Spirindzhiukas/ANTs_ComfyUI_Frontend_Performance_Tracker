@@ -304,7 +304,14 @@ which point there is nothing to schedule: the cost is the drawing itself.
 The mode paints every node as a flat rectangle below a zoom you pick,
 degrades the links (thinner strokes, curves kept), hides the DOM content
 of the nodes it boxed, and rate-limits redraws while nobody is touching
-the page.
+the page. Those rectangles do not have to be blank: **box detail** puts
+each node's own title-bar colour on them, and — one level up — the marks
+that would otherwise disappear at that zoom, a validation-error ring, the
+progress bar of the node that is running, and the dimming of a muted,
+bypassed or ghosted node. Every mark is read from the node's own fields
+(`has_errors`, `progress`, `mode`, `flags.ghost`), never guessed, and the
+panel counts them — each mark is one more rectangle call per node per
+frame, and the count is the honest price of it.
 
 **Redraw merging** is the other half of the same idea. `setDirty`
 requests were already counted exactly (and the Testing tab's cap can
@@ -554,6 +561,41 @@ installed as the sandbox's `CanvasRenderingContext2D` (the preview ladder
 patches `drawImage` there, the same way a browser exposes it), and
 `createImageBitmap` records the resize it was asked to perform instead of
 resizing anything.
+
+## What changed in v2.2.0
+
+- **The flat boxes now say what they stand for.** Painting 1,000 nodes as grey
+  rectangles removes nearly all of a node's draw cost, but it also removes the
+  node: at 10% zoom a node with a validation error looked exactly like a healthy
+  one, a muted node looked live, and nothing on screen said which node was which.
+  A new **box detail** setting next to the flatten threshold offers three levels:
+  `plain` (exactly what was painted before), `title` (each box gets the node's own
+  title-bar colour, drawn above the body where LiteGraph draws it, at its own
+  30-unit height), and `state` (adds the marks that vanish at this zoom a
+  validation-error ring, the progress bar of the node that is running, and the
+  dimming of a muted, bypassed or ghosted node).
+- **Every mark is the frontend's own, at the frontend's own numbers.** The error
+  ring is LiteGraph's error stroke (`#E00`, 10 units wide, 12 units outside the
+  node — the same geometry the full-detail node gets), the progress bar is the
+  frontend's own bar (green, as wide as `progress` says, with a floor of a few
+  screen pixels so it survives a low zoom), and the dimming uses its own alphas
+  (muted 40%, bypassed 20%, ghosted 30%). Nothing is inferred from a colour or a
+  name, and a node that says nothing gets no mark.
+- **It cannot change which nodes are boxes.** The ladder is about a box that
+  already exists: it does nothing while the zoom setting is off, nothing above
+  the flatten threshold, and switching it back to `plain` restores the previous
+  paint exactly. The panel counts every mark it drew (`N title bar(s)`, `N error
+  ring(s)`, `N progress bar(s)`, `N dimmed`), so the price of a mark is a number
+  rather than an assumption.
+- The copyable report's settings line now names the box-detail level, and a
+  small text bug is fixed with it (`idle redraw cap offms` reads `off`).
+- **New tests** (5): the default paints one rectangle per node and nothing else;
+  `title` adds a bar above the body at LiteGraph's own height, clamped so a short
+  node does not become nothing but title; `state` adds exactly one ring, one bar
+  and three dimmings to a graph where exactly one node has each condition; the
+  ladder never changes which nodes are flat and going back to `plain` restores
+  the paint byte for byte; and the panel and the API report the level and price
+  the marks. The demo prints one frame of each level's marks.
 
 ## What changed in v2.1.16
 

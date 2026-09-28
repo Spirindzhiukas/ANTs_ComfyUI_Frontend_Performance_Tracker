@@ -357,14 +357,22 @@ flatten threshold already had: frame time with bitmaps vs flat boxes vs live, at
 README: bitmaps help movement; they do nothing for a still frame that is slow for
 another reason.
 
-**K4. Informative boxes as the floor, not the ceiling (S).** Independent of
-bitmaps, and worth shipping on its own if the engine stalls: type/kind coding
-(title tint or a type colour), state marks for selected / error / executing /
-collapsed, and a hover or selection ring at gearbox thickness. Relevant detail
-from the frontend source: below its own LOD threshold (`low_quality`, which at
-200% Windows display scale is reached at ≈0.40 zoom — see `memory.md`) LiteGraph
+**K4. Informative boxes as the floor, not the ceiling (S) — DELIVERED in v2.2.0.**
+A `box detail` ladder (`plain` / `title` / `state`) next to the flatten threshold:
+the node's own title-bar colour above the body, then an error ring
+(`has_errors`), a progress bar (`progress`) and muted/bypassed/ghost dimming
+(`mode`, `flags.ghost`), all at the frontend's own numbers and all counted in the
+panel. `plain` is exactly the old paint. What was deliberately *not* built, and
+why: no "executing" mark (this frontend carries no per-node execution field —
+`node.progress` is the only one, and it is drawn); no slot dots (LiteGraph's slot
+positions are only computed when a node is drawn in full, and this path exists so
+that it is not — evenly-spaced dots would be a picture of a layout that is not
+there; the bitmap path in K2 draws the real slots instead). Relevant detail from
+the frontend source: below its own LOD threshold (`low_quality`, which at 200%
+Windows display scale is reached at ≈0.40 zoom — see `memory.md`) LiteGraph
 already skips title text, badges and widget text, which is part of why the boxes
-look so empty at 10%. Colour and state are what carry information at those zooms.
+looked so empty at 10%. Colour and state are what carry information at those
+zooms, and they are also the fallback the bitmap engine (K1–K3) must keep.
 
 **K5. The gesture LOD hold (S).** NodeSnapshots' "Simplify live nodes during
 navigation" is one line of LiteGraph state: hold `min_font_size_for_lod` high for

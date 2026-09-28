@@ -1501,3 +1501,201 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     assertIncludes(text, "node draw", "with the saving measured by the tracker itself");
   });
 });
+
+// A flat box that says nothing is a placeholder the user cannot read: at 10% zoom
+// a node with a validation error looks exactly like a healthy one, and a muted
+// node looks exactly like a live one. This ladder lets a box carry marks that
+// come from the node's own fields. Four promises:
+//   1. `plain` (the default) paints exactly what v2.1.16 painted;
+//   2. each level adds only its own marks, and never changes which nodes are flat;
+//   3. every mark comes from a field the frontend itself reads — an error stroke
+//      at its own width and padding, a progress bar at its own width, its own
+//      dimming alphas — so a box cannot claim something the node does not say;
+//   4. switching it back to plain, or the master switch off, restores the exact
+//      previous paint.
+suite("drawing: a flat box can say what it stands for, and only when asked", () => {
+  // Nodes with the fields the marks come from. `bigGraph`'s nodes are bare
+  // objects, which is all the flat path reads.
+  function markedGraph(h, extras) {
+    h.canvas.ds.scale = 0.1;
+    h.canvas.ds.offset[0] = 0;
+    h.canvas.ds.offset[1] = 0;
+    h.canvas.links = [];
+    h.canvas.nodes = [
+      { type: "KSampler", pos: [0, 0], size: [200, 100], selected: false, color: "#3f6f9f", bgcolor: "#2b2b2b" },
+      { type: "KSampler", pos: [240, 0], size: [200, 100], selected: false, color: "#7f3f3f", bgcolor: "#2b2b2b", has_errors: true },
+      { type: "KSampler", pos: [480, 0], size: [200, 100], selected: false, color: "#3f9f6f", bgcolor: "#2b2b2b", progress: 0.5 },
+      { type: "KSampler", pos: [720, 0], size: [200, 100], selected: false, color: "#6f6f6f", bgcolor: "#2b2b2b", mode: 2 },
+      { type: "KSampler", pos: [960, 0], size: [200, 100], selected: false, color: "#6f6f3f", bgcolor: "#2b2b2b", mode: 4 },
+      { type: "KSampler", pos: [1200, 0], size: [200, 100], selected: false, color: "#9f3f9f", bgcolor: "#2b2b2b", flags: { ghost: true } },
+    ];
+    Object.assign(h.canvas.nodes[0], extras || {});
+  }
+
+  // The ops of one frame, and the alpha each fillRect ran at.
+  function paint(h, zoom = 0.1) {
+    h.canvas.ds.scale = zoom;
+    h.canvas.ctx.ops.length = 0;
+    h.canvas.setDirty(true, true);
+    const alphas = [];
+    const ctx = h.canvas.ctx;
+    const realFill = ctx.fillRect;
+    ctx.fillRect = function (...args) {
+      alphas.push(this.globalAlpha);
+      return realFill.apply(this, args);
+    };
+    h.canvas.draw();
+    ctx.fillRect = realFill;
+    return { ops: ctx.ops.slice(), alphas };
+  }
+  const count = (ops, name) => ops.filter((o) => o[0] === name).length;
+
+  test("plain is the default, and it is exactly what v2.1.16 painted", async () => {
+    const h = await boot();
+    markedGraph(h);
+    drawLoop(h, 0.2);
+    assertEqual(h.tracker.lowZoom.state.boxDetail, "plain", "a box says nothing until it is asked to");
+    assert(h.tracker.lowZoom.limits.boxDetail.includes("state"), "and the ladder is offered in full");
+
+    h.tracker.lowZoom.set({ flatBelow: 0.2 });
+    const on = paint(h);
+    // One fill per node and nothing else: no title bar, no error ring, no bar,
+    // no dimming — the marks are what the level above adds.
+    assertEqual(count(on.ops, "fillRect"), 6, "one rectangle per node, exactly as before");
+    assertEqual(count(on.ops, "strokeRect"), 0, "and no strokes: an error or a selection would be one");
+    assert(on.alphas.every((a) => a === 1), "and nothing is drawn dimmed");
+    assertEqual(h.tracker.lowZoom.state.boxTitles, 0, "the counters agree that no marks were drawn");
+    assertEqual(h.tracker.lowZoom.state.boxErrors, 0);
+    assertEqual(h.tracker.lowZoom.state.boxBars, 0);
+    assertEqual(h.tracker.lowZoom.state.boxMuted, 0);
+    assertGreater(h.canvas.nodeDraws, 0, "and the nodes were still drawn, by LiteGraph, in the frames before the setting");
+  });
+
+  test("`title` adds the node's own title bar, above the body where LiteGraph draws it", async () => {
+    const h = await boot();
+    markedGraph(h);
+    h.tracker.lowZoom.set({ flatBelow: 0.2, boxDetail: "title" });
+    const frame = paint(h);
+    const fills = frame.ops.filter((o) => o[0] === "fillRect");
+    assertEqual(fills.length, 12, "one body plus one title bar per node");
+    const titles = fills.filter((o) => o[2] < 0); // drawn at a negative y: above the body
+    assertEqual(titles.length, 6, "and every title bar sits above its node, not inside it");
+    assertEqual(titles[1][4], 30, "at LiteGraph's own title height (30 graph units)");
+    assertEqual(titles[1][3], 200, "as wide as the node it stands for");
+    assertEqual(h.tracker.lowZoom.state.boxTitles, 6, "counted, so the panel can price it");
+    assertEqual(h.tracker.lowZoom.state.boxErrors, 0, "and nothing else came with it");
+    assertEqual(h.tracker.lowZoom.state.boxBars, 0);
+    assertEqual(h.tracker.lowZoom.state.boxMuted, 0);
+    // Nothing about *which* nodes are flat changed: the ladder is not a threshold.
+    assertEqual(h.tracker.lowZoom.flat.flatNodes, 6, "every node is still a box");
+    // And a short node is not nothing but title.
+    h.canvas.nodes = [{ type: "KSampler", pos: [0, 0], size: [200, 20], selected: false, color: "#3f6f9f" }];
+    const small = paint(h).ops.filter((o) => o[0] === "fillRect" && o[2] < 0);
+    assertEqual(small[0][4], 8, "a 20-unit-tall node gets an 8-unit title bar, clamped to two fifths of it");
+  });
+
+  test("`state` adds the frontend's own error stroke, progress bar and dimming", async () => {
+    const h = await boot();
+    markedGraph(h);
+    h.tracker.lowZoom.set({ flatBelow: 0.2, boxDetail: "state" });
+    const frame = paint(h);
+
+    // The error ring: the frontend's own colour, width and padding (LGraphNode
+    // draws `has_errors` as a stroke 10 units wide, 12 units outside the node).
+    const ring = frame.ops.filter((o) => o[0] === "strokeRect" && o[1] === -12);
+    assertEqual(ring.length, 1, "the one node with has_errors gets a ring");
+    assertEqual(ring[0][2], -12, "starting 12 units outside the box");
+    assertEqual(ring[0][3], 224, "and 24 units wider than the node (200 + 12 + 12)");
+    assertEqual(h.canvas.ctx.strokeStyle, "#E00", "in LiteGraph's own error colour");
+    assertEqual(h.tracker.lowZoom.state.boxErrors, 1, "counted");
+
+    // The progress bar: the frontend draws it from the top-left, `progress` wide.
+    const bars = frame.ops.filter((o) => o[0] === "fillRect" && o[1] === 0 && o[2] === 0 && o[3] < 200 && o[3] > 0);
+    assertEqual(bars.length, 1, "the one node that reports progress gets a bar");
+    assertEqual(bars[0][3], 100, "half of its width, which is the progress it reported");
+    assertEqual(h.tracker.lowZoom.state.boxBars, 1, "counted");
+
+    // Dimming: the frontend's own alphas, read from the node's own fields. Each
+    // dimmed node contributes its body and its title bar, so a node is two fills.
+    const dim = frame.alphas.filter((a) => a < 1);
+    const dimNodes = (alpha) => dim.filter((a) => a === alpha).length / 2;
+    assertEqual(dim.length, 6, "the muted, bypassed and ghosted nodes draw dimmed, body and title");
+    assertEqual(dimNodes(0.4), 1, "a muted node at the frontend's 0.4");
+    assertEqual(dimNodes(0.2), 1, "a bypassed node at 0.2");
+    assertEqual(dimNodes(0.3), 1, "a ghosted node at 0.3");
+    assertEqual(h.tracker.lowZoom.state.boxMuted, 3, "counted per node, not per fill");
+
+    // A node that is fine, running, or muted is never given a mark it did not ask
+    // for: no error ring on the running node, no bar on the healthy one.
+    assertEqual(frame.ops.filter((o) => o[0] === "strokeRect" && o[1] === -12).length, 1, "one error ring, not six");
+  });
+
+  test("the ladder only ever changes a box, never which nodes are boxes, and off restores the paint", async () => {
+    const h = await boot();
+    markedGraph(h);
+    h.tracker.lowZoom.set({ flatBelow: 0.2, boxDetail: "state" });
+    drawLoop(h, 0.2);
+    const flatNodes = h.tracker.lowZoom.flat.flatNodes;
+
+    // Above the flatten threshold nothing changes at all: the ladder is about a
+    // box, and there is no box here.
+    const close = paint(h, 0.5);
+    assertEqual(close.ops.filter((o) => o[0] === "fillRect" && o[2] < 0).length, 0, "no title bar above the threshold");
+    assertEqual(close.ops.filter((o) => o[0] === "strokeRect" && o[1] === -12).length, 0, "no error ring above it");
+
+    // And switching the ladder off puts the paint back exactly as it was.
+    h.canvas.ds.scale = 0.1;
+    h.tracker.lowZoom.set({ boxDetail: "plain" });
+    const plainFrame = paint(h);
+    assertEqual(count(plainFrame.ops, "fillRect"), 6, "one rectangle per node again");
+    assertEqual(count(plainFrame.ops, "strokeRect"), 0, "no marks");
+    assert(plainFrame.alphas.every((a) => a === 1), "nothing dimmed");
+    assertEqual(h.tracker.lowZoom.flat.flatNodes, flatNodes, "and the same nodes are flat as before the ladder was touched");
+
+    // The master switch is above the ladder: off, nothing is painted by this
+    // path at all.
+    h.tracker.lowZoom.set({ boxDetail: "state" });
+    h.tracker.lowZoom.setEnabled(false);
+    const offFrame = paint(h);
+    assertEqual(count(offFrame.ops, "strokeRect"), 0, "switched off, no box is painted by the tracker");
+    assertEqual(h.canvas.nodeDraws > 0, true, "and LiteGraph's own drawing is back");
+  });
+
+  test("the panel and the API report the ladder, and the readout prices the marks", async () => {
+    const h = await boot();
+    markedGraph(h);
+    h.tracker.lowZoom.set({ flatBelow: 0.2 });
+    drawLoop(h, 0.2);
+    await openTweaksTab(h);
+    const text = panelText(h);
+    assertIncludes(text, "boxes: plain fill (as before)", "the control offers the levels");
+    assertIncludes(text, "boxes: + the node's title bar colour", "including the title bar");
+    assertIncludes(text, "boxes: + title, error ring, progress bar, muted dim", "and the state marks");
+    assertIncludes(text, "the boxes are plain", "and the readout says what the boxes could show");
+
+    h.tracker.lowZoom.set({ boxDetail: "state" });
+    drawLoop(h, 0.2);
+    h.advance(600); // the panel refreshes on its own tick, not on the canvas's
+    await h.flush();
+    const after = panelText(h);
+    assertIncludes(after, 'box detail "state"', "the readout names the level in force");
+    // The counters are per paint and cumulative, like every other counter here, so
+    // the readout has to be compared with what the API reports, not with a number
+    // this test guessed.
+    const marks = h.tracker.lowZoom.flat;
+    assertGreater(marks.boxTitles, 6, `the marks are counted over every painted frame (${marks.boxTitles} title bars)`);
+    assertIncludes(after, `${marks.boxTitles} title bar(s)`, "and the readout prices them");
+    assertIncludes(after, `${marks.boxErrors} error ring(s)`, "ring by ring");
+    assertIncludes(after, `${marks.boxBars} progress bar(s)`, "bar by bar");
+    assertIncludes(after, `${marks.boxMuted} dimmed`, "and the dimming");
+
+    // The API is the seam tests and scripts use: state, limits, and the marks.
+    const api = h.tracker.lowZoom;
+    assertEqual(api.flat.boxDetail, "state", "the API reports the level");
+    assertEqual(api.flat.boxTitles, marks.boxTitles, "and the counters the readout quoted");
+    assertEqual(api.limits.boxDetail.join(","), "plain,title,state", "with the ladder exposed");
+    // A value from nowhere (a saved record, a script) lands on the do-nothing one.
+    api.set({ boxDetail: "sparkles" });
+    assertEqual(api.flat.boxDetail, "plain", "an unknown level falls back to the plain box");
+  });
+});
