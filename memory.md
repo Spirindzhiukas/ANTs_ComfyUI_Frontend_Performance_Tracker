@@ -221,6 +221,13 @@ The user's machine and reports, all of which drove priorities:
   **44.7 ms** (connections ~60%, other ~37%), fps ~15. Thinning links measured
   **30.4 → 23.1 ms/frame**. Eclipse/other extension culling off; governor limits
   off during those reports.
+- The frontend's own LOD threshold is derived, not fixed:
+  `min_font_size_for_lod / (14 × √devicePixelRatio)`. At the default setting of 8
+  and a 200% display (dpr 2) that is **≈0.40 zoom**, so at 10% zoom ComfyUI is
+  *already* drawing low-quality — no title text, badges, widget text or shadows —
+  and any "simplify nodes during gestures" lever only has an effect between 0.40
+  and 1.0 zoom. Below 0.40, savings have to come from not drawing the node at all
+  (our flatten path, and the node snapshots in plan.md Track K).
 - The user verifies by screenshot, and reports in terms of what they see on the
   page ("still clickable", "the wrench is gone"). Design changes accordingly:
   say what the page will look like, and prove it with the demo's printed numbers

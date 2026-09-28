@@ -260,6 +260,183 @@ and it must be off by default.
   Cute; costs draw time; likely only worth it behind the flatten threshold. Would
   need a measurement to justify.
 
+## Track K — Node stand-ins: from boxes to bitmaps (M–L)
+
+The flatten path draws a grey rectangle (`lodPaintNode`). It is honest work — it
+removes nearly all of a node's draw cost — but it tells the user nothing: not
+which node it was, not which type, not whether it is selected, executing or
+broken. That is the "dumb semi useless boxes" complaint, and it is fair.
+
+[NodeSnapshots](https://github.com/SparknightLLC/ComfyUI-NodeSnapshots)
+(SparknightLLC / EricBCoding, MIT) solves the same problem with real bitmaps:
+captured in small idle batches, reused while panning, zooming, dragging and
+resizing, with a signature check so a stale image is never shown. It is the right
+engine. Its storage strategy is what does not survive a large graph: captures are
+taken at a fixed 2 px per graph unit, so a 1000×400 node becomes 2000×800 RGBA —
+about 6.4 MB — and the default 256 MiB budget therefore covers roughly forty
+nodes. Its own README and reports show the consequences (long warm-up, nodes left
+live when the budget runs out). Our version keeps the engine, changes the storage
+strategy, and credits every byte of it (Track M).
+
+**K1. The capture engine, ported and credited (M).** Port these pieces as they
+are, with a source header on the file:
+
+- `node_signature()` — a JSON of everything that changes what a node draws:
+  title, size, flags, mode, colours, shape, collapsed width, subgraph version,
+  input/output counts, widget values, and the canvas render flags. Position,
+  zoom and subgraph entry are deliberately *not* in it, so pausing mid-pan never
+  invalidates a capture. Longer reuse interval (~100 ms) while the user is
+  interacting.
+- Never cache this node: any widget with an `element`, a widget of type
+  `dom`/`custom`, function-valued properties, strings over 4 kB. This is
+  NodeSnapshots' own conservative answer to "we cannot cheaply know when a custom
+  node changed", and it is the gap named in the request. The honest improvement is
+  not cleverer detection — nothing cheap can tell whether a custom draw callback
+  will keep drawing the same thing — but a **per-type override** on top of Track
+  D's policies: "this type is expensive and static, snapshot it anyway", chosen by
+  the user, with the failure mode (a node whose real content changes without the
+  signature changing) stated in the panel and README. Default stays: unknown
+  custom types are live.
+- A DOM-widget node cannot be snapshotted at all without baking the browser's own
+  rendering of that element, which is out of scope; those stay live and are
+  counted in K3's "misses by reason".
+- Always live: selected, hovered, carrying an error, executing or queued,
+  link-connector active, actively dragged; plus the user's per-type excludes
+  (Track D) as first-class settings instead of a comma-separated text field.
+- Slow-capture verdict: a node whose own capture took longer than the cutoff
+  stays live for the session. **Default 60 ms, not their 32 ms** — their issue #1
+  recommends exactly that raise for large custom nodes.
+- Context hygiene: copy the mutable `ctx` state before capture and restore it
+  after; force `ds.scale = 1` and `_isLowQuality = false` during capture (a
+  capture must never bake the *current* zoom or a temporary LOD state into a
+  reusable image); set `shadowColor` transparent before every `drawImage` so a
+  shadow is never blended into the bitmap.
+
+*Why ours can be cheaper:* capture and reuse both hang off the `drawNode`
+wrapper we already own (`web/tracker.js`, ~line 3186), and batching runs on the
+governor's idle lane (`govInputRecently`, `GOV.controls.budgetMs`, the `rafMode`
+coalescer, the input guard) instead of a second scheduler with its own idle
+clock, `requestIdleCallback` and timers. One idle lane, one set of numbers in the
+panel.
+
+*Risk:* the largest single change in this plan. Every part must fail open into
+the flat box, never throw inside `drawNode`, and switching it off must restore
+the exact previous behaviour (`normal` = strict no-op). The one place we must not
+follow NodeSnapshots is capture-into-the-live-canvas: a capture drawn through the
+visible context is only invisible because it happens while idle, and the idle
+lane can be pre-empted by a frame. Prefer a reusable offscreen canvas per capture
+size, and measure whether that costs more than their approach.
+
+*Verified by:* harness tests for signature stability (same node → same
+signature; a widget value change → different; a move → same), the reuse decision,
+the always-live set, the slow-capture block, and a `drawImage` counter on the
+fake canvas; the existing 131 tests unchanged with the feature off.
+
+**K2. Zoom-bucketed bitmaps, not a fixed capture scale (M).** The capture is
+taken at the scale of the zoom bucket it will be used in, and reuse is one
+`drawImage` from that box to the on-screen one. At the flatten zooms a node is
+drawn into roughly a hundred by forty screen pixels, so a bitmap of that size is
+on the order of 64 kB — even a thousand of them is tens of megabytes, not
+hundreds. At readable zooms the few visible nodes are the only ones worth
+capturing, where the budget has room. When a bucket is too wide to cover (a node
+spanning many zoom levels, or a graph in constant zoom motion), the flat box
+remains the fallback — the flatten path is not replaced, it becomes the floor.
+Reuse our `lodBucketFor` buckets and the `LOD.thumbs` WeakMap / `thumbBytes`
+accounting rather than adding a second cache with a second budget.
+
+*Numbers here are estimates to be confirmed by K3, not figures to put in the
+panel.*
+
+**K3. Prove it, then set the default (M).** The memory budget is a knob; the
+default comes from measurement on real workflows, as agreed. The panel reports
+what the cache actually did, in the same units as everything else: reuse hit
+rate, misses by reason (no capture yet, signature changed, too slow, excluded
+type, over budget), bytes held, capture-time distribution — and the same A/B the
+flatten threshold already had: frame time with bitmaps vs flat boxes vs live, at
+10%, 25%, 50% and 100% zoom. This is also where the honest limit goes into the
+README: bitmaps help movement; they do nothing for a still frame that is slow for
+another reason.
+
+**K4. Informative boxes as the floor, not the ceiling (S).** Independent of
+bitmaps, and worth shipping on its own if the engine stalls: type/kind coding
+(title tint or a type colour), state marks for selected / error / executing /
+collapsed, and a hover or selection ring at gearbox thickness. Relevant detail
+from the frontend source: below its own LOD threshold (`low_quality`, which at
+200% Windows display scale is reached at ≈0.40 zoom — see `memory.md`) LiteGraph
+already skips title text, badges and widget text, which is part of why the boxes
+look so empty at 10%. Colour and state are what carry information at those zooms.
+
+**K5. The gesture LOD hold (S).** NodeSnapshots' "Simplify live nodes during
+navigation" is one line of LiteGraph state: hold `min_font_size_for_lod` high for
+the duration of a gesture, then put it back — touching only its own value, and
+leaving a user-raised threshold alone. It only matters for nodes that are *live*
+at readable zooms; at 10% zoom this frontend is already low-quality by its own
+default, so the lever does nothing there. Small and reversible; the numbers
+decide whether it stays.
+
+**K6. A link-layer bitmap is a link setting (M).** Their `links.mjs` caches the
+visible connection layer plus an overscan margin and reuses it while panning and
+zooming. Genuinely useful — but under the standing rule it is a *link* subject,
+must never be entangled with node stand-ins, and must prove its own value in the
+link A/B (the thinned-link work already has that harness). Deliberately after K2,
+and only if K2 shows that bitmap reuse survives real graphs.
+
+## Track L — Console: attribution before silencing (M)
+
+[DisableBrowserLogs](https://github.com/SparknightLLC/ComfyUI-DisableBrowserLogs)
+(SparknightLLC, MIT, 78 lines) replaces `console.log`/`error`/`warn`/`info`/
+`debug`/`trace` with no-ops, permanently (`writable: false`,
+`configurable: false`) and re-applies itself if `globalThis.console` is
+reassigned. It exists because of a measured case in NodeSnapshots' issue #1: one
+`console.log` per wheel event took a large workflow to 5 FPS *with DevTools
+closed*. That cost is real — the browser serialises and buffers the message
+regardless of whether the console UI is open — and it is invisible to a pure
+frame profiler.
+
+What we will not copy is the switch: a non-configurable no-op cannot be undone
+without a reload, which breaks "off restores exact old behaviour". Our version,
+as a mode in the TWEAKS tab:
+
+- **off** (default) / **count only** / **count + rate-limit** (last message per
+  owner per interval, plus "and N more") / **mute per owner** / **mute all**.
+- Wrapping keeps the original functions and their descriptors, so off restores
+  the exact previous objects. `error` and `warn` are counted but only muteable
+  behind an explicit second confirmation, because silencing them hides real
+  problems.
+- **Attribution is the part we already own.** The same `parseCallerStack()` /
+  `packFromUrl()` machinery that names the pack behind an invalidation storm
+  names the owner behind a log storm: "console: 8,400 calls in 60 s — 96% from
+  <pack>". The user mutes that pack instead of blinding the console.
+- Our own ten `console` call sites go through the saved originals, so the tool
+  can never silence its own diagnostics.
+
+*Risk:* low mechanically; the load-bearing part is the text. A user who mutes
+everything and then files a bug report has no console to offer, so the panel says
+so next to the switch.
+
+*Verified by:* tests for call counting, owner attribution, rate-limit emission
+count, exact restoration of the original functions and property descriptors, and
+the reassignment trap (replacing `globalThis.console`, then still counting, and
+still reverting).
+
+## Track M — Provenance: licence and credit (S, with K1 and L)
+
+MIT permits reuse provided the copyright notice travels with the code; the honest
+version is stronger than the legal minimum, and the user asked for credit
+"everywhere it matters":
+
+- A source header in every file that carries ported code, naming the upstream
+  repository, the author (EricBCoding / SparknightLLC) and the licence.
+- A Credits section in the README that says plainly what was taken, what was
+  changed, and what was deliberately left out.
+- `THIRD_PARTY_NOTICES.md` carrying both MIT notices, with a note that
+  NodeSnapshots also ships `PHOSPHOR-LICENSE.txt` for a camera icon we are not
+  taking.
+- The same text in the commit body and the PR description.
+- While that file exists, this repo should carry its own `LICENSE` — it currently
+  has none, which is a poor look for a project that is about to embed someone
+  else's notice.
+
 ## What this must not become
 
 - Not a workflow runner, not a queue manager, not an execution profiler — the
@@ -273,6 +450,10 @@ and it must be off by default.
 
 ## Suggested order
 
+0. **K + M, then L** — the current request (2026-09-28). K1 → K2 → K3 in that
+   order, with M's notices in the same commits as K1; K4 first if the engine
+   stalls and something shippable is needed early; K5/K6 only after K2 has
+   numbers. Track L after K3, in the same round as agreed.
 1. **A1 + A3** (verify page / startup line) — small, and they make everything after
    this checkable on the real machine. A2 needs one run from the user.
 2. **B1 + B2** (measure any setting / ledger) — turns nine knobs into evidence.
@@ -287,9 +468,9 @@ and it must be off by default.
 
 ## Open questions for the user
 
-1. **Which of these is "the advanced stuff" you had in mind** — per-type policies
-   (D), presets/portability (C), cross-session comparison (E), an API other packs
-   can use (F), or the scheduler lanes (I)?
+1. ~~**Which of these is "the advanced stuff" you had in mind**~~ — **answered
+   2026-09-28**: the node stand-ins (Track K) plus the console mode (Track L), with
+   provenance (Track M) in the same round. Kept for the record.
 2. **May the tool write anything to disk?** Today it only writes localStorage.
    A report file (H2) is the natural next step, but it changes the "nothing
    server-side" property the README boasts about.
@@ -297,3 +478,7 @@ and it must be off by default.
    that a reported number is not a measured one?
 4. **Is a per-type "flatten always" policy wanted even at 100% zoom** (D1), and if
    so, should it be per type or per pack?
+5. **Confirm the licence position** (Track M): carrying MIT code with the notices
+   is permitted, but embedding someone else's copyright notice is a decision the
+   repository owner should make explicitly. And if this repo gets its own
+   `LICENSE`, which one — MIT, to match the ecosystem?
