@@ -573,6 +573,11 @@ patches `drawImage` there, the same way a browser exposes it), and
 `createImageBitmap` records the resize it was asked to perform instead of
 resizing anything.
 
+## What changed in v2.5.1
+
+- Selecting a node no longer swaps its picture for a painted box. The picture stays, and a ring is drawn on it. Drag, a running bar and an error still draw live.
+- Image-node photographs were missing from the smaller copies, which are what the screen uses past about 25% zoom on a 200% display. ComfyUI draws that photograph a moment after the node itself. The copies now wait for it. Thumbnails of image nodes already on disk are photographed again; other nodes' files are left as they are.
+
 ## What changed in v2.5.0
 
 - The node is **ANTs_Frontend_Optimizer**. Graphs saved with the old class key still load; that key is an alias. The Tweaks tab is **Node Rendering Settings**, one row per setting.

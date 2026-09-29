@@ -4,7 +4,7 @@ A running record for whoever picks this up next (including me). `CLAUDE.md` is t
 rules for changing the code; `plan.md` is where it is going. This file is the past:
 what was built, what was rejected, and what the evidence was.
 
-Last updated at **v2.5.0**, 161 tests green, PR #1 on
+Last updated at **v2.5.1**, 164 tests green, PR #1 on
 `Spirindzhiukas/ANTs_ComfyUI_Frontend_Performance_Tracker`.
 
 ---
@@ -13,8 +13,8 @@ Last updated at **v2.5.0**, 161 tests green, PR #1 on
 
 | | |
 | --- | --- |
-| Version | 2.5.0 (`web/tracker.js` `VERSION`) |
-| Tests | 161 (`node tests/run-tests.mjs`), plus `tests/test_init.py` |
+| Version | 2.5.1 (`web/tracker.js` `VERSION`) |
+| Tests | 164 (`node tests/run-tests.mjs`), plus `tests/test_init.py` |
 | Frontend | `web/tracker.js`, one ES module, no dependencies |
 | Backend | `__init__.py` — node `ANTs_Frontend_Optimizer` (old class key kept as an alias), the GPU route, and thumbnail read/write under ComfyUI's temp folder |
 | Panel | 9 tabs: Node Rendering Settings, Timing, Nodes, Stalls, Governor, Load, Memory, GPU / VRAM, Testing |

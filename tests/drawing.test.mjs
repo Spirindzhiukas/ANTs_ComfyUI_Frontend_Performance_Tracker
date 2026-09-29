@@ -1643,9 +1643,9 @@ suite("drawing: a flat box can say what it stands for, and only when asked", () 
 //      through the node's own draw path, into its own canvas, at graph scale;
 //   3. reuse is one drawImage of that canvas, and only for a node whose signature
 //      still matches;
-//   4. the nodes that must stay live stay live — selected, hovered, broken,
-//      running, dragged — and the nodes the canvas cannot own (a DOM widget, a
-//      function-valued property) are never captured at all;
+//   4. the nodes that must stay live stay live — broken, running, dragged.
+//      Hover and selection keep the picture. A DOM widget or a
+//      function-valued property is still captured: the picture is the canvas part;
 //   5. a capture that was slow blocks that node for the session;
 //   6. a capture's cost is this tool's, not the pack's: hooks run, attribution
 //      stands aside, and the time lands in the snapshot's own counter;
@@ -1814,21 +1814,20 @@ suite("drawing: node snapshots — a box that is a picture of the node", () => {
     // time as well as at reuse time, so no bitmap of a transient state can exist.
     // A ghosted node is deliberately *not* in this set: ghosting only changes the
     // drawing, so the captured bitmap already carries its dimming.
-    assertEqual(snapApi(h).captured, 2, "the hovered node is pictured too; select, error and progress stay live");
+    assertEqual(snapApi(h).captured, 3, "hover and selection are pictured; error and progress stay live");
     h.canvas.ctx.ops.length = 0;
     draw(h, 1);
-    assertEqual(blits(h).length, 2, "the untouched node and the hovered one are served from a picture");
-    assertEqual(boxes(h).length, 4, "select, error and the two progress nodes stay live");
+    assertEqual(blits(h).length, 3, "the selected node, the hovered one and the untouched one are pictures");
+    assertEqual(boxes(h).length, 3, "error and the two progress nodes stay live");
 
-    // A node that becomes selected after being captured must go back to live.
-    // The hovered one stays a picture: hover is not a reason to drop to a box.
+    // Selecting a node that already has a picture must not swap it for a box.
     const drawnBefore = snapApi(h).drawn;
     nodes[5].selected = true;
     h.canvas.ctx.ops.length = 0;
     draw(h, 1);
-    assertEqual(snapApi(h).drawn, drawnBefore + 1, "the selected node drops out; the hovered one is still served");
-    assertEqual(blits(h).length, 1, "only the hovered node is still a picture");
-    assertEqual(boxes(h).length, 5, "the newly selected node is live, with the ones that were already live");
+    assertEqual(snapApi(h).drawn, drawnBefore + 3, "selection does not drop the picture");
+    assertEqual(blits(h).length, 3, "the newly selected node is still a picture");
+    assertEqual(boxes(h).length, 3, "only error and progress are boxes");
 
     // The ghost case on its own, on a fresh graph: a ghosted node *is* captured
     // and served from its picture, because a ghost's dimming is part of the
@@ -1843,6 +1842,79 @@ suite("drawing: node snapshots — a box that is a picture of the node", () => {
     draw(h, 1);
     assertEqual(blits(h).length, 1, "and is served from its own picture");
     assertEqual(boxes(h).length, 0, "not painted as a box");
+  });
+
+  test("selecting a pictured node keeps the picture", async () => {
+    const h = await boot();
+    const nodes = snapGraph(h, 2);
+    h.canvas.ds.scale = 0.4; // under the 50% setting: thumbnails are on
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true });
+    draw(h, 1);
+    await idle(h);
+    nodes[0].selected = true;
+    h.canvas.ctx.ops.length = 0;
+    draw(h, 1);
+    assertEqual(blits(h).length, 2, "the selected node stays a picture");
+    assertEqual(boxes(h).length, 0, "selection does not paint a box over it");
+    const rings = h.canvas.ctx.ops.filter((o) => o[0] === "strokeRect");
+    assert(rings.length >= 1, "selection is a ring drawn on the picture");
+  });
+
+  test("an image drawn a microtask after the node is in the copy the screen blits", async () => {
+    const h = await boot();
+    h.window.devicePixelRatio = 2; // their display scale: past ~25% the quarter copy is used
+    const nodes = snapGraph(h, 1);
+    const img = { width: 80, height: 80, naturalWidth: 80, naturalHeight: 80, complete: true, src: "preview.png" };
+    nodes[0].imgs = [img];
+    // ComfyUI's image preview does not draw the picture inside drawNode. It queues
+    // that drawImage and returns. The capture used to copy the half and quarter
+    // canvases before that turn, so those copies — the ones used past ~25% — had
+    // the frame and not the photograph.
+    nodes[0].onDrawBackground = (ctx) => {
+      h.sandbox.queueMicrotask(() => {
+        ctx.__antsImage = true;
+        ctx.drawImage(img, 12, 28, 80, 60);
+      });
+    };
+    h.canvas.ds.scale = 0.1;
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true, snapRatio: 1 });
+    draw(h, 1);
+    await idle(h);
+    h.canvas.ctx.ops.length = 0;
+    draw(h, 1);
+    const blit = blits(h)[0];
+    assert(blit, "the node was served from a picture");
+    const src = blit[1];
+    assert(src && src._ctx, "the blit source is one of the stored canvases");
+    const copies = src._ctx.ops.filter((o) => o[0] === "drawImage" && o[1] && o[1]._ctx);
+    const copy = copies[copies.length - 1];
+    assert(copy && copy.imageReady, "the smaller copy was taken after the node's image had been drawn");
+  });
+
+  test("an image already queued before the capture still lands in the smaller copy", async () => {
+    const h = await boot();
+    h.window.devicePixelRatio = 2;
+    const nodes = snapGraph(h, 1);
+    const img = { width: 80, height: 80, naturalWidth: 80, naturalHeight: 80, complete: true, src: "preview.png" };
+    nodes[0].imgs = [img];
+    // Closed over before the capture replaces queueMicrotask, so this is the
+    // flusher ComfyUI already scheduled: the capture cannot collect it.
+    const q = h.sandbox.queueMicrotask;
+    nodes[0].onDrawBackground = (ctx) => {
+      q(() => {
+        ctx.__antsImage = true;
+        ctx.drawImage(img, 12, 28, 80, 60);
+      });
+    };
+    h.canvas.ds.scale = 0.1;
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true, snapRatio: 1 });
+    draw(h, 1);
+    await idle(h);
+    h.canvas.ctx.ops.length = 0;
+    draw(h, 1);
+    const blit = blits(h)[0];
+    const copies = blit[1]._ctx.ops.filter((o) => o[0] === "drawImage" && o[1] && o[1]._ctx);
+    assert(copies.length && copies[copies.length - 1].imageReady, "the copy was redrawn after the already-queued image landed");
   });
 
   test("dragging nodes keeps them live, panning does not invalidate anything", async () => {

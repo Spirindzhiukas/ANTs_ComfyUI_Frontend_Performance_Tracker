@@ -177,7 +177,12 @@ export function createHarness(options = {}) {
       this.font = "";
     }
     drawImage(...args) {
-      this.ops.push(["drawImage", ...args]);
+      const rec = ["drawImage", ...args];
+      // A copy of another canvas can say whether that canvas already held a
+      // deferred image draw. The stamp is set by the test, not by the tracker.
+      const src = args[0];
+      if (src && src._ctx && src._ctx.__antsImage) rec.imageReady = true;
+      this.ops.push(rec);
     }
     getImageData(x, y, w, h) {
       // What the snapshot engine's ink probe reads. Opaque by default, so the
@@ -411,12 +416,16 @@ export function createHarness(options = {}) {
       ctx.bezierCurveTo(a[0] + 40, a[1], b[0] - 40, b[1], b[0], b[1]);
       ctx.stroke();
     }
-    drawNode(node) {
+    drawNode(node, ctx) {
       this.nodeDraws++;
       this.nodeLowQuality.push(this._isLowQuality);
       busy(this.costs.chrome);
-      if (node && typeof node.onDrawForeground === "function") node.onDrawForeground(this.ctx);
-      if (node && typeof node.onDrawBackground === "function") node.onDrawBackground(this.ctx);
+      // LiteGraph draws into the context it was handed. A capture hands its own
+      // canvas; ignoring that and always painting this.ctx would hide a picture
+      // that only exists on the offscreen surface.
+      const target = ctx || this.ctx;
+      if (node && typeof node.onDrawForeground === "function") node.onDrawForeground(target);
+      if (node && typeof node.onDrawBackground === "function") node.onDrawBackground(target);
     }
     draw() {
       this.recomputeVisibleArea();
@@ -487,6 +496,7 @@ export function createHarness(options = {}) {
     parseFloat,
     decodeURIComponent,
     encodeURIComponent,
+    queueMicrotask,
     globalThis: null,
   };
   sandbox.globalThis = sandbox;

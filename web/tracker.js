@@ -27,7 +27,7 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.5.0";
+const VERSION = "2.5.1";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
 // The class key ComfyUI stores in a workflow. The old key is still recognised so
 // a graph saved before the rename does not lose this node.
@@ -3708,11 +3708,12 @@ function lodSnapOn(canvas) {
 function lodSnapLive(node, canvas) {
   try {
     if (!node) return true;
-    if (node.selected) return true; // being worked on
-    // Hover is not live. A pictured node used to drop back to a painted box under
-    // the pointer, so the picture and the box both did the work. The picture stays.
-    // Select, drag, a link drag, a running bar and an error still draw live, so
-    // the node can still be worked on. The node stays clickable either way.
+    // Hover is not live, and neither is selection. Both used to drop a pictured
+    // node back to a painted box, so the picture and the box both did the work.
+    // The picture stays. A selected node gets a ring on top of it (see the blit),
+    // not a second drawing of the node. Drag, a link drag, a running bar and an
+    // error still draw live, so that transient state is not a stale picture. The
+    // node stays clickable either way.
     if (node.has_errors) return true; // the error stroke is live state
     if (Number(node.progress) > 0) return true; // a running node draws a bar
     const c = canvas || null;
@@ -3927,10 +3928,9 @@ function lodSnapSignature(node, canvas) {
   str(node.boxcolor);
   flag(node.has_errors);
   num(node.progress);
-  // `selected` is deliberately absent: a selection ring is transient state the
-  // live path draws, and this node is drawn live while it is selected anyway. In
-  // the signature it would mean dropping and recapturing a bitmap every time
-  // somebody clicked a node.
+  // `selected` is deliberately absent. The ring is drawn on top of the picture
+  // at blit time, and the capture clears the flag so it is not baked in. In the
+  // signature it would mean dropping and recapturing a bitmap every click.
   // Connections, without walking them: a slot count changes when a link is added
   // or removed, and the count is the cheap part of that.
   num(node.inputs ? node.inputs.length : 0);
@@ -3966,6 +3966,12 @@ function lodSnapSignature(node, canvas) {
   // data URL is long, and its ends are what differ).
   const imgs = node.imgs || node.images;
   if (imgs && imgs.length) {
+    // v2.5.1: the capture waits one turn so a preview that draws its image in a
+    // microtask is in the bitmap. Files saved before that wait match this node's
+    // images and still have an empty frame. This token makes those files miss,
+    // so the next idle lane photographs them again. Nodes with no image are
+    // unchanged, and their files still hit.
+    str("img-defer-1");
     mix(imgs.length);
     const imax = Math.min(imgs.length, LOD_SNAP_IMGS_MAX);
     for (let i = 0; i < imax; i++) {
@@ -4244,6 +4250,19 @@ function lodSnapRender(node, canvas, geom, ratio) {
   const prevLow = canvas ? canvas._isLowQuality : undefined;
   const prevInNode = LOD.inNode;
   const prevCurrent = canvas ? canvas.current_node : undefined;
+  // The ring is drawn on the blit, not baked into a picture that will still be
+  // shown after the node is deselected. Cleared only for this draw.
+  let prevSelected;
+  let clearedSelected = false;
+  try {
+    prevSelected = node.selected;
+    if (prevSelected) {
+      node.selected = false;
+      clearedSelected = true;
+    }
+  } catch (e) {
+    /* a selected flag that cannot be written is left as it is */
+  }
   LOD.inCapture = true;
   try {
     // A capture is always the full-detail drawing at graph scale: the zoom and the
@@ -4252,15 +4271,84 @@ function lodSnapRender(node, canvas, geom, ratio) {
     if (canvas && "_isLowQuality" in canvas) canvas._isLowQuality = false;
     LOD.inNode = false; // no preview thumbnails inside a capture: full detail is the point
     if (canvas) canvas.current_node = node;
-    lodSnapOriginalDrawNode.call(canvas, node, cctx);
+    // ComfyUI's image preview does not draw the photograph here. It pushes the
+    // drawImage onto a list and queueMicrotask's a flusher. Collect those turns
+    // and run them before this function returns, so the canvas this capture
+    // hands back already contains the picture. A flusher that was queued before
+    // this draw is not in the list; the copies are redrawn one turn later for
+    // that case (lodSnapRefreshMips).
+    const queued = [];
+    const prevQ = globalThis.queueMicrotask;
+    let swapped = false;
+    try {
+      globalThis.queueMicrotask = (cb) => {
+        if (typeof cb === "function") queued.push(cb);
+      };
+      swapped = true;
+    } catch (e) {
+      /* if the global cannot be replaced, the later redraw of the copies is the net */
+    }
+    try {
+      lodSnapOriginalDrawNode.call(canvas, node, cctx);
+    } finally {
+      if (swapped) {
+        try {
+          globalThis.queueMicrotask = prevQ;
+        } catch (e) {
+          /* the draw is done; restoring the scheduler must not hide its result */
+        }
+      }
+    }
+    for (let i = 0; i < queued.length && i < 8; i++) {
+      try {
+        queued[i]();
+      } catch (e) {
+        /* a deferred draw that throws is the node's problem; the frame is still kept */
+      }
+    }
   } finally {
     LOD.inCapture = false;
     LOD.inNode = prevInNode;
     if (ds && prevScale !== undefined) ds.scale = prevScale;
     if (canvas && prevLow !== undefined && "_isLowQuality" in canvas) canvas._isLowQuality = prevLow;
     if (canvas && prevCurrent !== undefined) canvas.current_node = prevCurrent;
+    if (clearedSelected) {
+      try {
+        node.selected = prevSelected;
+      } catch (e) {
+        /* the flag was ours to put back; if it cannot be, the live ring still draws */
+      }
+    }
   }
   return { canvas: el, x: geom.x, y: geom.y, w: geom.w, h: geom.h, ratio: r, bytes: px * py * 4 };
+}
+
+// One turn of the microtask queue, then `fn`. ComfyUI's image preview does not
+// draw the photograph inside drawNode: it queues that drawImage and returns, on
+// the same context, so the pixels land after the call that asked for them. The
+// half and quarter copies are made from that canvas. Copying before the turn
+// means those copies — the ones the screen uses past about 25% zoom on a 200%
+// display — have the frame and not the picture. A turn already queued (the
+// preview's own flusher) runs first, which is the order this wants.
+function lodSnapDefer(fn) {
+  try {
+    const q = typeof queueMicrotask === "function" ? queueMicrotask : null;
+    if (q) {
+      q(fn);
+      return;
+    }
+  } catch (e) {
+    /* fall through to a promise turn */
+  }
+  try {
+    Promise.resolve().then(fn);
+  } catch (e) {
+    try {
+      fn();
+    } catch (err) {
+      /* the commit reports its own failure */
+    }
+  }
 }
 
 function lodSnapAbort(reason) {
@@ -4428,11 +4516,45 @@ function lodSnapCaptureNode(node, canvas) {
   LOD.snapCaptured++;
   LOD.snapFailStreak = 0;
   lodSnapAttachMips(rec);
-  lodThumbDiskSave(node, rec);
+  // The disk file is the bitmap after any image draw that was already queued
+  // before this capture (that one is not in the list we drained). One turn, then
+  // the copies are redrawn from the canvas and the file is written.
+  lodSnapDefer(() => lodSnapSettleImages(node, rec, made.canvas));
   if (coarse) LOD.snapCoarse++;
   else if (made.ratio < want) LOD.snapFit++;
   if (lodSnapPartial(node)) LOD.snapPartial++;
   return true;
+}
+
+// Redraw the half and quarter copies from the capture, then write the file.
+// Safe to run late: if this picture was dropped or replaced, it does nothing.
+function lodSnapSettleImages(node, rec, canvas) {
+  if (!rec || rec.canvas !== canvas) return;
+  lodSnapRefreshMips(rec);
+  try {
+    lodThumbDiskSave(node, rec);
+  } catch (e) {
+    /* the memory picture is already in use; a disk miss is the old path */
+  }
+}
+
+function lodSnapRefreshMips(rec) {
+  if (!rec || !rec.mips || !rec.canvas) return;
+  const src = rec.canvas;
+  for (const scale of [0.5, 0.25]) {
+    const c = rec.mips[scale];
+    if (!c || c === src || !(c.width > 0) || !(c.height > 0)) continue;
+    try {
+      const ctx = typeof c.getContext === "function" ? c.getContext("2d") : null;
+      if (!ctx || typeof ctx.drawImage !== "function") continue;
+      if (typeof ctx.clearRect === "function") ctx.clearRect(0, 0, c.width, c.height);
+      if ("imageSmoothingEnabled" in ctx) ctx.imageSmoothingEnabled = true;
+      if ("imageSmoothingQuality" in ctx) ctx.imageSmoothingQuality = "low";
+      ctx.drawImage(src, 0, 0, c.width, c.height);
+    } catch (e) {
+      /* the copy made at capture time remains */
+    }
+  }
 }
 
 // A picture thrown away because the node changed before it could be used. A node
@@ -4830,6 +4952,28 @@ function lodSnapEnqueue(node, canvas) {
   lodSnapPump();
 }
 
+// The ring the box path draws when a node is selected, drawn on top of a picture
+// so selection does not have to throw the picture away. Same colour and width as
+// the box, in the node's own coordinates (the blit context is already there).
+function lodSnapSelectionRing(node, canvas, ctx) {
+  try {
+    const size = (node && (node.renderingSize || node.size)) || [0, 0];
+    const w = Math.abs(Number(size[0])) || 0;
+    const h = Math.abs(Number(size[1])) || 0;
+    if (!(w > 0) || !(h > 0) || !ctx || typeof ctx.strokeRect !== "function") return;
+    const scale = (canvas && canvas.ds && Number(canvas.ds.scale)) || 1;
+    if (typeof ctx.save === "function") ctx.save();
+    ctx.shadowColor = "transparent";
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = "#ffb300";
+    ctx.lineWidth = 1 / (scale > 0 ? scale : 1);
+    ctx.strokeRect(0, 0, w, h);
+    if (typeof ctx.restore === "function") ctx.restore();
+  } catch (e) {
+    /* a ring that cannot be drawn is not a reason to drop the picture */
+  }
+}
+
 // The reuse path, called from inside the drawNode wrapper for a node that would
 // otherwise be a flat box. Answers "yes, I drew it" or "no, paint the box".
 function lodSnapPaint(node, canvas, ctx) {
@@ -4886,6 +5030,7 @@ function lodSnapPaint(node, canvas, ctx) {
   ctx.globalAlpha = 1; // and its own alpha (a muted node was captured dimmed)
   const src = lodSnapPick(rec, canvas);
   ctx.drawImage(src || rec.canvas, rec.x, rec.y, rec.w, rec.h);
+  if (node.selected) lodSnapSelectionRing(node, canvas, ctx);
   if (src && src !== rec.canvas) LOD.snapMipDrawn++;
   rec.usedFrame = LOD.snapFrame; // this frame is looking at it
   // Reuse order: the most recently used bitmap is the last to be evicted.
@@ -7897,7 +8042,7 @@ function buildTweaksTab(container) {
   settingRow(
     "Replace nodes with thumbnails",
     lodFlatSel,
-    "Below this zoom a node is one picture instead of a live draw. Hover keeps the picture. Select, drag, a running bar or an error still draws live.",
+    "Below this zoom a node is one picture instead of a live draw. Hover and selection keep the picture; a selected node gets a ring, not a box. Drag, a running bar or an error still draws live.",
     "A zoom, not a node size. A node whose own UI hides or adds a widget changes size while you look at it, and a per-node pixel rule then flips that node in and out of the stand-in. A zoom classifies every node the same way, once per frame. Collapsed nodes and this tool's own node are never replaced. Nothing about the graph changes. Off, or Back to full drawing, restores ComfyUI's own draw. The node stays clickable either way."
   );
 
