@@ -34,14 +34,19 @@ The Python side serves the frontend, adds one optional read-only route
 (/ants_tracker/gpu) that shells out to nvidia-smi, and — because the page cannot
 write a folder — stores node thumbnails under ComfyUI's temp directory when the
 frontend asks. That write is the one the panel's disk cache is for. Nothing else
-is written. If nvidia-smi is missing, the GPU route says so and the panel falls
-back to ComfyUI's own /system_stats.
+is written to disk. The separate window (/ants_optimizer/window) talks to the
+page through /ants_optimizer/ui, which is memory only: a revision and an origin,
+so a change made in the window and a change made on the page are the same
+settings, and neither side is the master. If nvidia-smi is missing, the GPU
+route says so and the panel falls back to ComfyUI's own /system_stats.
 
 Safe to drop into any workflow: no inputs, no outputs, no execution, no
 dependencies.
 """
 
+import copy
 import os
+import threading
 import time
 
 WEB_DIRECTORY = "web"
@@ -351,6 +356,85 @@ def thumb_info():
     return {"dir": root, "count": count, "maxAgeDays": 7}
 
 
+# The separate window and the ComfyUI page share this. It is not written to
+# disk. A settings change bumps rev and records who made it, so each side can
+# ignore its own echo. Telemetry does not bump rev: a live number is not a
+# change of settings. heard is set only when the window asks, so the page can
+# stop posting when nobody is looking.
+_ui_lock = threading.Lock()
+_UI_EMPTY = {
+    "rev": 0,
+    "origin": "",
+    "settings": None,
+    "telemetry": None,
+    "limits": None,
+    "command": "",
+    "command_label": "",
+    "command_rev": 0,
+    "heard": 0.0,
+}
+_ui = dict(_UI_EMPTY)
+
+
+def ui_reset():
+    with _ui_lock:
+        _ui.clear()
+        _ui.update(_UI_EMPTY)
+        _ui["settings"] = None
+        _ui["telemetry"] = None
+        _ui["limits"] = None
+
+
+def _ui_copy(now):
+    heard = _ui["heard"]
+    return {
+        "ok": True,
+        "rev": _ui["rev"],
+        "origin": _ui["origin"],
+        "settings": _ui["settings"],
+        "telemetry": _ui["telemetry"],
+        "limits": _ui["limits"],
+        "command": _ui["command"],
+        "commandLabel": _ui["command_label"],
+        "commandRev": _ui["command_rev"],
+        "heardAge": None if not heard else now - heard,
+    }
+
+
+def ui_snapshot(hear=False):
+    with _ui_lock:
+        now = time.time()
+        if hear:
+            _ui["heard"] = now
+        return _ui_copy(now)
+
+
+def ui_update(body, who=""):
+    if not isinstance(body, dict):
+        raise ValueError("body")
+    with _ui_lock:
+        now = time.time()
+        origin = str(body.get("origin") or who or "")
+        if isinstance(body.get("settings"), dict):
+            _ui["rev"] += 1
+            _ui["origin"] = origin
+            _ui["settings"] = copy.deepcopy(body["settings"])
+        if "telemetry" in body:
+            _ui["telemetry"] = copy.deepcopy(body.get("telemetry"))
+        if isinstance(body.get("limits"), dict):
+            _ui["limits"] = copy.deepcopy(body["limits"])
+        command = body.get("command")
+        if command:
+            _ui["command"] = str(command)
+            _ui["command_label"] = str(body.get("label") or "")
+            _ui["command_rev"] += 1
+            if origin:
+                _ui["origin"] = origin
+        if who == "window" or body.get("watch"):
+            _ui["heard"] = now
+        return _ui_copy(now)
+
+
 def register_routes():
     """
     Register the optional GPU route. Deliberately best-effort: if this ComfyUI
@@ -405,6 +489,28 @@ def register_routes():
         @routes.post("/ants_optimizer/thumbs/sweep")
         async def ants_optimizer_thumb_sweep(request):  # noqa: ARG001
             return web.json_response({"removed": sweep_thumbs()})
+
+        @routes.get("/ants_optimizer/window")
+        async def ants_optimizer_window(request):  # noqa: ARG001
+            path = os.path.join(os.path.dirname(__file__), "web", "window.html")
+            if not os.path.isfile(path):
+                return web.Response(status=404, text="missing")
+            return web.FileResponse(path, headers={"Cache-Control": "no-store"})
+
+        @routes.get("/ants_optimizer/ui")
+        async def ants_optimizer_ui_get(request):
+            return web.json_response(ui_snapshot(hear=request.query.get("from") == "window"))
+
+        @routes.post("/ants_optimizer/ui")
+        async def ants_optimizer_ui_post(request):
+            try:
+                body = await request.json()
+            except Exception:
+                return web.json_response({"ok": False, "error": "bad json"}, status=400)
+            try:
+                return web.json_response(ui_update(body))
+            except ValueError as err:
+                return web.json_response({"ok": False, "error": str(err)}, status=400)
 
     except Exception:  # pragma: no cover - a route may already exist on reload
         return False

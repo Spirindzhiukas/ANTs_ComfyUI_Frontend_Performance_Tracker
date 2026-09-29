@@ -20,6 +20,7 @@ Drop this whole folder into `ComfyUI/custom_nodes/` so it sits at:
 ComfyUI/custom_nodes/0000_ANTs_nasty_bastards_tracker/
     __init__.py
     web/tracker.js
+    web/window.html
 ```
 
 The `0000_` prefix is deliberate — it makes this load before other
@@ -37,20 +38,24 @@ is written server-side.
 ## Use
 
 The tracker starts recording automatically the moment the page loads —
-you don't need to place any node for it to work. Two ways to open the
-panel:
+you don't need to place any node for it to work. The gear opens a
+separate window. The panel on this page is only the fallback, for when
+the browser blocks that window.
 
 1. A small pill appears pinned to the screen at all times, with two
    round controls in it: a **switch** on the left and a **gear** on the
-   right. The gear opens/closes the panel. Press and hold anywhere on
-   the pill for a moment, then drag — it switches into move mode
-   instead of clicking, and remembers wherever you drop it (via
-   `localStorage`), even across page reloads. Handy since its default
-   spot can collide with ComfyUI's own minimap/queue UI depending on
-   your layout; drag it up near the top bar or wherever's actually
-   clear on your screen. The switch on the left is the tool's master
-   switch (see below), and neither control is ever taken off the
-   screen — not by a setting, not by the switch itself.
+   right. The gear opens the separate window (`/ants_optimizer/window`),
+   centered on the ComfyUI window. It is its own page: it is not drawn
+   on the canvas, and it does not hold the canvas document. Settings
+   and the live numbers go through `/ants_optimizer/ui`, so a change in
+   the window is a change on the page, and the other way around. A
+   second click brings that window forward. If the browser blocks the
+   popup, the panel on this page opens and says so. Press and hold
+   anywhere on the pill for a moment, then drag — it switches into move
+   mode instead of clicking, and remembers wherever you drop it (via
+   `localStorage`), even across page reloads. The switch on the left is
+   the tool's master switch (see below), and neither control is ever
+   taken off the screen — not by a setting, not by the switch itself.
 2. Or drag in the **"ANTs Nasty Bastards Tracker"** node (category
    `ANTs/debug`). It carries the same pill as the floating button —
    `[switch][gear]`: the gear opens the panel, the checkbox is the
@@ -572,6 +577,12 @@ installed as the sandbox's `CanvasRenderingContext2D` (the preview ladder
 patches `drawImage` there, the same way a browser exposes it), and
 `createImageBitmap` records the resize it was asked to perform instead of
 resizing anything.
+
+## What changed in v2.5.3
+
+- The corner grip grows the edge you drag. The panel is anchored on the left and the top, so a drag to the right makes it wider to the right. Dragging the header moves that same left edge, and does not put the anchor back on the right.
+- Window is no longer this panel moved into an empty document. It is a separate page at `/ants_optimizer/window`, centered on the ComfyUI window. The gear opens that page. The panel on this page opens only if the browser blocks the popup.
+- The page and the window share `/ants_optimizer/ui`. A settings change carries a revision and who made it, so neither side applies its own echo, and a live number does not count as a settings change. The window is not on the canvas. The page posts telemetry only while that window is asking.
 
 ## What changed in v2.5.2
 

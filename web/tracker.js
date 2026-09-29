@@ -27,7 +27,7 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.5.2";
+const VERSION = "2.5.3";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
 // The class key ComfyUI stores in a workflow. The old key is still recognised so
 // a graph saved before the rename does not lose this node.
@@ -2536,7 +2536,7 @@ function antsBuildTick(pill) {
 // does happens inside it, and nothing outside this tool knows it exists.
 function buildAntsNodeWidget() {
   const pill = el("div", { class: `ants-node-pill ${ANTS_OWN_CLASS}` });
-  pill.title = "ANTs Frontend Optimizer — the switch on the left turns the hooks and the optimisations off, the gear opens the panel";
+  pill.title = "ANTs Frontend Optimizer — the switch on the left turns the hooks and the optimisations off, the gear opens the separate window";
 
   const tick = antsBuildTick(pill);
   const gear = el("button", { class: "ants-node-btn ants-node-btn-gear", type: "button" });
@@ -2553,7 +2553,7 @@ function buildAntsNodeWidget() {
     } catch (e) {
       /* the click still counts */
     }
-    togglePanel();
+    antsOpenFromGear();
   });
   // Presses and drags on the pill are ours: letting them through would start a
   // node drag when someone meant to flip the switch.
@@ -2675,7 +2675,7 @@ function antsAttachNodeWidget(node) {
     /* the fallback below is a canvas button, which is worse but not nothing */
   }
   try {
-    node.addWidget("button", "Open Tracker", null, () => togglePanel());
+    node.addWidget("button", "Open Tracker", null, () => antsOpenFromGear());
   } catch (e) {
     /* a node with no widget API at all: the corner button is the only UI left */
   }
@@ -2778,6 +2778,7 @@ function antsSetEnabled(on) {
   } catch (e) {
     /* never fatal */
   }
+  if (!antsUiSilent) antsUiPublishSettings();
   return antsEnabled();
 }
 
@@ -3088,6 +3089,7 @@ function lodSaveSettings() {
   } catch (e) {
     /* a browser with storage switched off just does not remember */
   }
+  if (!antsUiSilent) antsUiPublishSettings();
 }
 
 // Called once at startup, before the panel is built, so the selects show what is
@@ -3305,9 +3307,14 @@ function lodSet(opts) {
     if (!on) lodSnapCancel();
   }
   if ("snapRatio" in o) {
+    const prevRatio = LOD.snapRatio;
     const r = Number(o.snapRatio) || LOD_SNAP_RATIO_DEFAULT;
     // Snapped to the ladder so the panel and the state cannot disagree.
     LOD.snapRatio = LOD_SNAP_RATIOS.reduce((best, v) => (Math.abs(v - r) < Math.abs(best - r) ? v : best), LOD_SNAP_RATIOS[0]);
+    // A new ratio makes every stored picture a lie. The window posts the ratio
+    // through the same call the panel uses, so the clear lives here, not only
+    // on the panel's change handler.
+    if (LOD.snapOn && LOD.snapRatio !== prevRatio) lodSnapClear("ratio");
   }
   if ("snapMb" in o) {
     const mb = Number(o.snapMb) || LOD_SNAP_BUDGET_DEFAULT;
@@ -7289,7 +7296,7 @@ const PANEL_Z = 99999;
 
 const STYLE = `
 #ants-tracker-panel {
-  position: fixed; top: 60px; right: 20px; width: 640px; height: 72vh;
+  position: fixed; top: 60px; left: 20px; right: auto; bottom: auto; width: 640px; height: 72vh;
   min-width: 320px; min-height: 220px; max-height: none;
   background: #1a1a1e; border: 1px solid #3a3a42; border-radius: 8px;
   box-shadow: 0 8px 24px rgba(0,0,0,0.5); color: #ddd;
@@ -7791,10 +7798,416 @@ const ui = {
   pauseBtn: null,
 };
 
+// The separate window. examples/pop_up_window opens a real page at its own
+// route and syncs with the node through a small API (a revision and an origin,
+// so neither side is the master). This is that pattern: /ants_optimizer/window
+// is the page, /ants_optimizer/ui is the link. The page is not moved into the
+// popup, and the popup does not run on the canvas. A blocked popup is the only
+// reason the in-page panel opens.
+const ANTS_WINDOW_URL = "/ants_optimizer/window";
+const ANTS_WINDOW_NAME = "ants-optimizer";
+const ANTS_WINDOW_W = 980;
+const ANTS_WINDOW_H = 840;
+const ANTS_WINDOW_BLOCKED = "The browser blocked the separate window. This panel is the fallback. Allow pop-ups for this site, then use Window.";
+let antsUiSilent = false;
+let antsUiRev = 0;
+let antsUiCommandRev = 0;
+let antsUiTimer = null;
+let antsUiHot = false;
+let antsUiOpened = false;
+let antsUiReport = "";
+
+function antsUiLimits() {
+  return {
+    flatZoom: LOD_FLAT_ZOOM.slice(),
+    inertZoom: VIEW_INERT_ZOOMS.slice(),
+    focusDom: VIEW_FOCUS_DOM.slice(),
+    foveaMargins: VIEW_FOVEA_MARGINS.slice(),
+    foveaRestores: VIEW_FOVEA_RESTORES.slice(),
+    displayScales: VIEW_DISPLAY_SCALES.slice(),
+    idleCapMs: LOD_IDLE_CAP_MS.slice(),
+    thumbZoom: LOD_THUMB_ZOOMS.slice(),
+    thumbLadder: LOD_THUMB_LADDER.slice(),
+    detailZoom: LOD_DETAIL_ZOOMS.slice(),
+    boxDetail: LOD_BOX_DETAIL.slice(),
+    snapRatios: LOD_SNAP_RATIOS.slice(),
+    snapBudgets: LOD_SNAP_BUDGETS.slice(),
+    linkWidth: LOD_LINK_WIDTH,
+    linkStyles: LOD_LINK_STYLES.slice(),
+  };
+}
+
+function antsUiSettings() {
+  return {
+    flatBelow: LOD.flatBelow,
+    boxDetail: LOD.boxDetail,
+    snapshots: !!LOD.snapOn,
+    snapRatio: LOD.snapRatio,
+    snapMb: LOD.snapMb,
+    snapExclude: LOD.snapExclude ? LOD.snapExclude.slice() : [],
+    detailZoom: LOD.detailZoom,
+    diskOn: !!LOD.diskOn,
+    linkZoom: !!LOD.linkZoom,
+    idleCapMs: LOD.idleCapMs,
+    linkStyle: LOD.linkStyle,
+    inertBelow: LOD.inertBelow,
+    fovea: !!LOD.fovea,
+    focusDom: LOD.focusDom,
+    foveaMargin: LOD.foveaMargin,
+    foveaRestore: LOD.foveaRestore,
+    displayScale: LOD.displayScale,
+    enabled: antsEnabled(),
+    paused: !!S.paused,
+  };
+}
+
+function antsUiTelemetry() {
+  let snapshot = null;
+  try {
+    snapshot = buildSnapshot();
+  } catch (e) {
+    snapshot = null;
+  }
+  const tel = {
+    snapshot,
+    drawing: {
+      version: VERSION,
+      enabled: antsEnabled(),
+      paused: !!S.paused,
+      zoom: lodZoomOf(),
+      flatBelow: LOD.flatBelow,
+      snapOn: !!LOD.snapOn,
+      snapDrawn: LOD.snapDrawn,
+      snapCaptured: LOD.snapCaptured,
+      snapBytes: LOD.snapBytes,
+      snapMb: LOD.snapMb,
+      snapMisses: LOD.snapMisses,
+      diskOn: !!LOD.diskOn,
+      diskLoaded: LOD.diskLoaded,
+      diskSaved: LOD.diskSaved,
+      diskDir: LOD.diskDir || "",
+      ab: LOD.ab && LOD.ab.text ? String(LOD.ab.text) : "",
+    },
+  };
+  if (antsUiReport) {
+    tel.report = antsUiReport;
+    antsUiReport = "";
+  }
+  return tel;
+}
+
+function antsUiPost(body) {
+  try {
+    const payload = JSON.stringify(body);
+    const p = fetch("/ants_optimizer/ui", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: payload,
+    });
+    if (p && typeof p.then === "function") return p.then(() => null).catch(() => null);
+  } catch (e) {
+    /* the route is optional; the page still applies the change locally */
+  }
+  return Promise.resolve(null);
+}
+
+function antsUiPublishSettings() {
+  if (antsUiSilent) return;
+  try {
+    antsUiPost({ origin: "page", settings: antsUiSettings(), limits: antsUiLimits() });
+  } catch (e) {
+    /* a publish must not take a setting change back */
+  }
+}
+
+function antsUiPublishTelemetry() {
+  try {
+    return antsUiPost({ origin: "page", telemetry: antsUiTelemetry(), limits: antsUiLimits() });
+  } catch (e) {
+    return Promise.resolve(null);
+  }
+}
+
+function antsUiApplySettings(settings) {
+  if (!settings || typeof settings !== "object") return;
+  const o = {};
+  for (const key of [
+    "flatBelow", "boxDetail", "snapshots", "snapRatio", "snapMb", "snapExclude",
+    "detailZoom", "diskOn", "idleCapMs", "linkStyle", "linkZoom", "inertBelow",
+    "fovea", "focusDom", "foveaMargin", "foveaRestore", "displayScale",
+  ]) {
+    if (key in settings) o[key] = settings[key];
+  }
+  antsUiSilent = true;
+  try {
+    if ("enabled" in settings && !!settings.enabled !== antsEnabled()) antsSetEnabled(!!settings.enabled);
+    if (Object.keys(o).length) lodSet(o);
+    if ("paused" in settings && !!settings.paused !== !!S.paused) togglePause();
+  } catch (e) {
+    /* a bad payload must not break the page that is drawing */
+  } finally {
+    antsUiSilent = false;
+  }
+}
+
+function antsUiApplyRemote(body) {
+  if (!body || typeof body !== "object" || body.ok === false) return;
+  const rev = Number(body.rev) || 0;
+  if (rev !== antsUiRev && body.origin === "window" && body.settings) {
+    antsUiRev = rev;
+    antsUiApplySettings(body.settings);
+  } else if (rev !== antsUiRev) {
+    antsUiRev = rev;
+  }
+  const cr = Number(body.commandRev) || 0;
+  if (cr === antsUiCommandRev || body.origin === "page" || !body.command) return;
+  antsUiCommandRev = cr;
+  const label = String(body.commandLabel || "");
+  try {
+    if (body.command === "measure-links") lodAbStart();
+    else if (body.command === "reset") resetAllStats();
+    else if (body.command === "report") antsUiReport = buildTelemetryReport();
+    else if (body.command === "mute" && label && !S.muted.has(label)) toggleMute(label);
+    else if (body.command === "unmute" && label && S.muted.has(label)) toggleMute(label);
+  } catch (e) {
+    /* the command can be sent again */
+  }
+}
+
+function antsWindowLive() {
+  const child = ui.popout;
+  if (child && child.closed) ui.popout = null;
+  if (ui.popout && !ui.popout.closed) return true;
+  return antsUiOpened || antsUiHot;
+}
+
+function antsUiSchedule() {
+  if (antsUiTimer) return;
+  const arm = () => {
+    antsUiTimer = null;
+    Promise.resolve(antsUiPump()).then(() => {
+      if (antsUiOpened || (ui.popout && !ui.popout.closed)) antsUiSchedule();
+    });
+  };
+  try {
+    antsUiTimer = govOwn(() => setTimeout(arm, antsWindowLive() ? 500 : 2000));
+  } catch (e) {
+    antsUiTimer = setTimeout(arm, antsWindowLive() ? 500 : 2000);
+  }
+}
+
+async function antsUiPump() {
+  try {
+    const res = await fetch("/ants_optimizer/ui?from=page");
+    if (res && res.ok && typeof res.json === "function") {
+      const body = await res.json();
+      antsUiApplyRemote(body);
+      const age = body && body.heardAge;
+      antsUiHot = typeof age === "number" && age >= 0 && age < 3;
+      if (ui.popout && ui.popout.closed) {
+        ui.popout = null;
+        antsUiOpened = false;
+      }
+      if (antsWindowLive()) await antsUiPublishTelemetry();
+    }
+  } catch (e) {
+    /* no route, no bus — the in-page panel still works */
+  }
+}
+
+function antsUiStart() {
+  antsUiSchedule();
+}
+
+function antsSayBlocked(text) {
+  LOD.popoutNote = text || "";
+  if (ui.popNote) {
+    ui.popNote.style.display = text ? "" : "none";
+    ui.popNote.textContent = text || "";
+  }
+}
+
+function antsWindowBox() {
+  const w = ANTS_WINDOW_W;
+  const h = ANTS_WINDOW_H;
+  const sx = Number(window.screenX != null ? window.screenX : window.screenLeft) || 0;
+  const sy = Number(window.screenY != null ? window.screenY : window.screenTop) || 0;
+  const ow = Number(window.outerWidth) || Number(window.innerWidth) || 1280;
+  const oh = Number(window.outerHeight) || Number(window.innerHeight) || 800;
+  return {
+    w,
+    h,
+    left: Math.round(sx + (ow - w) / 2),
+    top: Math.round(sy + (oh - h) / 2),
+  };
+}
+
+function antsFocusWindow() {
+  const child = ui.popout;
+  if (!child || child.closed) {
+    if (child && child.closed) ui.popout = null;
+    return false;
+  }
+  try {
+    if (typeof child.focus === "function") child.focus();
+  } catch (e) {
+    /* focusing is optional; the window is already open */
+  }
+  return true;
+}
+
+function antsTryOpenWindow() {
+  if (antsFocusWindow()) return true;
+  if (typeof window.open !== "function") return false;
+  const box = antsWindowBox();
+  const features = `popup=yes,resizable=yes,width=${box.w},height=${box.h},left=${box.left},top=${box.top}`;
+  let child = null;
+  try {
+    child = window.open(ANTS_WINDOW_URL, ANTS_WINDOW_NAME, features);
+  } catch (e) {
+    child = null;
+  }
+  if (!child) return false;
+  try {
+    if (typeof child.moveTo === "function") child.moveTo(box.left, box.top);
+    if (typeof child.resizeTo === "function") child.resizeTo(box.w, box.h);
+    if (typeof child.focus === "function") child.focus();
+  } catch (e) {
+    /* features already asked for the same box */
+  }
+  ui.popout = child;
+  antsUiOpened = true;
+  antsSayBlocked("");
+  try {
+    antsUiPublishSettings();
+    antsUiPublishTelemetry();
+  } catch (e) {
+    /* the window polls; a missed first post is not a failed open */
+  }
+  antsUiStart();
+  if (ui.panel && ui.panel.classList.contains("open") && !ui.panel.classList.contains("ants-docked")) {
+    togglePanel(false);
+  }
+  return true;
+}
+
+function antsOpenFromGear() {
+  if (antsFocusWindow()) return;
+  if (typeof window.open === "function") {
+    if (antsTryOpenWindow()) return;
+    togglePanel(true);
+    antsSayBlocked(ANTS_WINDOW_BLOCKED);
+    return;
+  }
+  togglePanel();
+}
+
+function antsOpenFromApi() {
+  if (antsFocusWindow()) return;
+  if (typeof window.open === "function") {
+    if (antsTryOpenWindow()) return;
+    togglePanel(true);
+    antsSayBlocked(ANTS_WINDOW_BLOCKED);
+    return;
+  }
+  togglePanel(true);
+}
+
+function antsPopout() {
+  if (antsTryOpenWindow()) return true;
+  togglePanel(true);
+  antsSayBlocked(ANTS_WINDOW_BLOCKED);
+  return false;
+}
+
+// A right-anchored panel grows to the left when its width changes, which is the
+// opposite of the corner being dragged. Pin left and top first, then change
+// only width and height, so the dragged corner is the one that moves.
+function antsPanelBox(panel) {
+  let left = parseFloat(panel.style.left);
+  let top = parseFloat(panel.style.top);
+  let width = parseFloat(panel.style.width);
+  let height = parseFloat(panel.style.height);
+  try {
+    if (typeof panel.getBoundingClientRect === "function") {
+      const rect = panel.getBoundingClientRect();
+      if (rect && rect.width > 0 && rect.height > 0) {
+        if (Number.isFinite(rect.left)) left = rect.left;
+        if (Number.isFinite(rect.top)) top = rect.top;
+        width = rect.width;
+        height = rect.height;
+      }
+    }
+  } catch (e) {
+    /* style is enough when the box cannot be measured */
+  }
+  if (!Number.isFinite(width) || width <= 0) width = 640;
+  if (!Number.isFinite(height) || height <= 0) height = 520;
+  if (!Number.isFinite(left)) {
+    const right = parseFloat(panel.style.right);
+    const vw = (typeof window !== "undefined" && window.innerWidth) || 1280;
+    left = Number.isFinite(right) ? vw - right - width : Math.max(8, vw - width - 20);
+  }
+  if (!Number.isFinite(top)) top = 60;
+  return { left, top, width, height };
+}
+
+function antsPinPanel(panel) {
+  if (!panel || (panel.classList && panel.classList.contains("ants-docked"))) return null;
+  const box = antsPanelBox(panel);
+  panel.style.left = `${Math.round(box.left)}px`;
+  panel.style.top = `${Math.round(box.top)}px`;
+  panel.style.right = "auto";
+  panel.style.bottom = "auto";
+  return box;
+}
+
+function antsRememberPanel(panel) {
+  try {
+    const box = {
+      left: panel.style.left,
+      top: panel.style.top,
+      w: panel.style.width,
+      h: panel.style.height,
+    };
+    localStorage.setItem("ants-tracker-panel-box", JSON.stringify(box));
+    localStorage.setItem("ants-tracker-panel-size", JSON.stringify({ w: box.w, h: box.h }));
+  } catch (e) {
+    /* remembering the size is optional */
+  }
+}
+
+function antsPlacePanel(panel) {
+  if (!panel || (panel.classList && panel.classList.contains("ants-docked"))) return;
+  let saved = null;
+  try {
+    const raw = localStorage.getItem("ants-tracker-panel-box") || localStorage.getItem("ants-tracker-panel-size");
+    if (raw) saved = JSON.parse(raw);
+  } catch (e) {
+    saved = null;
+  }
+  if (saved && saved.w) panel.style.width = String(saved.w);
+  if (saved && saved.h) {
+    panel.style.height = String(saved.h);
+    panel.style.maxHeight = "none";
+  }
+  if (saved && saved.left) {
+    panel.style.left = String(saved.left);
+    panel.style.top = saved.top ? String(saved.top) : "60px";
+  } else {
+    const width = parseFloat(panel.style.width) || 640;
+    const vw = (typeof window !== "undefined" && window.innerWidth) || 1280;
+    panel.style.left = `${Math.max(8, Math.round(vw - width - 20))}px`;
+    if (!panel.style.top) panel.style.top = "60px";
+  }
+  panel.style.right = "auto";
+  panel.style.bottom = "auto";
+}
+
 function antsInstallResize(panel) {
   const grip = el("div", {
     id: "ants-tracker-resize",
-    title: "Drag to resize. Rows stack when the panel is narrow.",
+    title: "Drag to resize. The corner you drag is the corner that moves.",
   });
   panel.appendChild(grip);
   let dragging = false;
@@ -7802,24 +8215,17 @@ function antsInstallResize(panel) {
   let startY = 0;
   let startW = 640;
   let startH = 520;
-  const box = () => {
-    try {
-      if (typeof panel.getBoundingClientRect === "function") {
-        const rect = panel.getBoundingClientRect();
-        if (rect && rect.width > 0 && rect.height > 0) return rect;
-      }
-    } catch (e) {
-      /* the stored size, or the default, is enough */
-    }
-    return { width: startW, height: startH };
-  };
+  let startLeft = 0;
+  let startTop = 0;
   grip.addEventListener("mousedown", (e) => {
     dragging = true;
     startX = e.clientX;
     startY = e.clientY;
-    const rect = box();
-    startW = rect.width || 640;
-    startH = rect.height || 520;
+    const pinned = antsPinPanel(panel) || antsPanelBox(panel);
+    startW = pinned.width || 640;
+    startH = pinned.height || 520;
+    startLeft = pinned.left;
+    startTop = pinned.top;
     if (e.preventDefault) e.preventDefault();
     if (e.stopPropagation) e.stopPropagation();
   });
@@ -7830,87 +8236,18 @@ function antsInstallResize(panel) {
     panel.style.width = `${Math.round(w)}px`;
     panel.style.height = `${Math.round(h)}px`;
     panel.style.maxHeight = "none";
+    // Left and top stay where the press put them. Width grows to the right,
+    // height grows down — the same direction as the pointer.
+    panel.style.left = `${Math.round(startLeft)}px`;
+    panel.style.top = `${Math.round(startTop)}px`;
+    panel.style.right = "auto";
+    panel.style.bottom = "auto";
   });
   window.addEventListener("mouseup", () => {
     if (!dragging) return;
     dragging = false;
-    try {
-      localStorage.setItem("ants-tracker-panel-size", JSON.stringify({ w: panel.style.width, h: panel.style.height }));
-    } catch (e) {
-      /* remembering the size is optional */
-    }
+    antsRememberPanel(panel);
   });
-  try {
-    const raw = localStorage.getItem("ants-tracker-panel-size");
-    if (raw) {
-      const saved = JSON.parse(raw);
-      if (saved && saved.w) panel.style.width = String(saved.w);
-      if (saved && saved.h) {
-        panel.style.height = String(saved.h);
-        panel.style.maxHeight = "none";
-      }
-    }
-  } catch (e) {
-    /* the default size stands */
-  }
-}
-
-function antsPopout() {
-  buildPanel();
-  let w = null;
-  try {
-    w = typeof window.open === "function" ? window.open("", "ants-optimizer", "popup=yes,width=780,height=900") : null;
-  } catch (e) {
-    w = null;
-  }
-  const say = (text) => {
-    LOD.popoutNote = text;
-    if (ui.popNote) {
-      ui.popNote.style.display = text ? "" : "none";
-      ui.popNote.textContent = text || "";
-    }
-  };
-  if (!w) {
-    say("The browser blocked the window. The panel stayed on this page.");
-    return false;
-  }
-  try {
-    w.document.title = "ANTs Frontend Optimizer";
-    if (w.document.body && w.document.body.style) {
-      w.document.body.style.margin = "0";
-      w.document.body.style.background = "#1a1a1e";
-    }
-    const style = document.getElementById("ants-tracker-style");
-    if (style && w.document && typeof w.document.createElement === "function" && w.document.head) {
-      const copy = w.document.createElement("style");
-      copy.textContent = style.textContent || "";
-      w.document.head.appendChild(copy);
-    }
-    ui.panel.classList.add("open");
-    ui.panel.classList.add("ants-popped");
-    ui.panel.classList.remove("ants-docked");
-    if (w.document.body) w.document.body.appendChild(ui.panel);
-    ui.popout = w;
-    say("");
-    const back = () => {
-      if (ui.popout !== w) return;
-      ui.popout = null;
-      try {
-        ui.panel.classList.remove("ants-popped");
-        document.body.appendChild(ui.panel);
-      } catch (e) {
-        /* the page is going away */
-      }
-    };
-    if (typeof w.addEventListener === "function") {
-      w.addEventListener("pagehide", back);
-      w.addEventListener("beforeunload", back);
-    }
-    return true;
-  } catch (e) {
-    say("The window opened, but the panel could not move into it. It stayed on this page.");
-    return false;
-  }
 }
 
 function buildPanel() {
@@ -7948,7 +8285,7 @@ function buildPanel() {
     class: "ants-hbtn",
     text: "Window",
     title:
-      "Open this panel in its own browser window, for a second monitor. It is the same page, not a second ComfyUI. If the browser blocks the popup, the panel stays here and says so.",
+      "Open the separate window. It is its own page, not this panel moved, and not a second ComfyUI. If the browser blocks it, this panel stays and says so.",
   });
   const closeBtn = el("span", { class: "ants-hbtn", text: "✕", title: "Close" });
   actions.appendChild(copyBtn);
@@ -8043,6 +8380,7 @@ function buildPanel() {
   ui.popNote = el("div", { id: "ants-tracker-popnote", class: "ants-note", style: { display: "none" } });
   panel.appendChild(ui.popNote);
   antsInstallResize(panel);
+  antsPlacePanel(panel);
   resetBtn.addEventListener("click", () => resetAllStats(true));
   if (ui.powerBtn) {
     ui.powerBtn.addEventListener("click", () => {
@@ -8078,27 +8416,30 @@ function makeDraggable(handle, target) {
   let dragging = false;
   let startX = 0;
   let startY = 0;
-  let startRight = 0;
+  let startLeft = 0;
   let startTop = 0;
   handle.addEventListener("mousedown", (e) => {
     if (e.target && typeof e.target.closest === "function" && e.target.closest(".ants-hbtn")) return;
+    if (target.classList && target.classList.contains("ants-docked")) return;
     dragging = true;
     startX = e.clientX;
     startY = e.clientY;
-    const rect = target.getBoundingClientRect();
-    startRight = (window.innerWidth || 0) - rect.right;
-    startTop = rect.top;
+    const pinned = antsPinPanel(target) || { left: 0, top: 0 };
+    startLeft = pinned.left;
+    startTop = pinned.top;
     if (e.preventDefault) e.preventDefault();
   });
   window.addEventListener("mousemove", (e) => {
     if (!dragging) return;
-    const dx = e.clientX - startX;
-    const dy = e.clientY - startY;
-    target.style.right = `${Math.max(0, startRight - dx)}px`;
-    target.style.top = `${Math.max(0, startTop + dy)}px`;
+    target.style.left = `${Math.round(startLeft + (e.clientX - startX))}px`;
+    target.style.top = `${Math.round(Math.max(0, startTop + (e.clientY - startY)))}px`;
+    target.style.right = "auto";
+    target.style.bottom = "auto";
   });
   window.addEventListener("mouseup", () => {
+    if (!dragging) return;
     dragging = false;
+    antsRememberPanel(target);
   });
 }
 
@@ -11038,6 +11379,7 @@ function togglePause() {
       ? "[ANTs Tracker] Sampling paused: the numbers are now a frozen snapshot. Rendering is completely unaffected."
       : "[ANTs Tracker] Sampling resumed."
   );
+  if (!antsUiSilent) antsUiPublishSettings();
   if (ui.built && ui.panel.classList.contains("open")) {
     renderSummary();
     updateActiveTab();
@@ -11174,7 +11516,7 @@ function wireCornerButton(node) {
       suppressClick = false;
       return;
     }
-    togglePanel();
+    antsOpenFromGear();
   });
 }
 
@@ -11187,13 +11529,13 @@ function buildCornerPill() {
   if (cornerBtnEl) return cornerBtnEl;
   injectStyle();
   const pill = el("div", { id: "ants-corner-pill", class: `ants-node-pill ${ANTS_OWN_CLASS}` });
-  pill.title = "ANTs Frontend Optimizer — the switch turns the hooks and the optimisations off, the gear opens the panel";
+  pill.title = "ANTs Frontend Optimizer — the switch turns the hooks and the optimisations off, the gear opens the separate window";
   const tick = antsBuildTick(pill);
   const gear = el("button", {
     id: "ants-corner-btn",
     class: "ants-node-btn ants-node-btn-gear",
     type: "button",
-    title: "ANTs Frontend Optimizer — click to open the panel, press and hold to move this button",
+    title: "ANTs Frontend Optimizer — click to open the separate window, press and hold to move this button. If the browser blocks the window, the panel on this page opens instead.",
   });
   const glyph = antsGearSvg();
   if (glyph) gear.appendChild(glyph);
@@ -11204,7 +11546,7 @@ function buildCornerPill() {
       /* the click still counts */
     }
     if (antsClickSuppressed(gear)) return; // that press was a drag of the pill
-    togglePanel();
+    antsOpenFromGear();
   });
   // The switch first, the gear after — the order the frame draws them in.
   pill.appendChild(tick);
@@ -11585,13 +11927,20 @@ function installDebugApi() {
           hookCalls,
         };
       },
-      open: () => togglePanel(true),
+      open: () => antsOpenFromApi(),
       close: () => togglePanel(false),
       popout: () => antsPopout(),
+      // The separate window's control link, so a test can apply a payload the
+      // window would have posted without standing up the route.
+      link: {
+        settings: () => antsUiSettings(),
+        limits: () => antsUiLimits(),
+        apply: (body) => antsUiApplyRemote(body),
+      },
       ramCheck: () => lodRamCheck(),
       runStart: () => lodRamRun(true),
       runFinish: () => lodRamFinish(),
-      toggle: () => togglePanel(),
+      toggle: () => antsOpenFromGear(),
       pause: () => {
         if (!S.paused) togglePause();
       },
@@ -11619,22 +11968,7 @@ function installDebugApi() {
           return lodVisibility(app.canvas);
         },
         get limits() {
-          return {
-            flatZoom: LOD_FLAT_ZOOM.slice(),
-            inertZoom: VIEW_INERT_ZOOMS.slice(),
-            focusDom: VIEW_FOCUS_DOM.slice(),
-            foveaMargins: VIEW_FOVEA_MARGINS.slice(),
-            foveaRestores: VIEW_FOVEA_RESTORES.slice(),
-            displayScales: VIEW_DISPLAY_SCALES.slice(),
-            idleCapMs: LOD_IDLE_CAP_MS.slice(),
-            thumbZoom: LOD_THUMB_ZOOMS.slice(),
-            thumbLadder: LOD_THUMB_LADDER.slice(),
-            detailZoom: LOD_DETAIL_ZOOMS.slice(),
-            boxDetail: LOD_BOX_DETAIL.slice(),
-            snapRatios: LOD_SNAP_RATIOS.slice(),
-            snapBudgets: LOD_SNAP_BUDGETS.slice(),
-            linkWidth: LOD_LINK_WIDTH,
-          };
+          return antsUiLimits();
         },
         get detail() {
           return {
@@ -11933,7 +12267,13 @@ app.registerExtension({
     govOwn(() => setInterval(sweepStaleData, SWEEP_MS));
     // Node types keep arriving as packs register, so re-scan for hooks that
     // never went through this tool's beforeRegisterNodeDef wrapper.
-    govOwn(() => setInterval(scanRegisteredTypes, 2000));
+    // The same interval that scans for late node types also asks whether the
+    // separate window is open. No extra timer: a timer registered at startup
+    // spends one of the attribution tokens the governor has for other packs.
+    govOwn(() => setInterval(() => {
+      scanRegisteredTypes();
+      if (!antsUiTimer) antsUiPump();
+    }, 2000));
     govOwn(() => setInterval(() => {
       if (ui.built && ui.panel.classList.contains("open") && ui.active === "gpu") refreshGpu();
     }, 2500));
@@ -11948,7 +12288,7 @@ app.registerExtension({
       /* a run with no execution events simply does not release stand-ins */
     }
     console.info(
-      `[ANTs Tracker] v${VERSION} running. Open the panel with the gear on the floating button (or the one on the tracker's own node); ` +
+      `[ANTs Tracker] v${VERSION} running. The gear opens the separate window; if the browser blocks it, the panel on this page opens instead. ` +
         "window.__antsTracker.snapshot / .report give the same data from the console."
     );
   },

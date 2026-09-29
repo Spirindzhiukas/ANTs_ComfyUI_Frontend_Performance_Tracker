@@ -76,6 +76,37 @@ class InitTests(unittest.TestCase):
             finally:
                 self.mod.set_thumb_root(None)
 
+    def test_window_bus_is_a_revision_not_a_master(self):
+        mod = self.mod
+        mod.ui_reset()
+        first = mod.ui_update({"origin": "page", "settings": {"flatBelow": 0.5}, "limits": {"flatZoom": [0, 0.5]}})
+        self.assertEqual(first["rev"], 1)
+        self.assertEqual(first["origin"], "page")
+        self.assertEqual(first["settings"]["flatBelow"], 0.5)
+        tel = mod.ui_update({"origin": "page", "telemetry": {"fps": 40}})
+        self.assertEqual(tel["rev"], 1, "a live number is not a settings change")
+        self.assertEqual(tel["telemetry"]["fps"], 40)
+        self.assertIsNone(tel["heardAge"], "the page asking is not the window listening")
+        heard = mod.ui_snapshot(hear=True)
+        self.assertIsNotNone(heard["heardAge"])
+        self.assertLess(heard["heardAge"], 2)
+        win = mod.ui_update({"origin": "window", "settings": {"flatBelow": 0.2}})
+        self.assertEqual(win["rev"], 2)
+        self.assertEqual(win["origin"], "window")
+        self.assertEqual(win["settings"]["flatBelow"], 0.2)
+        again = mod.ui_update({"origin": "page", "telemetry": {"fps": 41}})
+        self.assertEqual(again["rev"], 2)
+        cmd = mod.ui_update({"origin": "window", "command": "measure-links", "label": ""})
+        self.assertEqual(cmd["command"], "measure-links")
+        self.assertEqual(cmd["commandRev"], 1)
+        self.assertEqual(cmd["rev"], 2, "a command is not a settings revision")
+        html = (ROOT / "web" / "window.html").read_text(encoding="utf-8")
+        self.assertIn("/ants_optimizer/ui", html)
+        self.assertIn("from=window", html)
+        self.assertNotIn("window.opener", html)
+        self.assertNotIn("tracker.js", html)
+        self.assertIn('id="ants-window"', html)
+
     def test_routes_are_optional(self):
         # Outside ComfyUI there is no PromptServer, so registration must simply
         # report False instead of raising.

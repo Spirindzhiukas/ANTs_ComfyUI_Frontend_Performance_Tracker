@@ -3,8 +3,10 @@
 // reordered under the pointer, a Testing tab whose dropdown was destroyed
 // every 500ms, and an empty panel that could not explain itself.
 
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { createHarness, FRAME_MS } from "./harness.mjs";
-import { createDocument } from "./dom-shim.mjs";
 import { suite, test, assert, assertEqual, assertGreater, assertLess, assertIncludes } from "./framework.mjs";
 
 async function boot() {
@@ -616,28 +618,106 @@ suite("panel: the Governor tab", () => {
     assert(!tweaks.textContent.includes("widget threshold linked") || statusBody !== tweaks, "the status body is its own tab");
   });
 
-  test("the panel resizes on both axes, and a blocked window leaves it here", async () => {
+  test("the panel resizes in the dragged direction", async () => {
     const h = await boot();
     h.tracker.open();
     const panel = h.panel();
     const grip = byId(h, "ants-tracker-resize");
     assert(grip, "the panel has a resize grip");
     grip._fire("mousedown", { clientX: 100, clientY: 100, preventDefault() {}, stopPropagation() {} });
+    const left = panel.style.left;
+    const top = panel.style.top;
+    assertEqual(panel.style.right, "auto", "the grip is anchored on the left, not the right");
     h.window.fire("mousemove", { clientX: 180, clientY: 160 });
     h.window.fire("mouseup", {});
     assertEqual(panel.style.width, "720px", "width follows the drag");
     assertEqual(panel.style.height, "580px", "and so does height");
+    assertEqual(panel.style.left, left, "dragging the corner right does not move the left edge");
+    assertEqual(panel.style.top, top, "dragging the corner down does not move the top edge");
+    assertEqual(panel.style.right, "auto", "a resize does not put the anchor back on the right");
     assertIncludes(h.document.getElementById("ants-tracker-style").textContent, "container-type", "narrow panels restack their rows");
 
-    h.window.open = () => null;
-    assertEqual(h.tracker.popout(), false, "a blocked popup fails open");
-    assert(panel.parentNode === h.document.body, "the panel stayed on this page");
-    assertIncludes(panel.textContent, "blocked", "and the page says so");
+    const header = byId(h, "ants-tracker-header");
+    header._fire("mousedown", { clientX: 400, clientY: 80, preventDefault() {} });
+    const dragged = panel.style.left;
+    h.window.fire("mousemove", { clientX: 430, clientY: 100 });
+    h.window.fire("mouseup", {});
+    assertEqual(panel.style.left, `${Math.round(parseFloat(dragged) + 30)}px`, "a header drag moves the left edge with the pointer");
+    assertEqual(panel.style.right, "auto", "and does not re-anchor on the right");
+  });
 
-    const popup = { document: createDocument(), addEventListener() {} };
-    h.window.open = () => popup;
-    assertEqual(h.tracker.popout(), true, "an allowed popup takes the panel");
-    assert(panel.parentNode === popup.document.body, "into that window's document");
-    assert(popup.document.head.textContent.includes("ants-tracker-panel"), "with the styles copied, not assumed");
+  test("the separate window is its own page, centered, and the panel is only the fallback", async () => {
+    const html = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "web", "window.html"), "utf8");
+    assert(html.includes('id="ants-window"'), "the window is a real page");
+    assert(html.includes("/ants_optimizer/ui"), "it talks to the page through the route");
+    assert(!html.includes("window.opener"), "it does not hold the canvas document");
+    assert(!html.includes("tracker.js"), "and it does not load the canvas script");
+
+    const h = await boot();
+    const calls = [];
+    const moved = [];
+    let focused = 0;
+    const child = {
+      closed: false,
+      focus() { focused += 1; },
+      moveTo(x, y) { moved.push(["move", x, y]); },
+      resizeTo(w, ht) { moved.push(["size", w, ht]); },
+    };
+    h.window.screenX = 80;
+    h.window.screenY = 40;
+    h.window.outerWidth = 1400;
+    h.window.outerHeight = 1000;
+    h.window.open = (url, name, features) => {
+      calls.push({ url, name, features });
+      return child;
+    };
+    h.tracker.open();
+    assertEqual(calls.length, 1, "the gear's open path asks the browser once");
+    assertEqual(calls[0].url, "/ants_optimizer/window", "a real route, not an empty document");
+    assertEqual(calls[0].name, "ants-optimizer");
+    assert(!h.panel() || !h.panel()._cls.has("open"), "the in-page panel stays closed");
+    assert(!h.panel() || h.panel().parentNode === h.document.body, "and is not moved into the popup");
+    const width = Number(String(calls[0].features).match(/width=(\d+)/)[1]);
+    const height = Number(String(calls[0].features).match(/height=(\d+)/)[1]);
+    const left = Number(String(calls[0].features).match(/left=(-?\d+)/)[1]);
+    const top = Number(String(calls[0].features).match(/top=(-?\d+)/)[1]);
+    assertEqual(left, Math.round(80 + (1400 - width) / 2), "left centers the window on the ComfyUI window");
+    assertEqual(top, Math.round(40 + (1000 - height) / 2), "top does too");
+    assertEqual(moved[0][0], "move");
+    assertEqual(moved[0][1], left);
+    assertEqual(moved[0][2], top);
+    h.tracker.open();
+    assertEqual(calls.length, 1, "a second open focuses the window that is already there");
+    assertGreater(focused, 1, "and asks it to the front");
+
+    const blocked = await boot();
+    blocked.window.open = () => null;
+    blocked.tracker.open();
+    const panel = blocked.panel();
+    assert(panel && panel._cls.has("open"), "a blocked popup opens the in-page panel");
+    assert(panel.parentNode === blocked.document.body, "and leaves it on this page");
+    assertIncludes(panel.textContent, "blocked", "and says so");
+  });
+
+  test("a change posted by the window changes the page, and the page's own echo does not", async () => {
+    const h = await boot();
+    h.tracker.link.apply({
+      ok: true,
+      rev: 1,
+      origin: "window",
+      settings: { flatBelow: 0.2, snapshots: false, boxDetail: "title" },
+    });
+    assertEqual(h.tracker.lowZoom.state.flatBelow, 0.2, "the window's setting is the page's setting");
+    assertEqual(h.tracker.lowZoom.state.snapOn, false, "and it can turn the pictures off");
+    assertEqual(h.tracker.lowZoom.state.boxDetail, "title");
+    h.tracker.link.apply({
+      ok: true,
+      rev: 2,
+      origin: "page",
+      settings: { flatBelow: 0.5 },
+    });
+    assertEqual(h.tracker.lowZoom.state.flatBelow, 0.2, "the page does not apply its own echo");
+    h.tracker.link.apply({ ok: true, rev: 2, origin: "window", command: "measure-links", commandRev: 1 });
+    assert(h.tracker.lowZoom.state.ab && h.tracker.lowZoom.state.ab.text, "a window command starts the link measurement");
   });
 });

@@ -4,7 +4,7 @@ A running record for whoever picks this up next (including me). `CLAUDE.md` is t
 rules for changing the code; `plan.md` is where it is going. This file is the past:
 what was built, what was rejected, and what the evidence was.
 
-Last updated at **v2.5.2**, 168 tests green, PR #1 on
+Last updated at **v2.5.3**, 170 tests green, PR #1 on
 `Spirindzhiukas/ANTs_ComfyUI_Frontend_Performance_Tracker`.
 
 ---
@@ -13,12 +13,12 @@ Last updated at **v2.5.2**, 168 tests green, PR #1 on
 
 | | |
 | --- | --- |
-| Version | 2.5.2 (`web/tracker.js` `VERSION`) |
-| Tests | 168 (`node tests/run-tests.mjs`), plus `tests/test_init.py` |
-| Frontend | `web/tracker.js`, one ES module, no dependencies |
+| Version | 2.5.3 (`web/tracker.js` `VERSION`) |
+| Tests | 170 (`node tests/run-tests.mjs`), plus `tests/test_init.py` |
+| Frontend | `web/tracker.js`, one ES module, no dependencies. The separate window is `web/window.html`, served at `/ants_optimizer/window`, not loaded as an extension. |
 | Backend | `__init__.py` — node `ANTs_Frontend_Optimizer` (old class key kept as an alias), the GPU route, and thumbnail read/write under ComfyUI's temp folder |
 | Panel | 10 tabs: Node Rendering Settings, Status, Timing, Nodes, Stalls, Governor, Load, Memory, GPU / VRAM, Testing |
-| Entry points | floating pill `[switch][gear]` (always on screen), the node's own pill, and `window.__antsTracker` |
+| Entry points | floating pill `[switch][gear]` (always on screen), the node's own pill, and `window.__antsTracker`. The gear opens the separate window; the in-page panel is the fallback when the popup is blocked. |
 | Persisted | `ants.lowZoom.v1` (drawing + view settings), `ants-governor-v1` (scheduler limits), `ants-tracker-corner-pos` (pill position) |
 
 The tool measures, in the order the questions get asked: frame cost and where it
@@ -36,6 +36,8 @@ something has to be drawn less or hit-tested less.
 ## 2. Version log
 
 The commit log is the full record; this is the "why", newest first.
+
+**v2.5.3 — the window is a page, and the corner grows the way it is dragged.** The fallback panel was right-anchored, so widening it moved the left edge. It is pinned on the left and the top before the size changes; a header drag writes left, not right. The Window button no longer moves the panel into `about:blank`. The gear opens `/ants_optimizer/window`, centered on the ComfyUI window. That page does not load the canvas script and does not hold the canvas document. Settings and telemetry go through `/ants_optimizer/ui`: a revision and an origin, same shape as the uploaded `examples/pop_up_window` console, so a change in the window and a change on the page are one setting and neither side applies its own echo. Telemetry does not bump the revision. The page posts it only while the window is asking, on a timer that already existed, so startup does not spend an attribution token. If the browser blocks the popup, the in-page panel opens and says so. It is a browser window, not a second OS process, and not a worker. Vue node mode may still ignore a LiteGraph resize flag; the grip does not depend on that.
 
 **v2.5.2 — drag keeps the picture, and the higher zoom wins.** A node drag no longer swaps a pictured node for a box. A link drag, a running bar and an error still draw live. The new switch under Widgets stop answering is on by default; while it is on, pictures follow the higher of the preview zoom and the widget-stop zoom, in both How widgets go modes. Turning it off leaves the two dropdowns independent. Capture adds 0.25x and 0.5x; 1x stays the default, and automatic coarsening still stops at 1x unless the user asked for smaller. The budget ladder adds 4096 and 8192. A missing `snapMb` is 4096; an explicit saved 256/512/1024/2048 stays. Execute and Run-to-node read `/system_stats` `system.ram_total` / `ram_free`: 85% used releases off-screen stand-ins, 95% releases all of them, disk files stay, and the lane asks for them again when the run finishes. No reading, no release. The panel opens on Node Rendering Settings; Status is the next tab. The floating panel has a both-axis grip and restacks below 460px. The graph node is marked resizable and docks the panel when grown; Vue node mode may ignore a LiteGraph `resizable` flag, and the grip does not depend on it. Window is `window.open` of this same panel, not a second process. A worker still cannot call `drawNode`; the idle gap is 32ms and on-screen nodes are photographed first.
 
