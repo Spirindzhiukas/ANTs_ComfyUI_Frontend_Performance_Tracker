@@ -256,7 +256,7 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     h.canvas.draw();
     await openTweaksTab(h);
     assertIncludes(panelText(h), "is below your 20% setting", "the panel names the zoom and the setting");
-    assertIncludes(panelText(h), "Replace nodes with thumbnails", "and the control is named for what it does");
+    assertIncludes(panelText(h), "Replace node previews with bitmap stand-ins at zoom levels", "and the control is named for what it does");
     assertIncludes(panelText(h), "below 20%", "and it reads as a zoom");
   });
 
@@ -857,6 +857,16 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     node.pos = [0, 0];
     node.size = [200, 100];
     node.onNodeCreated();
+    assertEqual(node.resizable, true, "the graph node is resizable");
+    node.size = [480, 320];
+    const kept = node.computeSize();
+    assertGreater(kept[0], 400, "a width the user set is not snapped back");
+    assertGreater(kept[1], 280, "nor is the height — both axes");
+    node.onResize([480, 360]);
+    assert(h.panel() && h.panel().parentNode === node._antsHost, "a large node holds the settings, so they can reflow with it");
+    assert(h.panel()._cls.has("ants-docked"), "and the panel is docked, not a second copy");
+    node.onResize([200, 40]);
+    assert(h.panel().parentNode === h.document.body, "shrinking the node floats the panel again");
     // A normal node next to it, with a DOM widget of its own: the sweep needs
     // something it *is* allowed to switch off, or "it left ours alone" proves
     // nothing.
@@ -1917,9 +1927,9 @@ suite("drawing: node snapshots — a box that is a picture of the node", () => {
     assert(copies.length && copies[copies.length - 1].imageReady, "the copy was redrawn after the already-queued image landed");
   });
 
-  test("dragging nodes keeps them live, panning does not invalidate anything", async () => {
+  test("dragging a pictured node keeps the picture, a link drag does not", async () => {
     const h = await boot();
-    snapGraph(h, 2);
+    const nodes = snapGraph(h, 2);
     h.tracker.lowZoom.set({ flatBelow: 0.2, snapshots: true });
     draw(h, 1);
     await idle(h);
@@ -1928,8 +1938,14 @@ suite("drawing: node snapshots — a box that is a picture of the node", () => {
     h.canvas.isDragging = true; // a node is being dragged
     h.canvas.ctx.ops.length = 0;
     draw(h, 1);
-    assertEqual(blits(h).length, 0, "while dragging, nodes are drawn live");
+    assertEqual(blits(h).length, 2, "while dragging, the pictures stay — a drag is not a box");
     h.canvas.isDragging = false;
+
+    h.canvas.connecting_node = nodes[0];
+    h.canvas.ctx.ops.length = 0;
+    draw(h, 1);
+    assertEqual(blits(h).length, 0, "a link drag still draws live");
+    h.canvas.connecting_node = null;
 
     // Panning and zooming are camera moves: the picture is still valid.
     h.canvas.ds.offset[0] = -500;
@@ -1938,6 +1954,78 @@ suite("drawing: node snapshots — a box that is a picture of the node", () => {
     draw(h, 1);
     assertEqual(blits(h).length, 2, "a pan and a zoom reuse every bitmap");
     assertEqual(snapApi(h).invalidated, 0, "and invalidate nothing");
+  });
+
+  test("the higher linked threshold keeps pictures while dragging, in either widget mode", async () => {
+    const h = await boot();
+    snapGraph(h, 2);
+    h.tracker.lowZoom.set({ flatBelow: 0.2, inertBelow: 0.5, linkZoom: true, snapshots: true, focusDom: "inert" });
+    h.canvas.ds.scale = 0.3; // past 20%, not past 50%
+    draw(h, 1);
+    await idle(h);
+    assertEqual(h.tracker.lowZoom.flat.on, true, "linked, the higher zoom is the picture zone");
+    assertEqual(h.tracker.lowZoom.flat.pictureBelow, 0.5, "and the readout says which one won");
+    h.canvas.isDragging = true;
+    h.canvas.ctx.ops.length = 0;
+    draw(h, 1);
+    assertGreater(blits(h).length, 0, "dragging past the widget zoom still shows pictures");
+    h.canvas.isDragging = false;
+
+    h.tracker.lowZoom.set({ focusDom: "hide" });
+    h.canvas.isDragging = true;
+    h.canvas.ctx.ops.length = 0;
+    draw(h, 1);
+    assertGreater(blits(h).length, 0, "and the same when widgets are hidden outright");
+    h.canvas.isDragging = false;
+
+    h.tracker.lowZoom.set({ linkZoom: false, flatBelow: 0.2, inertBelow: 0.5 });
+    h.canvas.ds.scale = 0.3;
+    draw(h, 1);
+    assertEqual(h.tracker.lowZoom.flat.on, false, "unlinked, only the preview zoom replaces nodes");
+    assertEqual(h.tracker.lowZoom.state.flatBelow, 0.2, "the preview setting was not rewritten");
+    assertEqual(h.tracker.lowZoom.state.inertBelow, 0.5, "and the widget setting was left alone");
+  });
+
+  test("a run releases stand-ins only when system RAM is high, and does not touch disk files", async () => {
+    const h = await boot();
+    const nodes = snapGraph(h, 2);
+    nodes[0].id = 11;
+    nodes[1].id = 12;
+    nodes[1].pos = [40000, 0];
+    h.tracker.lowZoom.set({ flatBelow: 0.2, snapshots: true, diskOn: true });
+    draw(h, 1);
+    await idle(h);
+    const before = snapApi(h).bytes;
+    assertGreater(before, 0, "pictures are held");
+
+    h.fetchRoutes.set("/system_stats", { system: { ram_total: 64e9, ram_free: 40e9 } });
+    const fine = await h.tracker.ramCheck();
+    assertEqual(fine.purged, 0, "under 85% nothing is released");
+    assertEqual(snapApi(h).bytes, before, "and the pictures stay");
+
+    h.fetchRoutes.set("/system_stats", { devices: [{ name: "gpu" }] });
+    const unknown = await h.tracker.ramCheck();
+    assertEqual(unknown.purged, 0, "a stats payload with no RAM reading releases nothing");
+    assertEqual(snapApi(h).bytes, before, "the pictures are still there");
+    assertIncludes(snapApi(h).ramNote, "nothing was released", "and the panel is told why");
+
+    h.fetchRoutes.set("/system_stats", { system: { ram_total: 64e9, ram_free: 6e9 } });
+    const off = await h.tracker.runStart();
+    assertGreater(off.purged, 0, "at 85% the off-screen stand-in leaves memory");
+    assertGreater(snapApi(h).bytes, 0, "the on-screen one stays");
+    assertEqual(snapApi(h).ramLast, "off-screen", "and that is the release that happened");
+
+    h.fetchRoutes.set("/system_stats", { system: { ram_total: 64e9, ram_free: 1e9 } });
+    const full = await h.tracker.ramCheck();
+    assertGreater(full.purged, 0, "at 95% the on-screen stand-in leaves memory too");
+    assertEqual(snapApi(h).bytes, 0, "memory is clear");
+    assertEqual(snapApi(h).ramLast, "full", "disk files were not the thing released");
+
+    h.fetchRoutes.set("/system_stats", { system: { ram_total: 64e9, ram_free: 40e9 } });
+    const back = await h.tracker.runFinish();
+    await h.flush();
+    assertGreater(back, 0, "when the run finishes the lane asks for the pictures again");
+    assertGreater(snapApi(h).queue + (snapApi(h).held || 0), 0, "and something is loading or queued, not left blank");
   });
 
   test("a node that changes is dropped, not shown stale", async () => {
@@ -2267,17 +2355,19 @@ suite("drawing: node snapshots — a box that is a picture of the node", () => {
     assertGreater(live, 0, "with pictures still held for the nodes that are being drawn");
   });
 
-  test("the budget ladder is 256 MiB to 2 GiB, and nothing below the floor survives", async () => {
+  test("the budget ladder is 256 MiB to 8 GiB, and nothing below the floor survives", async () => {
     const h = await boot();
     const api = h.tracker.lowZoom;
-    assertEqual(api.limits.snapBudgets.join(","), "256,512,1024,2048", "the ladder, doubling to 2 GiB");
-    assertEqual(api.snapshots.budgetMb, 512, "with a 512 MiB default");
+    assertEqual(api.limits.snapBudgets.join(","), "256,512,1024,2048,4096,8192", "the ladder, doubling to 8 GiB");
+    assertEqual(api.snapshots.budgetMb, 4096, "with a 4096 MiB default when nothing is saved");
     // A value below the floor — from a saved v2.3.0 record, or a script — is clamped
     // up to it rather than honoured: below 256 MiB a large graph only thrashes.
     api.set({ snapMb: 32 });
     assertEqual(api.snapshots.budgetMb, 256, "32 MiB lands on the floor");
     api.set({ snapMb: 8192 });
-    assertEqual(api.snapshots.budgetMb, 2048, "and the ceiling is 2 GiB");
+    assertEqual(api.snapshots.budgetMb, 8192, "8192 is a step, not a clamp");
+    api.set({ snapMb: 20000 });
+    assertEqual(api.snapshots.budgetMb, 8192, "and the ceiling is 8 GiB");
     api.set({ snapMb: 1000 });
     assertEqual(api.snapshots.budgetMb, 1024, "a value between steps lands on the nearest one");
     // The saved record is read back through the same clamp.
@@ -2285,6 +2375,17 @@ suite("drawing: node snapshots — a box that is a picture of the node", () => {
     const h2 = await boot({ storage: h.localStorage });
     assertEqual(h2.tracker.lowZoom.snapshots.budgetMb, 256, "a saved sub-floor budget becomes the floor on the next load");
     assertEqual(h2.tracker.lowZoom.snapshots.wanted, true, "and the feature is remembered");
+    // An explicit saved step below the new default is not promoted to 4096.
+    h2.tracker.lowZoom.set({ snapMb: 512 });
+    const h3 = await boot({ storage: h.localStorage });
+    assertEqual(h3.tracker.lowZoom.snapshots.budgetMb, 512, "a saved 512 stays 512");
+    h.localStorage.setItem("ants.lowZoom.v1", JSON.stringify({ flatBelow: 0.2, snapshots: true }));
+    const h4 = await boot({ storage: h.localStorage });
+    assertEqual(h4.tracker.lowZoom.snapshots.budgetMb, 4096, "a missing budget key is the new default");
+    h4.tracker.lowZoom.set({ snapRatio: 0.25 });
+    assertEqual(h4.tracker.lowZoom.snapshots.ratio, 0.25, "0.25x is a capture step, not snapped up to 1x");
+    h4.tracker.lowZoom.set({ snapRatio: 0.5 });
+    assertEqual(h4.tracker.lowZoom.snapshots.ratio, 0.5, "and 0.5x stays 0.5x");
   });
 
   test("a shadow-flag change pauses reuse without throwing the pictures away", async () => {
@@ -2400,12 +2501,15 @@ suite("drawing: node snapshots — a box that is a picture of the node", () => {
     const text = panelText(h);
     assertIncludes(text, "picture of the node", "the control offers it");
     assertIncludes(text, "capture 1x per graph unit", "with the ratio it will capture at");
-    assertIncludes(text, "bitmap budget 512 MiB", "and the budget");
+    assertIncludes(text, "Stand-in memory (ram) budget", "the budget is named for what it holds");
+    assertIncludes(text, "4096 MiB", "and the default step");
+    assertIncludes(text, "Stand-in capture resolution", "the capture setting is named");
+    assertIncludes(text, "Keep stand-in previews on disk", "and the disk setting");
     assertIncludes(text, "remembered node(s) have a picture", "the readout leads with how much of the graph is pictured");
     const api = h.tracker.lowZoom;
     assertEqual(api.snapshots.wanted, true, "the API says it is wanted");
-    assertEqual(api.limits.snapRatios.join(","), "1,2,3", "and exposes the ladders");
-    assertEqual(api.limits.snapBudgets.join(","), "256,512,1024,2048", "including the budget ladder");
+    assertEqual(api.limits.snapRatios.join(","), "0.25,0.5,1,2,3", "and exposes the ladders");
+    assertEqual(api.limits.snapBudgets.join(","), "256,512,1024,2048,4096,8192", "including the budget ladder");
     assertEqual(api.snapshots.installed, true, "with the canvas seam in place");
     // A type the user excludes is kept live on purpose, and counted as such
     // rather than as a failure (v2.4.0: this is now the *only* way a node the

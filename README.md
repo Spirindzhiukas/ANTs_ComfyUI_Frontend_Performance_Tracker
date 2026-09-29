@@ -573,6 +573,14 @@ patches `drawImage` there, the same way a browser exposes it), and
 `createImageBitmap` records the resize it was asked to perform instead of
 resizing anything.
 
+## What changed in v2.5.2
+
+- Dragging a pictured node keeps the picture. A link drag, a running bar and an error still draw live. The switch under Widgets stop answering, on by default, links that zoom to the preview zoom; the higher one wins, in both How widgets go modes.
+- Stand-in capture resolution adds 0.25x and 0.5x. 1x stays the default. Stand-in memory adds 4096 and 8192; a missing saved budget is 4096, a saved 256/512/1024/2048 stays.
+- Execute and Run-to-node, when `/system_stats` reports system RAM: off-screen stand-ins leave memory at 85% used, all of them at 95%. Disk files stay and are asked for again when the run finishes. No reading, no release.
+- The panel opens on Node Rendering Settings. Status is the next tab. The panel has a resize grip on both axes, and rows stack when it is narrow. The graph node is marked resizable on both axes; growing it docks the panel into the node. Vue node mode may still ignore a LiteGraph resize flag — the grip does not depend on that.
+- Window opens this same panel in its own browser window, for a second monitor. It is not a second ComfyUI. A blocked popup leaves the panel here and says so.
+
 ## What changed in v2.5.1
 
 - Selecting a node no longer swaps its picture for a painted box. The picture stays, and a ring is drawn on it. Drag, a running bar and an error still draw live.

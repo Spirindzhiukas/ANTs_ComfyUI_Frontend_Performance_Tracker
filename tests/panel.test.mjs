@@ -4,6 +4,7 @@
 // every 500ms, and an empty panel that could not explain itself.
 
 import { createHarness, FRAME_MS } from "./harness.mjs";
+import { createDocument } from "./dom-shim.mjs";
 import { suite, test, assert, assertEqual, assertGreater, assertLess, assertIncludes } from "./framework.mjs";
 
 async function boot() {
@@ -151,7 +152,7 @@ suite("panel", () => {
     drawLoop(h, 1);
     h.advance(600); // let a refresh tick land
 
-    for (const name of ["timing", "nodes", "stalls", "governor", "load", "memory", "gpu", "testing"]) {
+    for (const name of ["status", "timing", "nodes", "stalls", "governor", "load", "memory", "gpu", "testing"]) {
       clickTab(h, name);
       h.advance(600);
       const container = byId(h, "ants-tracker-body").children.find((c) => c._cls.has("active"));
@@ -166,6 +167,7 @@ suite("panel", () => {
     const cost = { ms: 0.8 };
     h.canvas.nodes = [await withExtension(h, "HeavyPack", cost, "HeavyNode")];
     h.tracker.open();
+    clickTab(h, "timing");
     drawLoop(h, 1);
     h.advance(600);
     const text = byId(h, "ants-tracker-body").textContent;
@@ -197,6 +199,7 @@ suite("panel", () => {
     const pricey = { ms: 1.6 };
     h.canvas.nodes = [await withExtension(h, "CheapPack", cheap, "CheapNode"), await withExtension(h, "PriceyPack", pricey, "PriceyNode")];
     h.tracker.open();
+    clickTab(h, "timing");
     drawLoop(h, 1);
     h.advance(600);
 
@@ -246,6 +249,7 @@ suite("panel", () => {
   test("empty Timing tab explains itself instead of showing nothing", async () => {
     const h = await boot();
     h.tracker.open();
+    clickTab(h, "timing");
     h.advance(600);
     const text = byId(h, "ants-tracker-body").textContent;
     assertIncludes(text, "No draw hooks were found", "says what it does not know, and where to look instead");
@@ -269,6 +273,7 @@ suite("panel", () => {
   test("pause from the header freezes the numbers and marks the panel", async () => {
     const h = await boot();
     h.tracker.open();
+    clickTab(h, "timing");
     drawLoop(h, 0.5);
     const frames = h.tracker.snapshot.frame.n;
     const pauseBtn = byClass(h, "ants-hbtn").find((n) => n.textContent.includes("Pause"));
@@ -593,5 +598,46 @@ suite("panel: the Governor tab", () => {
     assertIncludes(text, "renderFrame", "the offending script is named in the trace row");
     assertIncludes(text, "forced layout", "forced layout is reported");
     assertIncludes(text, "insideFramePoll", "and the governed source that ran inside the frame is listed");
+  });
+
+  test("the panel opens on Node Rendering Settings, with Status next to it", async () => {
+    const h = await boot();
+    h.tracker.open();
+    const buttons = tabButtons(h);
+    const active = buttons.find((b) => b._cls.has("active"));
+    assert(active && active.textContent.includes("Node Rendering"), "the default tab is the rendering settings");
+    const rendering = buttons.findIndex((b) => b.textContent.includes("Node Rendering"));
+    const status = buttons.findIndex((b) => b.textContent === "Status");
+    assertEqual(status, rendering + 1, "Status sits immediately after it");
+    clickTab(h, "status");
+    const statusBody = byId(h, "ants-tracker-body").children.find((c) => c._cls.has("active"));
+    assertIncludes(statusBody.textContent, "Status", "the readout lives on that tab");
+    const tweaks = byId(h, "ants-tracker-body").children[rendering];
+    assert(!tweaks.textContent.includes("widget threshold linked") || statusBody !== tweaks, "the status body is its own tab");
+  });
+
+  test("the panel resizes on both axes, and a blocked window leaves it here", async () => {
+    const h = await boot();
+    h.tracker.open();
+    const panel = h.panel();
+    const grip = byId(h, "ants-tracker-resize");
+    assert(grip, "the panel has a resize grip");
+    grip._fire("mousedown", { clientX: 100, clientY: 100, preventDefault() {}, stopPropagation() {} });
+    h.window.fire("mousemove", { clientX: 180, clientY: 160 });
+    h.window.fire("mouseup", {});
+    assertEqual(panel.style.width, "720px", "width follows the drag");
+    assertEqual(panel.style.height, "580px", "and so does height");
+    assertIncludes(h.document.getElementById("ants-tracker-style").textContent, "container-type", "narrow panels restack their rows");
+
+    h.window.open = () => null;
+    assertEqual(h.tracker.popout(), false, "a blocked popup fails open");
+    assert(panel.parentNode === h.document.body, "the panel stayed on this page");
+    assertIncludes(panel.textContent, "blocked", "and the page says so");
+
+    const popup = { document: createDocument(), addEventListener() {} };
+    h.window.open = () => popup;
+    assertEqual(h.tracker.popout(), true, "an allowed popup takes the panel");
+    assert(panel.parentNode === popup.document.body, "into that window's document");
+    assert(popup.document.head.textContent.includes("ants-tracker-panel"), "with the styles copied, not assumed");
   });
 });

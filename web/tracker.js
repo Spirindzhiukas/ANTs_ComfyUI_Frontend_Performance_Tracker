@@ -27,7 +27,7 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.5.1";
+const VERSION = "2.5.2";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
 // The class key ComfyUI stores in a workflow. The old key is still recognised so
 // a graph saved before the rename does not lose this node.
@@ -894,7 +894,8 @@ const LOD = {
   // defined further down with the rest of this block's constants.
   snapOn: true, // the stand-in is a picture of the node; a fill is the fallback
   snapRatio: 1, // capture pixels per graph unit. 1x is enough below 50% zoom
-  snapMb: 512, // byte budget for stored bitmaps; the literal is LOD_SNAP_BUDGET_DEFAULT
+  snapMb: 4096, // byte budget for stored bitmaps; the literal is LOD_SNAP_BUDGET_DEFAULT
+  linkZoom: true, // widget-stop zoom and the picture zoom share the higher of the two
   snapFrame: 0, // drawn frames since load: what "in use" is measured in
   snaps: null, // Map<node, record> in reuse order (a Map iterates in insertion order)
   snapQueue: null, // Set<node> waiting for a capture, insertion order
@@ -1057,7 +1058,8 @@ const LOD_BOX_PROGRESS_PX = 3; // a bar is at least this tall in CSS pixels
 //     stays the only thing that decides which nodes stop being drawn in full, so
 //     no zoom this tool does not already touch can change appearance (golden
 //     rule 6). Reuse while panning is the point — panning moves the camera, not
-//     the node — so a canvas pan does not disable it, while dragging a node does.
+//     the node — so a canvas pan does not disable it, and neither does dragging a
+//     node. A link drag, a running bar and an error still draw live.
 //   * the capture draws into its own offscreen canvas rather than the visible
 //     one. The live context is never touched, so there is no canvas state to
 //     restore (upstream had to copy sixteen properties and put them back).
@@ -1076,17 +1078,16 @@ const LOD_BOX_PROGRESS_PX = 3; // a bar is at least this tall in CSS pixels
 //     and the readout names it — that name is the actionable part.
 // The ratio and the budget are provisional: the plan measures before fixing them
 // (K3), and the numbers are in the panel rather than in a claim.
-const LOD_SNAP_RATIOS = [1, 2, 3]; // capture pixels per graph unit
-const LOD_SNAP_RATIO_DEFAULT = 1; // 1x is enough below 50% zoom; 2x and 3x are there if a capture is looked at near 100%
-// The budget ladder starts at 256 MiB and doubles to 2 GiB. Below 256 was removed
+const LOD_SNAP_RATIOS = [0.25, 0.5, 1, 2, 3]; // capture pixels per graph unit
+const LOD_SNAP_RATIO_DEFAULT = 1; // 1x stays the default; 0.25x and 0.5x are choices, not the fallback
+// The budget ladder starts at 256 MiB and doubles to 8 GiB. Below 256 was removed
 // after a real report: a 1,041-node graph at 256 MiB held 255.6 MB, and every new
 // capture evicted a bitmap that was on screen (7,040 captures for 1,041 nodes),
-// which is visible as boxes and pictures flickering on and off. The floor is now
-// the smallest number that can hold a large graph's worth of pictures at all.
-// The ceiling is 2 GiB: this memory is canvas surfaces outside the JS heap, which
-// the Memory tab cannot see, so it stays a number the user picks deliberately.
-const LOD_SNAP_BUDGETS = [256, 512, 1024, 2048]; // MiB held by stored bitmaps
-const LOD_SNAP_BUDGET_DEFAULT = 512;
+// which is visible as boxes and pictures flickering on and off. The floor is still
+// that smallest step. A missing saved budget is 4096; an explicit saved 256, 512,
+// 1024 or 2048 is left alone. This memory is canvas surfaces outside the JS heap.
+const LOD_SNAP_BUDGETS = [256, 512, 1024, 2048, 4096, 8192]; // MiB held by stored bitmaps
+const LOD_SNAP_BUDGET_DEFAULT = 4096;
 // "In use" is measured in drawn frames, not in milliseconds. A time window looked
 // right and failed a test that mattered: while the page is idle no frame is drawn
 // at all, so bitmaps that are still on screen aged out and became evictable the
@@ -1105,7 +1106,11 @@ const LOD_SNAP_MAX_DIM = 2048; // px; a capture is fitted down to this, or the n
 const LOD_SNAP_SLOW_MS = 60; // a slower capture blocks that node for the session
 const LOD_SNAP_SIG_MS = 100; // a signature is re-checked at most this often
 const LOD_SNAP_IDLE_MS = 400; // input within this many ms stops the capture lane
-const LOD_SNAP_GAP_MS = 200; // between capture slices
+const LOD_SNAP_GAP_MS = 32; // between capture slices, once the page is idle
+// Execute / Run and Run-to-node. System RAM, not the canvas budget. A missing
+// reading does not invent a number and does not release anything.
+const LOD_RAM_OFF = 0.85; // off-screen stand-ins leave memory
+const LOD_RAM_FULL = 0.95; // every in-memory stand-in leaves; disk files stay
 const LOD_SNAP_QUEUE_MAX = 4096; // candidates remembered at once
 const LOD_SNAP_FAIL_MAX = 5; // capture failures in a row before the mode gives up
 const LOD_SNAP_TYPES_MAX = 64; // never-snapshot type list cap (a policy, not a dump)
@@ -1210,11 +1215,21 @@ function lodZoomOf(canvas) {
   return LOD.zoom;
 }
 
+// The zoom below which a node is a stand-in. Linked (the default), that is the
+// higher of the picture setting and the "widgets stop answering" setting, so a
+// drag past either one still shows pictures. Unlinked, only the picture setting.
+function lodPictureBelow() {
+  const flat = Number(LOD.flatBelow) || 0;
+  if (!LOD.linkZoom) return flat;
+  return Math.max(flat, Number(LOD.inertBelow) || 0);
+}
+
 function lodFlatOn(canvas) {
   if (!S.enabled) return false;
-  if (!(LOD.flatBelow > 0)) return false;
+  const below = lodPictureBelow();
+  if (!(below > 0)) return false;
   const z = lodZoomOf(canvas);
-  return z > 0 && z < LOD.flatBelow;
+  return z > 0 && z < below;
 }
 
 // Is this node painted as a rectangle right now? Exempt: a collapsed node is
@@ -2557,6 +2572,93 @@ function buildAntsNodeWidget() {
   return pill;
 }
 
+// The graph node was sized to the pill and, on some frontends, only allowed to
+// grow on one axis. A free minimum and a computeSize that does not shrink a
+// size the user already set is what both axes need. Vue node mode may ignore a
+// LiteGraph `resizable` flag; the floating panel's own grip does not depend on it.
+function antsUnlockNode(node) {
+  try {
+    node.resizable = true;
+    const prev = node.computeSize;
+    node.computeSize = function (out) {
+      let base = [220, 48];
+      try {
+        if (typeof prev === "function") {
+          const got = prev.apply(this, arguments);
+          if (got && got.length >= 2) base = [Number(got[0]) || base[0], Number(got[1]) || base[1]];
+        }
+      } catch (e) {
+        /* the floor stands */
+      }
+      const cur = this.size || base;
+      const w = Math.max(180, base[0] || 0, Number(cur[0]) || 0);
+      const h = Math.max(36, base[1] || 0, Number(cur[1]) || 0);
+      if (out && out.length >= 2) {
+        out[0] = w;
+        out[1] = h;
+        return out;
+      }
+      return [w, h];
+    };
+    if (typeof node.addDOMWidget === "function" && !node._antsHost) {
+      const host = document.createElement("div");
+      host.className = "ants-own ants-node-host";
+      host.style.width = "100%";
+      host.style.minHeight = "0";
+      const widget = node.addDOMWidget("ants_host", "ants-ui", host, {
+        serialize: false,
+        hideOnZoom: false,
+      });
+      if (widget) {
+        widget.computeLayoutSize = () => ({ minWidth: 180, minHeight: 0, maxWidth: 4096, maxHeight: 4096 });
+      }
+      node._antsHost = host;
+    }
+    const prevResize = node.onResize;
+    node.onResize = function (size) {
+      let ret;
+      try {
+        if (typeof prevResize === "function") ret = prevResize.apply(this, arguments);
+      } catch (e) {
+        /* the reflow still runs */
+      }
+      antsReflowNode(this, size);
+      return ret;
+    };
+  } catch (e) {
+    /* the floating panel still resizes on its own grip */
+  }
+}
+
+function antsReflowNode(node, size) {
+  try {
+    buildPanel();
+    const host = node && node._antsHost;
+    if (!host || !ui.panel) return;
+    const w = (size && Number(size[0])) || (node.size && Number(node.size[0])) || 0;
+    const h = (size && Number(size[1])) || (node.size && Number(node.size[1])) || 0;
+    if (w >= 280 && h >= 160) {
+      host.appendChild(ui.panel);
+      ui.panel.classList.add("open");
+      ui.panel.classList.add("ants-docked");
+      ui.panel.classList.remove("ants-popped");
+      ui.panel.style.width = "100%";
+      ui.panel.style.height = `${Math.max(160, Math.round(h - 28))}px`;
+      ui.docked = node;
+      return;
+    }
+    if (ui.docked === node) {
+      ui.docked = null;
+      ui.panel.classList.remove("ants-docked");
+      ui.panel.style.width = "";
+      ui.panel.style.height = "";
+      document.body.appendChild(ui.panel);
+    }
+  } catch (e) {
+    /* docking is optional; the grip on the floating panel still works */
+  }
+}
+
 // Attaching the pill to a node, through whichever API this frontend version has.
 function antsAttachNodeWidget(node) {
   const pill = buildAntsNodeWidget();
@@ -2972,6 +3074,7 @@ function lodSaveSettings() {
         detailZoom: LOD.detailZoom,
         thumbZoom: 0,
         diskOn: !!LOD.diskOn,
+        linkZoom: !!LOD.linkZoom,
         idleCapMs: LOD.idleCapMs,
         linkStyle: LOD.linkStyle,
         inertBelow: LOD.inertBelow,
@@ -3007,10 +3110,20 @@ function lodLoadSettings() {
     const saved = JSON.parse(raw);
     if (!saved || typeof saved !== "object") return false;
     const legacyPx = saved.flatBelow === undefined ? Number(saved.minPx) || 0 : 0;
+    const linkZoom = saved.linkZoom === undefined ? true : !!saved.linkZoom;
+    let flatBelow = saved.flatBelow === undefined
+      ? (legacyPx > 0 ? lodZoomForPx(legacyPx) : 0.5)
+      : Number(saved.flatBelow) || 0;
+    let inertBelow = saved.inertBelow === undefined ? 0 : Number(saved.inertBelow) || 0;
+    // Missing key means the new default: the higher threshold wins, and the two
+    // dropdowns agree. An explicit false is left alone.
+    if (linkZoom) {
+      const z = Math.max(flatBelow, inertBelow);
+      flatBelow = z;
+      inertBelow = z;
+    }
     lodSet({
-      flatBelow: saved.flatBelow === undefined
-        ? (legacyPx > 0 ? lodZoomForPx(legacyPx) : 0.5)
-        : Number(saved.flatBelow) || 0,
+      flatBelow,
       legacyPx,
       boxDetail: saved.boxDetail === undefined ? LOD_BOX_DETAIL_DEFAULT : String(saved.boxDetail),
       snapshots: saved.snapshots === undefined ? true : !!saved.snapshots,
@@ -3024,7 +3137,8 @@ function lodLoadSettings() {
       // Anything that is not an explicit "straight" means curves. A v2.1.9
       // "auto" record becomes "spline" and raises the note above.
       linkStyle: saved.linkStyle === "straight" ? "straight" : "spline",
-      inertBelow: saved.inertBelow === undefined ? 0 : Number(saved.inertBelow) || 0,
+      linkZoom,
+      inertBelow,
       fovea: !!saved.fovea,
       focusDom: saved.focusDom === undefined ? VIEW_FOCUS_DOM_DEFAULT : String(saved.focusDom),
       foveaMargin: saved.foveaMargin === undefined ? VIEW_FOVEA_MARGIN_DEFAULT : Number(saved.foveaMargin) || 0,
@@ -3229,6 +3343,7 @@ function lodSet(opts) {
     LOD.inertBelow = z === 0 ? 0 : VIEW_INERT_ZOOMS.reduce((best, v) => (Math.abs(v - z) < Math.abs(best - z) ? v : best), VIEW_INERT_ZOOMS[0]) || z;
   }
   if ("fovea" in o) LOD.fovea = !!o.fovea;
+  if ("linkZoom" in o) LOD.linkZoom = !!o.linkZoom;
   // A focus setting changing is exactly when a node can go from "hovered" to
   // "switched off", so the record of which nodes are already held back is dropped
   // and the next drawn frame re-evaluates them — which is what forces the leave
@@ -3708,17 +3823,15 @@ function lodSnapOn(canvas) {
 function lodSnapLive(node, canvas) {
   try {
     if (!node) return true;
-    // Hover is not live, and neither is selection. Both used to drop a pictured
-    // node back to a painted box, so the picture and the box both did the work.
-    // The picture stays. A selected node gets a ring on top of it (see the blit),
-    // not a second drawing of the node. Drag, a link drag, a running bar and an
-    // error still draw live, so that transient state is not a stale picture. The
-    // node stays clickable either way.
+    // Hover is not live, and neither is selection or a node drag. Those used to
+    // drop a pictured node back to a painted box. The picture stays, and it moves
+    // with the node. A selected node gets a ring on top of it (see the blit).
+    // A link drag, a running bar and an error still draw live. The node stays
+    // clickable either way.
     if (node.has_errors) return true; // the error stroke is live state
     if (Number(node.progress) > 0) return true; // a running node draws a bar
     const c = canvas || null;
     if (c) {
-      if (c.isDragging) return true; // dragging nodes/items: the geometry is moving
       if (c.connecting_node) return true; // a link is being dragged from a node
       const lc = c.linkConnector;
       if (lc && lc.renderLinks && lc.renderLinks.length) return true;
@@ -3796,13 +3909,23 @@ function lodSnapGeometry(node) {
 // on every slice). At 10% zoom a node captured at 1x still has ten times the
 // pixels the screen shows, so fitting it is worth far more than skipping it, and
 // the readout counts how many were fitted. 0 means no ratio fits: too big.
+// Automatic coarsening stops at 1x unless the user asked for a smaller capture.
+// 0.25x and 0.5x are settings, not the fallback that fills a tight budget.
+function lodSnapCoarseFloor(want) {
+  const asked = Number(want);
+  return asked > 0 && asked < 1 ? asked : 1;
+}
+
 function lodSnapFitRatio(geom, want) {
-  const ratio = Math.max(1, Math.min(4, Number(want) || 1));
+  const asked = Number(want) || 1;
+  const ratio = Math.max(LOD_SNAP_RATIOS[0], Math.min(LOD_SNAP_RATIOS[LOD_SNAP_RATIOS.length - 1], asked));
+  const floor = lodSnapCoarseFloor(asked);
   const longest = Math.max(geom.w, geom.h);
   if (!(longest > 0)) return 0;
   for (let i = LOD_SNAP_RATIOS.length - 1; i >= 0; i--) {
     const r = LOD_SNAP_RATIOS[i];
-    if (r > ratio) continue;
+    if (r > ratio + 1e-9) continue;
+    if (r + 1e-9 < floor) continue;
     if (Math.ceil(longest * r) <= LOD_SNAP_MAX_DIM) return r;
   }
   return 0;
@@ -4101,6 +4224,161 @@ function lodSnapDrop(node, why) {
   return rec;
 }
 
+// A RAM release must be able to load the same file again. Forgetting the "already
+// asked" mark does not delete the file.
+function lodThumbDiskForget(node) {
+  if (!LOD.diskAsked) return;
+  let id = "";
+  try {
+    id = lodThumbId(node);
+  } catch (e) {
+    return;
+  }
+  if (!id) return;
+  for (const key of [...LOD.diskAsked]) {
+    if (String(key).startsWith(id + "\0")) LOD.diskAsked.delete(key);
+  }
+}
+
+// System RAM from ComfyUI's own /system_stats. No reading, no release.
+async function lodRamSample() {
+  try {
+    if (typeof fetch !== "function") {
+      LOD.ramUsed = null;
+      LOD.ramNote = "system RAM unknown — no fetch, so nothing was released";
+      return null;
+    }
+    const res = await fetch("/system_stats");
+    if (!res || !res.ok || typeof res.json !== "function") {
+      LOD.ramUsed = null;
+      LOD.ramNote = "system RAM unknown — /system_stats did not answer, so nothing was released";
+      return null;
+    }
+    const body = await res.json();
+    const sys = body && body.system;
+    const total = Number(sys && sys.ram_total) || 0;
+    const free = Number(sys && (sys.ram_free != null ? sys.ram_free : sys.ram_available));
+    if (!(total > 0) || !Number.isFinite(free) || free < 0 || free > total) {
+      LOD.ramUsed = null;
+      LOD.ramNote = "system RAM unknown — /system_stats had no ram_total and ram_free, so nothing was released";
+      return null;
+    }
+    const used = 1 - free / total;
+    LOD.ramUsed = used;
+    LOD.ramNote = "";
+    return used;
+  } catch (e) {
+    LOD.ramUsed = null;
+    LOD.ramNote = "system RAM unknown — the stats request failed, so nothing was released";
+    return null;
+  }
+}
+
+function lodSnapPurgeRam(all) {
+  if (!LOD.snaps) return 0;
+  const canvas = typeof app !== "undefined" && app ? app.canvas : null;
+  const area = !all && canvas ? viewArea(canvas, 0) : null;
+  if (!all && !area) return 0; // cannot tell off-screen from on-screen: release nothing
+  let n = 0;
+  for (const node of [...LOD.snaps.keys()]) {
+    const rec = LOD.snaps.get(node);
+    if (!rec || !rec.canvas) continue;
+    if (!all && viewTouchesArea(node, area)) continue;
+    lodThumbDiskForget(node);
+    lodSnapDrop(node, all ? "ram full" : "ram off-screen");
+    n++;
+  }
+  if (n) {
+    LOD.ramPurged = (LOD.ramPurged || 0) + n;
+    LOD.ramLast = all ? "full" : "off-screen";
+  }
+  return n;
+}
+
+async function lodRamCheck() {
+  const used = await lodRamSample();
+  if (used == null) return { used: null, purged: 0 };
+  if (used >= LOD_RAM_FULL) return { used, purged: lodSnapPurgeRam(true) };
+  if (used >= LOD_RAM_OFF) return { used, purged: lodSnapPurgeRam(false) };
+  return { used, purged: 0 };
+}
+
+function lodRamReload() {
+  const canvas = typeof app !== "undefined" && app ? app.canvas : null;
+  if (!canvas || !lodSnapOn(canvas)) return 0;
+  const nodes = lodGraphNodes(canvas);
+  if (!nodes) return 0;
+  let n = 0;
+  for (const node of nodes) {
+    const rec = LOD.snaps && LOD.snaps.get(node);
+    if (rec && rec.canvas) continue;
+    lodSnapEnqueue(node, canvas);
+    n++;
+  }
+  return n;
+}
+
+async function lodRamFinish() {
+  LOD.ramRunning = false;
+  const used = await lodRamSample();
+  const canvas = typeof app !== "undefined" && app ? app.canvas : null;
+  if (!canvas || !lodSnapOn(canvas)) return 0;
+  const nodes = lodGraphNodes(canvas);
+  if (!nodes) return 0;
+  const area = viewArea(canvas, 0);
+  const tight = used != null && used >= LOD_RAM_OFF;
+  let n = 0;
+  for (const node of nodes) {
+    const rec = LOD.snaps && LOD.snaps.get(node);
+    if (rec && rec.canvas) continue;
+    // Still tight: bring back what is on screen. The rest stays on disk until
+    // the view asks for it. A miss is photographed again on the idle lane.
+    if (tight && area && !viewTouchesArea(node, area)) continue;
+    lodSnapEnqueue(node, canvas);
+    n++;
+  }
+  LOD.ramReloaded = (LOD.ramReloaded || 0) + n;
+  return n;
+}
+
+function lodRamRun(starting) {
+  if (!starting) return lodRamFinish();
+  LOD.ramRunning = true;
+  if (!LOD.ramTimer) {
+    try {
+      LOD.ramTimer = govOwn(() => setInterval(() => {
+        if (LOD.ramRunning) lodRamCheck();
+      }, 2000));
+    } catch (e) {
+      /* one check on start is still the policy */
+    }
+  }
+  return lodRamCheck();
+}
+
+function lodInstallRamWatch() {
+  try {
+    const api = app && app.api;
+    if (!api || typeof api.addEventListener !== "function" || LOD.ramWatch) {
+      if (!LOD.ramWatch) LOD.ramNote = LOD.ramNote || "run watch: no execution events on this page, so a run will not release stand-ins";
+      return false;
+    }
+    LOD.ramWatch = true;
+    api.addEventListener("execution_start", () => {
+      try { lodRamRun(true); } catch (e) { /* fail open */ }
+    });
+    const end = () => {
+      try { lodRamFinish(); } catch (e) { /* fail open */ }
+    };
+    api.addEventListener("execution_success", end);
+    api.addEventListener("execution_error", end);
+    api.addEventListener("execution_interrupted", end);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
 // Everything, because the stored bitmaps describe a theme that no longer exists.
 function lodSnapClear(reason) {
   lodSnapEnsure();
@@ -4385,7 +4663,7 @@ function lodSnapCaptureNode(node, canvas) {
   if (lodSnapLive(node, canvas)) return false; // nothing to capture: it is being drawn live
   const geom = lodSnapGeometry(node);
   if (!geom) return false;
-  const want = Math.max(1, Math.min(4, Number(LOD.snapRatio) || 1));
+  const want = Number(LOD.snapRatio) || LOD_SNAP_RATIO_DEFAULT;
   const fit = lodSnapFitRatio(geom, want);
   if (!fit) {
     // No ratio on the ladder keeps this node inside the dimension cap: it is
@@ -4405,10 +4683,11 @@ function lodSnapCaptureNode(node, canvas) {
   let ratio = fit;
   let bytes = lodSnapBytesFor(geom, ratio);
   let coarse = false;
-  if (!lodSnapMakeRoom(bytes, true) && ratio > LOD_SNAP_RATIOS[0]) {
-    const small = lodSnapBytesFor(geom, LOD_SNAP_RATIOS[0]);
+  const coarseFloor = lodSnapCoarseFloor(want);
+  if (!lodSnapMakeRoom(bytes, true) && ratio > coarseFloor) {
+    const small = lodSnapBytesFor(geom, coarseFloor);
     if (lodSnapMakeRoom(small, true)) {
-      ratio = LOD_SNAP_RATIOS[0];
+      ratio = coarseFloor;
       bytes = small;
       coarse = true;
     }
@@ -4620,16 +4899,33 @@ function lodSnapSlice() {
   }
   lodSnapPrune(canvas);
   const budget = Math.max(1, Number(GOV.controls.budgetMs) || 12);
-  for (const node of LOD.snapQueue) {
-    LOD.snapQueue.delete(node);
-    if (nowMs() - t0 >= budget || govInputRecently(nowMs(), LOD_SNAP_IDLE_MS)) {
-      LOD.snapQueue.add(node); // next slice, from the back of the queue
-      break;
-    }
+  while (LOD.snapQueue.size) {
+    if (nowMs() - t0 >= budget || govInputRecently(nowMs(), LOD_SNAP_IDLE_MS)) break;
+    const node = lodSnapTake(canvas);
+    if (!node) break;
     lodSnapCaptureNode(node, canvas);
   }
   if (LOD.snapQueue.size) lodSnapSchedule(LOD_SNAP_GAP_MS);
   else LOD.snapPumping = false;
+}
+
+// On-screen nodes first. The queue is a Set, so this is a scan, not a second
+// scheduler. A worker cannot call the node's own draw — that is the slow part.
+function lodSnapTake(canvas) {
+  const area = viewArea(canvas, 0);
+  let first = null;
+  if (area) {
+    for (const node of LOD.snapQueue) {
+      if (!first) first = node;
+      if (viewTouchesArea(node, area)) {
+        LOD.snapQueue.delete(node);
+        return node;
+      }
+    }
+  }
+  const node = first || LOD.snapQueue.values().next().value;
+  if (node) LOD.snapQueue.delete(node);
+  return node || null;
 }
 
 // Called from the draw path for a node that has just been painted as a box: it is
@@ -6993,20 +7289,32 @@ const PANEL_Z = 99999;
 
 const STYLE = `
 #ants-tracker-panel {
-  position: fixed; top: 60px; right: 20px; width: 640px; max-height: 82vh;
+  position: fixed; top: 60px; right: 20px; width: 640px; height: 72vh;
+  min-width: 320px; min-height: 220px; max-height: none;
   background: #1a1a1e; border: 1px solid #3a3a42; border-radius: 8px;
   box-shadow: 0 8px 24px rgba(0,0,0,0.5); color: #ddd;
   font: 12px/1.4 -apple-system, "Segoe UI", sans-serif;
   z-index: ${PANEL_Z}; display: none; flex-direction: column; overflow: hidden;
+  container-type: inline-size; container-name: ants;
 }
 #ants-tracker-panel.open { display: flex; }
+#ants-tracker-panel.ants-popped,
+#ants-tracker-panel.ants-docked {
+  position: relative; top: auto; right: auto; width: 100%; height: 100%;
+  max-height: none; border-radius: 0; box-shadow: none;
+}
+#ants-tracker-resize {
+  position: absolute; right: 0; bottom: 0; width: 16px; height: 16px;
+  cursor: nwse-resize; z-index: 3;
+  background: linear-gradient(135deg, transparent 50%, #6a5520 50%);
+}
 #ants-tracker-header {
   cursor: move; padding: 6px 10px; background: #26262c;
   border-bottom: 1px solid #3a3a42; display: flex; align-items: center;
-  justify-content: space-between; user-select: none; gap: 8px;
+  justify-content: space-between; user-select: none; gap: 8px; flex-wrap: wrap;
 }
 #ants-tracker-header b { color: #f0a020; }
-#ants-tracker-header .ants-actions { display: flex; align-items: center; gap: 4px; }
+#ants-tracker-header .ants-actions { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
 .ants-hbtn {
   cursor: pointer; color: #aaa; padding: 2px 7px; border-radius: 4px;
   font-size: 11px; border: 1px solid transparent; white-space: nowrap;
@@ -7105,6 +7413,10 @@ tr.ants-details table.ants-sub td { color: #bbb; }
 .ants-set-ctrl { min-width: 0; }
 .ants-set-ctrl .ants-select { max-width: 100%; }
 .ants-set-desc { grid-column: 1 / -1; color: #8b8b96; font-size: 11px; line-height: 1.35; margin: 0; }
+@container ants (max-width: 460px) {
+  .ants-set { grid-template-columns: 1fr; }
+  .ants-sum-row { flex-direction: column; align-items: flex-start; }
+}
 /* Elements of a node that is currently drawn as a rectangle: see lodSweepDom. */
 .ants-lod-box { display: none !important; }
 .ants-off-note {
@@ -7472,12 +7784,134 @@ const ui = {
   tabs: {},
   tabBtns: {},
   state: {},
-  active: "timing",
+  active: "tweaks",
   refreshTimer: null,
   prevScroll: {},
   built: false,
   pauseBtn: null,
 };
+
+function antsInstallResize(panel) {
+  const grip = el("div", {
+    id: "ants-tracker-resize",
+    title: "Drag to resize. Rows stack when the panel is narrow.",
+  });
+  panel.appendChild(grip);
+  let dragging = false;
+  let startX = 0;
+  let startY = 0;
+  let startW = 640;
+  let startH = 520;
+  const box = () => {
+    try {
+      if (typeof panel.getBoundingClientRect === "function") {
+        const rect = panel.getBoundingClientRect();
+        if (rect && rect.width > 0 && rect.height > 0) return rect;
+      }
+    } catch (e) {
+      /* the stored size, or the default, is enough */
+    }
+    return { width: startW, height: startH };
+  };
+  grip.addEventListener("mousedown", (e) => {
+    dragging = true;
+    startX = e.clientX;
+    startY = e.clientY;
+    const rect = box();
+    startW = rect.width || 640;
+    startH = rect.height || 520;
+    if (e.preventDefault) e.preventDefault();
+    if (e.stopPropagation) e.stopPropagation();
+  });
+  window.addEventListener("mousemove", (e) => {
+    if (!dragging) return;
+    const w = Math.max(320, Math.min(1600, startW + (e.clientX - startX)));
+    const h = Math.max(220, Math.min(1400, startH + (e.clientY - startY)));
+    panel.style.width = `${Math.round(w)}px`;
+    panel.style.height = `${Math.round(h)}px`;
+    panel.style.maxHeight = "none";
+  });
+  window.addEventListener("mouseup", () => {
+    if (!dragging) return;
+    dragging = false;
+    try {
+      localStorage.setItem("ants-tracker-panel-size", JSON.stringify({ w: panel.style.width, h: panel.style.height }));
+    } catch (e) {
+      /* remembering the size is optional */
+    }
+  });
+  try {
+    const raw = localStorage.getItem("ants-tracker-panel-size");
+    if (raw) {
+      const saved = JSON.parse(raw);
+      if (saved && saved.w) panel.style.width = String(saved.w);
+      if (saved && saved.h) {
+        panel.style.height = String(saved.h);
+        panel.style.maxHeight = "none";
+      }
+    }
+  } catch (e) {
+    /* the default size stands */
+  }
+}
+
+function antsPopout() {
+  buildPanel();
+  let w = null;
+  try {
+    w = typeof window.open === "function" ? window.open("", "ants-optimizer", "popup=yes,width=780,height=900") : null;
+  } catch (e) {
+    w = null;
+  }
+  const say = (text) => {
+    LOD.popoutNote = text;
+    if (ui.popNote) {
+      ui.popNote.style.display = text ? "" : "none";
+      ui.popNote.textContent = text || "";
+    }
+  };
+  if (!w) {
+    say("The browser blocked the window. The panel stayed on this page.");
+    return false;
+  }
+  try {
+    w.document.title = "ANTs Frontend Optimizer";
+    if (w.document.body && w.document.body.style) {
+      w.document.body.style.margin = "0";
+      w.document.body.style.background = "#1a1a1e";
+    }
+    const style = document.getElementById("ants-tracker-style");
+    if (style && w.document && typeof w.document.createElement === "function" && w.document.head) {
+      const copy = w.document.createElement("style");
+      copy.textContent = style.textContent || "";
+      w.document.head.appendChild(copy);
+    }
+    ui.panel.classList.add("open");
+    ui.panel.classList.add("ants-popped");
+    ui.panel.classList.remove("ants-docked");
+    if (w.document.body) w.document.body.appendChild(ui.panel);
+    ui.popout = w;
+    say("");
+    const back = () => {
+      if (ui.popout !== w) return;
+      ui.popout = null;
+      try {
+        ui.panel.classList.remove("ants-popped");
+        document.body.appendChild(ui.panel);
+      } catch (e) {
+        /* the page is going away */
+      }
+    };
+    if (typeof w.addEventListener === "function") {
+      w.addEventListener("pagehide", back);
+      w.addEventListener("beforeunload", back);
+    }
+    return true;
+  } catch (e) {
+    say("The window opened, but the panel could not move into it. It stayed on this page.");
+    return false;
+  }
+}
 
 function buildPanel() {
   if (ui.built) return ui.panel;
@@ -7510,11 +7944,18 @@ function buildPanel() {
     title: "Freeze sampling so the numbers stop moving while you read them. Rendering is untouched.",
   });
   const resetBtn = el("span", { class: "ants-hbtn", text: "⟲ Reset", title: "Clear all recorded samples (keeps mutes and settings)" });
+  const windowBtn = el("span", {
+    class: "ants-hbtn",
+    text: "Window",
+    title:
+      "Open this panel in its own browser window, for a second monitor. It is the same page, not a second ComfyUI. If the browser blocks the popup, the panel stays here and says so.",
+  });
   const closeBtn = el("span", { class: "ants-hbtn", text: "✕", title: "Close" });
   actions.appendChild(copyBtn);
   actions.appendChild(ui.powerBtn);
   actions.appendChild(ui.pauseBtn);
   actions.appendChild(resetBtn);
+  actions.appendChild(windowBtn);
   actions.appendChild(closeBtn);
   header.appendChild(title);
   header.appendChild(actions);
@@ -7562,6 +8003,7 @@ function buildPanel() {
   const tabsBody = el("div", { id: "ants-tracker-body" });
   for (const [name, label] of [
     ["tweaks", "Node Rendering Settings"],
+    ["status", "Status"],
     ["timing", "Timing"],
     ["nodes", "Nodes"],
     ["stalls", "Stalls"],
@@ -7597,6 +8039,10 @@ function buildPanel() {
 
   copyBtn.addEventListener("click", (e) => copyTelemetryReport(e.currentTarget));
   ui.pauseBtn.addEventListener("click", () => togglePause());
+  windowBtn.addEventListener("click", () => antsPopout());
+  ui.popNote = el("div", { id: "ants-tracker-popnote", class: "ants-note", style: { display: "none" } });
+  panel.appendChild(ui.popNote);
+  antsInstallResize(panel);
   resetBtn.addEventListener("click", () => resetAllStats(true));
   if (ui.powerBtn) {
     ui.powerBtn.addEventListener("click", () => {
@@ -7781,6 +8227,18 @@ function timingEmptyText() {
     `these owners are no longer drawing through these hooks — look for a widget draw(), an instance hook, or a heartbeat. ` +
     `Owners wrapped: ${shown.join(", ")}${owners.length > shown.length ? `, +${owners.length - shown.length} more` : ""}.`
   );
+}
+
+function buildStatusTab(container) {
+  container.appendChild(el("div", { class: "ants-section-title", text: "Status" }));
+  const lodLine = el("div", { class: "ants-note", style: { whiteSpace: "pre-wrap" } });
+  container.appendChild(lodLine);
+  ui.lodLine = lodLine;
+  ui.state.status = {
+    update: () => {
+      if (ui.lodUpdate) ui.lodUpdate();
+    },
+  };
 }
 
 function buildTimingTab(container) {
@@ -8036,14 +8494,16 @@ function buildTweaksTab(container) {
   }
   lodFlatSel.value = String(LOD.flatBelow);
   lodFlatSel.addEventListener("change", () => {
-    lodSet({ flatBelow: Number(lodFlatSel.value) });
+    const z = Number(lodFlatSel.value) || 0;
+    if (LOD.linkZoom) lodSet({ flatBelow: z, inertBelow: z });
+    else lodSet({ flatBelow: z });
     lodUpdate();
   });
   settingRow(
-    "Replace nodes with thumbnails",
+    "Replace node previews with bitmap stand-ins at zoom levels",
     lodFlatSel,
-    "Below this zoom a node is one picture instead of a live draw. Hover and selection keep the picture; a selected node gets a ring, not a box. Drag, a running bar or an error still draws live.",
-    "A zoom, not a node size. A node whose own UI hides or adds a widget changes size while you look at it, and a per-node pixel rule then flips that node in and out of the stand-in. A zoom classifies every node the same way, once per frame. Collapsed nodes and this tool's own node are never replaced. Nothing about the graph changes. Off, or Back to full drawing, restores ComfyUI's own draw. The node stays clickable either way."
+    "Below this zoom a node is one picture instead of a live draw. Hover, selection and a drag keep the picture. A selected node gets a ring, not a box. A link drag, a running bar or an error still draws live.",
+    "A zoom, not a node size. Past this percentage means zoomed out below it. A node whose own UI hides or adds a widget changes size while you look at it, and a per-node pixel rule then flips that node in and out of the stand-in. A zoom classifies every node the same way, once per frame. Collapsed nodes and this tool's own node are never replaced. Nothing about the graph changes. Off, or Back to full drawing, restores ComfyUI's own draw. The node stays clickable either way. While the link below is on, this zoom and the widget-stop zoom are the same, and the higher one wins."
   );
 
   const lodStandSel = el("select", { class: "ants-select" });
@@ -8084,15 +8544,15 @@ function buildTweaksTab(container) {
     lodUpdate();
   });
   settingRow(
-    "Capture scale",
+    "Stand-in capture resolution",
     snapRatioSel,
-    "Stored at this many pixels per graph unit. 1x is the default. Half and quarter copies are made from it and chosen by how big the node is on screen.",
+    "Pixels per graph unit in the photograph. 1x is the default. 0.25x and 0.5x are choices for a large graph. Half and quarter copies of whatever you capture are still made for the screen.",
     "The graph canvas is Canvas2D. It has no mipmap format drawImage can sample, and a WebGL mip chain cannot be handed to it. The 1x capture is downscaled here to 1/2 and 1/4, and the blit uses the smallest copy whose longest side still covers the on-screen device pixels: node size times zoom times display scale. At 20% zoom on a 200% display a typical node needs the half copy. The quarter copy is only used when the screen cannot show those extra pixels, which is around 10% and below. 2x and 3x cost four and nine times the memory and only help near 100% zoom."
   );
 
   const snapMbSel = el("select", { class: "ants-select" });
   for (const mb of LOD_SNAP_BUDGETS) {
-    const opt = el("option", { text: `bitmap budget ${mb} MiB` });
+    const opt = el("option", { text: `${mb} MiB` });
     opt.value = String(mb);
     snapMbSel.appendChild(opt);
   }
@@ -8102,10 +8562,10 @@ function buildTweaksTab(container) {
     lodUpdate();
   });
   settingRow(
-    "Memory budget",
+    "Stand-in memory (ram) budget",
     snapMbSel,
-    "How much canvas memory the pictures may hold. A picture that is on screen is not released to make room.",
-    "Releasing a picture that is being drawn is what flicker looks like. When the budget is full of those, a new capture is made coarser if that fits, and otherwise refused — those nodes stay fills. What does get released are pictures of nodes that have stopped being drawn. This is canvas memory outside the JS heap, so the Memory tab cannot see it. The status line says what is actually held."
+    "How much RAM the stand-in pictures may hold. A picture on screen is not released to make room for another picture.",
+    "4096 MiB is the default only when nothing is saved. A saved 256, 512, 1024 or 2048 stays. 8192 is the top of the ladder. Releasing a picture that is being drawn is what flicker looks like, so a full budget refuses a new capture instead. This is canvas memory outside the JS heap, so the Memory tab cannot see it. On Execute or Run-to-node, if system RAM is at 85% the off-screen stand-ins leave memory; at 95% all of them do. Disk files stay, and are loaded back when the run finishes. If /system_stats does not report RAM, nothing is released."
   );
 
   const diskSel = el("select", { class: "ants-select" });
@@ -8123,7 +8583,7 @@ function buildTweaksTab(container) {
     lodUpdate();
   });
   settingRow(
-    "Keep on disk",
+    "Keep stand-in previews on disk",
     diskSel,
     "Loaded from ComfyUI's temp/ANTs_Frontend_Optimizer_THUMBNAILS next time, keyed by node id and a signature of what it draws. A change overwrites the file. Deleting the node deletes the file. Files older than a week are removed.",
     "The page cannot write a folder itself. The route writes under the running ComfyUI temp directory. The folder is detected from ComfyUI's own temp path, or from this pack's location if that import is missing. A signature mismatch is not shown: the node is photographed again and the old file is replaced. If the route is missing, the memory cache continues and nothing is written."
@@ -8213,14 +8673,34 @@ function buildTweaksTab(container) {
   }
   viewInertSel.value = String(LOD.inertBelow);
   viewInertSel.addEventListener("change", () => {
-    lodSet({ inertBelow: Number(viewInertSel.value) || 0 });
+    const z = Number(viewInertSel.value) || 0;
+    if (LOD.linkZoom) lodSet({ inertBelow: z, flatBelow: z });
+    else lodSet({ inertBelow: z });
     lodUpdate();
   });
   settingRow(
     "Widgets stop answering",
     viewInertSel,
     "Below this zoom a node's widgets ignore the pointer. The nodes themselves stay selectable, draggable and editable.",
-    "No hover reports, no tooltips, no clicks on a widget, no drag onto one, no wheel capture — so scrolling over a node zooms the graph instead of the thing on it. The nodes themselves stay live: they still select, drag, edit and open their menu. A 3D viewport that is asked whether the pointer is over it says no, so it stops re-rendering its scene."
+    "No hover reports, no tooltips, no clicks on a widget, no drag onto one, no wheel capture — so scrolling over a node zooms the graph instead of the thing on it. The nodes themselves stay live: they still select, drag, edit and open their menu. A 3D viewport that is asked whether the pointer is over it says no, so it stops re-rendering its scene. This applies in both How widgets go modes."
+  );
+
+  const linkBox = el("input", { type: "checkbox" });
+  linkBox.checked = !!LOD.linkZoom;
+  linkBox.addEventListener("change", () => {
+    if (linkBox.checked) {
+      const z = Math.max(Number(LOD.flatBelow) || 0, Number(LOD.inertBelow) || 0);
+      lodSet({ linkZoom: true, flatBelow: z, inertBelow: z });
+    } else {
+      lodSet({ linkZoom: false });
+    }
+    lodUpdate();
+  });
+  settingRow(
+    "Widget's threshold linked to the Nodes preview threshold",
+    linkBox,
+    "On by default. The higher of the two zooms wins, so a drag past either one still shows pictures.",
+    "Past a percentage means zoomed out below it. While this is on, changing either dropdown sets both to the value you just picked, and turning it on takes the higher of the two. Off, each dropdown is its own. Either way a pictured node stays a picture while you drag it, in both How widgets go modes. Nodes stay selectable, draggable and editable. A link being dragged still draws live."
   );
 
   const viewFoveaSel = el("select", { class: "ants-select" });
@@ -8345,10 +8825,6 @@ function buildTweaksTab(container) {
     "Flattening, the stand-in, link thinning, link shape and viewport focus go back to a full draw. Pictures already on disk stay until a node changes, a node is deleted, or the weekly sweep removes a file older than a week."
   );
 
-  const lodLine = el("div", { class: "ants-note", style: { whiteSpace: "pre-wrap" } });
-  container.appendChild(el("div", { class: "ants-section-title", text: "Status" }));
-  container.appendChild(lodLine);
-
   function lodUpdate() {
     // The display-scale check is refreshed here as well as on the sweep: it is a
     // readout, and a readout derived from the viewport should be derived from the
@@ -8384,6 +8860,7 @@ function buildTweaksTab(container) {
     syncSel(viewRestoreSel, LOD.foveaRestore);
     syncSel(viewScaleSel, LOD.displayScale);
     syncSel(viewDomSel, LOD.focusDom);
+    if (linkBox) linkBox.checked = !!LOD.linkZoom;
     const fm = frameMetrics();
     const bits = [];
     const vis = lodVisibility(app.canvas);
@@ -8500,8 +8977,8 @@ function buildTweaksTab(container) {
           if (LOD.snapFull) {
             parts.push(
               `${LOD.snapFull} capture(s) refused: the budget is full of bitmaps that are being looked at, and not even a ` +
-                `${LOD_SNAP_RATIOS[0]}x copy fits — releasing one of those is what flicker looks like, so the lane stops instead (raise the budget, ` +
-                `or capture at ${LOD_SNAP_RATIOS[0]}x: a quarter of the memory, four times the nodes)`
+                `1x copy fits — releasing one of those is what flicker looks like, so the lane stops instead (raise the budget, ` +
+                `or capture at 1x, or at the smaller step you picked)`
             );
           }
           if (LOD.snapFlagHeld) {
@@ -8517,6 +8994,13 @@ function buildTweaksTab(container) {
           if (LOD.diskLoaded) parts.push(`${LOD.diskLoaded} loaded from disk`);
           if (LOD.diskSaved) parts.push(`${LOD.diskSaved} written to disk`);
           if (LOD.diskDir) parts.push(`folder ${LOD.diskDir}`);
+          if (LOD.ramPurged) parts.push(`${LOD.ramPurged} released for system RAM (${LOD.ramLast || "run"}); disk files kept`);
+          if (LOD.ramNote) parts.push(LOD.ramNote);
+          if (LOD.snapQueue && LOD.snapQueue.size) {
+            parts.push(
+              `${LOD.snapQueue.size} still to photograph on the idle lane. The node's own draw cannot move to a worker; the lane yields between slices so a drag is not blocked`
+            );
+          }
           if (LOD.snapMipDrawn) parts.push(`${LOD.snapMipDrawn} draw(s) used a half or quarter copy`);
           if (LOD.snapFailed) parts.push(`${LOD.snapFailed} capture(s) failed`);
           bits2.push(`snapshots: ${parts.join(", ")}`);
@@ -8702,9 +9186,15 @@ function buildTweaksTab(container) {
       );
     }
     if (LOD.error) bits.push(`turned itself off after an error: ${LOD.error}`);
-    lodLine.textContent = bits.join("\n");
+    if (LOD.linkZoom) {
+      bits.push(
+        `widget threshold linked to the preview threshold: pictures follow the higher of the two (${Math.round(lodPictureBelow() * 100)}%)`
+      );
+    }
+    if (ui.lodLine) ui.lodLine.textContent = bits.join("\n");
   }
 
+  ui.lodUpdate = lodUpdate;
   ui.state.tweaks = {
     update: () => {
       if (lodAbBtn) lodAbBtn.textContent = LOD.ab && !LOD.ab.done ? "Measuring\u2026" : "Measure link thinning";
@@ -10414,6 +10904,7 @@ function buildGovernorTab(container) {
 function buildTabContents() {
   if (ui.state.timing) return;
   buildTweaksTab(ui.tabs.tweaks);
+  buildStatusTab(ui.tabs.status);
   buildTimingTab(ui.tabs.timing);
   buildNodesTab(ui.tabs.nodes);
   buildStallsTab(ui.tabs.stalls);
@@ -10422,8 +10913,9 @@ function buildTabContents() {
   buildMemoryTab(ui.tabs.memory);
   buildGpuTab(ui.tabs.gpu);
   buildTestingTab(ui.tabs.testing);
-  ui.tabs.timing.classList.add("active");
-  ui.tabBtns.timing.classList.add("active");
+  ui.tabs.tweaks.classList.add("active");
+  ui.tabBtns.tweaks.classList.add("active");
+  ui.active = "tweaks";
 }
 
 // Periodic sweep. Two jobs, both about keeping the window honest:
@@ -10522,6 +11014,10 @@ function togglePanel(force) {
   const shouldOpen = force !== undefined ? force : !ui.panel.classList.contains("open");
   ui.panel.classList.toggle("open", shouldOpen);
   if (shouldOpen) {
+    // Opening the panel, from the node or the floating gear, lands on the
+    // rendering settings. A tab picked while it is open stays until it closes.
+    ui.active = "";
+    setTab("tweaks");
     renderSummary();
     updateActiveTab();
     startRefresh();
@@ -11091,6 +11587,10 @@ function installDebugApi() {
       },
       open: () => togglePanel(true),
       close: () => togglePanel(false),
+      popout: () => antsPopout(),
+      ramCheck: () => lodRamCheck(),
+      runStart: () => lodRamRun(true),
+      runFinish: () => lodRamFinish(),
       toggle: () => togglePanel(),
       pause: () => {
         if (!S.paused) togglePause();
@@ -11227,12 +11727,18 @@ function installDebugApi() {
             frame: LOD.snapFrame,
             exclude: LOD.snapExclude.slice(),
             installed: lodSnapInstalled,
+            ramUsed: LOD.ramUsed,
+            ramPurged: LOD.ramPurged || 0,
+            ramNote: LOD.ramNote || "",
+            ramLast: LOD.ramLast || "",
           };
         },
         get flat() {
           return {
             on: lodFlatOn(),
             belowZoom: LOD.flatBelow,
+            pictureBelow: lodPictureBelow(),
+            linkZoom: !!LOD.linkZoom,
             zoom: lodZoomOf(),
             // What the setting would have been under the old per-node pixel
             // rule, for anyone comparing a v2.1.8 snapshot with a new one.
@@ -11252,6 +11758,9 @@ function installDebugApi() {
           };
         },
         set: (opts) => lodSet(opts),
+        ramCheck: () => lodRamCheck(),
+        runStart: () => lodRamRun(true),
+        runFinish: () => lodRamFinish(),
         // Starts the on/off measurement of the link setting and returns its
         // state; the verdict lands in `state.ab.text` when it finishes.
         measureLinks: () => lodAbStart(),
@@ -11433,6 +11942,11 @@ app.registerExtension({
     } catch (e) {
       /* the disk cache is optional; a missing route leaves the memory cache */
     }
+    try {
+      lodInstallRamWatch();
+    } catch (e) {
+      /* a run with no execution events simply does not release stand-ins */
+    }
     console.info(
       `[ANTs Tracker] v${VERSION} running. Open the panel with the gear on the floating button (or the one on the tracker's own node); ` +
         "window.__antsTracker.snapshot / .report give the same data from the console."
@@ -11453,6 +11967,7 @@ app.registerExtension({
       // it is the control that switches the tool off, so it has to be there when
       // everything else has been switched off.
       antsAttachNodeWidget(this);
+      antsUnlockNode(this);
       try {
         this.setDirtyCanvas(true, true);
       } catch (e) {
@@ -11504,8 +12019,14 @@ app.registerExtension({
 //  * Only pure compute can leave the main thread. Vue's render, the DOM, and
 //    canvas drawing cannot: they are main-thread-only by specification, and
 //    OffscreenCanvas only helps an application that created its canvas that way
-//    (ComfyUI does not). The worker lane exists for the pure-math parts, and it
-//    says so when it falls back to the main thread.
+//    (ComfyUI does not). A stand-in photograph is that draw — a worker cannot
+//    call it. The idle lane yields between slices so a drag is not blocked; it
+//    does not multithread the photograph. The worker lane exists for the
+//    pure-math parts, and it says so when it falls back to the main thread.
+//  * The Window button is window.open of this same page's panel, for a second
+//    monitor. It is not a second ComfyUI process. A blocked popup leaves the
+//    panel where it is and says so. Styles are copied into the new document;
+//    they do not follow a node that was only moved.
 //  * Worker functions cannot capture closures, which is why the lane takes a
 //    job name (or a self-contained function source) plus structured-cloneable
 //    arguments and nothing else.
