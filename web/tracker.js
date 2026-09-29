@@ -1,4 +1,4 @@
-// ANTs Nasty Bastards Tracker — frontend profiler for ComfyUI
+// ANTs Frontend Optimizer — frontend profiler for ComfyUI
 // ==========================================================
 // v2. Answers, in order of how often you need them:
 //   1. "How fast is the canvas actually redrawing, and how much of each frame
@@ -27,9 +27,17 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.4.1";
+const VERSION = "2.5.0";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
-const NODE_NAME = "ANTsNastyBastardsTracker";
+// The class key ComfyUI stores in a workflow. The old key is still recognised so
+// a graph saved before the rename does not lose this node.
+const NODE_NAME = "ANTs_Frontend_Optimizer";
+const NODE_NAME_ALIAS = "ANTsNastyBastardsTracker";
+
+function lodOwnNode(node) {
+  const t = node && (node.type || node.comfyClass);
+  return t === NODE_NAME || t === NODE_NAME_ALIAS;
+}
 
 // --- windows ---------------------------------------------------------------
 // Recent-cost window for hooks/node types. Short on purpose: "what is costing
@@ -858,11 +866,13 @@ function maybeWrapInstanceHooks(node) {
 //   * links are painted as straight lines while the graph is rectangles;
 //   * and while nobody is touching the page the redraw rate is capped, because
 //     the frame nobody is looking at is the cheapest frame on the page.
-// All three are opt-in and off by default. Any exception turns the mode back off
+// Replacing a node is on at 50% for a fresh install: that is the zoom a large
+// screen stops being able to read a live node. A saved "off" stays off, and
+// "Back to full drawing" is the way back. Any exception turns the mode back off
 // with the reason in the panel: a rendering change this tool cannot explain
 // would be worse than a slow frame.
 const LOD = {
-  flatBelow: 0, // paint every node as a rectangle below this zoom (0 = off)
+  flatBelow: 0.5, // replace every node with its thumbnail below this zoom (0 = off)
   legacyPx: 0, // a v2.1.8 "nodes under Npx" setting, carried over, shown once
   idleCapMs: 0, // while untouched, at most one redraw per this many ms (0 = off)
   nodes: 0, // node draws replaced by a rectangle
@@ -882,8 +892,8 @@ const LOD = {
   // Node snapshots — the ladder above taken one step further: the box is a
   // picture of the node. The literals here are LOD_SNAP_* defaults, which are
   // defined further down with the rest of this block's constants.
-  snapOn: false, // opt-in; nothing is captured or blitted while off
-  snapRatio: 2, // capture pixels per graph unit
+  snapOn: true, // the stand-in is a picture of the node; a fill is the fallback
+  snapRatio: 1, // capture pixels per graph unit. 1x is enough below 50% zoom
   snapMb: 512, // byte budget for stored bitmaps; the literal is LOD_SNAP_BUDGET_DEFAULT
   snapFrame: 0, // drawn frames since load: what "in use" is measured in
   snaps: null, // Map<node, record> in reuse order (a Map iterates in insertion order)
@@ -922,7 +932,17 @@ const LOD = {
   // Preview bitmaps. A 4096px image drawn into a 40px box on screen costs the
   // full-size upload and blit every redraw; past the zoom you set, the draw is
   // served from a cached copy of about the resolution the screen can show.
-  thumbZoom: 0.6, // substitute below this zoom (0 = never); 60% by default
+  thumbZoom: 0, // retired: the node picture is the thumbnail. Kept at 0 so a saved value cannot bring the drawImage path back
+  diskOn: true, // load and store those pictures under ComfyUI's temp folder
+  diskAsked: null, // Set of id+sig already requested this page
+  diskDead: false, // the route failed enough times; stay in memory
+  diskFail: 0,
+  diskLoaded: 0,
+  diskSaved: 0,
+  diskDir: "",
+  diskSwept: false,
+  snapMipDrawn: 0, // blits that used a half or quarter copy
+  snapMipSkipped: 0, // pictures kept at 1x because the budget could not hold the chain
   inNode: false, // true only while a node is being drawn
   imgSeen: 0, // drawImage calls for image-shaped sources inside a node
   imgThumb: 0, // served from a cached thumbnail
@@ -1057,7 +1077,7 @@ const LOD_BOX_PROGRESS_PX = 3; // a bar is at least this tall in CSS pixels
 // The ratio and the budget are provisional: the plan measures before fixing them
 // (K3), and the numbers are in the panel rather than in a claim.
 const LOD_SNAP_RATIOS = [1, 2, 3]; // capture pixels per graph unit
-const LOD_SNAP_RATIO_DEFAULT = 2; // 2 keeps a 200% display sharp at 100% zoom
+const LOD_SNAP_RATIO_DEFAULT = 1; // 1x is enough below 50% zoom; 2x and 3x are there if a capture is looked at near 100%
 // The budget ladder starts at 256 MiB and doubles to 2 GiB. Below 256 was removed
 // after a real report: a 1,041-node graph at 256 MiB held 255.6 MB, and every new
 // capture evicted a bitmap that was on screen (7,040 captures for 1,041 nodes),
@@ -1206,7 +1226,7 @@ function lodFlatNode(node, canvas) {
   if (!lodFlatOn(canvas)) return false;
   if (!node) return false;
   if (node.flags && node.flags.collapsed) return false;
-  if (node.type === NODE_NAME) return false;
+  if (lodOwnNode(node)) return false;
   if (lodVueNodesMode()) return false;
   return true;
 }
@@ -2245,7 +2265,7 @@ function viewApplyFocus(canvas) {
     // nodes are the exception to the exception: there the node *is* the element,
     // so it is left alone entirely — switching it off would be switching the node
     // off, and the widget-level gates are what cover that rendering mode.
-    const own = rec.node && rec.node.type === NODE_NAME;
+    const own = rec.node && lodOwnNode(rec.node);
     const widgetish = rec.via !== "root" && !own && !viewOwnAncestor(el, 8);
     const wantBox = rec.flat || rec.fovea || (inertOn && hideDom && widgetish);
     const wantInert = rec.fovea || (inertOn && widgetish);
@@ -2501,7 +2521,7 @@ function antsBuildTick(pill) {
 // does happens inside it, and nothing outside this tool knows it exists.
 function buildAntsNodeWidget() {
   const pill = el("div", { class: `ants-node-pill ${ANTS_OWN_CLASS}` });
-  pill.title = "ANTs Nasty Bastards Tracker — the switch on the left turns the hooks and the optimisations off, the gear opens the panel";
+  pill.title = "ANTs Frontend Optimizer — the switch on the left turns the hooks and the optimisations off, the gear opens the panel";
 
   const tick = antsBuildTick(pill);
   const gear = el("button", { class: "ants-node-btn ants-node-btn-gear", type: "button" });
@@ -2680,7 +2700,7 @@ function antsSetEnabled(on) {
 function viewWidgetsOff(node, canvas) {
   if (!S.enabled) return false;
   if (!node) return false;
-  if (node.type === NODE_NAME) return false;
+  if (lodOwnNode(node)) return false;
   const c = canvas || (typeof app !== "undefined" && app && app.canvas) || null;
   if (viewInertOn(c)) return true;
   if (!LOD.fovea) return false;
@@ -2950,7 +2970,8 @@ function lodSaveSettings() {
         snapMb: LOD.snapMb,
         snapExclude: LOD.snapExclude.slice(),
         detailZoom: LOD.detailZoom,
-        thumbZoom: LOD.thumbZoom,
+        thumbZoom: 0,
+        diskOn: !!LOD.diskOn,
         idleCapMs: LOD.idleCapMs,
         linkStyle: LOD.linkStyle,
         inertBelow: LOD.inertBelow,
@@ -2988,16 +3009,17 @@ function lodLoadSettings() {
     const legacyPx = saved.flatBelow === undefined ? Number(saved.minPx) || 0 : 0;
     lodSet({
       flatBelow: saved.flatBelow === undefined
-        ? (legacyPx > 0 ? lodZoomForPx(legacyPx) : 0)
+        ? (legacyPx > 0 ? lodZoomForPx(legacyPx) : 0.5)
         : Number(saved.flatBelow) || 0,
       legacyPx,
       boxDetail: saved.boxDetail === undefined ? LOD_BOX_DETAIL_DEFAULT : String(saved.boxDetail),
-      snapshots: !!saved.snapshots,
-      snapRatio: saved.snapRatio === undefined ? LOD_SNAP_RATIO_DEFAULT : Number(saved.snapRatio) || 0,
+      snapshots: saved.snapshots === undefined ? true : !!saved.snapshots,
+      snapRatio: saved.snapRatio === undefined ? LOD_SNAP_RATIO_DEFAULT : Number(saved.snapRatio) || 1,
       snapMb: saved.snapMb === undefined ? LOD_SNAP_BUDGET_DEFAULT : Number(saved.snapMb) || 0,
       snapExclude: Array.isArray(saved.snapExclude) ? saved.snapExclude : [],
       detailZoom: saved.detailZoom === undefined ? 0 : Number(saved.detailZoom) || 0,
-      thumbZoom: saved.thumbZoom === undefined ? 0.6 : Number(saved.thumbZoom) || 0,
+      thumbZoom: 0, // the drawImage ladder is retired; a saved value is not brought back
+      diskOn: saved.diskOn === undefined ? true : !!saved.diskOn,
       idleCapMs: Number(saved.idleCapMs) || 0,
       // Anything that is not an explicit "straight" means curves. A v2.1.9
       // "auto" record becomes "spline" and raises the note above.
@@ -3196,9 +3218,11 @@ function lodSet(opts) {
   }
   if ("idleCapMs" in o) LOD.idleCapMs = Math.max(0, Number(o.idleCapMs) || 0);
   if ("thumbZoom" in o) {
-    LOD.thumbZoom = Math.max(0, Math.min(1, Number(o.thumbZoom) || 0));
-    if (LOD.thumbZoom > 0) lodInstallDrawImage();
+    // Retired in v2.5.0. The node picture is the thumbnail. A scripted value is
+    // ignored so the old drawImage substitution cannot come back on.
+    LOD.thumbZoom = 0;
   }
+  if ("diskOn" in o) LOD.diskOn = !!o.diskOn;
   if ("detailZoom" in o) LOD.detailZoom = Math.max(0, Math.min(1, Number(o.detailZoom) || 0));
   if ("inertBelow" in o) {
     const z = Math.max(0, Math.min(1, Number(o.inertBelow) || 0));
@@ -3622,7 +3646,9 @@ function patchCanvasDraw() {
     );
   }
 
-  lodInstallDrawImage();
+  // The drawImage thumbnail ladder was retired in v2.5.0. The picture of the node
+  // is the thumbnail, and it replaces the node. Wrapping every drawImage on the
+  // page was the second system doing the same job.
 
   canvasPatched = true;
   return true;
@@ -3683,13 +3709,15 @@ function lodSnapLive(node, canvas) {
   try {
     if (!node) return true;
     if (node.selected) return true; // being worked on
-    if (node.mouseOver) return true; // under the pointer
+    // Hover is not live. A pictured node used to drop back to a painted box under
+    // the pointer, so the picture and the box both did the work. The picture stays.
+    // Select, drag, a link drag, a running bar and an error still draw live, so
+    // the node can still be worked on. The node stays clickable either way.
     if (node.has_errors) return true; // the error stroke is live state
     if (Number(node.progress) > 0) return true; // a running node draws a bar
     const c = canvas || null;
     if (c) {
       if (c.isDragging) return true; // dragging nodes/items: the geometry is moving
-      if (c.node_over === node) return true; // the frontend's own hover field
       if (c.connecting_node) return true; // a link is being dragged from a node
       const lc = c.linkConnector;
       if (lc && lc.renderLinks && lc.renderLinks.length) return true;
@@ -3718,7 +3746,7 @@ function lodSnapLive(node, canvas) {
 function lodSnapKeepLive(node) {
   try {
     if (!node) return "";
-    if (node.type === NODE_NAME) return "this tool's own node";
+    if (lodOwnNode(node)) return "this tool's own node";
     const type = node.type || node.comfyClass;
     if (type && LOD.snapExclude.indexOf(String(type)) >= 0) return `kept live by your list (${type})`;
   } catch (e) {
@@ -4018,18 +4046,25 @@ function lodSnapEnsure() {
   return true;
 }
 
+function lodSnapZeroCanvas(el) {
+  if (!el) return;
+  try {
+    el.width = 0;
+    el.height = 0;
+  } catch (e) {
+    /* a canvas that refuses to shrink is still dropped from the cache */
+  }
+}
+
 function lodSnapRelease(rec) {
   if (!rec) return;
-  if (rec.canvas) {
-    try {
-      // Zeroing the dimensions is what actually gives the pixels back; leaving a
-      // dead canvas referenced would keep the memory until GC felt like it.
-      rec.canvas.width = 0;
-      rec.canvas.height = 0;
-    } catch (e) {
-      /* a canvas that refuses to shrink is still dropped from the cache below */
+  if (rec.mips) {
+    for (const key of Object.keys(rec.mips)) {
+      if (rec.mips[key] && rec.mips[key] !== rec.canvas) lodSnapZeroCanvas(rec.mips[key]);
     }
+    rec.mips = null;
   }
+  lodSnapZeroCanvas(rec.canvas);
   LOD.snapBytes = Math.max(0, LOD.snapBytes - (Number(rec.bytes) || 0));
   rec.canvas = null;
   rec.bytes = 0;
@@ -4135,6 +4170,7 @@ function lodSnapPrune(canvas) {
     if (rec.canvas) lodSnapRelease(rec);
     LOD.snaps.delete(node);
     if (LOD.snapQueue) LOD.snapQueue.delete(node);
+    lodThumbDiskDelete(node);
     LOD.snapPruned++;
   }
 }
@@ -4249,6 +4285,7 @@ function lodSnapCancel() {
 function lodSnapCaptureNode(node, canvas) {
   lodSnapEnsure();
   let rec = LOD.snaps.get(node);
+  if (rec && rec.diskPending) return false; // a disk load is in flight; don't photograph twice
   if (rec && (rec.canvas || rec.blocked || rec.failed)) return false;
   const whyLive = lodSnapKeepLive(node);
   if (whyLive) {
@@ -4390,6 +4427,8 @@ function lodSnapCaptureNode(node, canvas) {
   LOD.snapBytes += rec.bytes;
   LOD.snapCaptured++;
   LOD.snapFailStreak = 0;
+  lodSnapAttachMips(rec);
+  lodThumbDiskSave(node, rec);
   if (coarse) LOD.snapCoarse++;
   else if (made.ratio < want) LOD.snapFit++;
   if (lodSnapPartial(node)) LOD.snapPartial++;
@@ -4474,11 +4513,314 @@ function lodSnapSlice() {
 // Called from the draw path for a node that has just been painted as a box: it is
 // a candidate. Cheap in the steady state (one map lookup for a node that already
 // has a bitmap) and never runs while the mode is off.
+// Canvas2D has no mipmap format drawImage can sample, and a WebGL mip chain
+// cannot be handed to LiteGraph's 2D canvas. The 1x capture is downscaled here
+// to 1/2 and 1/4, and the blit picks the smallest copy whose longest side still
+// covers the on-screen device pixels. 1/4 is used only when the screen cannot
+// show the extra pixels — around 10% zoom and below on a 200% display, not at 20%.
+function lodSnapMips(canvas) {
+  const mips = { 1: canvas };
+  if (!canvas || !canvas.width || !canvas.height) return mips;
+  const doc = typeof document !== "undefined" ? document : null;
+  if (!doc || typeof doc.createElement !== "function") return mips;
+  for (const scale of [0.5, 0.25]) {
+    const w = Math.max(1, Math.round(canvas.width * scale));
+    const h = Math.max(1, Math.round(canvas.height * scale));
+    if (w >= canvas.width && h >= canvas.height) continue;
+    try {
+      const c = doc.createElement("canvas");
+      c.width = w;
+      c.height = h;
+      const ctx = c.getContext("2d");
+      if (!ctx || typeof ctx.drawImage !== "function") continue;
+      if ("imageSmoothingEnabled" in ctx) ctx.imageSmoothingEnabled = true;
+      if ("imageSmoothingQuality" in ctx) ctx.imageSmoothingQuality = "low";
+      ctx.drawImage(canvas, 0, 0, w, h);
+      mips[scale] = c;
+    } catch (e) {
+      /* a missing level means the blit uses the next larger copy */
+    }
+  }
+  return mips;
+}
+
+function lodSnapPick(rec, canvas) {
+  const full = rec && rec.canvas;
+  if (!full) return null;
+  const mips = rec.mips;
+  if (!mips) return full;
+  let zoom = 1;
+  try {
+    zoom = lodZoomOf(canvas);
+  } catch (e) {
+    zoom = 1;
+  }
+  let dpr = 1;
+  try {
+    dpr = Number(viewDisplayScale()) || 1;
+  } catch (e) {
+    dpr = 1;
+  }
+  const need = Math.max(1, Math.max(Number(rec.w) || 0, Number(rec.h) || 0) * (zoom > 0 ? zoom : 1) * dpr);
+  let best = full;
+  let bestSide = Math.max(full.width || 0, full.height || 0);
+  for (const scale of [0.25, 0.5]) {
+    const c = mips[scale];
+    if (!c) continue;
+    const side = Math.max(c.width || 0, c.height || 0);
+    if (side >= need && side < bestSide) {
+      best = c;
+      bestSide = side;
+    }
+  }
+  return best;
+}
+
+function lodSnapAttachMips(rec) {
+  if (!rec || !rec.canvas || rec.mips) return;
+  const mips = lodSnapMips(rec.canvas);
+  let extra = 0;
+  for (const scale of [0.5, 0.25]) {
+    const c = mips[scale];
+    if (c) extra += c.width * c.height * 4;
+  }
+  if (!extra) {
+    rec.mips = mips;
+    return;
+  }
+  // The 1x picture is already in the budget. The chain is kept only if the extra
+  // fits without taking a picture off the screen.
+  if (!lodSnapMakeRoom(extra)) {
+    for (const scale of [0.5, 0.25]) lodSnapZeroCanvas(mips[scale]);
+    LOD.snapMipSkipped++;
+    return;
+  }
+  rec.mips = mips;
+  rec.bytes = (Number(rec.bytes) || 0) + extra;
+  LOD.snapBytes += extra;
+}
+
+const THUMB_DISK_PREFIX = "/ants_optimizer/thumbs";
+
+function lodThumbId(node) {
+  try {
+    if (!node || node.id == null || node.id === "") return "";
+    return String(node.id).replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 80);
+  } catch (e) {
+    return "";
+  }
+}
+
+function lodThumbDiskNoteFail() {
+  LOD.diskFail = (LOD.diskFail || 0) + 1;
+  if (LOD.diskFail > 8) LOD.diskDead = true;
+}
+
+function lodThumbDiskSweep() {
+  if (!LOD.diskOn || LOD.diskSwept) return;
+  LOD.diskSwept = true;
+  try {
+    if (typeof fetch !== "function") return;
+    fetch(THUMB_DISK_PREFIX + "/sweep", { method: "POST" }).catch(() => {});
+    fetch(THUMB_DISK_PREFIX + "/info")
+      .then((res) => (res && res.ok && typeof res.json === "function" ? res.json() : null))
+      .then((body) => {
+        if (body && body.dir) LOD.diskDir = String(body.dir);
+      })
+      .catch(() => {});
+  } catch (e) {
+    /* no route: the memory cache continues */
+  }
+}
+
+function lodThumbDiskDelete(node) {
+  if (!LOD.diskOn) return;
+  const id = lodThumbId(node);
+  if (!id) return;
+  try {
+    if (typeof fetch !== "function") return;
+    fetch(THUMB_DISK_PREFIX + "/" + encodeURIComponent(id), { method: "DELETE" }).catch(() => {});
+  } catch (e) {
+    /* a missing route does not keep a deleted node's picture on screen */
+  }
+}
+
+function lodThumbDiskSave(node, rec) {
+  if (!LOD.diskOn || LOD.diskDead || !rec || !rec.canvas || !rec.sig || rec.fromDisk) return;
+  const id = lodThumbId(node);
+  if (!id) return;
+  const canvas = rec.canvas;
+  const sig = rec.sig;
+  const send = (blob) => {
+    if (!blob) return;
+    try {
+      fetch(THUMB_DISK_PREFIX + "/" + encodeURIComponent(id) + "?sig=" + encodeURIComponent(sig), {
+        method: "PUT",
+        body: blob,
+        headers: { "Content-Type": blob.type || "image/png" },
+      })
+        .then((res) => {
+          if (res && res.ok) LOD.diskSaved++;
+          else lodThumbDiskNoteFail();
+        })
+        .catch(() => lodThumbDiskNoteFail());
+    } catch (e) {
+      lodThumbDiskNoteFail();
+    }
+  };
+  try {
+    if (typeof canvas.toBlob === "function") {
+      canvas.toBlob(send, "image/png");
+    }
+  } catch (e) {
+    /* no toBlob: the memory picture still stands */
+  }
+}
+
+function lodThumbDiskInstall(node, canvas, sig, blob) {
+  const paint = (bmp) => {
+    try {
+      let live = "";
+      try {
+        live = lodSnapSignature(node, canvas);
+      } catch (e) {
+        return;
+      }
+      if (live !== sig) return;
+      const cur = LOD.snaps && LOD.snaps.get(node);
+      if (cur && cur.canvas) return;
+      const doc = typeof document !== "undefined" ? document : null;
+      if (!doc) return;
+      const el = doc.createElement("canvas");
+      const w = Number(bmp && (bmp.width || bmp.naturalWidth)) || 0;
+      const h = Number(bmp && (bmp.height || bmp.naturalHeight)) || 0;
+      if (!w || !h) return;
+      el.width = w;
+      el.height = h;
+      const ctx = el.getContext("2d");
+      if (!ctx) return;
+      ctx.drawImage(bmp, 0, 0);
+      const geom = lodSnapGeometry(node);
+      if (!geom) return;
+      const mips = lodSnapMips(el);
+      let bytes = w * h * 4;
+      for (const scale of [0.5, 0.25]) {
+        const c = mips[scale];
+        if (c) bytes += c.width * c.height * 4;
+      }
+      if (!lodSnapMakeRoom(bytes)) {
+        lodSnapZeroCanvas(el);
+        return;
+      }
+      const rec = cur || { sig: "", checkedAt: 0, bytes: 0, canvas: null };
+      rec.canvas = el;
+      rec.mips = mips;
+      rec.x = geom.x;
+      rec.y = geom.y;
+      rec.w = geom.w;
+      rec.h = geom.h;
+      rec.bytes = bytes;
+      rec.sig = sig;
+      rec.checkedAt = nowMs();
+      rec.at = rec.checkedAt;
+      rec.usedFrame = LOD.snapFrame;
+      rec.shadows = !!(canvas && canvas.render_shadows);
+      rec.ratio = 1;
+      rec.blocked = false;
+      rec.failed = false;
+      rec.diskPending = false;
+      rec.fromDisk = true;
+      lodSnapEnsure();
+      LOD.snaps.delete(node);
+      LOD.snaps.set(node, rec);
+      LOD.snapBytes += bytes;
+      LOD.diskLoaded++;
+      if (LOD.snapQueue) LOD.snapQueue.delete(node);
+      try {
+        if (bmp && typeof bmp.close === "function") bmp.close();
+      } catch (e) {
+        /* the canvas holds the pixels */
+      }
+    } catch (e) {
+      /* a bad file is a miss: the idle lane will photograph */
+    }
+  };
+  try {
+    if (typeof createImageBitmap === "function") {
+      Promise.resolve(createImageBitmap(blob)).then(paint).catch(() => {});
+    }
+  } catch (e) {
+    /* no decoder: capture instead */
+  }
+}
+
+function lodThumbDiskAsk(node, canvas) {
+  if (!LOD.diskOn || LOD.diskDead) return false;
+  const id = lodThumbId(node);
+  if (!id) return false;
+  let sig = "";
+  try {
+    sig = lodSnapSignature(node, canvas);
+  } catch (e) {
+    return false;
+  }
+  if (!sig) return false;
+  if (!LOD.diskAsked) LOD.diskAsked = new Set();
+  const key = id + "\0" + sig;
+  if (LOD.diskAsked.has(key)) return false;
+  LOD.diskAsked.add(key);
+  lodSnapEnsure();
+  let rec = LOD.snaps.get(node);
+  if (rec && rec.canvas) return false;
+  if (!rec) {
+    rec = { sig: "", checkedAt: 0, bytes: 0, canvas: null, diskPending: true };
+    LOD.snaps.set(node, rec);
+  } else {
+    rec.diskPending = true;
+  }
+  let pending = null;
+  try {
+    if (typeof fetch !== "function") {
+      rec.diskPending = false;
+      return false;
+    }
+    pending = fetch(THUMB_DISK_PREFIX + "/" + encodeURIComponent(id) + "?sig=" + encodeURIComponent(sig));
+  } catch (e) {
+    rec.diskPending = false;
+    return false;
+  }
+  Promise.resolve(pending)
+    .then((res) => {
+      if (!res || !res.ok || typeof res.blob !== "function") return null;
+      return res.blob();
+    })
+    .then((blob) => {
+      rec.diskPending = false;
+      if (!blob) {
+        if (LOD.snapQueue) LOD.snapQueue.add(node);
+        lodSnapPump();
+        return;
+      }
+      lodThumbDiskInstall(node, canvas, sig, blob);
+    })
+    .catch(() => {
+      rec.diskPending = false;
+      lodThumbDiskNoteFail();
+      if (LOD.snapQueue) LOD.snapQueue.add(node);
+      lodSnapPump();
+    });
+  return true;
+}
+
 function lodSnapEnqueue(node, canvas) {
   if (!lodSnapOn(canvas)) return;
   lodSnapEnsure();
   const rec = LOD.snaps.get(node);
+  if (rec && rec.diskPending) return;
   if (rec && (rec.canvas || rec.blocked || rec.failed)) return;
+  if (!rec || !rec.canvas) {
+    if (lodThumbDiskAsk(node, canvas)) return;
+  }
   // A node refused for budget waits: retrying it every slice would burn the lane
   // and change nothing until something goes cold.
   if (rec && Number.isFinite(rec.budgetFullAt) && nowMs() - rec.budgetFullAt < LOD_SNAP_HOLD_MS) return;
@@ -4542,7 +4884,9 @@ function lodSnapPaint(node, canvas, ctx) {
   }
   ctx.shadowColor = "transparent"; // the image carries its own shadows
   ctx.globalAlpha = 1; // and its own alpha (a muted node was captured dimmed)
-  ctx.drawImage(rec.canvas, rec.x, rec.y, rec.w, rec.h);
+  const src = lodSnapPick(rec, canvas);
+  ctx.drawImage(src || rec.canvas, rec.x, rec.y, rec.w, rec.h);
+  if (src && src !== rec.canvas) LOD.snapMipDrawn++;
   rec.usedFrame = LOD.snapFrame; // this frame is looking at it
   // Reuse order: the most recently used bitmap is the last to be evicted.
   LOD.snaps.delete(node);
@@ -6539,10 +6883,11 @@ const STYLE = `
 .ants-pill.ants-bad { border-color: #7a3030; color: #d08a8a; }
 .ants-pill.ants-bad b { color: #ff6b6b; }
 .ants-pill.ants-ok b { color: #7ed07e; }
-#ants-tracker-tabs { display: flex; border-bottom: 1px solid #3a3a42; background: #202024; }
+#ants-tracker-tabs { display: flex; flex-wrap: wrap; border-bottom: 1px solid #3a3a42; background: #202024; }
 #ants-tracker-tabs button {
-  flex: 1; background: none; border: none; color: #999; padding: 6px 2px;
+  flex: 1 1 auto; background: none; border: none; color: #999; padding: 6px 4px;
   cursor: pointer; font-size: 11px; border-bottom: 2px solid transparent;
+  white-space: normal; line-height: 1.2;
 }
 #ants-tracker-tabs button.active { color: #f0a020; border-bottom-color: #f0a020; }
 #ants-tracker-tabs button .ants-badge {
@@ -6604,6 +6949,17 @@ tr.ants-details table.ants-sub td { color: #bbb; }
   background: #202024; color: #eee; border: 1px solid #444; border-radius: 4px;
   padding: 4px 8px; font-size: 12px; width: 100%; max-width: 380px;
 }
+/* One setting, one row: name, control, a short line under both. The long text
+   lives on the name's hover, the way a profile inspector lays a setting out. */
+.ants-set {
+  display: grid; grid-template-columns: minmax(148px, 34%) minmax(160px, 1fr);
+  gap: 2px 12px; align-items: center;
+  padding: 8px 0; border-bottom: 1px solid #2a2a32;
+}
+.ants-set-name { color: #eee; font-size: 12px; font-weight: 600; }
+.ants-set-ctrl { min-width: 0; }
+.ants-set-ctrl .ants-select { max-width: 100%; }
+.ants-set-desc { grid-column: 1 / -1; color: #8b8b96; font-size: 11px; line-height: 1.35; margin: 0; }
 /* Elements of a node that is currently drawn as a rectangle: see lodSweepDom. */
 .ants-lod-box { display: none !important; }
 .ants-off-note {
@@ -6988,7 +7344,7 @@ function buildPanel() {
   const header = el("div", { id: "ants-tracker-header" });
   const title = el("span");
   title.appendChild(el("b", { text: "ANTs" }));
-  title.appendChild(document.createTextNode(` Nasty Bastards Tracker v${VERSION}`));
+  title.appendChild(document.createTextNode(` Frontend Optimizer v${VERSION}`));
   const actions = el("div", { class: "ants-actions" });
   const copyBtn = el("span", {
     class: "ants-hbtn",
@@ -7060,7 +7416,7 @@ function buildPanel() {
   const tabsBar = el("div", { id: "ants-tracker-tabs" });
   const tabsBody = el("div", { id: "ants-tracker-body" });
   for (const [name, label] of [
-    ["tweaks", "Tweaks"],
+    ["tweaks", "Node Rendering Settings"],
     ["timing", "Timing"],
     ["nodes", "Nodes"],
     ["stalls", "Stalls"],
@@ -7507,147 +7863,148 @@ function buildTweaksTab(container) {
   // budget above is usually not a scheduling problem: on a big graph at low
   // zoom, the cost is a thousand nodes drawn properly several times a second,
   // and culling cannot remove a node that is inside the viewport.
-  container.appendChild(el("div", { class: "ants-section-title", text: "Low-zoom drawing (experiment)" }));
+  container.appendChild(el("div", { class: "ants-section-title", text: "Node rendering" }));
 
-  const lodFlatSel = el("select", { class: "ants-select", style: { width: "auto", maxWidth: "240px" } });
+  function settingRow(name, control, desc, hover) {
+    const row = el("div", { class: "ants-set" });
+    const label = el("div", { class: "ants-set-name", text: name });
+    if (hover) {
+      label.title = hover;
+      if (control) control.title = hover;
+    }
+    row.appendChild(label);
+    const ctrl = el("div", { class: "ants-set-ctrl" });
+    if (control) ctrl.appendChild(control);
+    row.appendChild(ctrl);
+    if (desc) row.appendChild(el("div", { class: "ants-set-desc", text: desc }));
+    container.appendChild(row);
+    return row;
+  }
+
+  const lodFlatSel = el("select", { class: "ants-select" });
   for (const z of LOD_FLAT_ZOOM) {
     const opt = el("option", {
-      text: z === 0 ? "draw every node in full" : `flat nodes below ${Math.round(z * 100)}% zoom`,
+      text: z === 0 ? "off — draw every node" : `below ${Math.round(z * 100)}%`,
     });
     opt.value = String(z);
     lodFlatSel.appendChild(opt);
   }
   lodFlatSel.value = String(LOD.flatBelow);
-  lodFlatSel.title =
-    "Below this zoom every node is painted as its background colour only: no border, title, slots, widgets or previews — and " +
-    "anything DOM-shaped on those nodes (image previews, curve editors, 3D viewports, custom node UIs) is hidden with them. " +
-    "It is a zoom, not a node size, on purpose: a node whose own UI hides, greys or adds a widget changes its size while you are " +
-    "looking at it, so a per-node pixel rule flattens the same node on one frame and draws it in full on the next, and the nodes " +
-    "that move are exactly the dynamic-UI ones. A zoom is a property of the camera — every node is classified the same way, once " +
-    "per frame — and nothing at all is touched above it. Collapsed nodes and this tool's own node are never flattened. Nothing " +
-    "about the graph changes; only how it is painted.";
   lodFlatSel.addEventListener("change", () => {
     lodSet({ flatBelow: Number(lodFlatSel.value) });
     lodUpdate();
   });
+  settingRow(
+    "Replace nodes with thumbnails",
+    lodFlatSel,
+    "Below this zoom a node is one picture instead of a live draw. Hover keeps the picture. Select, drag, a running bar or an error still draws live.",
+    "A zoom, not a node size. A node whose own UI hides or adds a widget changes size while you look at it, and a per-node pixel rule then flips that node in and out of the stand-in. A zoom classifies every node the same way, once per frame. Collapsed nodes and this tool's own node are never replaced. Nothing about the graph changes. Off, or Back to full drawing, restores ComfyUI's own draw. The node stays clickable either way."
+  );
 
-  // What those rectangles are allowed to say. It sits directly under the flatten
-  // control because it is about the same thing: the box a node becomes. It can
-  // never change *which* nodes become boxes — that stays a zoom — and every mark
-  // comes from a field on the node itself.
-  const lodBoxSel = el("select", { class: "ants-select", style: { width: "auto", maxWidth: "280px" } });
+  const lodStandSel = el("select", { class: "ants-select" });
   for (const [id, text] of [
-    ["plain", "boxes: plain fill (as before)"],
-    ["title", "boxes: + the node's title bar colour"],
-    ["state", "boxes: + title, error ring, progress bar, muted dim"],
+    ["plain", "plain fill"],
+    ["title", "title bar colour"],
+    ["state", "title, error ring, progress, muted"],
+    ["picture", "picture of the node"],
   ]) {
     const opt = el("option", { text });
     opt.value = id;
-    lodBoxSel.appendChild(opt);
+    lodStandSel.appendChild(opt);
   }
-  lodBoxSel.value = LOD.boxDetail;
-  lodBoxSel.title =
-    "How much a flat box says about the node it stands for. Only ever affects a node that is already being painted as a box (so it does " +
-    "nothing while the setting above is off, and it can never flatten a node on its own). Every mark is read from the node itself, never " +
-    "guessed: the title bar uses the node's own title colour, drawn where LiteGraph draws it; the error ring is the frontend's own error " +
-    "stroke at its own width and padding; the progress bar is the frontend's own bar, green, `progress` wide, with a floor of a few screen " +
-    "pixels so it survives a low zoom; the dimming uses the frontend's own alphas for a muted (40%), bypassed (20%) or ghosted (30%) node. " +
-    "Each mark is one more rectangle call per node per frame, and the readout below counts them, so the extra calls are visible rather " +
-    "than assumed (the harness cannot price a fillRect, so no ms figure is claimed for them here). 'plain' is exactly what this tool " +
-    "painted before the setting existed.";
-  lodBoxSel.addEventListener("change", () => {
-    lodSet({ boxDetail: lodBoxSel.value });
+  lodStandSel.value = LOD.snapOn ? "picture" : LOD.boxDetail;
+  lodStandSel.addEventListener("change", () => {
+    const v = lodStandSel.value;
+    if (v === "picture") lodSet({ snapshots: true });
+    else lodSet({ snapshots: false, boxDetail: v });
     lodUpdate();
   });
+  settingRow(
+    "Stand-in",
+    lodStandSel,
+    "What replaces the node. A picture is a bitmap of the node itself. Until one is ready, the painted fill stands in.",
+    "Plain, title and state are painted rectangles. They never decide which nodes are replaced — the zoom above does. A picture is captured once while the page is idle and drawn in the node's place, the same way a box was. Image previews are not a second system: the picture is the preview, and it replaces the node, not a box inside it. A node that draws nothing into the canvas keeps the fill, because a transparent picture would erase it. Switching to a fill releases the stored bitmaps."
+  );
 
-  // Node snapshots: the same box, but a picture of the node instead of a fill.
-  const snapSel = el("select", { class: "ants-select", style: { width: "auto", maxWidth: "280px" } });
-  for (const [id, text] of [
-    ["off", "boxes: painted rectangles (off)"],
-    ["on", "boxes: pictures of the nodes (snapshots)"],
-  ]) {
-    const opt = el("option", { text });
-    opt.value = id;
-    snapSel.appendChild(opt);
-  }
-  snapSel.value = LOD.snapOn ? "on" : "off";
-  snapSel.title =
-    "Paint a flat box as a bitmap of the node it stands for, captured once while the page is idle, instead of a plain rectangle. It only ever " +
-    "replaces a box: the flatten setting above decides which nodes stop being drawn in full, and this can never change that. Every node the " +
-    "canvas draws is captured, including the ones other tools refuse: a widget that is a DOM element, an image preview or a custom widget means " +
-    "the picture is the canvas part only (the browser draws the rest over the node), and the readout counts those. A node whose own draw leaves " +
-    "the canvas empty keeps its box instead — a transparent picture would erase it — as does a node that is selected, hovered, broken, " +
-    "running or being dragged, one whose own capture took longer than " + LOD_SNAP_SLOW_MS + "ms, one too big for a " + LOD_SNAP_MAX_DIM +
-    "px capture at any ratio, and one whose drawing changes before every picture can be drawn (the churn guard). The readout names them, which " +
-    "is more use than the count. Anything else that changes what a node draws changes its signature, and a bitmap whose signature no longer " +
-    "matches is dropped, not shown. Panning and zooming deliberately do not invalidate anything: the camera moves, the node does not. When the " +
-    "budget is full of pictures that are being drawn, a capture is made coarser (1x) if that fits, and only refused if it does not — taking " +
-    "one of those pictures away is what visible flicker is, and the readout counts both. Switching this off releases every stored bitmap " +
-    "immediately.";
-  snapSel.addEventListener("change", () => {
-    lodSet({ snapshots: snapSel.value === "on" });
-    lodUpdate();
-  });
-
-  const snapRatioSel = el("select", { class: "ants-select", style: { width: "auto", maxWidth: "240px" } });
+  const snapRatioSel = el("select", { class: "ants-select" });
   for (const r of LOD_SNAP_RATIOS) {
     const opt = el("option", { text: `capture ${r}x per graph unit` });
     opt.value = String(r);
     snapRatioSel.appendChild(opt);
   }
   snapRatioSel.value = String(LOD.snapRatio);
-  snapRatioSel.title =
-    "How many pixels each graph unit gets in a stored bitmap. At 2x a 200-unit node is 400 px wide, which stays sharp on a 200% display at " +
-    "100% zoom; at 1x the bitmap is half that and costs a quarter of the memory. This changes only when a node is captured (or recaptured), " +
-    "never what the page draws live. A node too big for the " + LOD_SNAP_MAX_DIM + "px cap at this ratio is captured at the largest lower " +
-    "ratio that fits instead of being skipped, and the readout counts those. Worth measuring, not assuming: at the zooms where nodes are " +
-    "flattened (below the threshold above) a picture is drawn at half size or less, so 1x already has more pixels than the screen shows — " +
-    "2x and 3x buy sharpness only for the foveated margin at a high zoom, and cost four and nine times the memory.";
   snapRatioSel.addEventListener("change", () => {
     lodSet({ snapRatio: Number(snapRatioSel.value) || 0 });
-    if (LOD.snapOn) lodSnapClear("ratio"); // every stored bitmap is at the old ratio
+    if (LOD.snapOn) lodSnapClear("ratio");
     lodUpdate();
   });
+  settingRow(
+    "Capture scale",
+    snapRatioSel,
+    "Stored at this many pixels per graph unit. 1x is the default. Half and quarter copies are made from it and chosen by how big the node is on screen.",
+    "The graph canvas is Canvas2D. It has no mipmap format drawImage can sample, and a WebGL mip chain cannot be handed to it. The 1x capture is downscaled here to 1/2 and 1/4, and the blit uses the smallest copy whose longest side still covers the on-screen device pixels: node size times zoom times display scale. At 20% zoom on a 200% display a typical node needs the half copy. The quarter copy is only used when the screen cannot show those extra pixels, which is around 10% and below. 2x and 3x cost four and nine times the memory and only help near 100% zoom."
+  );
 
-  const snapMbSel = el("select", { class: "ants-select", style: { width: "auto", maxWidth: "220px" } });
+  const snapMbSel = el("select", { class: "ants-select" });
   for (const mb of LOD_SNAP_BUDGETS) {
     const opt = el("option", { text: `bitmap budget ${mb} MiB` });
     opt.value = String(mb);
     snapMbSel.appendChild(opt);
   }
   snapMbSel.value = String(LOD.snapMb);
-  snapMbSel.title =
-    "How much memory the stored bitmaps may hold. A picture that is being drawn is never released to make room: releasing one that is on " +
-    "screen is exactly what makes pictures and boxes flicker, so when the budget is full of pictures that are in use, a new capture is made " +
-    "coarser (1x, a quarter of the memory) if that fits, and otherwise refused — those nodes stay boxes, and the readout below counts both " +
-    "the coarse pictures and the refusals, with the names of the nodes behind them. What does get released are the pictures of nodes that have " +
-    "stopped being drawn for a couple of frames: nodes off screen, or a graph you have switched away from. Releasing zeroes the canvas, so " +
-    "the pixels go back to the browser rather than waiting for a collection. The ladder starts at 256 MiB because below that a large graph " +
-    "only thrashes (a 1,041-node graph at 256 MiB was measured capturing 7,040 times for 1,041 nodes, at the cap the whole time), and it " +
-    "stops at 2 GiB. What one picture costs: (node width + 48) x (node height + 78) x 4 bytes x ratio squared - a 200x100 node is about " +
-    "176 KB at 2x, a 1000x600 node about 4 MB - and this is canvas memory outside the JS heap, so the Memory tab, which reports the heap, " +
-    "cannot see it. The readout below says what is actually held.";
   snapMbSel.addEventListener("change", () => {
     lodSet({ snapMb: Number(snapMbSel.value) || 0 });
     lodUpdate();
   });
+  settingRow(
+    "Memory budget",
+    snapMbSel,
+    "How much canvas memory the pictures may hold. A picture that is on screen is not released to make room.",
+    "Releasing a picture that is being drawn is what flicker looks like. When the budget is full of those, a new capture is made coarser if that fits, and otherwise refused — those nodes stay fills. What does get released are pictures of nodes that have stopped being drawn. This is canvas memory outside the JS heap, so the Memory tab cannot see it. The status line says what is actually held."
+  );
 
-  const lodIdleSel = el("select", { class: "ants-select", style: { width: "auto", maxWidth: "240px" } });
+  const diskSel = el("select", { class: "ants-select" });
+  for (const [id, text] of [
+    ["on", "on"],
+    ["off", "off — memory only"],
+  ]) {
+    const opt = el("option", { text });
+    opt.value = id;
+    diskSel.appendChild(opt);
+  }
+  diskSel.value = LOD.diskOn ? "on" : "off";
+  diskSel.addEventListener("change", () => {
+    lodSet({ diskOn: diskSel.value === "on" });
+    lodUpdate();
+  });
+  settingRow(
+    "Keep on disk",
+    diskSel,
+    "Loaded from ComfyUI's temp/ANTs_Frontend_Optimizer_THUMBNAILS next time, keyed by node id and a signature of what it draws. A change overwrites the file. Deleting the node deletes the file. Files older than a week are removed.",
+    "The page cannot write a folder itself. The route writes under the running ComfyUI temp directory. The folder is detected from ComfyUI's own temp path, or from this pack's location if that import is missing. A signature mismatch is not shown: the node is photographed again and the old file is replaced. If the route is missing, the memory cache continues and nothing is written."
+  );
+
+  const lodIdleSel = el("select", { class: "ants-select" });
   for (const ms of LOD_IDLE_CAP_MS) {
     const opt = el("option", { text: ms === 0 ? "redraw as often as asked" : `${Math.round(1000 / ms)}/s while nothing is touched` });
     opt.value = String(ms);
     lodIdleSel.appendChild(opt);
   }
   lodIdleSel.value = String(LOD.idleCapMs);
-  lodIdleSel.title =
-    "While no pointer, wheel or key event has arrived for a moment, redraws are rate-limited to this — a rate limit, not " +
-    "data loss: the last request of a burst still gets one trailing redraw. Touch the page and the cap is lifted instantly.";
   lodIdleSel.addEventListener("change", () => {
     lodSet({ idleCapMs: Number(lodIdleSel.value) });
     lodUpdate();
   });
+  settingRow(
+    "Idle redraw cap",
+    lodIdleSel,
+    "While nobody is touching the page, redraws are limited to this rate. Touch the page and the cap lifts at once.",
+    "A rate limit, not data loss: the last request of a burst still gets one trailing redraw. It does not change what a node or a link looks like."
+  );
 
-  const lodLinkSel = el("select", { class: "ants-select", style: { width: "auto", maxWidth: "260px" } });
+  container.appendChild(el("div", { class: "ants-section-title", text: "Links" }));
+
+  const lodLinkSel = el("select", { class: "ants-select" });
   for (const [id, text] of [
     ["spline", "links: keep every curve"],
     ["straight", "links: always straight lines"],
@@ -7657,18 +8014,18 @@ function buildTweaksTab(container) {
     lodLinkSel.appendChild(opt);
   }
   lodLinkSel.value = LOD.linkStyle;
-  lodLinkSel.title =
-    "The shape of a link, and only that. \"Keep every curve\" draws links the way ComfyUI draws them, at every zoom, whatever the node " +
-    "setting is doing \u2014 combine it with the thinning setting below to pay less for the curves instead of losing their shape. " +
-    "\"Always straight lines\" is for graphs that were drawn with straight links to begin with. Nothing here touches nodes: the node " +
-    "setting decides what a node costs, this decides a link's shape, thinning decides how much ink that shape uses, and none of the " +
-    "three can change another's subject.";
   lodLinkSel.addEventListener("change", () => {
     lodSet({ linkStyle: lodLinkSel.value });
     lodUpdate();
   });
+  settingRow(
+    "Link shape",
+    lodLinkSel,
+    "The shape of a link, and only that. It never paints a node.",
+    "Keep every curve draws links the way ComfyUI draws them, at every zoom, whatever the node setting is doing. Always straight lines is for graphs that were drawn with straight links to begin with."
+  );
 
-  const lodDetailSel = el("select", { class: "ants-select", style: { width: "auto", maxWidth: "260px" } });
+  const lodDetailSel = el("select", { class: "ants-select" });
   for (const z of LOD_DETAIL_ZOOMS) {
     const opt = el("option", {
       text: z === 0 ? "full link and node detail" : `links thinned below ${Math.round(z * 100)}% zoom`,
@@ -7677,230 +8034,175 @@ function buildTweaksTab(container) {
     lodDetailSel.appendChild(opt);
   }
   lodDetailSel.value = String(LOD.detailZoom);
-  lodDetailSel.title =
-    "Below this zoom, links are stroked 1px wide instead of 3 and lose the dark outline drawn under them (a second stroke 4 units " +
-    "wider, which on a long link is most of the ink) \u2014 the curves are kept exactly as they are, because straight lines destroy " +
-    "the shape of a workflow built out of splines. This setting changes link ink and nothing else: it does not flatten a node, does not " +
-    "hide a widget, and does not touch the frame's own quality flag. The two values are put back as soon as the link is drawn.";
   lodDetailSel.addEventListener("change", () => {
     lodSet({ detailZoom: Number(lodDetailSel.value) });
     lodUpdate();
   });
+  settingRow(
+    "Link thinning",
+    lodDetailSel,
+    "Below this zoom, links are stroked 1px wide instead of 3 and lose the dark outline. The curves stay where they were. Link ink and nothing else.",
+    "This setting changes link ink and nothing else: it does not flatten a node, does not hide a widget, and does not touch the frame's own quality flag. The two values are put back as soon as the link is drawn. It does not reach the frontend walking every input slot of every node before it decides which links are on screen."
+  );
 
-  const lodThumbSel = el("select", { class: "ants-select", style: { width: "auto", maxWidth: "240px" } });
-  for (const z of LOD_THUMB_ZOOMS) {
-    const opt = el("option", {
-      text: z === 0 ? "previews drawn full size" : `previews as thumbnails below ${Math.round(z * 100)}% zoom`,
-    });
-    opt.value = String(z);
-    lodThumbSel.appendChild(opt);
-  }
-  lodThumbSel.value = String(LOD.thumbZoom);
-  lodThumbSel.title =
-    "Image, preview and compare nodes keep a full-resolution bitmap on the canvas and blit it into a box that may be forty " +
-    "pixels wide. Below this zoom they are served from a cached copy of about the resolution the screen can show (64, 128, " +
-    "256, 512, 1024 or 2048px on the long side), scaled to the same rectangle. The graph is not touched — only the bitmap that " +
-    "gets uploaded per redraw, and the first frame after a zoom change still draws the full image while the copy is made.";
-  lodThumbSel.addEventListener("change", () => {
-    lodSet({ thumbZoom: Number(lodThumbSel.value) });
+  const lodAbBtn = el("button", { class: "ants-btn", text: "Measure link thinning" });
+  lodAbBtn.addEventListener("click", () => {
+    if (LOD.ab && !LOD.ab.done) return;
+    lodAbStart();
     lodUpdate();
   });
+  settingRow(
+    "Measure it",
+    lodAbBtn,
+    "Alternates thinning on and off on this page and compares the two halves. Nothing is saved. The setting is put back at the end.",
+    "Answers whether this setting is doing anything here by measuring instead of arguing. One second each, three times over, on the connections stage of the frame budget."
+  );
 
   container.appendChild(el("div", { class: "ants-section-title", text: "Viewport focus" }));
 
-  const viewInertBox = el("input", { type: "checkbox", checked: LOD.inertBelow > 0 });
-  viewInertBox.title =
-    "Switches node *widgets* off below the zoom on the right: no hover reports, no tooltips, no clicks on a widget, no drag onto one, no wheel " +
-    "capture \u2014 so scrolling over a node zooms the graph instead of the thing on it. The nodes themselves stay live: they still select, drag, " +
-    "edit and open their menu, and the canvas still pans and zooms. It is not only about your mouse: a widget that cannot be pointed at stops " +
-    "doing work, and a 3D viewport that is asked whether the pointer is over it says no, so it stops re-rendering its scene.";
-  const viewInertLabel = el("label", { class: "ants-inline" });
-  viewInertLabel.appendChild(viewInertBox);
-  viewInertLabel.appendChild(el("span", { text: " node widgets stop answering the pointer when zoomed out (the nodes stay selectable)" }));
-
-  const viewInertSel = el("select", { class: "ants-select", style: { width: "auto", maxWidth: "200px" } });
+  const viewInertSel = el("select", { class: "ants-select" });
   for (const z of VIEW_INERT_ZOOMS) {
     const opt = el("option", { text: z === 0 ? "never (nodes stay live)" : `below ${Math.round(z * 100)}% zoom` });
     opt.value = String(z);
     viewInertSel.appendChild(opt);
   }
   viewInertSel.value = String(LOD.inertBelow);
-  viewInertBox.addEventListener("change", () => {
-    lodSet({ inertBelow: viewInertBox.checked ? Math.max(VIEW_INERT_DEFAULT, Number(viewInertSel.value) || 0) : 0 });
-    viewInertSel.value = String(LOD.inertBelow);
-    lodUpdate();
-  });
   viewInertSel.addEventListener("change", () => {
-    const z = Number(viewInertSel.value) || 0;
-    lodSet({ inertBelow: z });
-    viewInertBox.checked = z > 0;
+    lodSet({ inertBelow: Number(viewInertSel.value) || 0 });
     lodUpdate();
   });
-
-  const viewFoveaBox = el("input", { type: "checkbox", checked: !!LOD.fovea });
-  viewFoveaBox.title =
-    "Off-screen nodes get the boxed treatment at every zoom, however far in you are: their DOM content is hidden and made inert while their node " +
-    "is further than the margin on the right from what you can see. Going away is a class on something nobody is looking at; coming back is " +
-    "re-running layout for that widget (and re-measuring a 3D renderer), which is why only a few come back per drawn frame \u2014 anything that is " +
-    "actually on screen comes back at once, so a visible widget is never blank. This is the foveated part: only what is in front of you is live.";
-  const viewFoveaLabel = el("label", { class: "ants-inline" });
-  viewFoveaLabel.appendChild(viewFoveaBox);
-  viewFoveaLabel.appendChild(
-    el("span", { text: " off-screen nodes are boxed and inert too, at every zoom (foveated)" })
+  settingRow(
+    "Widgets stop answering",
+    viewInertSel,
+    "Below this zoom a node's widgets ignore the pointer. The nodes themselves stay selectable, draggable and editable.",
+    "No hover reports, no tooltips, no clicks on a widget, no drag onto one, no wheel capture — so scrolling over a node zooms the graph instead of the thing on it. The nodes themselves stay live: they still select, drag, edit and open their menu. A 3D viewport that is asked whether the pointer is over it says no, so it stops re-rendering its scene."
   );
 
-  const viewMarginSel = el("select", { class: "ants-select", style: { width: "auto", maxWidth: "170px" } });
+  const viewFoveaSel = el("select", { class: "ants-select" });
+  for (const [id, text] of [
+    ["off", "off"],
+    ["on", "on"],
+  ]) {
+    const opt = el("option", { text });
+    opt.value = id;
+    viewFoveaSel.appendChild(opt);
+  }
+  viewFoveaSel.value = LOD.fovea ? "on" : "off";
+  viewFoveaSel.addEventListener("change", () => {
+    lodSet({ fovea: viewFoveaSel.value === "on" });
+    lodUpdate();
+  });
+  settingRow(
+    "Off-screen nodes",
+    viewFoveaSel,
+    "Off-screen nodes get the same boxed, inert treatment at every zoom, past the margin on the next row.",
+    "Going away is a class on something nobody is looking at. Coming back re-runs layout for that widget, which is why only a few come back per drawn frame. Anything actually on screen comes back at once, so a visible widget is never blank."
+  );
+
+  const viewMarginSel = el("select", { class: "ants-select" });
   for (const m of VIEW_FOVEA_MARGINS) {
-    const opt = el("option", { text: m === 0.5 ? "margin: \u00bd screen" : `margin: ${m === 0.25 ? "\u00bc" : m} screen${m > 1 ? "s" : ""}` });
+    const opt = el("option", { text: m === 0.5 ? "margin: ½ screen" : `margin: ${m === 0.25 ? "¼" : m} screen${m > 1 ? "s" : ""}` });
     opt.value = String(m);
     viewMarginSel.appendChild(opt);
   }
   viewMarginSel.value = String(LOD.foveaMargin);
-  viewMarginSel.title =
-    "How far outside the visible area a node has to be before its DOM content is taken away. Half a screen by default: smaller margins box more, " +
-    "which is less work and more boxes; larger margins are gentler on the eye and box less.";
   viewMarginSel.addEventListener("change", () => {
     lodSet({ foveaMargin: Number(viewMarginSel.value) || 0 });
     lodUpdate();
   });
+  settingRow(
+    "Off-screen margin",
+    viewMarginSel,
+    "How far outside the visible area a node has to be before its widgets are taken away. Half a screen by default.",
+    "Smaller margins box more, which is less work and more boxes. Larger margins are gentler on the eye and box less."
+  );
 
-  const viewRestoreSel = el("select", { class: "ants-select", style: { width: "auto", maxWidth: "170px" } });
+  const viewRestoreSel = el("select", { class: "ants-select" });
   for (const r of VIEW_FOVEA_RESTORES) {
     const opt = el("option", { text: r === 0 ? "come back: all at once" : `come back: ${r} per frame` });
     opt.value = String(r);
     viewRestoreSel.appendChild(opt);
   }
   viewRestoreSel.value = String(LOD.foveaRestore);
-  viewRestoreSel.title =
-    "How many off-screen nodes may be handed back to full DOM content per drawn frame. Coming back is the expensive direction, so it is rationed: " +
-    "the slower it is, the more of the graph stays boxed while you pan. Whatever is on screen is handed back immediately regardless of this, so " +
-    "nothing you can see is ever left blank.";
   viewRestoreSel.addEventListener("change", () => {
     lodSet({ foveaRestore: Number(viewRestoreSel.value) || 0 });
     lodUpdate();
   });
+  settingRow(
+    "Come back",
+    viewRestoreSel,
+    "How many off-screen nodes may be handed back per drawn frame. Whatever is on screen comes back immediately.",
+    "Coming back is the expensive direction, so it is rationed. The slower it is, the more of the graph stays boxed while you pan. Nothing you can see is left blank."
+  );
 
-  const viewScaleSel = el("select", { class: "ants-select", style: { width: "auto", maxWidth: "170px" } });
+  const viewScaleSel = el("select", { class: "ants-select" });
   for (const d of VIEW_DISPLAY_SCALES) {
     const opt = el("option", { text: d === 0 ? "display scale: auto" : `display scale: ${Math.round(d * 100)}%` });
     opt.value = String(d);
     viewScaleSel.appendChild(opt);
   }
   viewScaleSel.value = String(LOD.displayScale);
-  viewScaleSel.title =
-    "The device-pixel ratio of the canvas: Windows display scaling (System \u2192 Display \u2192 Scale, often 200% on a 4K screen) makes the " +
-    "canvas backing store larger than the element it is drawn in, and anything that does not account for it is out by that factor. Auto reads it " +
-    "from the browser and re-checks it on every sweep; pin it here if the readout below says the detection disagrees with what you know.";
   viewScaleSel.addEventListener("change", () => {
     lodSet({ displayScale: Number(viewScaleSel.value) || 0 });
     lodUpdate();
   });
+  settingRow(
+    "Display scale",
+    viewScaleSel,
+    "Windows display scaling, often 200% on a 4K screen. Auto reads it once at start and re-checks it. Pin it if the status line disagrees.",
+    "The device-pixel ratio of the canvas. Display scaling makes the canvas backing store larger than the element it is drawn in, and anything that does not account for it is out by that factor."
+  );
 
-  const viewRow = el("div", { class: "ants-row" });
-  viewRow.appendChild(viewInertLabel);
-  viewRow.appendChild(viewInertSel);
-  container.appendChild(viewRow);
-  container.appendChild(viewFoveaLabel);
-  const viewDomSel = el("select", { class: "ants-select", style: { width: "auto", maxWidth: "190px" } });
+  const viewDomSel = el("select", { class: "ants-select" });
   for (const m of VIEW_FOCUS_DOM) {
     const opt = el("option", { text: m === "hide" ? "widgets: hidden outright" : "widgets: inert only" });
     opt.value = m;
     viewDomSel.appendChild(opt);
   }
   viewDomSel.value = LOD.focusDom;
-  viewDomSel.title =
-    "What \"switched off\" means for a node's DOM below the focus zoom. Hidden outright is the default and the stronger of the two: an element with " +
-    "display:none cannot be clicked, hovered, dragged onto or scrolled into whatever its own CSS says, and a V8/driver cannot route a pointer into it " +
-    "at all. Inert only leaves the widget on screen with pointer-events taken away, which is enough for a page whose CSS cooperates and is the gentler " +
-    "of the two to look at.";
   viewDomSel.addEventListener("change", () => {
     lodSet({ focusDom: viewDomSel.value });
     lodUpdate();
   });
-
-  const viewRow2 = el("div", { class: "ants-row" });
-  viewRow2.appendChild(viewMarginSel);
-  viewRow2.appendChild(viewRestoreSel);
-  viewRow2.appendChild(viewScaleSel);
-  viewRow2.appendChild(viewDomSel);
-  container.appendChild(viewRow2);
-
-  const lodAbBtn = el("button", { class: "ants-btn", text: "Measure link thinning" });
-  lodAbBtn.title =
-    "Answers \"is this setting doing anything on my page\" by measuring instead of arguing: the thinning is alternated on and off, one second each, " +
-    "three times over, and the two halves are compared on the connections stage of the frame budget. Nothing is saved, nothing else changes, and the " +
-    "setting is put back at the end.";
-  lodAbBtn.addEventListener("click", () => {
-    if (LOD.ab && !LOD.ab.done) return;
-    lodAbStart();
-    lodUpdate();
-  });
+  settingRow(
+    "How widgets go",
+    viewDomSel,
+    "Hidden outright cannot be clicked or hovered, whatever its own CSS says. Inert only takes pointer events away and leaves the widget on screen.",
+    "Hidden is the stronger of the two. Inert is gentler to look at, and enough for a page whose CSS cooperates."
+  );
 
   const lodOffBtn = el("button", { class: "ants-btn", text: "Back to full drawing" });
-  lodOffBtn.title =
-    "Turn all of them off \u2014 flattening, link thinning, thumbnails and the redraw cap \u2014 and let ComfyUI draw the canvas " +
-    "exactly as it wants, including any DOM content this tool was hiding.";
   lodOffBtn.addEventListener("click", () => {
-    lodSet({ flatBelow: 0, boxDetail: "plain", snapshots: false, idleCapMs: 0, thumbZoom: 0, detailZoom: 0, linkStyle: "spline", inertBelow: 0, fovea: false });
+    lodSet({
+      flatBelow: 0,
+      boxDetail: "plain",
+      snapshots: false,
+      idleCapMs: 0,
+      thumbZoom: 0,
+      detailZoom: 0,
+      linkStyle: "spline",
+      inertBelow: 0,
+      fovea: false,
+    });
     lodFlatSel.value = "0";
-    lodBoxSel.value = "plain";
-    snapSel.value = "off";
+    lodStandSel.value = "plain";
     lodLinkSel.value = "spline";
     lodDetailSel.value = "0";
-    lodThumbSel.value = "0";
     lodIdleSel.value = "0";
+    viewInertSel.value = "0";
+    viewFoveaSel.value = "off";
     lodUpdate();
   });
-
-  const lodRow = el("div", { style: { display: "flex", flexWrap: "wrap", gap: "10px", alignItems: "center", margin: "4px 0" } });
-  lodRow.appendChild(lodFlatSel);
-  lodRow.appendChild(lodBoxSel);
-  lodRow.appendChild(snapSel);
-  lodRow.appendChild(snapRatioSel);
-  lodRow.appendChild(snapMbSel);
-  lodRow.appendChild(lodLinkSel);
-  lodRow.appendChild(lodDetailSel);
-  lodRow.appendChild(lodThumbSel);
-  lodRow.appendChild(lodIdleSel);
-  lodRow.appendChild(lodAbBtn);
-  lodRow.appendChild(lodOffBtn);
-  container.appendChild(lodRow);
-  const lodLine = el("div", { class: "ants-note", style: { whiteSpace: "pre-wrap" } });
-  container.appendChild(lodLine);
-  container.appendChild(
-    el("p", {
-      class: "ants-note",
-      text:
-        "Why this exists: a timer limit (the Governor tab) can only make a source run less often, and on a graph that is entirely " +
-        "inside the viewport a culling scan has nothing to remove either. What is left is the cost of one redraw — this block " +
-        "attacks that directly. It is off by default, it never edits the graph, it is lifted the moment you click \"Back to full " +
-        "drawing\", and if any part of it throws it switches itself off rather than leave the canvas in a state this tool cannot " +
-        "explain. Compare the ms/frame numbers above before and after switching it on: they are measured by the same wrapping of " +
-        "drawNode/drawConnections that produced them, not by a stopwatch held next to the screen. " +
-        "The preview setting is separate and works on its own: image, preview and compare nodes blit a full-resolution bitmap " +
-        "into whatever box the node occupies, and at low zoom that box is a few dozen pixels \u2014 the thumbnail ladder follows the " +
-        "screen (about 512px around 60% zoom down to 64px around 10%), so what changes is how much image data is uploaded per " +
-        "redraw, not what the node shows. " +
-        "The three settings are independent and meant to be used together. The node setting decides what a node costs \u2014 below that " +
-        "zoom, a node is one flat rectangle, and everything that lives on top of that node (image and video previews, curve editors, 3D " +
-        "viewports, custom Vue or JS node UIs) is hidden with it and taken out of the per-frame layout pass. It is a zoom rather than a " +
-        "node size because nodes with JS or dynamic UIs hide, grey or add widgets as you work: their size changes while the camera stands " +
-        "still, and a per-node pixel rule then paints the same node flat on one frame and in full on the next. The link setting decides " +
-        "the shape of a link: ComfyUI's curves, or straight lines. The thinning setting decides how much ink a curve uses \u2014 below " +
-        "its zoom links are stroked 1px wide instead of 3 and lose the dark outline drawn under them, which on a long link is most of " +
-        "the pixels, and the curves stay exactly where they were \u2014 link ink and nothing else, so a link setting never paints a node. " +
-        "Viewport focus is the interaction half, and it is four mechanisms because one is not enough: node DOM is hidden outright (so nothing can be " +
-        "routed into it), the canvas's own widget hit-test is answered with \"no widget\" (a slider drawn on the canvas cannot be grabbed or hovered, " +
-        "the node still selects and drags), the node mouse hooks a 3D viewport hangs its \"pointer is over me\" flag on are held back (the render loop " +
-        "asks exactly that before drawing a frame), and the events aimed at a switched-off widget are swallowed at the document (so it works even if a " +
-        "framework rewrites the class this tool wrote). The tracker's own node is exempt from all four. The foveated half applies the same treatment to " +
-        "nodes beyond the margin from the visible area, at every zoom, and comes back on a budget so panning does not rebuild everything it passes. " +
-        "How much that is worth depends on the page, and the readout measures it rather than claiming it: the connections stage also contains " +
-        "the frontend walking every input slot of every node before it decides which links are even on screen, and \"Measure link thinning\" " +
-        "compares the setting against itself so the two parts are told apart. Everything here is remembered across sessions and handed back by " +
-        "\"Back to full drawing\".",
-    })
+  settingRow(
+    "Way back",
+    lodOffBtn,
+    "Turns the drawing changes off and lets ComfyUI paint the canvas. The disk cache is left as you set it.",
+    "Flattening, the stand-in, link thinning, link shape and viewport focus go back to a full draw. Pictures already on disk stay until a node changes, a node is deleted, or the weekly sweep removes a file older than a week."
   );
+
+  const lodLine = el("div", { class: "ants-note", style: { whiteSpace: "pre-wrap" } });
+  container.appendChild(el("div", { class: "ants-section-title", text: "Status" }));
+  container.appendChild(lodLine);
 
   function lodUpdate() {
     // The display-scale check is refreshed here as well as on the sweep: it is a
@@ -7912,6 +8214,31 @@ function buildTweaksTab(container) {
     } catch (e) {
       /* the readout falls back to whatever the last probe found */
     }
+    const syncSel = (sel, value) => {
+      if (!sel) return;
+      const next = String(value);
+      if (sel.value === next) return;
+      try {
+        if (typeof document !== "undefined" && document.activeElement === sel) return;
+      } catch (e) {
+        /* a document with no active element just gets the value */
+      }
+      sel.value = next;
+    };
+    syncSel(lodFlatSel, LOD.flatBelow);
+    syncSel(lodStandSel, LOD.snapOn ? "picture" : LOD.boxDetail);
+    syncSel(snapRatioSel, LOD.snapRatio);
+    syncSel(snapMbSel, LOD.snapMb);
+    syncSel(diskSel, LOD.diskOn ? "on" : "off");
+    syncSel(lodIdleSel, LOD.idleCapMs);
+    syncSel(lodLinkSel, LOD.linkStyle);
+    syncSel(lodDetailSel, LOD.detailZoom);
+    syncSel(viewInertSel, LOD.inertBelow);
+    syncSel(viewFoveaSel, LOD.fovea ? "on" : "off");
+    syncSel(viewMarginSel, LOD.foveaMargin);
+    syncSel(viewRestoreSel, LOD.foveaRestore);
+    syncSel(viewScaleSel, LOD.displayScale);
+    syncSel(viewDomSel, LOD.focusDom);
     const fm = frameMetrics();
     const bits = [];
     const vis = lodVisibility(app.canvas);
@@ -7993,7 +8320,7 @@ function buildTweaksTab(container) {
         if (lodSnapOn()) {
           const pictured = lodSnapPictured();
           const parts = [
-            `${pictured} of ${LOD.snaps.size} remembered node(s) have a picture`,
+            `${pictured} of ${LOD.snaps ? LOD.snaps.size : 0} remembered node(s) have a picture`,
             `${LOD.snapDrawn} draw(s) served from stored bitmaps`,
             `${LOD.snapCaptured} captured (${fmtBytes(LOD.snapBytes)} of ${LOD.snapMb} MiB held)`,
             `${LOD.snapMisses} box(es) painted while a picture was missing`,
@@ -8042,6 +8369,10 @@ function buildTweaksTab(container) {
             );
           }
           if (LOD.snapPruned) parts.push(`${LOD.snapPruned} pruned (node left the graph)`);
+          if (LOD.diskLoaded) parts.push(`${LOD.diskLoaded} loaded from disk`);
+          if (LOD.diskSaved) parts.push(`${LOD.diskSaved} written to disk`);
+          if (LOD.diskDir) parts.push(`folder ${LOD.diskDir}`);
+          if (LOD.snapMipDrawn) parts.push(`${LOD.snapMipDrawn} draw(s) used a half or quarter copy`);
           if (LOD.snapFailed) parts.push(`${LOD.snapFailed} capture(s) failed`);
           bits2.push(`snapshots: ${parts.join(", ")}`);
           const named = lodSnapWhyText();
@@ -10215,13 +10546,13 @@ function buildCornerPill() {
   if (cornerBtnEl) return cornerBtnEl;
   injectStyle();
   const pill = el("div", { id: "ants-corner-pill", class: `ants-node-pill ${ANTS_OWN_CLASS}` });
-  pill.title = "ANTs Nasty Bastards Tracker — the switch turns the hooks and the optimisations off, the gear opens the panel";
+  pill.title = "ANTs Frontend Optimizer — the switch turns the hooks and the optimisations off, the gear opens the panel";
   const tick = antsBuildTick(pill);
   const gear = el("button", {
     id: "ants-corner-btn",
     class: "ants-node-btn ants-node-btn-gear",
     type: "button",
-    title: "ANTs Nasty Bastards Tracker — click to open the panel, press and hold to move this button",
+    title: "ANTs Frontend Optimizer — click to open the panel, press and hold to move this button",
   });
   const glyph = antsGearSvg();
   if (glyph) gear.appendChild(glyph);
@@ -10323,7 +10654,7 @@ function buildTelemetryReport() {
   const s = buildSnapshot();
   const fm = s.frame;
 
-  lines.push(`ANTs Nasty Bastards Tracker v${s.version} snapshot — ${s.generatedAt}`);
+  lines.push(`ANTs Frontend Optimizer v${s.version} snapshot — ${s.generatedAt}`);
   lines.push(
     `env: ${s.env.ua} | dpr ${s.env.dpr} | ${s.env.cores} cores | graph ${s.env.nodes} nodes / ${s.env.links} links | zoom ${fmtMs(s.env.zoom, 2)} | canvas ${s.env.canvas}`
   );
@@ -10952,6 +11283,11 @@ app.registerExtension({
     govOwn(() => setInterval(() => {
       if (ui.built && ui.panel.classList.contains("open") && ui.active === "gpu") refreshGpu();
     }, 2500));
+    try {
+      lodThumbDiskSweep();
+    } catch (e) {
+      /* the disk cache is optional; a missing route leaves the memory cache */
+    }
     console.info(
       `[ANTs Tracker] v${VERSION} running. Open the panel with the gear on the floating button (or the one on the tracker's own node); ` +
         "window.__antsTracker.snapshot / .report give the same data from the console."
@@ -10963,7 +11299,7 @@ app.registerExtension({
   },
 
   beforeRegisterNodeDef(nodeType, nodeData) {
-    if (!nodeData || nodeData.name !== NODE_NAME) return;
+    if (!nodeData || (nodeData.name !== NODE_NAME && nodeData.name !== NODE_NAME_ALIAS)) return;
     const onNodeCreated = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function () {
       const ret = onNodeCreated ? onNodeCreated.apply(this, arguments) : undefined;

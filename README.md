@@ -29,8 +29,10 @@ Don't rename it unless you also rename it to something that still
 sorts first.
 
 Restart ComfyUI. No dependencies, nothing to `pip install`, no build
-step. Nothing is persisted server-side; the only thing written to disk
-anywhere is the panel button's screen position (browser `localStorage`).
+step. The panel button's position is remembered in the browser. Node
+thumbnails, when that setting is on, are written under the running
+ComfyUI `temp/ANTs_Frontend_Optimizer_THUMBNAILS/` folder. Nothing else
+is written server-side.
 
 ## Use
 
@@ -570,6 +572,13 @@ installed as the sandbox's `CanvasRenderingContext2D` (the preview ladder
 patches `drawImage` there, the same way a browser exposes it), and
 `createImageBitmap` records the resize it was asked to perform instead of
 resizing anything.
+
+## What changed in v2.5.0
+
+- The node is **ANTs_Frontend_Optimizer**. Graphs saved with the old class key still load; that key is an alias. The Tweaks tab is **Node Rendering Settings**, one row per setting.
+- Image previews are no longer a second system. Below the zoom you set, the node is replaced by a picture of itself — the same mechanism the boxes used. Hover keeps that picture. Select, drag, a running bar or an error still draws live, and the node stays clickable.
+- Fresh installs replace nodes below 50% and capture at 1x. A saved choice is left alone. Half and quarter copies are made from the capture and chosen by on-screen device pixels. Canvas2D has no mipmap format, so the copy is picked here rather than sampled from one.
+- Pictures are kept on disk under ComfyUI's temp folder, keyed by node id and a signature. A change overwrites the file, deleting the node deletes it, and files older than a week are removed. If the route is missing, the memory cache continues.
 
 ## What changed in v2.4.1
 

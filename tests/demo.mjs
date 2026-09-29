@@ -307,7 +307,7 @@ const placeViewport = () => {
 };
 placeViewport();
 
-h.tracker.lowZoom.set({ flatBelow: 0.2, idleCapMs: 500, thumbZoom: 0.6, detailZoom: 0.6, linkStyle: "spline" });
+h.tracker.lowZoom.set({ flatBelow: 0.2, idleCapMs: 500, detailZoom: 0.6, linkStyle: "spline" });
 
 // One node with a 4096px image in it, drawn the way a preview/load/compare node
 // draws: the first frame paints the full bitmap, the next one is served from the
@@ -318,26 +318,10 @@ h.canvas.nodes[0].img = demoImg;
 h.canvas.nodes[0].onDrawBackground = function (ctx) {
   ctx.drawImage(this.img, 0, 0, 400, 200);
 };
-// The preview ladder above the flat setting: the node is drawn in full (25% is
-// above 20%) and the 4096px image is served from a copy made for the size it
-// actually covers on screen. Below the flat setting there is nothing to serve —
-// the node is a rectangle and never asks for the image at all.
-h.canvas.ds.scale = 0.25;
-h.tracker.lowZoom.set({ thumbZoom: 1 }); // thumbnails below 100% zoom
-for (let round = 0; round < 2; round++) {
-  h.advance(FRAME_MS);
-  h.canvas.setDirty(true, true);
-  h.canvas.draw();
-  run(500);
-  await pump(); // the copy is made asynchronously, like createImageBitmap in a browser
-}
-const pv = h.tracker.lowZoom.previews;
-console.log(
-  `  previews at 25% zoom: ${pv.served} of ${pv.seen} image draw(s) served from a cached thumbnail (${pv.built} cached, ` +
-    `${h.imageBitmaps.length ? h.imageBitmaps[h.imageBitmaps.length - 1].width : "?"}px on its long side for a 100px box)`
-);
+// The separate image-preview ladder is retired. Below the flatten zoom the node
+// itself is the thumbnail: one picture, not a second copy of the image inside it.
 h.canvas.ds.scale = 0.1;
-h.tracker.lowZoom.set({ flatBelow: 0.2, thumbZoom: 0.6 });
+h.tracker.lowZoom.set({ flatBelow: 0.2, snapshots: true });
 
 bullets("LOW-ZOOM MODE: WHAT IT DID TO THIS PAGE");
 const frame = (n) => {

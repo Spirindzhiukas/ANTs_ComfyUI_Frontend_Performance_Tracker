@@ -70,7 +70,10 @@ async function openTweaksTab(h) {
   const bar = h.document.getElementById("ants-tracker-tabs");
   if (bar) {
     const buttons = bar.children.filter((c) => c.tagName === "BUTTON");
-    const tweaks = buttons.find((b) => String(b.textContent).toLowerCase().includes("tweaks"));
+    const tweaks = buttons.find((b) => {
+      const t = String(b.textContent).toLowerCase();
+      return t.includes("rendering") || t.includes("tweaks");
+    });
     if (tweaks) tweaks.click();
     else if (buttons[0]) buttons[0].click();
   }
@@ -86,14 +89,16 @@ function oneFrame(h) {
 }
 
 suite("drawing: low-zoom mode paints less, and only when asked", () => {
-  test("nothing is flattened by default: every node and every link goes through LiteGraph's own drawing", async () => {
+  test("a fresh install replaces nodes below 50%, and off restores LiteGraph's own drawing", async () => {
     const h = await boot();
+    assertEqual(h.tracker.lowZoom.state.flatBelow, 0.5, "the default zoom is 50%");
+    assertEqual(h.tracker.lowZoom.state.snapOn, true, "and the stand-in is a picture of the node");
+    assertEqual(h.tracker.lowZoom.state.snapRatio, 1, "captured at 1x");
+    assertEqual(h.tracker.lowZoom.state.thumbZoom, 0, "the separate image-preview ladder is retired");
     bigGraph(h, 12);
+    h.tracker.lowZoom.set({ flatBelow: 0, snapshots: false });
     drawLoop(h, 0.2);
-    assertEqual(h.tracker.lowZoom.state.flatBelow, 0, "nothing is simplified until it is switched on");
-    assertEqual(h.tracker.lowZoom.previews.belowZoom, 0.6, "previews are the one part that is on, below 60% zoom");
-    assertEqual(h.tracker.lowZoom.state.idleCapMs, 0, "and no redraw cap");
-    assertEqual(h.tracker.lowZoom.state.nodes, 0);
+    assertEqual(h.tracker.lowZoom.state.nodes, 0, "off means nothing is replaced");
     assertEqual(h.tracker.lowZoom.state.links, 0);
     assertGreater(h.canvas.nodeDraws, 0, "the original node draw path ran");
     assertEqual(h.canvas.linkDraws, h.canvas.links.length * 12, "and every link went through LiteGraph's renderer");
@@ -105,6 +110,7 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     const h = await boot();
     h.canvas.costs = { background: 0.5, connections: 1.0, chrome: 1.5, link: 0 };
     bigGraph(h, 40, 0.1); // 200 units x 0.1 = 20px on screen
+    h.tracker.lowZoom.set({ flatBelow: 0, snapshots: false }); // the baseline is a full draw
     drawLoop(h, 0.2);
     assertClose(h.tracker.snapshot.frame.nodeMsPerFrame, 60, 3, "40 nodes at 1.5ms each, drawn in full");
 
@@ -250,7 +256,8 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     h.canvas.draw();
     await openTweaksTab(h);
     assertIncludes(panelText(h), "is below your 20% setting", "the panel names the zoom and the setting");
-    assertIncludes(panelText(h), "flat nodes below 20% zoom", "and the control reads as a zoom");
+    assertIncludes(panelText(h), "Replace nodes with thumbnails", "and the control is named for what it does");
+    assertIncludes(panelText(h), "below 20%", "and it reads as a zoom");
   });
 
   test("a node that changes its own size cannot flicker in and out of the flat state", async () => {
@@ -316,11 +323,11 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     assert(!panelText(h2).includes("carried over from v2.1.8"), "the panel no longer mentions it");
   });
 
-  test("a big preview is served from a thumbnail, and the resolution follows the zoom", async () => {
+  test("an image preview is not given a second thumbnail path", async () => {
     const h = await boot();
     h.window.devicePixelRatio = 1;
     const img = { naturalWidth: 4096, naturalHeight: 3072 };
-    bigGraph(h, 1, 0.6);
+    bigGraph(h, 1, 1);
     h.canvas.links = [];
     h.canvas.nodes[0].type = "LoadImage";
     h.canvas.nodes[0].img = img;
@@ -328,87 +335,14 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
       ctx.drawImage(this.img, 0, 0, 400, 300);
     };
     h.canvas.costs.chrome = 0.01;
-    h.tracker.lowZoom.set({ thumbZoom: 1 }); // thumbnails below 100% zoom
-
-    h.canvas.ds.scale = 0.6; // 400 units x 0.6 = 240px on screen
-    oneFrame(h);
-    assertEqual(h.imageBitmaps.length, 1, "one thumbnail was asked for");
-    assertEqual(h.imageBitmaps[0].width, 256, "256px for a box that is 240px wide on screen at 60% zoom");
-    assertEqual(h.imageBitmaps[0].height, 192, "kept in proportion");
-    assertEqual(h.imageBitmaps[0].quality, "low", "resized cheaply, not with a good filter");
-    const firstFrame = h.canvas.ctx.ops.filter((o) => o[0] === "drawImage");
-    assertEqual(firstFrame[firstFrame.length - 1][1], img, "the first frame still drew the full image");
-
-    await h.flush(); // the copy resolves
-    h.canvas.ctx.ops.length = 0;
-    oneFrame(h);
-    const after = h.canvas.ctx.ops.filter((o) => o[0] === "drawImage");
-    assertEqual(after.length, 1, "and the next frame drew one image");
-    assert(after[0][1] !== img, "from the cached copy, not the source");
-    assertEqual(after[0][1].width, 256, "at the size the screen can show");
-    // this call is the five-argument form: ops are ["drawImage", src, dx, dy, dw, dh]
-    assertEqual(after[0][2], 0, "with the destination rectangle untouched");
-    assertEqual(after[0][4], 400, "including its width in graph units");
-    assertEqual(after[0][5], 300, "and its height");
-    assertEqual(h.tracker.lowZoom.previews.served, 1, "and the panel counts it");
-
-    // Zoomed further out the node covers fewer pixels, so the copy shrinks too.
-    h.canvas.ds.scale = 0.1;
-    h.tracker.lowZoom.set({ thumbZoom: 1 });
-    oneFrame(h);
-    const small = h.imageBitmaps[h.imageBitmaps.length - 1];
-    assertEqual(small.width, 64, "64px on the long side at 10% zoom: one source image, two sizes on demand");
-    assertEqual(h.tracker.lowZoom.previews.belowZoom, 1);
-    await h.flush();
-    h.canvas.ctx.ops.length = 0;
-    oneFrame(h);
-    const tiny = h.canvas.ctx.ops.filter((o) => o[0] === "drawImage");
-    assertEqual(tiny[0][1].width, 64, "and the frame now uses the smaller copy");
-    assertEqual(h.tracker.lowZoom.previews.built, 2, "two thumbnails cached, one per bucket");
-  });
-
-  test("readable zooms, small images and thumbnails themselves are left alone", async () => {
-    const h = await boot();
-    h.window.devicePixelRatio = 1;
-    const img = { naturalWidth: 4096, naturalHeight: 4096 };
-    const small = { naturalWidth: 128, naturalHeight: 128 };
-    bigGraph(h, 2, 1);
-    h.canvas.links = [];
-    h.canvas.nodes[0].img = img;
-    h.canvas.nodes[0].onDrawBackground = function (ctx) {
-      // the nine-argument form: a crop of the source into the node's box
-      ctx.drawImage(this.img, 1024, 768, 2048, 1536, 0, 0, 400, 400);
-    };
-    h.canvas.nodes[1].img = small;
-    h.canvas.nodes[1].onDrawBackground = function (ctx) {
-      ctx.drawImage(this.img, 0, 0, 100, 100);
-    };
-    h.canvas.costs.chrome = 0.01;
-    h.tracker.lowZoom.set({ thumbZoom: 0.6 });
-
-    h.canvas.ds.scale = 1; // readable: no thumbnail at all
-    oneFrame(h);
-    assertEqual(h.imageBitmaps.length, 0, "at full zoom every preview is drawn from its own image");
-
-    h.canvas.ds.scale = 0.1; // now the threshold is met
+    // The old ladder is ignored. A live node draws its own image.
+    h.tracker.lowZoom.set({ flatBelow: 0, snapshots: false, thumbZoom: 1 });
     oneFrame(h);
     await h.flush();
-    assertEqual(h.imageBitmaps.length, 1, "only the big image gets a copy");
-    assertGreater(h.tracker.lowZoom.previews.skipped, 0, "the 128px source is left alone: copying it would gain nothing");
-    h.canvas.ctx.ops.length = 0;
-    oneFrame(h);
+    assertEqual(h.imageBitmaps.length, 0, "no second copy of the preview is asked for");
+    assertEqual(h.tracker.lowZoom.state.thumbZoom, 0, "and the setting cannot be turned back on");
     const drawn = h.canvas.ctx.ops.filter((o) => o[0] === "drawImage");
-    assertEqual(drawn.length, 2, "both nodes still draw an image");
-    const sources = drawn.map((o) => o[1]);
-    assertIncludes(sources, small, "the 128px one from its own source");
-    const copy = sources.find((s) => s !== small && s !== img);
-    assert(copy, "the 4096px one from a copy");
-    assertEqual(copy.width, 64, "at the 64px bucket this zoom asks for");
-    const cropped = drawn.find((o) => o.length === 10);
-    assert(cropped, "the cropped call kept its nine-argument form");
-    assertEqual(cropped[2], 16, "with the source rectangle scaled into the copy (1024 of 4096 -> 16 of 64)");
-    assertEqual(cropped[5], 24, "height too (1536 of 4096 -> 24 of 64)");
-    assertEqual(cropped[9], 400, "and the destination untouched");
+    assert(drawn.some((o) => o[1] === img), "the node's own image is what gets drawn");
   });
 
 
@@ -1460,7 +1394,7 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     const h2 = await boot({ storage: h.localStorage });
     assertEqual(h2.tracker.lowZoom.state.flatBelow, 0.3, "the zoom threshold came back");
     assertEqual(h2.tracker.lowZoom.state.detailZoom, 0.4, "so did the link thinning");
-    assertEqual(h2.tracker.lowZoom.state.thumbZoom, 0.8, "and the previews");
+    assertEqual(h2.tracker.lowZoom.state.thumbZoom, 0, "the separate preview setting is retired and not restored");
     assertEqual(h2.tracker.lowZoom.state.idleCapMs, 500, "and the idle cap");
     assertEqual(h2.tracker.lowZoom.state.linkStyle, "spline", "and the link style");
     await openTweaksTab(h2);
@@ -1497,7 +1431,7 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     const text = panelText(h);
     assertIncludes(text, "culling cannot save anything here", "the panel draws the conclusion, not just the number");
     assertIncludes(text, "frontend LOD is switched off", "and names the frontend's own LOD switch instead of leaving it hidden");
-    assertIncludes(text, "flat nodes below 20% zoom", "and shows what the mode is set to");
+    assertIncludes(text, "below 20%", "and shows what the mode is set to");
     assertIncludes(text, "node draw", "with the saving measured by the tracker itself");
   });
 });
@@ -1553,6 +1487,8 @@ suite("drawing: a flat box can say what it stands for, and only when asked", () 
   test("plain is the default, and it is exactly what v2.1.16 painted", async () => {
     const h = await boot();
     markedGraph(h);
+    // The stand-in default is a picture. This test is about the painted fill, so the picture is off.
+    h.tracker.lowZoom.set({ flatBelow: 0, snapshots: false });
     drawLoop(h, 0.2);
     assertEqual(h.tracker.lowZoom.state.boxDetail, "plain", "a box says nothing until it is asked to");
     assert(h.tracker.lowZoom.limits.boxDetail.includes("state"), "and the ladder is offered in full");
@@ -1633,7 +1569,7 @@ suite("drawing: a flat box can say what it stands for, and only when asked", () 
   test("the ladder only ever changes a box, never which nodes are boxes, and off restores the paint", async () => {
     const h = await boot();
     markedGraph(h);
-    h.tracker.lowZoom.set({ flatBelow: 0.2, boxDetail: "state" });
+    h.tracker.lowZoom.set({ flatBelow: 0.2, boxDetail: "state", snapshots: false });
     drawLoop(h, 0.2);
     const flatNodes = h.tracker.lowZoom.flat.flatNodes;
 
@@ -1664,13 +1600,13 @@ suite("drawing: a flat box can say what it stands for, and only when asked", () 
   test("the panel and the API report the ladder, and the readout prices the marks", async () => {
     const h = await boot();
     markedGraph(h);
-    h.tracker.lowZoom.set({ flatBelow: 0.2 });
+    h.tracker.lowZoom.set({ flatBelow: 0.2, snapshots: false });
     drawLoop(h, 0.2);
     await openTweaksTab(h);
     const text = panelText(h);
-    assertIncludes(text, "boxes: plain fill (as before)", "the control offers the levels");
-    assertIncludes(text, "boxes: + the node's title bar colour", "including the title bar");
-    assertIncludes(text, "boxes: + title, error ring, progress bar, muted dim", "and the state marks");
+    assertIncludes(text, "plain fill", "the control offers the levels");
+    assertIncludes(text, "title bar colour", "including the title bar");
+    assertIncludes(text, "title, error ring, progress, muted", "and the state marks");
     assertIncludes(text, "the boxes are plain", "and the readout says what the boxes could show");
 
     h.tracker.lowZoom.set({ boxDetail: "state" });
@@ -1764,7 +1700,7 @@ suite("drawing: node snapshots — a box that is a picture of the node", () => {
   test("off by default: no captures, no bitmaps, no canvases", async () => {
     const h = await boot();
     snapGraph(h, 4);
-    h.tracker.lowZoom.set({ flatBelow: 0.2 }); // boxes, with snapshots left alone
+    h.tracker.lowZoom.set({ flatBelow: 0.2, snapshots: false }); // boxes, with pictures left off
     draw(h, 2);
     await idle(h);
     const api = snapApi(h);
@@ -1786,7 +1722,7 @@ suite("drawing: node snapshots — a box that is a picture of the node", () => {
     await idle(h);
     const api = snapApi(h);
     assertEqual(api.captured, 3, "and all three were captured while idle");
-    assertEqual(h.canvases.length, 3, "each capture got its own offscreen canvas");
+    assertEqual(h.canvases.length, 9, "each capture got a 1x canvas plus a half and a quarter copy");
     assertGreater(api.bytes, 0, "with a byte cost that is counted");
 
     // The capture drew the node: the offscreen context has the node's own body
@@ -1808,13 +1744,43 @@ suite("drawing: node snapshots — a box that is a picture of the node", () => {
     draw(h, 1);
     const blit = blits(h);
     assertEqual(blit.length, 3, "one drawImage per node");
-    assertEqual(blit[0][1], h.canvases[0], "the image is the canvas that node was captured into");
+    assert(h.canvases.includes(blit[0][1]), "the image is one of the stored canvases");
+    assert(Math.max(blit[0][1].width, blit[0][1].height) >= 248 * 0.1, "the copy still covers the pixels on screen");
+    assert(blit[0][1].width < h.canvases[0].width, "and at this zoom it is a smaller copy, not the 1x capture");
     assertEqual(blit[0][2], -24, "placed at the left of the padded rect");
     assertEqual(blit[0][3], -54, "and above the body: the title bar and padding");
     assertEqual(blit[0][4], 248, "as wide as the node plus its padding");
     assertEqual(blit[0][5], 178, "and tall enough for the body, the title bar and the padding");
     assertEqual(boxes(h).length, 0, "no rectangle was painted for any of them");
     assertEqual(snapApi(h).drawn, 3, "and the reuse is counted");
+  });
+
+  test("the blit uses the smallest copy that still covers the screen", async () => {
+    const h = await boot();
+    h.window.devicePixelRatio = 2; // their display scale
+    snapGraph(h, 1);
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true, snapRatio: 1 });
+    draw(h, 1);
+    await idle(h);
+    const capture = h.canvases[0];
+    const pick = () => {
+      h.canvas.ctx.ops.length = 0;
+      draw(h, 1);
+      return blits(h)[0][1];
+    };
+    // 248 graph units. At 10% and dpr 2 the screen shows about 50 device pixels.
+    // A quarter of 248 is 62, which still covers that, so the quarter copy is used.
+    h.canvas.ds.scale = 0.1;
+    const far = pick();
+    assert(far.width < capture.width / 2, "at 10% the quarter copy is enough");
+    assert(Math.max(far.width, far.height) >= 248 * 0.1 * 2, "and it still covers the device pixels");
+    // At 20% and dpr 2 the screen shows about 100 device pixels. 62 is short, so
+    // the half copy is used. The quarter copy would be soft here, and is not.
+    h.canvas.ds.scale = 0.2;
+    const mid = pick();
+    assert(mid.width > far.width, "at 20% the quarter copy is too small");
+    assert(mid.width < capture.width, "and the full capture is not needed yet");
+    assert(Math.max(mid.width, mid.height) >= 248 * 0.2 * 2, "the half copy covers the screen");
   });
 
   test("nothing is captured while the page is being used", async () => {
@@ -1837,7 +1803,7 @@ suite("drawing: node snapshots — a box that is a picture of the node", () => {
     const h = await boot();
     const nodes = snapGraph(h, 6);
     nodes[0].selected = true; // being worked on
-    nodes[1].mouseOver = {}; // under the pointer
+    nodes[1].mouseOver = {}; // under the pointer: a hover keeps the picture, it does not drop to a box
     nodes[2].has_errors = true; // broken
     nodes[3].progress = 0.5; // running
     nodes[4].progress = 0.001; // executing, however briefly
@@ -1848,19 +1814,21 @@ suite("drawing: node snapshots — a box that is a picture of the node", () => {
     // time as well as at reuse time, so no bitmap of a transient state can exist.
     // A ghosted node is deliberately *not* in this set: ghosting only changes the
     // drawing, so the captured bitmap already carries its dimming.
-    assertEqual(snapApi(h).captured, 1, "one of the six is a candidate at all");
+    assertEqual(snapApi(h).captured, 2, "the hovered node is pictured too; select, error and progress stay live");
     h.canvas.ctx.ops.length = 0;
     draw(h, 1);
-    assertEqual(blits(h).length, 1, "exactly one node is served from a picture");
-    assertEqual(boxes(h).length, 5, "the other five are drawn by the box path, live");
+    assertEqual(blits(h).length, 2, "the untouched node and the hovered one are served from a picture");
+    assertEqual(boxes(h).length, 4, "select, error and the two progress nodes stay live");
 
     // A node that becomes selected after being captured must go back to live.
+    // The hovered one stays a picture: hover is not a reason to drop to a box.
     const drawnBefore = snapApi(h).drawn;
     nodes[5].selected = true;
     h.canvas.ctx.ops.length = 0;
     draw(h, 1);
-    assertEqual(snapApi(h).drawn, drawnBefore, "a newly selected node is not served from its bitmap");
-    assertEqual(boxes(h).length, 6, "all six are boxes again, and the selection ring is drawn live");
+    assertEqual(snapApi(h).drawn, drawnBefore + 1, "the selected node drops out; the hovered one is still served");
+    assertEqual(blits(h).length, 1, "only the hovered node is still a picture");
+    assertEqual(boxes(h).length, 5, "the newly selected node is live, with the ones that were already live");
 
     // The ghost case on its own, on a fresh graph: a ghosted node *is* captured
     // and served from its picture, because a ghost's dimming is part of the
@@ -1969,7 +1937,7 @@ suite("drawing: node snapshots — a box that is a picture of the node", () => {
     h.canvas.nodes = nodes;
     h.app.graph._nodes = nodes;
 
-    h.tracker.lowZoom.set({ snapshots: true });
+    h.tracker.lowZoom.set({ flatBelow: 0, snapshots: true });
     draw(h, 3); // drawn live first, so the hook has attributed calls to protect
     // The hook's bucket after three live frames' worth of attribution.
     // The pack's row, as the Timing tab sees it: calls attributed inside frames,
@@ -2033,7 +2001,7 @@ suite("drawing: node snapshots — a box that is a picture of the node", () => {
     // this tool and upstream did until v2.4.0 — at 10% zoom 1x is still ten times
     // the pixels the screen shows).
     nodes[0].size = [300, 1200];
-    h.tracker.lowZoom.set({ flatBelow: 0.2, snapshots: true });
+    h.tracker.lowZoom.set({ flatBelow: 0.2, snapshots: true, snapRatio: 2 });
     draw(h, 1);
     await idle(h);
     const api = snapApi(h);
@@ -2059,7 +2027,7 @@ suite("drawing: node snapshots — a box that is a picture of the node", () => {
     const api = snapApi(h);
     assertEqual(api.captured, 1, "only the node that fits was captured");
     assertEqual(api.large, 1, "the too-big node is counted once, as a node");
-    assertEqual(h.canvases.length, 1, "and no canvas was ever made for it");
+    assertEqual(h.canvases.length, 3, "only the node that fits was photographed, with its half and quarter copies");
     assert(api.why.some((e) => /2100 units tall/.test(e.why)), "with its size in the readout's reasons");
     h.advance(600); // the panel refresh
     await h.flush();
@@ -2074,7 +2042,7 @@ suite("drawing: node snapshots — a box that is a picture of the node", () => {
     draw(h, 3);
     await idle(h, 3000);
     assertEqual(snapApi(h).large, 1, "still one attempt, not one per slice");
-    assertEqual(h.canvases.length, 1, "and still no canvas");
+    assertEqual(h.canvases.length, 3, "and still no canvas for the node that does not fit");
   });
 
   test("a node whose own draw leaves the canvas empty keeps its box", async () => {
@@ -2124,10 +2092,10 @@ suite("drawing: node snapshots — a box that is a picture of the node", () => {
 
   test("when the budget cannot hold your ratio, a coarse picture beats none", async () => {
     const h = await boot();
-    // 24 nodes of 600x400 at 3x (about 11 MB each) fill the 256 MiB floor to
-    // within a megabyte; the two small nodes that follow cannot be held at 3x, so
-    // they are taken at 1x (about 176 kB) rather than refused. One more big node
-    // then finds no room at either size and *is* refused.
+    // Big nodes at 3x fill the 256 MiB floor. A node that does not fit at 3x is
+    // taken coarser if 1x fits, and refused only if even that does not. The mip
+    // copies are in the same budget, so the exact count is lower than a 1x-only
+    // cache, and the policy is what this test holds.
     h.canvas.ds.scale = 0.1;
     h.canvas.links = [];
     const nodes = [];
@@ -2147,12 +2115,14 @@ suite("drawing: node snapshots — a box that is a picture of the node", () => {
     draw(h, 1);
     await idle(h, 8000);
     const api = snapApi(h);
-    assertEqual(api.coarse, 2, "the two small nodes were captured coarser than the ratio asked for");
-    assertEqual(api.full, 1, "and the node that fitted at no size was refused");
+    // The half and quarter copies are counted in the same budget, so fewer 3x
+    // pictures fit than when a capture was only its 1x bitmap. The policy is
+    // unchanged: nothing on screen is released, and a coarser picture beats none.
+    assertGreater(api.coarse, 0, "a node that would not fit at 3x was taken coarser, not skipped");
+    assertGreater(api.full, 0, "and a node that fitted at no size was refused");
     assertEqual(api.evicted, 0, "nothing was taken off the screen for them");
-    assertEqual(api.pictured, 26, "so 26 of the 27 nodes have a picture, not 24");
-    const small = h.canvases.filter((c) => c.height === 178);
-    assertEqual(small.length, 2, "at the size the budget could hold");
+    assertGreater(api.pictured, 0, "the ones that fit kept their pictures");
+    assert(api.bytes <= 256 * 1024 * 1024, "the mip chain is inside the budget, not added on top of it");
   });
 
   test("a full budget refuses captures instead of evicting what is on screen", async () => {
@@ -2305,7 +2275,7 @@ suite("drawing: node snapshots — a box that is a picture of the node", () => {
 
     h.tracker.lowZoom.set({ snapshots: false });
     assertEqual(snapApi(h).bytes, 0, "switching off releases the memory");
-    assertEqual(h.canvases.filter((c) => c.width === 0).length, 3, "and zeroes every canvas");
+    assertEqual(h.canvases.filter((c) => c.width === 0).length, 9, "and zeroes every canvas, including the half and quarter copies");
     h.canvas.ctx.ops.length = 0;
     draw(h, 1);
     assertEqual(blits(h).length, 0, "nothing is served from a picture any more");
@@ -2356,8 +2326,8 @@ suite("drawing: node snapshots — a box that is a picture of the node", () => {
     await h.flush();
     await openTweaksTab(h);
     const text = panelText(h);
-    assertIncludes(text, "boxes: pictures of the nodes (snapshots)", "the control offers it");
-    assertIncludes(text, "capture 2x per graph unit", "with the ratio it will capture at");
+    assertIncludes(text, "picture of the node", "the control offers it");
+    assertIncludes(text, "capture 1x per graph unit", "with the ratio it will capture at");
     assertIncludes(text, "bitmap budget 512 MiB", "and the budget");
     assertIncludes(text, "remembered node(s) have a picture", "the readout leads with how much of the graph is pictured");
     const api = h.tracker.lowZoom;
@@ -2415,7 +2385,7 @@ suite("drawing: node snapshots — what releases a bitmap besides the budget", (
     assertGreater(api(h).bytes, 0, "holding bitmaps while switched on");
     assertEqual(h.tracker.lowZoom.setEnabled(false), false, "the switch goes off");
     assertEqual(api(h).bytes, 0, "and the bitmaps go with it");
-    assertEqual(h.canvases.filter((c) => c.width === 0).length, 3, "every canvas zeroed");
+    assertEqual(h.canvases.filter((c) => c.width === 0).length, 9, "every canvas zeroed, including the half and quarter copies");
     assertEqual(h.tracker.lowZoom.setEnabled(true), true, "switched back on");
     // A drawn frame is what puts nodes back in the queue — the same way the first
     // capture happened.

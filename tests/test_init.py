@@ -27,11 +27,54 @@ class InitTests(unittest.TestCase):
         self.assertEqual(self.mod.WEB_DIRECTORY, "web")
 
     def test_node_contract(self):
-        node = self.mod.ANTsNastyBastardsTracker()
-        self.assertEqual(self.mod.ANTsNastyBastardsTracker.CATEGORY, "ANTs/debug")
+        node = self.mod.ANTsFrontendOptimizer()
+        self.assertEqual(self.mod.ANTsFrontendOptimizer.CATEGORY, "ANTs")
         self.assertEqual(node.noop(), ())
-        self.assertEqual(self.mod.ANTsNastyBastardsTracker.INPUT_TYPES(), {"required": {}})
-        self.assertIn("ANTsNastyBastardsTracker", self.mod.NODE_CLASS_MAPPINGS)
+        self.assertEqual(self.mod.ANTsFrontendOptimizer.INPUT_TYPES(), {"required": {}})
+        self.assertIn("ANTs_Frontend_Optimizer", self.mod.NODE_CLASS_MAPPINGS)
+        # Saved workflows store the old class key. It has to keep loading.
+        self.assertIs(self.mod.NODE_CLASS_MAPPINGS["ANTsNastyBastardsTracker"], self.mod.ANTsFrontendOptimizer)
+        self.assertEqual(self.mod.NODE_DISPLAY_NAME_MAPPINGS["ANTs_Frontend_Optimizer"], "ANTs Frontend Optimizer")
+
+    def test_thumbnails_are_keyed_overwritten_and_swept(self):
+        import tempfile
+        import time
+
+        png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+        with tempfile.TemporaryDirectory() as tmp:
+            self.mod.set_thumb_root(tmp)
+            try:
+                self.assertEqual(self.mod.safe_token("../etc/passwd"), "etc_passwd")
+                self.assertNotIn("/", self.mod.safe_token("../etc/passwd"))
+                self.assertEqual(self.mod.safe_token("..\\\\windows"), "windows")
+                self.assertEqual(self.mod.safe_token(""), "")
+                path = self.mod.write_thumb("12", "abc", png)
+                self.assertTrue(path.endswith("12__abc.png"))
+                self.assertEqual(self.mod.read_thumb("12", "abc"), path)
+                self.assertIsNone(self.mod.read_thumb("12", "other"), "a different signature is not this node's picture")
+                # A change replaces the file. The old signature is gone.
+                self.mod.write_thumb("12", "def", png)
+                self.assertIsNone(self.mod.read_thumb("12", "abc"))
+                self.assertIsNotNone(self.mod.read_thumb("12", "def"))
+                # A week-old file goes. A fresh one stays.
+                old = self.mod.write_thumb("99", "old", png)
+                fresh_time = time.time()
+                os_mtime = fresh_time - 8 * 24 * 60 * 60
+                import os
+                os.utime(old, (os_mtime, os_mtime))
+                removed = self.mod.sweep_thumbs(now=fresh_time)
+                self.assertEqual(removed, 1)
+                self.assertIsNone(self.mod.read_thumb("99", "old"))
+                self.assertIsNotNone(self.mod.read_thumb("12", "def"))
+                self.assertEqual(self.mod.delete_thumbs("12"), 1)
+                self.assertIsNone(self.mod.read_thumb("12", "def"))
+                with self.assertRaises(ValueError):
+                    self.mod.write_thumb("12", "abc", b"not an image")
+                info = self.mod.thumb_info()
+                self.assertEqual(info["dir"], tmp)
+                self.assertEqual(info["maxAgeDays"], 7)
+            finally:
+                self.mod.set_thumb_root(None)
 
     def test_routes_are_optional(self):
         # Outside ComfyUI there is no PromptServer, so registration must simply

@@ -30,17 +30,30 @@ How it works (see web/tracker.js for the real logic):
      benchmark for comparable A/B runs, and a plain-text snapshot for bug
      reports.
 
-The Python side does almost nothing on purpose: it serves the frontend and adds
-one optional read-only route (/ants_tracker/gpu) that shells out to nvidia-smi,
-because GPU memory is the one thing page JavaScript genuinely cannot read. If
-nvidia-smi is missing, the route says so and the panel falls back to ComfyUI's
-own /system_stats.
+The Python side serves the frontend, adds one optional read-only route
+(/ants_tracker/gpu) that shells out to nvidia-smi, and — because the page cannot
+write a folder — stores node thumbnails under ComfyUI's temp directory when the
+frontend asks. That write is the one the panel's disk cache is for. Nothing else
+is written. If nvidia-smi is missing, the GPU route says so and the panel falls
+back to ComfyUI's own /system_stats.
 
 Safe to drop into any workflow: no inputs, no outputs, no execution, no
-dependencies, no writes to disk.
+dependencies.
 """
 
+import os
+import time
+
 WEB_DIRECTORY = "web"
+
+# Node pictures, keyed by node id and a signature of what the node draws. The
+# page cannot write this folder; it asks these helpers. The directory is ComfyUI's
+# own temp folder when that can be found, otherwise temp/ next to custom_nodes.
+THUMB_DIR_NAME = "ANTs_Frontend_Optimizer_THUMBNAILS"
+THUMB_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
+THUMB_MAX_BYTES = 8 * 1024 * 1024
+
+_thumb_root_override = None
 
 # The GPU probe is cached for this long. The panel polls it at most every 2.5s
 # while its GPU tab is open, and spawning nvidia-smi is not free.
@@ -173,6 +186,171 @@ def _cached_gpu_payload():
     return payload
 
 
+def set_thumb_root(path):
+    """Test seam. None restores autodetection."""
+    global _thumb_root_override
+    _thumb_root_override = path
+
+
+def safe_token(value, limit=80):
+    """A filename token. Anything else is refused, not escaped into a path."""
+    raw = str(value or "")
+    out = []
+    for ch in raw:
+        if ch.isalnum() or ch in "._-":
+            out.append(ch)
+        else:
+            out.append("_")
+    token = "".join(out).strip("._")
+    if token in ("", ".", ".."):
+        return ""
+    return token[:limit]
+
+
+def comfy_temp_dir():
+    """ComfyUI's temp folder, or temp/ next to custom_nodes if that import is missing."""
+    folder_paths = None
+    try:
+        import folder_paths as found
+        folder_paths = found
+    except Exception:
+        folder_paths = None
+    if folder_paths is not None:
+        for name in ("get_temp_directory", "get_temp_dir"):
+            fn = getattr(folder_paths, name, None)
+            if callable(fn):
+                try:
+                    found = fn()
+                except Exception:
+                    found = None
+                if found:
+                    return str(found)
+        for attr in ("temp_directory", "temp_dir"):
+            found = getattr(folder_paths, attr, None)
+            if found:
+                return str(found)
+    here = os.path.dirname(os.path.abspath(__file__))
+    # custom_nodes/<this pack>/__init__.py → the ComfyUI root is two levels up.
+    root = os.path.dirname(os.path.dirname(here))
+    return os.path.join(root, "temp")
+
+
+def thumb_root():
+    if _thumb_root_override:
+        os.makedirs(_thumb_root_override, exist_ok=True)
+        return _thumb_root_override
+    path = os.path.join(comfy_temp_dir(), THUMB_DIR_NAME)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def image_kind(data):
+    if not data or len(data) < 12:
+        return ""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "webp"
+    return ""
+
+
+def write_thumb(node_id, sig, data):
+    """Replace every stored picture for this node id with this one. A change wins."""
+    ident = safe_token(node_id)
+    signature = safe_token(sig)
+    if not ident or not signature:
+        raise ValueError("bad id")
+    if not data or len(data) > THUMB_MAX_BYTES:
+        raise ValueError("bad body")
+    if not image_kind(data):
+        raise ValueError("not an image")
+    root = thumb_root()
+    prefix = ident + "__"
+    for name in list(os.listdir(root)):
+        if name.startswith(prefix) and name.endswith((".png", ".webp", ".tmp")):
+            try:
+                os.remove(os.path.join(root, name))
+            except OSError:
+                pass
+    ext = "webp" if image_kind(data) == "webp" else "png"
+    final = os.path.join(root, "%s__%s.%s" % (ident, signature, ext))
+    tmp = final + ".tmp"
+    with open(tmp, "wb") as handle:
+        handle.write(data)
+    os.replace(tmp, final)
+    return final
+
+
+def read_thumb(node_id, sig):
+    """The file for this id and signature, or None. A different signature is a miss."""
+    ident = safe_token(node_id)
+    signature = safe_token(sig)
+    if not ident or not signature:
+        return None
+    root = thumb_root()
+    for ext in ("png", "webp"):
+        path = os.path.join(root, "%s__%s.%s" % (ident, signature, ext))
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def delete_thumbs(node_id):
+    ident = safe_token(node_id)
+    if not ident:
+        return 0
+    root = thumb_root()
+    prefix = ident + "__"
+    removed = 0
+    for name in list(os.listdir(root)):
+        if not name.startswith(prefix):
+            continue
+        try:
+            os.remove(os.path.join(root, name))
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def sweep_thumbs(now=None, max_age=THUMB_MAX_AGE_SECONDS):
+    """Delete thumbnail files older than a week. The weekly cleanup."""
+    root = thumb_root()
+    moment = time.time() if now is None else float(now)
+    removed = 0
+    for name in list(os.listdir(root)):
+        if name.startswith("."):
+            continue
+        path = os.path.join(root, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            age = moment - os.path.getmtime(path)
+        except OSError:
+            continue
+        if age > max_age:
+            try:
+                os.remove(path)
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
+def thumb_info():
+    root = thumb_root()
+    count = 0
+    try:
+        count = sum(
+            1
+            for name in os.listdir(root)
+            if not name.startswith(".") and os.path.isfile(os.path.join(root, name))
+        )
+    except OSError:
+        count = 0
+    return {"dir": root, "count": count, "maxAgeDays": 7}
+
+
 def register_routes():
     """
     Register the optional GPU route. Deliberately best-effort: if this ComfyUI
@@ -199,6 +377,35 @@ def register_routes():
             payload = await loop.run_in_executor(None, _cached_gpu_payload)
             return web.json_response(payload)
 
+        @routes.get("/ants_optimizer/thumbs/info")
+        async def ants_optimizer_thumbs_info(request):  # noqa: ARG001
+            return web.json_response(thumb_info())
+
+        @routes.get("/ants_optimizer/thumbs/{node_id}")
+        async def ants_optimizer_thumb_get(request):
+            path = read_thumb(request.match_info.get("node_id"), request.query.get("sig"))
+            if not path:
+                return web.Response(status=404, text="miss")
+            return web.FileResponse(path, headers={"Cache-Control": "no-store", "X-Ants-Sig": safe_token(request.query.get("sig"))})
+
+        @routes.put("/ants_optimizer/thumbs/{node_id}")
+        async def ants_optimizer_thumb_put(request):
+            data = await request.read()
+            try:
+                write_thumb(request.match_info.get("node_id"), request.query.get("sig"), data)
+            except ValueError as err:
+                return web.Response(status=400, text=str(err))
+            return web.Response(status=204)
+
+        @routes.delete("/ants_optimizer/thumbs/{node_id}")
+        async def ants_optimizer_thumb_delete(request):
+            removed = delete_thumbs(request.match_info.get("node_id"))
+            return web.json_response({"removed": removed})
+
+        @routes.post("/ants_optimizer/thumbs/sweep")
+        async def ants_optimizer_thumb_sweep(request):  # noqa: ARG001
+            return web.json_response({"removed": sweep_thumbs()})
+
     except Exception:  # pragma: no cover - a route may already exist on reload
         return False
     return True
@@ -207,14 +414,14 @@ def register_routes():
 register_routes()
 
 
-class ANTsNastyBastardsTracker:
+class ANTsFrontendOptimizer:
     """
-    Dummy node. Its only job is to carry a widget button (added on the JS side)
-    that opens the tracker panel. The tracker itself runs continuously from page
-    load whether or not this node exists in your graph.
+    Dummy node. Its only job is to carry the pill (added on the JS side) that
+    opens the panel. The tool itself runs from page load whether or not this
+    node is in the graph.
     """
 
-    CATEGORY = "ANTs/debug"
+    CATEGORY = "ANTs"
     FUNCTION = "noop"
     RETURN_TYPES = ()
     OUTPUT_NODE = True
@@ -227,12 +434,17 @@ class ANTsNastyBastardsTracker:
         return ()
 
 
+# Saved workflows store the class key. The old key stays so those graphs still load.
+ANTsNastyBastardsTracker = ANTsFrontendOptimizer
+
 NODE_CLASS_MAPPINGS = {
-    "ANTsNastyBastardsTracker": ANTsNastyBastardsTracker,
+    "ANTs_Frontend_Optimizer": ANTsFrontendOptimizer,
+    "ANTsNastyBastardsTracker": ANTsFrontendOptimizer,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "ANTsNastyBastardsTracker": "🔧 ANTs Nasty Bastards Tracker",
+    "ANTs_Frontend_Optimizer": "ANTs Frontend Optimizer",
+    "ANTsNastyBastardsTracker": "ANTs Frontend Optimizer",
 }
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
