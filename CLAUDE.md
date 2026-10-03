@@ -12,19 +12,23 @@ this is going. Read the golden rules before the code.
 
 | Path | What it is |
 | --- | --- |
-| `web/tracker.js` | The whole frontend: instrumentation, the scheduler layer, the low-zoom/viewport rules, the panel. ~9.5k lines, one ES module, `import { app } from "/scripts/app.js"`. |
-| `__init__.py` | The node class (does nothing, never executes) and one optional read-only route `GET /ants_tracker/gpu`. |
+| `web/tracker.js` | The whole frontend: instrumentation, the scheduler layer, the low-zoom/viewport rules, the panel. ~12k lines, one ES module, `import { app } from "/scripts/app.js"`. |
+| `web/window.html` | The separate window at `/ants_optimizer/window`: its own page (no canvas script), talking to the ComfyUI page through `/ants_optimizer/ui`. |
+| `__init__.py` | The node class (does nothing, never executes) and nine best-effort routes: `GET /ants_tracker/gpu`, the five `/ants_optimizer/thumbs/*` routes, `/ants_optimizer/window` and `/ants_optimizer/ui`. |
 | `tests/` | Zero-dependency test suite + a synthetic-browser harness + a demo. No npm, no jsdom, no browser. |
 | `tools/pill-preview.mjs` | Renders the pill into `preview/` straight from the real CSS and glyph builders. |
 | `tools/box-preview.mjs` | Renders the flat boxes at each `boxDetail` level into `preview/` by recording the real paint ops (`lodPaintNode`) and replaying them as SVG. |
 | `preview/` | Generated. Never hand-edit; regenerate. |
-| `README.md` | User-facing docs. Every release adds a "What changed in vX.Y.Z" section **at the top of the changelog**. |
+| `README.md` | User-facing docs: install, use, every setting with its ladder and default, the tabs, the limits, credits. |
+| `CHANGELOG.md` | Version history. Every release adds a "What changed in vX.Y.Z" section **at the top**. |
+| `ANALYSIS.md` | What works, what failed and was fixed, and which ideas were retired; keep it honest and dated. |
+| `LICENSE` / `THIRD_PARTY_NOTICES.md` | This project's MIT licence, and the upstream notices carried with the ported ideas (the NodeSnapshots notice verbatim; no other code is copied). |
 | `REVIEW.md` | The v1 defect review with line references and the v2 fix for each. Read it before touching attribution or muting. |
 
 ## Commands
 
 ```bash
-node tests/run-tests.mjs              # all tests — must be green before any commit
+node tests/run-tests.mjs              # all 172 tests — must be green before any commit
 node tests/run-tests.mjs <substring>  # one suite/test, e.g. ... pill
 python3 tests/test_init.py            # the Python side (route parsing, node contract)
 node tests/demo.mjs                   # prints what the panel says against a synthetic graph
@@ -90,8 +94,7 @@ Read in this order to understand the file:
 | `--- 1. wrap extension registration` | The interceptor for `app.registerExtension` that wraps every other extension's `nodeCreated`/hook installs. |
 | `--- 2. catch hooks never routed through beforeRegisterNodeDef` | Pre-existing prototypes and per-instance hooks. |
 | `--- 3. canvas-level patches` | `draw` frame total, per-node-type cost, the three draw stages. |
-| `--- low-zoom drawing` | `LOD`, every predicate (`lodOn`, `lodFlatOn`, …), the DOM registry/sweep, preview ladder, link ink. |
-| `--- previews` | The thumbnail ladder (`LOD.thumbs`, a WeakMap per source; `createImageBitmap` with a canvas fallback). |
+| `--- low-zoom drawing` | `LOD`, every predicate (`lodOn`, `lodFlatOn`, …), the DOM registry/sweep, link ink, and the retired-ladder tombstone (`LOD.thumbZoom = 0` — do not restore it). |
 | `--- node snapshots` | The bitmap engine: signature, the keep-live set and every reason a node stays a box (with its name in the readout), size fitting and the ink probe, the capture into an offscreen canvas, the idle-lane pump, the budget (coarse-before-refused), and the reuse path called from the `drawNode` wrapper. Reads `LOD_SNAP_*` and the block comment above them first. |
 | `--- DOM boxes` | `view*`: the widget gate, the node-DOM registry, the event gate, fovea. |
 | `--- the event gate` | `LOD.blockSet` and the document-capture listener. |
@@ -138,7 +141,8 @@ predicate, not inline in a hot path.
    `set`) so tests and scripts do not reach into internals.
 8. **Tests**: one that the default changes nothing, one that switching it on
    changes exactly its own subject, one that switching it off restores.
-9. **README**: the changelog section, and `memory.md` if it involved a decision.
+9. **Docs**: a `CHANGELOG.md` entry, the README if a user-facing setting or
+   number changed, and `memory.md` if it involved a decision.
 
 ## Testing
 
@@ -213,9 +217,9 @@ Rules for tests:
 2. `cp web/tracker.js /tmp/x.mjs && node --check /tmp/x.mjs`.
 3. Bump `VERSION` in `web/tracker.js` (the panel, the report and the snapshot all
    read it from there).
-4. README: a new `## What changed in vX.Y.Z` section directly above the previous
-   one, written as "the problem, then what changed, then what it cost", plus the
-   test count in the Development block.
+4. `CHANGELOG.md`: a new `## What changed in vX.Y.Z` section directly above the
+   previous one, written as "the problem, then what changed, then what it cost";
+   keep the test count in the README's Development block current.
 5. `memory.md`: append to the version log; add any decision worth not re-litigating.
 6. `node tools/pill-preview.mjs > preview/pill.html` if any pill CSS, glyph or
    control changed.

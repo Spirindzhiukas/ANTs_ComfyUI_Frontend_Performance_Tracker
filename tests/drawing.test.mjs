@@ -2522,6 +2522,44 @@ suite("drawing: node snapshots — a box that is a picture of the node", () => {
     assertEqual(api.snapshots.captured, 3, "a fresh page state captures again");
     h.tracker.lowZoom.set({ snapshots: false });
   });
+
+  test("the keep-live list is a control, not an API-only setting", async () => {
+    const h = await boot();
+    snapGraph(h, 3);
+    h.tracker.lowZoom.set({ flatBelow: 0.2, snapshots: true });
+    draw(h, 1);
+    await idle(h);
+    h.advance(600); // the panel refreshes on its own tick
+    await h.flush();
+    await openTweaksTab(h);
+    assertIncludes(panelText(h), "Keep these node types live", "the setting is in the panel");
+    const field = h
+      .panel()
+      .descendants()
+      .find((n) => n.tagName === "INPUT" && String(n.type).toLowerCase() === "text");
+    assert(field, "and it is a text field, not a dropdown of types the tool guessed");
+    field.value = " SnapThing , , OtherThing ";
+    field._fire("change");
+    await h.flush();
+    assertEqual(h.tracker.lowZoom.state.snapExclude.join(","), "SnapThing,OtherThing", "typing a list applies it, trimmed and without blanks");
+    assertEqual(field.value, "SnapThing, OtherThing", "and the field shows what was accepted");
+    // A type on the list is kept live *on purpose* and says so, rather than
+    // being counted as a capture that failed. The capture path is what counts
+    // it, so a box has to be painted for the node to reach that path — and a
+    // picture that already existed has to be dropped, or the list would appear
+    // to do nothing until the node next changed.
+    const capturedBefore = h.tracker.lowZoom.snapshots.captured;
+    draw(h, 1);
+    await idle(h);
+    h.advance(600);
+    await h.flush();
+    assertGreater(h.tracker.lowZoom.snapshots.keptLive, 0, "the engine counts it as kept live on purpose, not as a failed capture");
+    assertEqual(h.tracker.lowZoom.snapshots.captured, capturedBefore, "and no new picture is taken for a type on the list");
+    // And an empty box clears it again.
+    field.value = "";
+    field._fire("change");
+    assertEqual(h.tracker.lowZoom.state.snapExclude.length, 0, "clearing the field clears the list");
+  });
 });
 
 // The two ways a snapshot store can quietly go wrong on a long-lived page: memory

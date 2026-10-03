@@ -27,7 +27,7 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.5.3";
+const VERSION = "2.5.4";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
 // The class key ComfyUI stores in a workflow. The old key is still recognised so
 // a graph saved before the rename does not lose this node.
@@ -50,7 +50,6 @@ const FRAME_KEEP_MS = 30000;
 const MIN_FRAMES_FOR_RATE = 4;
 const SWEEP_MS = 1000;
 const UI_REFRESH_MS = 500;
-const SELF_SAMPLE_MS = 1000; // tracker's own cost accounting
 
 // --- ring buffer sizing ----------------------------------------------------
 const RING_CAP_INITIAL = 64;
@@ -58,7 +57,6 @@ const RING_CAP_MAX = 4096;
 const MAX_CALLERS = 80;
 const MAX_STALL_SOURCES = 80;
 const STACK_SAMPLES_PER_SEC = 20;
-const MAX_LOAF_SAMPLES = 600;
 
 // ---------------------------------------------------------------- utils ----
 
@@ -863,7 +861,8 @@ function maybeWrapInstanceHooks(node) {
 //   * below a zoom the user picks, every node is painted as one flat rectangle
 //     instead of LiteGraph's border, gradient, title, slots, widgets and
 //     previews — and the DOM content of those nodes goes with it;
-//   * links are painted as straight lines while the graph is rectangles;
+//   * a link's shape is the user's own choice (straight lines only when asked
+//     for), and link ink can be thinned below a zoom without touching nodes;
 //   * and while nobody is touching the page the redraw rate is capped, because
 //     the frame nobody is looking at is the cheapest frame on the page.
 // Replacing a node is on at 50% for a fresh install: that is the zoom a large
@@ -872,7 +871,7 @@ function maybeWrapInstanceHooks(node) {
 // with the reason in the panel: a rendering change this tool cannot explain
 // would be worse than a slow frame.
 const LOD = {
-  flatBelow: 0.5, // replace every node with its thumbnail below this zoom (0 = off)
+  flatBelow: 0.5, // replace every node with a stand-in below this zoom (0 = off)
   legacyPx: 0, // a v2.1.8 "nodes under Npx" setting, carried over, shown once
   idleCapMs: 0, // while untouched, at most one redraw per this many ms (0 = off)
   nodes: 0, // node draws replaced by a rectangle
@@ -930,10 +929,11 @@ const LOD = {
   snapTimer: null,
   snapExclude: [], // node types the user has asked to keep live
   inCapture: false, // true only while a capture draws: attribution steps aside
-  // Preview bitmaps. A 4096px image drawn into a 40px box on screen costs the
-  // full-size upload and blit every redraw; past the zoom you set, the draw is
-  // served from a cached copy of about the resolution the screen can show.
-  thumbZoom: 0, // retired: the node picture is the thumbnail. Kept at 0 so a saved value cannot bring the drawImage path back
+  // The image-preview thumbnail ladder (v2.1.5) was retired in v2.5.0: the node
+  // picture *is* the thumbnail. The whole drawImage substitution was removed
+  // after being unreachable for two releases; this tombstone stays so a saved
+  // record cannot bring it back and `state.thumbZoom` still answers 0.
+  thumbZoom: 0,
   diskOn: true, // load and store those pictures under ComfyUI's temp folder
   diskAsked: null, // Set of id+sig already requested this page
   diskDead: false, // the route failed enough times; stay in memory
@@ -944,17 +944,6 @@ const LOD = {
   diskSwept: false,
   snapMipDrawn: 0, // blits that used a half or quarter copy
   snapMipSkipped: 0, // pictures kept at 1x because the budget could not hold the chain
-  inNode: false, // true only while a node is being drawn
-  imgSeen: 0, // drawImage calls for image-shaped sources inside a node
-  imgThumb: 0, // served from a cached thumbnail
-  imgFull: 0, // drawn full size because the thumbnail was not ready
-  imgSkipped: 0, // left alone (small source, or nothing to gain)
-  thumbs: null, // WeakMap<source, Map<bucket, record>>
-  produced: new WeakSet(), // bitmaps and canvases this ladder made
-  thumbQueue: [], // insertion order, for the size cap
-  thumbsBuilt: 0,
-  thumbBytes: 0,
-  thumbFailures: 0,
   zoom: 0,
   // Link ink. Past a zoom the user sets, links are stroked 1px wide instead of 3
   // and lose the dark outline drawn under them — a change to the *stroke*, made
@@ -1127,12 +1116,6 @@ const LOD_SNAP_WHY_MAX = 6;
 const LOD_SNAP_IMGS_MAX = 8;
 const LOD_IDLE_CAP_MS = [0, 250, 500, 1000];
 const LOD_IDLE_INPUT_MS = 400; // how long one touch keeps the cap lifted
-// Zoom levels at which previews may be served from a thumbnail.
-const LOD_THUMB_ZOOMS = [0, 1, 0.8, 0.6, 0.4, 0.2];
-const LOD_THUMB_LADDER = [64, 128, 256, 512, 1024, 2048]; // longest side, px
-const LOD_THUMB_MIN_SRC = 256; // sources smaller than this are not worth copying
-const LOD_THUMB_MAX = 48; // thumbnails kept before the oldest is dropped
-const LOD_THUMB_MAX_BYTES = 64 * 1024 * 1024; // and a byte budget, because 48 large copies are a lot of memory
 // Zoom levels below which links and node detail are reduced.
 const LOD_DETAIL_ZOOMS = [0, 1, 0.8, 0.6, 0.4, 0.2];
 const LOD_LINK_WIDTH = 1; // graph units; LiteGraph's own default is 3
@@ -1142,7 +1125,6 @@ const LOD_INERT_CLASS = "ants-lod-inert"; // elements switched off while their n
 // Below this zoom nobody can read a node, let alone use one, so its UI is
 // switched off rather than paid for on every pointer event.
 const VIEW_INERT_ZOOMS = [0, 0.2, 0.3, 0.4, 0.5, 0.6];
-const VIEW_INERT_DEFAULT = 0.4; // what the toggle uses when it is switched on
 // Foveated: how far outside the viewport a node must be before its DOM content is
 // taken out of the picture entirely. Half a screen by default: that is enough
 // margin that a node crossing it under a pan takes longer to arrive than the
@@ -1193,7 +1175,7 @@ const LOD_STORE_KEY = "ants.lowZoom.v1";
 // off, they all answer "no" and the page is drawn exactly as ComfyUI draws it.
 function lodOn() {
   if (!S.enabled) return false;
-  return LOD.flatBelow > 0 || LOD.idleCapMs > 0 || LOD.thumbZoom > 0 || LOD.detailZoom > 0 || LOD.inertBelow > 0 || LOD.fovea || LOD.snapOn;
+  return LOD.flatBelow > 0 || LOD.idleCapMs > 0 || LOD.detailZoom > 0 || LOD.inertBelow > 0 || LOD.fovea || LOD.snapOn;
 }
 
 function antsEnabled() {
@@ -1470,16 +1452,6 @@ function lodLinksStraight() {
   return LOD.linkStyle === "straight";
 }
 
-function lodBoxifyOn(canvas) {
-  return lodFlatOn(canvas);
-}
-
-function lodPreviewsOn(canvas) {
-  if (!(LOD.thumbZoom > 0)) return false;
-  const z = lodZoomOf(canvas);
-  return z > 0 && z < LOD.thumbZoom;
-}
-
 // This frontend can render nodes as Vue DOM overlays, in which case LiteGraph
 // draws no node chrome at all — painting rectangles for them would put the
 // canvas *behind* the DOM nodes it is meant to replace.
@@ -1666,137 +1638,6 @@ function lodPaintLink(ctx, a, b, color) {
   ctx.stroke();
 }
 
-// ------------------------------------------------------------- previews -----
-// Which resolution does the screen need? A node draws in graph units, so the
-// destination rectangle has to be multiplied by the zoom and the device pixel
-// ratio before it means anything on screen.
-function lodBucketFor(px, sourceLong) {
-  for (const b of LOD_THUMB_LADDER) if (b >= px) return Math.min(b, sourceLong);
-  return sourceLong;
-}
-
-function lodImageSize(img) {
-  if (!img) return null;
-  const w = Number(img.naturalWidth || img.videoWidth || img.width) || 0;
-  const h = Number(img.naturalHeight || img.videoHeight || img.height) || 0;
-  if (!(w > 0) || !(h > 0)) return null;
-  return { w, h };
-}
-
-function lodDpr() {
-  try {
-    const dpr = Number(typeof window !== "undefined" && window.devicePixelRatio);
-    return Number.isFinite(dpr) && dpr > 0 ? dpr : 1;
-  } catch (e) {
-    return 1;
-  }
-}
-
-function lodEvictThumbs() {
-  while (LOD.thumbQueue.length > LOD_THUMB_MAX || LOD.thumbBytes > LOD_THUMB_MAX_BYTES) {
-    const old = LOD.thumbQueue.shift();
-    const per = LOD.thumbs && LOD.thumbs.get(old.src);
-    const rec = per && per.get(old.bucket);
-    if (rec && rec.ready) LOD.thumbBytes = Math.max(0, LOD.thumbBytes - (rec.bytes || 0));
-    if (per) per.delete(old.bucket);
-  }
-}
-
-function lodBuildThumb(img, size, bucket, rec, per) {
-  const k = Math.min(1, bucket / Math.max(size.w, size.h));
-  const tw = Math.max(1, Math.round(size.w * k));
-  const th = Math.max(1, Math.round(size.h * k));
-  const done = (bitmap) => {
-    rec.bitmap = bitmap;
-    rec.ready = true;
-    LOD.produced.add(bitmap);
-    rec.bytes = tw * th * 4;
-    LOD.thumbsBuilt++;
-    LOD.thumbBytes += rec.bytes;
-    lodEvictThumbs();
-  };
-  try {
-    if (typeof createImageBitmap === "function") {
-      Promise.resolve(createImageBitmap(img, { resizeWidth: tw, resizeHeight: th, resizeQuality: "low" }))
-        .then(done)
-        .catch(() => {
-          LOD.thumbFailures++;
-          per.delete(bucket);
-        });
-      return;
-    }
-  } catch (e) {
-    /* no createImageBitmap: fall through to the canvas path */
-  }
-  try {
-    const c = document.createElement("canvas");
-    c.width = tw;
-    c.height = th;
-    const cctx = c.getContext("2d");
-    if (!cctx) throw new Error("no 2d context for thumbnails");
-    cctx.drawImage(img, 0, 0, tw, th);
-    done(c);
-  } catch (e) {
-    LOD.thumbFailures++;
-    per.delete(bucket);
-  }
-}
-
-// The thumbnail for this source at this size, or null while it is being built.
-function lodThumbFor(img, size, bucket) {
-  if (!LOD.thumbs) LOD.thumbs = new WeakMap();
-  let per = LOD.thumbs.get(img);
-  if (!per) {
-    per = new Map();
-    LOD.thumbs.set(img, per);
-  }
-  const rec = per.get(bucket);
-  if (rec) return rec.ready ? rec.bitmap : null;
-  const pending = { ready: false, bitmap: null, bytes: 0, src: img, bucket };
-  per.set(bucket, pending);
-  LOD.thumbQueue.push({ src: img, bucket });
-  lodBuildThumb(img, size, bucket, pending, per);
-  return null;
-}
-
-// A drop-in replacement for one drawImage() call, or null to leave it alone.
-function lodThumbArgs(args) {
-  if (!lodPreviewsOn()) return null;
-  const img = args[0];
-  if (!img || typeof img !== "object") return null;
-  // Thumbnails of thumbnails are pointless: anything we produced is already the
-  // resolution the screen asked for.
-  if (LOD.produced && LOD.produced.has(img)) return null;
-  const size = lodImageSize(img);
-  if (!size) return null;
-  const long = Math.max(size.w, size.h);
-  if (long < LOD_THUMB_MIN_SRC) {
-    LOD.imgSkipped++;
-    return null;
-  }
-  const nine = args.length >= 9;
-  const dw = Number(nine ? args[7] : args[3]) || 0;
-  const dh = Number(nine ? args[8] : args[4]) || 0;
-  const need = Math.max(Math.abs(dw), Math.abs(dh)) * (LOD.zoom > 0 ? LOD.zoom : 1) * lodDpr();
-  const bucket = lodBucketFor(need, long);
-  if (!(bucket > 0) || bucket >= long) {
-    LOD.imgSkipped++;
-    return null;
-  }
-  LOD.imgSeen++;
-  const thumb = lodThumbFor(img, size, bucket);
-  if (!thumb) {
-    LOD.imgFull++;
-    return null;
-  }
-  LOD.imgThumb++;
-  if (nine) {
-    const k = thumb.width / Math.max(1, size.w);
-    return [thumb, args[1] * k, args[2] * k, args[3] * k, args[4] * k, args[5], args[6], dw, dh];
-  }
-  return [thumb, args[1], args[2], dw, dh];
-}
-
 let lodDomSweepTimer = null;
 
 // Nodes and widgets arrive while the page is running (a workflow load, an
@@ -1824,37 +1665,6 @@ function lodInstallDomSweep() {
     /* no timers: the sweep still runs whenever the zoom or the setting changes */
   }
 }
-
-let lodDrawImagePatched = false;
-
-// Only image draws that happen *inside* a node are touched: the graph's own
-// bitmaps (background grid, per-node-type icons) are already small and are not
-// what costs a frame. Installed once, and inert while the mode is off.
-function lodInstallDrawImage() {
-  if (lodDrawImagePatched) return true;
-  try {
-    const proto = typeof CanvasRenderingContext2D !== "undefined" && CanvasRenderingContext2D.prototype;
-    if (!proto || typeof proto.drawImage !== "function") return false;
-    const original = proto.drawImage;
-    proto.drawImage = function (...args) {
-      if (LOD.inNode && LOD.thumbZoom > 0) {
-        try {
-          const sub = lodThumbArgs(args);
-          if (sub) return original.apply(this, sub);
-        } catch (err) {
-          LOD.thumbFailures++;
-          if (LOD.thumbFailures > 8) lodSet({ thumbZoom: 0 });
-        }
-      }
-      return original.apply(this, args);
-    };
-    lodDrawImagePatched = true;
-    return true;
-  } catch (e) {
-    return false;
-  }
-}
-
 // The frontend has its own low-quality rendering: `_isLowQuality` is what
 // `low_quality` reads, and below its own threshold (Settings -> LiteGraph,
 // "Zoom Node Level of Detail") it stops drawing node shadows and rounded
@@ -3329,7 +3139,24 @@ function lodSet(opts) {
   }
   if ("snapExclude" in o) {
     const list = Array.isArray(o.snapExclude) ? o.snapExclude : [];
-    LOD.snapExclude = list.map((t) => String(t)).filter(Boolean).slice(0, LOD_SNAP_TYPES_MAX);
+    const next = list.map((t) => String(t)).filter(Boolean).slice(0, LOD_SNAP_TYPES_MAX);
+    const prev = LOD.snapExclude || [];
+    const changed = next.join("\u0000") !== prev.join("\u0000");
+    LOD.snapExclude = next;
+    // A type just added to the list has to stop being served from a picture now,
+    // not whenever its next capture happens: a control that appears to do
+    // nothing is worse than no control. Only the newly excluded types' records
+    // are dropped, so adding one type does not recapture the rest of the graph —
+    // and their nodes count as "kept live on purpose", not as failed captures.
+    if (changed && LOD.snaps && LOD.snaps.size) {
+      for (const t of next) {
+        if (prev.indexOf(t) >= 0) continue;
+        for (const node of [...LOD.snaps.keys()]) {
+          const type = String((node && (node.type || node.comfyClass)) || "");
+          if (type === t) lodSnapDrop(node, `kept live by your list (${t})`);
+        }
+      }
+    }
   }
   if ("autoLinkCarried" in o) LOD.autoLinkCarried = !!o.autoLinkCarried;
   // v1 and v2.1.8 scripts passed a pixel width. Kept working: translated.
@@ -3397,7 +3224,7 @@ function lodSet(opts) {
   const now = lodOn();
   if (now) LOD.error = "";
   // The first change is the moment worth measuring from, whether or not the mode
-  // was already partly on (previews are on by default).
+  // was already on (stand-in pictures are on by default).
   if (now && !LOD.baseline) lodCaptureBaseline();
   if (!now && was) LOD.baseline = null;
   if (LOD.idleCapMs > 0 || LOD.snapOn) govInstallInputGuard();
@@ -3567,8 +3394,8 @@ function patchCanvasDraw() {
         if (!drawOwner.display) drawOwner.display = true;
         drawOwner.drew = (drawOwner.drew || 0) + 1;
       }
-      // The plan also carries the zoom, which the preview ladder needs even when
-      // no node is being flattened.
+      // The plan also carries the zoom: focus, the fovea and the picture decision
+      // all read it even when no node is being flattened.
       if (S.enabled && lodOn()) lodPlanFrame(this);
       drawDepth++;
       let ret;
@@ -3634,14 +3461,7 @@ function patchCanvasDraw() {
         return undefined;
       }
       const t0 = performance.now();
-      const outerInNode = LOD.inNode;
-      LOD.inNode = true; // preview substitution is only for what a node draws
-      let ret;
-      try {
-        ret = originalDrawNode.call(this, node, ctx, ...rest);
-      } finally {
-        LOD.inNode = outerInNode;
-      }
+      const ret = originalDrawNode.call(this, node, ctx, ...rest);
       const dt = performance.now() - t0;
       if (!S.paused) {
         const typeName = (node && (node.type || (node.constructor && node.constructor.type))) || "unknown";
@@ -4310,21 +4130,6 @@ async function lodRamCheck() {
   return { used, purged: 0 };
 }
 
-function lodRamReload() {
-  const canvas = typeof app !== "undefined" && app ? app.canvas : null;
-  if (!canvas || !lodSnapOn(canvas)) return 0;
-  const nodes = lodGraphNodes(canvas);
-  if (!nodes) return 0;
-  let n = 0;
-  for (const node of nodes) {
-    const rec = LOD.snaps && LOD.snaps.get(node);
-    if (rec && rec.canvas) continue;
-    lodSnapEnqueue(node, canvas);
-    n++;
-  }
-  return n;
-}
-
 async function lodRamFinish() {
   LOD.ramRunning = false;
   const used = await lodRamSample();
@@ -4533,7 +4338,6 @@ function lodSnapRender(node, canvas, geom, ratio) {
   const ds = canvas && canvas.ds;
   const prevScale = ds ? ds.scale : undefined;
   const prevLow = canvas ? canvas._isLowQuality : undefined;
-  const prevInNode = LOD.inNode;
   const prevCurrent = canvas ? canvas.current_node : undefined;
   // The ring is drawn on the blit, not baked into a picture that will still be
   // shown after the node is deselected. Cleared only for this draw.
@@ -4554,7 +4358,6 @@ function lodSnapRender(node, canvas, geom, ratio) {
     // frontend's own low-quality mode must not be baked into a reusable image.
     if (ds) ds.scale = 1;
     if (canvas && "_isLowQuality" in canvas) canvas._isLowQuality = false;
-    LOD.inNode = false; // no preview thumbnails inside a capture: full detail is the point
     if (canvas) canvas.current_node = node;
     // ComfyUI's image preview does not draw the photograph here. It pushes the
     // drawImage onto a list and queueMicrotask's a flusher. Collect those turns
@@ -4593,7 +4396,6 @@ function lodSnapRender(node, canvas, geom, ratio) {
     }
   } finally {
     LOD.inCapture = false;
-    LOD.inNode = prevInNode;
     if (ds && prevScale !== undefined) ds.scale = prevScale;
     if (canvas && prevLow !== undefined && "_isLowQuality" in canvas) canvas._isLowQuality = prevLow;
     if (canvas && prevCurrent !== undefined) canvas.current_node = prevCurrent;
@@ -7826,8 +7628,6 @@ function antsUiLimits() {
     foveaRestores: VIEW_FOVEA_RESTORES.slice(),
     displayScales: VIEW_DISPLAY_SCALES.slice(),
     idleCapMs: LOD_IDLE_CAP_MS.slice(),
-    thumbZoom: LOD_THUMB_ZOOMS.slice(),
-    thumbLadder: LOD_THUMB_LADDER.slice(),
     detailZoom: LOD_DETAIL_ZOOMS.slice(),
     boxDetail: LOD_BOX_DETAIL.slice(),
     snapRatios: LOD_SNAP_RATIOS.slice(),
@@ -8872,6 +8672,31 @@ function buildTweaksTab(container) {
     "Plain, title and state are painted rectangles. They never decide which nodes are replaced — the zoom above does. A picture is captured once while the page is idle and drawn in the node's place, the same way a box was. Image previews are not a second system: the picture is the preview, and it replaces the node, not a box inside it. A node that draws nothing into the canvas keeps the fill, because a transparent picture would erase it. Switching to a fill releases the stored bitmaps."
   );
 
+  // The keep-live list. The snapshot engine has honoured `snapExclude` since
+  // v2.4.0 and the readout names it ("kept live by your list"), but until now
+  // the only way to add a type was the console — a mechanism with no door.
+  const snapKeepInput = el("input", { class: "ants-select", type: "text" });
+  snapKeepInput.placeholder = "PreviewImage, VHS_VideoCombine, …";
+  snapKeepInput.value = (LOD.snapExclude || []).join(", ");
+  const commitSnapKeep = () => {
+    const list = String(snapKeepInput.value || "")
+      .split(",")
+      .map((t) => t.trim())
+      .filter(Boolean);
+    lodSet({ snapExclude: list });
+    // lodSet trims and caps; show exactly what was accepted, not what was typed.
+    snapKeepInput.value = (LOD.snapExclude || []).join(", ");
+    lodUpdate();
+  };
+  snapKeepInput.addEventListener("change", commitSnapKeep);
+  snapKeepInput.addEventListener("blur", commitSnapKeep);
+  settingRow(
+    "Keep these node types live",
+    snapKeepInput,
+    "Comma-separated node types that are never served from a picture: they keep their painted fill, or draw live, however far you zoom out.",
+    "A type on this list is counted apart from a failure — the readout's \"kept live on purpose\" is this setting doing its job. It is the escape hatch for a type whose picture is wrong for a reason this tool cannot see (a node that reads state it does not draw, a canvas that other code writes asynchronously). Matching is exact and case-sensitive, against the type name on the node."
+  );
+
   const snapRatioSel = el("select", { class: "ants-select" });
   for (const r of LOD_SNAP_RATIOS) {
     const opt = el("option", { text: `capture ${r}x per graph unit` });
@@ -9486,31 +9311,10 @@ function buildTweaksTab(container) {
           bits2.push("the nodes painted flat at this zoom have no DOM content to hide (their visuals are canvas-drawn)");
         }
       }
-      if (LOD.thumbZoom > 0) {
-        const frames = Math.max(1, since ? since.n : 1);
-        if (lodPreviewsOn()) {
-          bits2.push(
-            `previews: ${LOD.imgThumb} of ${LOD.imgSeen} image draw(s) served from a cached thumbnail ` +
-              `(${(LOD.imgThumb / frames).toFixed(1)}/frame) · ${LOD.thumbsBuilt} cached, ≈${fmtBytes(LOD.thumbBytes)}` +
-              `${LOD.imgFull ? ` · ${LOD.imgFull} drawn full size while a thumbnail was made` : ""}` +
-              `${LOD.imgSkipped ? ` · ${LOD.imgSkipped} draw(s) left alone (source already small)` : ""}` +
-              `${LOD.thumbFailures ? ` · ${LOD.thumbFailures} failed` : ""}`
-          );
-        } else {
-          bits2.push(
-            `previews: drawn full size at this zoom (${LOD.zoom.toFixed(2)}) — thumbnails start below ${Math.round(LOD.thumbZoom * 100)}%`
-          );
-        }
-      }
       bits.push(bits2.join(" · "));
     } else {
       bits.push("off — the canvas is drawn exactly as ComfyUI draws it");
     }
-      if (!LOD.flatBelow && !LOD.idleCapMs && LOD.thumbZoom > 0) {
-        bits.push(
-          "nothing but the previews is switched on: they are the part that helps at every zoom, and \"Back to full drawing\" turns them off too"
-        );
-      }
     if (LOD.legacyPx) {
       bits.push(
         `carried over from v2.1.8: your setting was "nodes under ${LOD.legacyPx}px". The rule is a zoom now, so it is "flat nodes below ` +
@@ -11669,9 +11473,6 @@ function buildTelemetryReport() {
               ? `, link strokes ${fmtMs((LOD.linkMs / Math.max(1, LOD.linkCalls)) * 1000, 0)}\u00b5s each over ${LOD.linkCalls} call(s) ` +
                 `(the rest of the connections stage is the frontend's own per-slot walk)`
               : "") +
-            (LOD.thumbZoom > 0
-              ? `, previews ${LOD.imgThumb}/${LOD.imgSeen} served from thumbnails (${LOD.thumbsBuilt} cached, ${fmtBytes(LOD.thumbBytes)}) below ${Math.round(LOD.thumbZoom * 100)}% zoom`
-              : "") +
             (LOD.detailZoom > 0
               ? LOD.thinLinks > 0
                 ? `, links ${LOD.thinLinks} segment(s) drawn 1px without outlines below ${Math.round(LOD.detailZoom * 100)}% zoom`
@@ -12005,19 +11806,11 @@ function installDebugApi() {
             widgets: LOD.domWidgets ? [...LOD.domWidgets.keys()] : [],
           };
         },
+        // The image-preview thumbnail ladder was retired in v2.5.0 and its
+        // implementation removed; this stays so a script gets an answer rather
+        // than undefined, and the answer is the truth: it is not there.
         get previews() {
-          return {
-            on: lodPreviewsOn(),
-            zoom: LOD.zoom,
-            belowZoom: LOD.thumbZoom,
-            served: LOD.imgThumb,
-            seen: LOD.imgSeen,
-            fullSize: LOD.imgFull,
-            skipped: LOD.imgSkipped,
-            built: LOD.thumbsBuilt,
-            bytes: LOD.thumbBytes,
-            failures: LOD.thumbFailures,
-          };
+          return { on: false, retired: true, zoom: LOD.zoom };
         },
         get frontendLod() {
           return lodFrontendLod(app.canvas);
@@ -12363,10 +12156,13 @@ app.registerExtension({
 //    call it. The idle lane yields between slices so a drag is not blocked; it
 //    does not multithread the photograph. The worker lane exists for the
 //    pure-math parts, and it says so when it falls back to the main thread.
-//  * The Window button is window.open of this same page's panel, for a second
-//    monitor. It is not a second ComfyUI process. A blocked popup leaves the
-//    panel where it is and says so. Styles are copied into the new document;
-//    they do not follow a node that was only moved.
+//  * The Window button opens /ants_optimizer/window: its own page, served by
+//    this extension, for a second monitor. It is not a second ComfyUI process
+//    and not a worker. It talks to the ComfyUI page through /ants_optimizer/ui
+//    (a revision and an origin, so neither side is the master), which means it
+//    shows the live numbers only while the ComfyUI page is open and answering;
+//    with that page gone the window says so instead of pretending. A blocked
+//    popup leaves the in-page panel as the fallback and says why.
 //  * Worker functions cannot capture closures, which is why the lane takes a
 //    job name (or a self-contained function source) plus structured-cloneable
 //    arguments and nothing else.
@@ -12378,8 +12174,10 @@ app.registerExtension({
 //    the moment it was captured*: while a node's own live drawing animates
 //    without changing any field in the signature (a shader-like hook with its own
 //    clock), the picture is the frame it was taken from, not a moving image.
-//  * A capture is drawn at the capture ratio (default 2 pixels per graph unit)
+//  * A capture is drawn at the capture ratio (default 1 pixel per graph unit)
 //    and scaled into the node's box on screen. Zoomed in past that, a snapshot is
 //    softer than the live drawing — which is why a node that is being worked at,
 //    selected or hovered is never served from one, and why the ratio is a
-//    setting rather than a constant.
+//    setting rather than a constant. The ratio is also the coverage knob on a
+//    large graph: the budget divided by the pixels per picture decides how many
+//    nodes can hold one at all.

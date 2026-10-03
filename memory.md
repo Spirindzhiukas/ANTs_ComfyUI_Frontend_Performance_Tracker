@@ -4,7 +4,7 @@ A running record for whoever picks this up next (including me). `CLAUDE.md` is t
 rules for changing the code; `plan.md` is where it is going. This file is the past:
 what was built, what was rejected, and what the evidence was.
 
-Last updated at **v2.5.3**, 170 tests green, PR #1 on
+Last updated at **v2.5.4**, 172 tests green, PR #1 on
 `Spirindzhiukas/ANTs_ComfyUI_Frontend_Performance_Tracker`.
 
 ---
@@ -13,10 +13,10 @@ Last updated at **v2.5.3**, 170 tests green, PR #1 on
 
 | | |
 | --- | --- |
-| Version | 2.5.3 (`web/tracker.js` `VERSION`) |
-| Tests | 170 (`node tests/run-tests.mjs`), plus `tests/test_init.py` |
+| Version | 2.5.4 (`web/tracker.js` `VERSION`) |
+| Tests | 172 (`node tests/run-tests.mjs`), plus `tests/test_init.py` |
 | Frontend | `web/tracker.js`, one ES module, no dependencies. The separate window is `web/window.html`, served at `/ants_optimizer/window`, not loaded as an extension. |
-| Backend | `__init__.py` — node `ANTs_Frontend_Optimizer` (old class key kept as an alias), the GPU route, and thumbnail read/write under ComfyUI's temp folder |
+| Backend | `__init__.py` — node `ANTs_Frontend_Optimizer` (old class key kept as an alias), nine best-effort routes (GPU, five thumbnail routes, the window page, `/ants_optimizer/ui`), and thumbnail read/write under ComfyUI's temp folder |
 | Panel | 10 tabs: Node Rendering Settings, Status, Timing, Nodes, Stalls, Governor, Load, Memory, GPU / VRAM, Testing |
 | Entry points | floating pill `[switch][gear]` (always on screen), the node's own pill, and `window.__antsTracker`. The gear opens the separate window; the in-page panel is the fallback when the popup is blocked. |
 | Persisted | `ants.lowZoom.v1` (drawing + view settings), `ants-governor-v1` (scheduler limits), `ants-tracker-corner-pos` (pill position) |
@@ -27,7 +27,7 @@ what is eating frames that is not canvas drawing at all (Stalls + invalidation
 callers), and what a change would be worth (mute + scripted pan A/B). Then there
 is a scheduler layer that can act on what it finds (Governor), and a set of
 drawing settings that make one redraw cheaper on graphs too big to draw in detail
-(Tweaks: node flattening, link ink, preview thumbnails, idle cap, viewport focus).
+(Node Rendering Settings: node stand-ins, link ink, idle cap, viewport focus).
 
 That last group is where the recent work has been, because a ~1000-node graph at
 10% zoom is the user's actual situation and no amount of measurement fixes it —
@@ -36,6 +36,8 @@ something has to be drawn less or hit-tested less.
 ## 2. Version log
 
 The commit log is the full record; this is the "why", newest first.
+
+**v2.5.4 — audit, README rewrite, and the keep-live list gets a door.** The README still described v2.1 (five tabs, the old install folder, one route, "nothing else is written server-side", 161 tests) and carried no credits, so it was rewritten from the code and the version history moved to `CHANGELOG.md` — 900 lines of archaeology were the reason the body could drift unnoticed. `LICENSE` and `THIRD_PARTY_NOTICES.md` now exist (plan.md Track M), with the NodeSnapshots MIT notice verbatim. Two real defects turned up while verifying the code: `snapExclude` had no UI at all (a mechanism with no door — the readout said "kept live by your list" and the only way in was the console), and adding a type did nothing until that node changed because an existing record was still served (fixed by dropping only the newly excluded types' records in `lodSet`). The demo was printing the wrong tab names (it skipped `status` and indexed the bar), was still explaining the retired preview ladder, and called the tab "Tweaks"; `tracker.js`'s header comment claimed links go straight while nodes are rectangles, which stopped being true when `linkStyle` was decoupled. All fixed. A new test pins the window/page setting-key agreement in both directions, so a control that posts a key the page ignores cannot ship silently. Nothing was taken out of the drawing engine in this pass — the dead ladder, boxify and drawImage code had already been removed; `ANALYSIS.md` records the evidence and the retired ideas.
 
 **v2.5.3 — the window is a page, and the corner grows the way it is dragged.** The fallback panel was right-anchored, so widening it moved the left edge. It is pinned on the left and the top before the size changes; a header drag writes left, not right. The Window button no longer moves the panel into `about:blank`. The gear opens `/ants_optimizer/window`, centered on the ComfyUI window. That page does not load the canvas script and does not hold the canvas document. Settings and telemetry go through `/ants_optimizer/ui`: a revision and an origin, same shape as the uploaded `examples/pop_up_window` console, so a change in the window and a change on the page are one setting and neither side applies its own echo. Telemetry does not bump the revision. The page posts it only while the window is asking, on a timer that already existed, so startup does not spend an attribution token. If the browser blocks the popup, the in-page panel opens and says so. It is a browser window, not a second OS process, and not a worker. Vue node mode may still ignore a LiteGraph resize flag; the grip does not depend on that.
 

@@ -514,6 +514,18 @@ version is stronger than the legal minimum, and the user asked for credit
   has none, which is a poor look for a project that is about to embed someone
   else's notice.
 
+**Done (v2.5.4):** `LICENSE` (MIT, this repository),
+`THIRD_PARTY_NOTICES.md` with the NodeSnapshots notice verbatim (and the
+PHOSPHOR note), the README **Credits** section, and the same text in this
+pass's commit message. What was actually taken is smaller than the plan
+assumed: no code was copied from either upstream project — the stand-in
+engine is a re-implementation of the idea on this file's own seams, and the
+console mode is still unbuilt. DisableBrowserLogs carries no licence file at
+its root, so it is credited as an idea only; `THIRD_PARTY_NOTICES.md` says
+that plainly rather than shipping a notice it cannot vouch for. A source
+header naming the upstream work sits above the snapshot engine in
+`web/tracker.js`.
+
 ## What this must not become
 
 - Not a workflow runner, not a queue manager, not an execution profiler — the
