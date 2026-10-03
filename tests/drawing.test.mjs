@@ -2629,3 +2629,253 @@ suite("drawing: node snapshots — what releases a bitmap besides the budget", (
     assertLess(api(h).bytes, before, "and released its pixels");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Nodes 2.0 (the Vue-nodes renderer). This is the mode the tool must survive
+// without painting anything: `LiteGraph.vueNodesMode` is set from
+// `Comfy.VueNodes.Enabled`, `LGraphCanvas.drawNode()` returns early, every node
+// is a DOM element, and DOM widgets sit in the `[data-testid="dom-widgets"]`
+// layer positioned by the frontend's own converter.
+//
+// What is pinned here, in the order the questions get asked:
+//   1. the mode is *detected* (the whole no-painting rule hangs off one flag);
+//   2. nothing is painted behind a DOM node, and no node DOM is hidden because
+//      of a setting that cannot act on this renderer;
+//   3. the settings that do act on this renderer — link ink, the idle cap, the
+//      governor, viewport focus — still work, and the measurement is unaffected;
+//   4. the stand-in engine does not spend a slice, a byte or a disk write on
+//      pictures this renderer can never draw back;
+//   5. the panel says which renderer it is looking at, and why the setting that
+//      cannot act here is quiet — a control that silently does nothing is worse
+//      than one that explains itself.
+suite("drawing: the Nodes 2.0 (Vue nodes) frontend", () => {
+  const draw = (h, n = 1) => {
+    for (let i = 0; i < n; i++) {
+      h.advance(FRAME_MS);
+      h.canvas.setDirty(true, true);
+      h.canvas.draw();
+    }
+  };
+  const idle = async (h, ms = 1000) => {
+    h.advance(ms);
+    await h.flush();
+    h.advance(ms);
+    await h.flush();
+  };
+  const fills = (h) => h.canvas.ctx.ops.filter((o) => o[0] === "fillRect");
+  const snapApi = (h) => h.tracker.lowZoom.snapshots;
+
+  // A Vue-nodes page: three nodes, each with a DOM widget (the shape an image
+  // preview or a 3D viewport has), all of them rendered as elements.
+  function vueGraph(h, count = 3) {
+    h.canvas.ds.scale = 0.1; // well below the 50% default: the canvas mode would flatten
+    h.canvas.ds.offset[0] = 0;
+    h.canvas.ds.offset[1] = 0;
+    h.canvas.links = [];
+    const nodes = [];
+    for (let i = 0; i < count; i++) {
+      const n = h.node({ type: "KSampler", pos: [i * 240, 0], size: [200, 100], widgets: [] });
+      const el = h.document.createElement("canvas");
+      h.document.body.appendChild(el);
+      n.addDOMWidget("preview", "img", el, { hideOnZoom: false });
+      nodes.push(n);
+    }
+    h.canvas.nodes = nodes;
+    h.app.graph._nodes = nodes;
+    for (let i = 0; i < count; i++) h.canvas.links.push({ color: "#888888", from: [0, 0], to: [10, 10] });
+    const vue = h.enterVueNodes();
+    return { nodes, vue };
+  }
+
+  test("the mode is detected, and nothing is painted behind the DOM nodes", async () => {
+    const h = await boot();
+    const { nodes, vue } = vueGraph(h, 3);
+    assertEqual(h.LiteGraph.vueNodesMode, true, "the frontend says which renderer it is (LiteGraph.vueNodesMode)");
+    assertEqual(h.tracker.lowZoom.vueNodes, true, "and the tool reads the same flag, not a guess");
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true });
+    const before = fills(h).length;
+    draw(h, 3);
+    await idle(h);
+    assertEqual(h.tracker.lowZoom.state.nodes, 0, "no node is painted: the canvas draws none of them");
+    assertEqual(fills(h).length, before, "and no rectangle appears anywhere behind a DOM node");
+    assertEqual(snapApi(h).captured, 0, "and no picture is taken of a node that is never drawn as a box");
+    assertEqual(snapApi(h).on, false, "the stand-in engine reports itself off in this renderer, rather than counting pictures nobody can draw");
+    // The nodes' own DOM is not touched by a setting that cannot act on it.
+    for (const n of nodes) {
+      const root = vue.rootFor(n);
+      assert(root, "each node is a DOM element carrying data-node-id");
+      assert(!root.classList.contains("ants-lod-box"), "the node itself is never hidden by the stand-in setting");
+    }
+    assertEqual(h.tracker.lowZoom.dom.hidden, 0, "nothing of the node's DOM is hidden for a box that does not exist");
+    // And the measurement keeps working: frames are still counted.
+    assertGreater(h.tracker.totals.frames, 0, "the frame clock still runs");
+  });
+
+  test("the settings that act on DOM and on links still work", async () => {
+    const h = await boot();
+    const { nodes, vue } = vueGraph(h, 3);
+    // Link ink is a canvas change: links are still drawn by the canvas here.
+    // Spline style first: this is the path that keeps the curve and thins the
+    // stroke, and it goes through the canvas' own link renderer.
+    // (No idle cap here: a merged redraw would skip a frame's links entirely and
+    // that is a different feature's test. This one is about ink reaching the canvas.)
+    h.tracker.lowZoom.set({ flatBelow: 0, detailZoom: 0.6 });
+    h.canvas.ctx.ops.length = 0;
+    h.canvas.linkSettings.length = 0;
+    draw(h, 1);
+    assertGreater(h.tracker.lowZoom.detail.thinLinks, 0, "link thinning still reaches the ink");
+    assertGreater(h.canvas.linkSettings.length, 0, "and it went through the canvas' own link drawing");
+    assert(
+      h.canvas.linkSettings.every((s) => s.width === 1 && s.border === false),
+      "every link stroked thin, without its outline"
+    );
+    // Straight lines are the other canvas link setting, and it is reached too —
+    // this one draws the link itself and skips the canvas renderer entirely.
+    h.tracker.lowZoom.set({ linkStyle: "straight" });
+    const straightBefore = h.tracker.lowZoom.state.links;
+    const canvasDraws = h.canvas.linkDraws;
+    draw(h, 2);
+    assertGreater(h.tracker.lowZoom.state.links, straightBefore, "the straight-line setting draws links itself in this renderer");
+    assertEqual(h.canvas.linkDraws, canvasDraws, "and the canvas' own link renderer is not called while it does");
+
+    // Viewport focus: "widgets stop answering" acts on elements, so it works here.
+    h.tracker.lowZoom.set({ inertBelow: 0.2, focusDom: "hide" });
+    h.advance(1200);
+    await h.flush();
+    draw(h, 2);
+    const wrapper = vue.wrappers.get(nodes[0].widgets[0].element);
+    assert(wrapper, "the DOM widget is in the layer the frontend positions");
+    assert(wrapper.classList.contains("ants-lod-box"), "its element is switched off below the widget zoom");
+    assert(!vue.rootFor(nodes[0]).classList.contains("ants-lod-box"), "the node itself still is not: only its widgets are");
+    assertEqual(h.tracker.lowZoom.dom.hidden, 3, "the readout counts all three widget wrappers, each through its widget's own element");
+    assertGreater(h.tracker.lowZoom.focus.inertElements, 0, "the engine's inert counter moved");
+
+    // The other route into the registry: a component widget (what a 3D viewport
+    // is) has no element of its own, so its wrapper is reachable only through the
+    // frontend's DOM widget layer, and the readout keeps that count separate.
+    const comp = h.node({ type: "Preview3D", pos: [700, 0], size: [200, 100], widgets: [] });
+    const layerEl = h.document.querySelectorAll('[data-testid="dom-widgets"]')[0];
+    const compWrapper = h.document.createElement("div");
+    compWrapper.className = "dom-widget size-full";
+    layerEl.appendChild(compWrapper);
+    comp.widgets.push({ name: "view", type: "component", component: {}, node: comp, wrapper: compWrapper });
+    h.canvas.nodes.push(comp);
+    h.app.graph._nodes.push(comp);
+    h.advance(1200);
+    await h.flush();
+    draw(h, 1);
+    assert(compWrapper.classList.contains("ants-lod-box"), "a component widget with no element of its own is reached through the layer");
+    assertEqual(h.tracker.lowZoom.dom.layer, 1, "and the readout counts that one as the DOM widget layer");
+
+    // Coming back: above the zoom the widget is handed back.
+    h.canvas.ds.scale = 0.5;
+    vue.place();
+    h.tracker.lowZoom.set({ inertBelow: 0.2 });
+    h.advance(1200);
+    await h.flush();
+    draw(h, 2);
+    assert(!wrapper.classList.contains("ants-lod-box"), "and handed back when the node is readable again");
+    assert(!wrapper.classList.contains("ants-lod-inert"), "including its inert class");
+  });
+
+  test("the stand-in engine does not photograph nodes this renderer cannot draw back", async () => {
+    const h = await boot();
+    vueGraph(h, 4);
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true, diskOn: true });
+    draw(h, 2);
+    await idle(h);
+    // Run a job and finish it: the RAM lane's restore is the one path that walks
+    // the graph without going through a drawn node.
+    h.tracker.runStart();
+    draw(h, 1);
+    const before = snapApi(h).captured;
+    h.tracker.runFinish();
+    await idle(h, 1500);
+    assertEqual(snapApi(h).captured, before, "finishing a run does not start photographing every node on screen");
+    assertEqual(snapApi(h).held, 0, "no bitmap is held");
+    assertEqual(snapApi(h).blank, 0, "and no node is written off as \"draws nothing into the canvas\" for a picture that was never going to be drawn");
+    assertEqual(snapApi(h).queue, 0, "the idle lane stays empty");
+    assertEqual(h.canvases.length, 0, "not even one offscreen canvas was created for a capture");
+  });
+
+  test("an off-screen DOM node is not hidden while it is on screen, and the fovea still culls", async () => {
+    const h = await boot();
+    const { nodes, vue } = vueGraph(h, 3);
+    // Node 2 is far outside the viewport (the graph is 1600x900 CSS px at scale 0.1).
+    nodes[2].pos = [40000, 0];
+    vue.place();
+    h.tracker.lowZoom.set({ flatBelow: 0, fovea: true, foveaMargin: 0.5, foveaRestore: 1 });
+    h.advance(1200);
+    await h.flush();
+    draw(h, 2);
+    assert(vue.rootFor(nodes[2]).classList.contains("ants-lod-box"), "a far off-screen node's element is taken out of the picture");
+    assert(!vue.rootFor(nodes[0]).classList.contains("ants-lod-box"), "an on-screen node's element is never hidden");
+    // Bring it back: it must come back at once, because it is on screen now.
+    nodes[2].pos = [0, 200];
+    vue.place();
+    draw(h, 2);
+    assert(!vue.rootFor(nodes[2]).classList.contains("ants-lod-box"), "and it is handed back the moment it returns to the screen");
+    // Off, everything is handed back.
+    h.tracker.lowZoom.off();
+    assertEqual(h.tracker.lowZoom.dom.hidden, 0, "turning the settings off leaves none of somebody else's DOM hidden");
+  });
+
+  test("the panel names the renderer instead of blaming the flatten setting", async () => {
+    const h = await boot();
+    vueGraph(h, 3);
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true });
+    draw(h, 1);
+    h.advance(1200);
+    await h.flush();
+    await openTweaksTab(h);
+    const text = panelText(h);
+    assertIncludes(text, "Vue nodes", "the readout says which renderer this is");
+    assert(!text.includes("collapsed boxes or this tool's own node, which are never flattened"), "and does not blame collapsed nodes for a decision this renderer made");
+    assert(!text.includes("snapshots are on but not painting anything"), "nor the flatten setting, which is switched on and below its zoom");
+    // The copyable report is read by people who never open the panel, so it has
+    // to be as honest as the panel is.
+    const report = h.tracker.report;
+    assert(report.includes("node stand-ins idle"), "the report says the stand-ins are idle in this renderer");
+    assert(!report.includes("every node a rectangle"), "and does not claim nodes are rectangles here");
+  });
+
+  test("a page that switches to this renderer hands back the pictures it can no longer paint", async () => {
+    const h = await boot();
+    const nodes = [];
+    for (let i = 0; i < 2; i++) nodes.push(h.node({ type: "KSampler", pos: [i * 240, 0], size: [200, 100], widgets: [] }));
+    h.canvas.nodes = nodes;
+    h.app.graph._nodes = nodes;
+    h.canvas.ds.scale = 0.1;
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true });
+    draw(h, 2);
+    await idle(h);
+    assertGreater(snapApi(h).held, 0, "the canvas renderer captured pictures for these nodes");
+    assertGreater(snapApi(h).bytes, 0, "and is holding memory for them");
+    // The flag flips on the live page (useVueFeatureFlags watches the setting),
+    // so the cache has to let go of what it can never draw again.
+    const vue = h.enterVueNodes();
+    draw(h, 1);
+    await idle(h);
+    assertEqual(snapApi(h).held, 0, "switching renderer releases every bitmap");
+    assertEqual(snapApi(h).bytes, 0, "and the memory with it");
+    assertEqual(snapApi(h).queue, 0, "and the queue");
+    vue.exit();
+  });
+
+  test("switching the renderer back on the same page brings the stand-ins back, without a reload", async () => {
+    const h = await boot();
+    const { vue } = vueGraph(h, 3);
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true });
+    h.canvas.ds.scale = 0.4; // below the setting: the canvas renderer would flatten here
+    draw(h, 2);
+    assertEqual(h.tracker.lowZoom.state.nodes, 0, "nothing is flattened while the nodes are DOM elements");
+    assertEqual(h.tracker.lowZoom.snapshots.on, false, "and the picture engine stands down with it");
+    // The frontend watches its own setting and flips the flag on the live
+    // LiteGraph object (useVueFeatureFlags.ts), so this answer has to be read per
+    // frame rather than latched when the page loaded.
+    vue.exit();
+    draw(h, 2);
+    assertGreater(h.tracker.lowZoom.state.nodes, 0, "switching the renderer off brings node flattening straight back");
+    assertEqual(h.tracker.lowZoom.snapshots.on, true, "and the picture engine with it");
+  });
+});

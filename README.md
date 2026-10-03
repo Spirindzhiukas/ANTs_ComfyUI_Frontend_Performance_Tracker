@@ -6,7 +6,7 @@ for: *which extension's JavaScript is actually costing me frames while I pan
 this graph, and what is eating main-thread time that no draw hook owns?* —
 without opening DevTools and without restarting ComfyUI to bisect.
 
-Version **2.5.4**. Everything runs from page load: no node has to be placed,
+Version **2.5.5**. Everything runs from page load: no node has to be placed,
 nothing executes, and the tool never changes your graph or your workflows.
 
 - **Measure** — per-extension and per-node-type frame cost, canvas draw
@@ -145,6 +145,31 @@ drawing**, and "off" is a real restoration, not a memory of one.
 | Display scale | auto · 1× · 1.25× · 1.5× · 2× · 2.5× · 3× | **auto** | Windows display scaling. Auto reads it at startup and re-checks; pin it if the Status line disagrees. |
 | How widgets go | hide · inert | **hide** | *hide* takes the element out of the picture as well as out of the pointer's way; *inert* only takes pointer events away and leaves it on screen. Both add a CSS class and restore exactly what was there. |
 | Way back | button | — | Back to full drawing: every drawing change off, the disk cache left as you set it. |
+
+### What these settings do in the Nodes 2.0 (Vue) frontend
+
+ComfyUI's newer frontend can render every node as a DOM element
+(`LiteGraph.vueNodesMode`, the **Nodes 2.0** setting). LiteGraph's own
+`drawNode` returns immediately there, so the canvas draws links, groups and
+the grid, and no node chrome at all. Every setting that replaces a *node the
+canvas drew* has nothing to replace, and this tool says so instead of
+pretending:
+
+| Setting | In the Vue-nodes frontend |
+| --- | --- |
+| Replace node previews with bitmap stand-ins at zoom levels | Idle. There is no canvas node to paint as a box, and a capture of one would be blank — the engine reports itself off rather than filling its idle lane with pictures that can never be drawn. |
+| Stand-in, capture resolution, RAM budget, disk cache | Idle for the same reason; nothing is captured, held or written. |
+| Keep these node types live | Ignored while idle; your list is kept for when you are back on the canvas renderer. |
+| Link shape, link thinning, Measure link thinning | **Work.** Links are still drawn by the canvas, so the 1 px/no-outline thinning and the straight-line style reach the ink exactly as in canvas mode. |
+| Idle redraw cap | **Works** — it caps the canvas redraws, nodes or not. |
+| Widgets stop answering, off-screen nodes, margin, come back, display scale, how widgets go | **Work.** These act on DOM elements and on the pointer, which exist in both renderers. The node's own root element is never hidden; only its widgets are. |
+| The governor, Timing, Stalls, Nodes, Load, Memory, GPU tabs | Unaffected: they measure timers, main-thread stalls, redraw requests and resources, not node painting. |
+
+The Status tab names the renderer in its first line and explains the idle
+settings in place ("Vue nodes", "this frontend draws nodes as DOM elements"),
+so a setting that is quiet for a structural reason is not mistaken for a
+broken one. Switching Nodes 2.0 off in ComfyUI's settings takes effect on the
+same page — the flag is read per frame, not latched at load.
 
 Retired: the v2.1.5 separate image-preview thumbnail ladder. The node's
 picture *is* the thumbnail — a second, hidden copy of an image that is
@@ -402,16 +427,19 @@ short version:
   Firefox and Safari have no long-task or `performance.memory` API, so the
   Memory and Stalls tabs are empty there by design; everything else works.
 - ComfyUI's classic canvas frontend is fully covered. In the Vue-based
-  ("Nodes 2.0") frontend, node visuals that are DOM rather than canvas cannot
-  be attributed by name; that frontend also exposes no LOD threshold on the
-  canvas, and the Status tab says so.
+  ("Nodes 2.0") frontend the canvas draws links, groups and the grid only, so
+  the node stand-in settings are idle by design (see *What these settings do
+  in the Nodes 2.0 (Vue) frontend*); link ink, the idle redraw cap, the widget
+  and focus settings and every measurement still apply. Node visuals that are
+  DOM rather than canvas cannot be attributed by name, and that frontend also
+  exposes no LOD threshold on the canvas — the Status tab says both.
 - Nothing here depends on a specific ComfyUI version; every patch fails open
   and says so in the console rather than half-applying.
 
 ## Development
 
 ```bash
-node tests/run-tests.mjs              # all tests — 172 passing, zero dependencies
+node tests/run-tests.mjs              # all tests — 179 passing, zero dependencies
 node tests/run-tests.mjs <substring>  # one suite or test
 python3 tests/test_init.py            # the Python side (routes, node contract)
 node tests/demo.mjs                   # prints what every tab says, against a synthetic graph

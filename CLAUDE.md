@@ -28,7 +28,7 @@ this is going. Read the golden rules before the code.
 ## Commands
 
 ```bash
-node tests/run-tests.mjs              # all 172 tests — must be green before any commit
+node tests/run-tests.mjs              # all 179 tests — must be green before any commit
 node tests/run-tests.mjs <substring>  # one suite/test, e.g. ... pill
 python3 tests/test_init.py            # the Python side (route parsing, node contract)
 node tests/demo.mjs                   # prints what the panel says against a synthetic graph
@@ -169,6 +169,15 @@ Seams worth knowing:
   `h.tracker.totals`, `h.tracker._state`, `h.tracker._panel`.
 - `h.infos()/warnings()/errors()` — console capture. `errors()` must be empty in
   a passing test.
+- `h.enterVueNodes()` — switches the page to the Nodes 2.0 (Vue nodes) renderer
+  for the rest of the test: the flag goes on `h.LiteGraph.vueNodesMode` (the same
+  object the frontend writes), `drawNode()` early-returns, and each node gets a
+  `.lg-node[data-node-id]` root plus the `.dom-widget` wrappers of any widget that
+  was added with `addDOMWidget`, positioned in client pixels like
+  `DomWidgets.vue` does it. Returns `{container, roots, wrappers, place(),
+  rootFor(node), exit()}`; `exit()` puts the canvas renderer back on the same
+  page. The fixture's shapes come from the upstream files listed in
+  `ANALYSIS.md` — change it there first if it ever drifts.
 
 Rules for tests:
 

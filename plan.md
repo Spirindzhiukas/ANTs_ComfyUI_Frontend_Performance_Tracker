@@ -278,6 +278,19 @@ nodes. Its own README and reports show the consequences (long warm-up, nodes lef
 live when the budget runs out). Our version keeps the engine, changes the storage
 strategy, and credits every byte of it (Track M).
 
+**Renderer compatibility — checked against the frontend, not assumed
+(v2.5.5).** On ComfyUI's newer frontend (Nodes 2.0 / Vue nodes,
+`LiteGraph.vueNodesMode`) every node is a DOM element and `drawNode` returns
+immediately, so a stand-in box would be painted *behind* the thing it replaces
+and a capture of it would be blank. The engine now reads the same flag the
+frontend sets, reports itself off there rather than queueing blank captures,
+and the readout names the renderer instead of blaming a setting; the focus
+half (widgets stop answering, off-screen culling) still works, and the link
+settings are canvas-side and unaffected. The upstream contract this was
+checked against, file by file, is in `ANALYSIS.md`. Not otherwise a change to
+this track: nothing about the capture design depends on which renderer the
+page uses.
+
 **K1. The capture engine, ported and credited (M) — DELIVERED in v2.3.0.**
 Shipped as designed, with three decisions the code argues for and this file
 records: (a) a snapshot replaces a *flat box*, never a live node, so the flatten

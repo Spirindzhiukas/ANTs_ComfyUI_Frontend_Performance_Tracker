@@ -4,7 +4,7 @@ A running record for whoever picks this up next (including me). `CLAUDE.md` is t
 rules for changing the code; `plan.md` is where it is going. This file is the past:
 what was built, what was rejected, and what the evidence was.
 
-Last updated at **v2.5.4**, 172 tests green, PR #1 on
+Last updated at **v2.5.5**, 179 tests green, PR #2 on
 `Spirindzhiukas/ANTs_ComfyUI_Frontend_Performance_Tracker`.
 
 ---
@@ -13,8 +13,8 @@ Last updated at **v2.5.4**, 172 tests green, PR #1 on
 
 | | |
 | --- | --- |
-| Version | 2.5.4 (`web/tracker.js` `VERSION`) |
-| Tests | 172 (`node tests/run-tests.mjs`), plus `tests/test_init.py` |
+| Version | 2.5.5 (`web/tracker.js` `VERSION`) |
+| Tests | 179 (`node tests/run-tests.mjs`), plus `tests/test_init.py` |
 | Frontend | `web/tracker.js`, one ES module, no dependencies. The separate window is `web/window.html`, served at `/ants_optimizer/window`, not loaded as an extension. |
 | Backend | `__init__.py` — node `ANTs_Frontend_Optimizer` (old class key kept as an alias), nine best-effort routes (GPU, five thumbnail routes, the window page, `/ants_optimizer/ui`), and thumbnail read/write under ComfyUI's temp folder |
 | Panel | 10 tabs: Node Rendering Settings, Status, Timing, Nodes, Stalls, Governor, Load, Memory, GPU / VRAM, Testing |
@@ -36,6 +36,8 @@ something has to be drawn less or hit-tested less.
 ## 2. Version log
 
 The commit log is the full record; this is the "why", newest first.
+
+**v2.5.5 — the Nodes 2.0 (Vue nodes) frontend, verified against the frontend's own code.** ComfyUI's newer frontend renders every node as a DOM element (`LiteGraph.vueNodesMode`, set from the `Comfy.VueNodes.Enabled` setting by `useVueFeatureFlags.ts`), and `LGraphCanvas.drawNode` returns immediately there: the canvas draws links, groups and the grid only. The tool already refused to paint a rectangle behind a DOM node (`lodFlatNode`), but three things did not follow from that. The stand-in engine still reported itself on and the once-a-second lane still queued captures — every one of which would have produced a blank bitmap and been written off as "draws nothing into the canvas" and blocked for the session, so finishing a run was enough to fill the idle lane with dead ends; `lodSnapOn()` now answers false in this renderer and the enqueue path inherits it. The readout blamed the wrong setting ("snapshots are on but not painting anything: they need the flatten setting above switched on" — it *was* switched on and below its zoom) and offered "collapsed boxes or this tool's own node" as the reason `0 of N` nodes were flattened; the Status tab now names the renderer in its first line and explains the idle settings where their numbers would be, and so does the copyable report. And the DOM half kept building its registry and walking it per frame to reach a decision that cannot change in this mode; one predicate, `lodDomWanted()`, is now used by the sweep, the frame plan, the settings-apply and switch-on paths, while the focus half (widgets stop answering, the off-screen/fovea culling) still counts and still works — it acts on DOM elements and the pointer, and the node's own root element is still never hidden. The flag is read per call rather than latched, so switching Nodes 2.0 off in ComfyUI's settings takes effect on the same page. A fourth defect only turned up because the switch was modelled as a live event rather than a page-load fact: a warm cache (or a queue with work in it) stayed in memory after the move to the DOM renderer, where no box can ever be painted from it — the drain slice now releases the cache on that transition, the same release as switching the setting off.  Seven tests cover this, on a fixture built to the upstream shapes (`data-node-id` roots, the `dom-widgets` layer with client-pixel `left`/`top`, `drawNode` early-returning, `addDOMWidget`'s `hideOnZoom` default); the contract table with the upstream file for each claim is in `ANALYSIS.md` — including the honest limit that no real Vue-nodes page was executed, only the fixture.
 
 **v2.5.4 — audit, README rewrite, and the keep-live list gets a door.** The README still described v2.1 (five tabs, the old install folder, one route, "nothing else is written server-side", 161 tests) and carried no credits, so it was rewritten from the code and the version history moved to `CHANGELOG.md` — 900 lines of archaeology were the reason the body could drift unnoticed. `LICENSE` and `THIRD_PARTY_NOTICES.md` now exist (plan.md Track M), with the NodeSnapshots MIT notice verbatim. Two real defects turned up while verifying the code: `snapExclude` had no UI at all (a mechanism with no door — the readout said "kept live by your list" and the only way in was the console), and adding a type did nothing until that node changed because an existing record was still served (fixed by dropping only the newly excluded types' records in `lodSet`). The demo was printing the wrong tab names (it skipped `status` and indexed the bar), was still explaining the retired preview ladder, and called the tab "Tweaks"; `tracker.js`'s header comment claimed links go straight while nodes are rectangles, which stopped being true when `linkStyle` was decoupled. All fixed. A new test pins the window/page setting-key agreement in both directions, so a control that posts a key the page ignores cannot ship silently. Nothing was taken out of the drawing engine in this pass — the dead ladder, boxify and drawImage code had already been removed; `ANALYSIS.md` records the evidence and the retired ideas.
 

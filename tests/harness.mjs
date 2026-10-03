@@ -418,6 +418,11 @@ export function createHarness(options = {}) {
     }
     drawNode(node, ctx) {
       this.nodeDraws++;
+      // Nodes 2.0: `LGraphCanvas.drawNode()` returns early when
+      // `LiteGraph.vueNodesMode` is set — the node is a DOM element and the
+      // canvas draws none of it. The call still happens (the canvas walks its
+      // node list), so a wrapper around it still runs; what stops is the work.
+      if (LiteGraphShim.vueNodesMode) return;
       this.nodeLowQuality.push(this._isLowQuality);
       busy(this.costs.chrome);
       // LiteGraph draws into the context it was handed. A capture hands its own
@@ -578,6 +583,87 @@ export function createHarness(options = {}) {
     return new FakeLGraphNode(opts);
   }
 
+  // ------------------------------------------------- Nodes 2.0 (Vue) mode ---
+  // The renderer this tool has to survive without painting anything: every node
+  // is a DOM element and the canvas draws none of it. Built to the frontend's own
+  // shapes, with the source of each one, so this cannot drift from the real page:
+  //
+  //   * `LiteGraph.vueNodesMode` is set from the `Comfy.VueNodes.Enabled` setting
+  //     (useVueFeatureFlags.ts) and `LiteGraph` is put on `window`
+  //     (useGlobalLitegraph.ts).
+  //   * Each node is `<div class="lg-node absolute" data-node-id="N" tabindex="0">`
+  //     positioned by `transform: translate(x, y)` — no left/top
+  //     (LGraphNode.vue).
+  //   * DOM widgets live in the `[data-testid="dom-widgets"]` layer, one
+  //     `.dom-widget` per widget, `position: fixed` with `left`/`top` in client
+  //     pixels plus `transform: scale(<zoom>)` (DomWidgets.vue +
+  //     useAbsolutePosition({ useTransform: true })).
+  //   * The conversion is the frontend's own: client = (graph + offset) * scale
+  //     + canvas rect (useCanvasPositionConversion.ts), which is what the
+  //     tracker's ownership arithmetic has to invert.
+  //
+  // `place()` re-positions the wrappers the way the frontend does on every drawn
+  // frame, so a test can pan and zoom and then ask what the tracker made of it.
+  function enterVueNodes() {
+    LiteGraphShim.vueNodesMode = true;
+    const container = document.createElement("div");
+    container.className = "vue-nodes";
+    document.body.appendChild(container);
+    const roots = new Map(); // node id (string) -> element
+    const wrappers = new Map(); // widget element -> its .dom-widget wrapper
+    const nodes = () => (canvas.nodes && canvas.nodes.length ? canvas.nodes : app.graph._nodes) || [];
+    let nextId = 1;
+    for (const n of nodes()) {
+      if (n.id === undefined || n.id === null || n.id === "") n.id = nextId++;
+      const root = document.createElement("div");
+      root.className = "lg-node absolute";
+      root.setAttribute("data-node-id", String(n.id));
+      root.style.transform = `translate(${n.pos[0]}px, ${n.pos[1] - 30}px)`;
+      container.appendChild(root);
+      roots.set(String(n.id), root);
+    }
+    const place = () => {
+      const scale = Number(canvas.ds.scale) || 1;
+      const ox = Number(canvas.ds.offset[0]) || 0;
+      const oy = Number(canvas.ds.offset[1]) || 0;
+      let originX = 0;
+      let originY = 0;
+      try {
+        const r = canvas.canvas && typeof canvas.canvas.getBoundingClientRect === "function" ? canvas.canvas.getBoundingClientRect() : null;
+        originX = r ? Number(r.left) || 0 : 0;
+        originY = r ? Number(r.top) || 0 : 0;
+      } catch (e) {
+        /* the shim's rect is always 0,0 */
+      }
+      for (const n of nodes()) {
+        for (const w of n._domWidgets || []) {
+          if (!w.wrapper) continue;
+          const margin = Number(w.margin) || 10; // BaseDOMWidgetImpl.DEFAULT_MARGIN
+          const gx = Number(n.pos[0]) + margin;
+          const gy = Number(n.pos[1]) + margin + (Number(w.y) || 0);
+          w.wrapper.style.position = "fixed";
+          w.wrapper.style.left = `${(gx + ox) * scale + originX}px`;
+          w.wrapper.style.top = `${(gy + oy) * scale + originY}px`;
+          w.wrapper.style.transform = `scale(${scale})`;
+          wrappers.set(w.element, w.wrapper);
+        }
+      }
+    };
+    place();
+    return {
+      container,
+      roots,
+      wrappers,
+      place,
+      rootFor: (n) => roots.get(String(n.id)) || null,
+      // What the frontend does with a widget while its node is off screen
+      // (DomWidgets.vue's `isNodeVisible`) — a test can hand it back.
+      exit: () => {
+        LiteGraphShim.vueNodesMode = false;
+      },
+    };
+  }
+
   function addResource(url, { startTime = 0, duration = 10, transferSize = 1000, encodedBodySize = 1000 } = {}) {
     resourceEntries.push({ name: url, startTime, duration, transferSize, encodedBodySize, decodedBodySize: encodedBodySize });
   }
@@ -632,6 +718,7 @@ export function createHarness(options = {}) {
     registerNodeType,
     makeNode,
     node,
+    enterVueNodes,
     addResource,
     panel,
     textOf,

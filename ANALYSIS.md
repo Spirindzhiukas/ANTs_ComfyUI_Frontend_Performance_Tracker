@@ -1,6 +1,6 @@
 # What works, what fails, and what was taken out
 
-An audit of the repository as of v2.5.4, done by reading the sources rather
+An audit of the repository as of v2.5.5, done by reading the sources rather
 than the docs, running the suites, and running the demo. Every claim below
 has a file and (where it matters) a line reference. Found defects were fixed
 in the same pass; retired ideas were removed rather than documented as if
@@ -9,7 +9,8 @@ they still existed.
 ## How this was checked
 
 ```bash
-node tests/run-tests.mjs        # 172 passing (171 before this pass; one added)
+node tests/run-tests.mjs        # 179 passing (172 before the Nodes 2.0 pass; seven added)
+node tests/run-tests.mjs "Nodes 2.0"   # the seven that cover that renderer
 python3 tests/test_init.py      # Ran 9 tests ... OK
 node tests/demo.mjs             # exit 0, prints every tab
 cp web/tracker.js /tmp/x.mjs && node --check /tmp/x.mjs   # ES-module syntax
@@ -84,6 +85,45 @@ README was treated as a suspect, not a spec — it described v2.1.
 | 7 | **No licence and no third-party notices.** The project embeds an idea that comes with an MIT notice, and carried no `LICENSE` of its own. | No `LICENSE`, no notices file (plan.md, Track M). | Added `LICENSE` (MIT), `THIRD_PARTY_NOTICES.md` with the upstream MIT notice verbatim, and the README credits saying exactly what was taken and what was not. |
 | 8 | **The window and the page could disagree about a setting with nothing to catch it** — a control that posts a key the page ignores is a control that silently does nothing. | No test compared the two key sets. | New test *"the window and the page agree on which settings exist"*: every key the window posts must be published by the page, and every published key must have a field the window paints. |
 
+## Nodes 2.0 (the Vue-nodes frontend), verified against the frontend's own code
+
+The question was whether this tool's drawing rules are still *true* on
+ComfyUI's newer frontend. They were not, in three places. The contract was
+read from the frontend's sources rather than inferred from behaviour:
+
+| Upstream file (Comfy-Org/ComfyUI_frontend, `main`) | What it says |
+| --- | --- |
+| `src/composables/useVueFeatureFlags.ts` | `LiteGraph.vueNodesMode = settingStore.get('Comfy.VueNodes.Enabled')`, re-applied by a watcher — so the flag changes on a live page. |
+| `src/composables/useGlobalLitegraph.ts` | `window.LiteGraph = LiteGraph`, so the flag is reachable from an extension. |
+| `src/renderer/extensions/vueNodes/components/LGraphNode.vue` | Each node is `<div class="group/node lg-node absolute" data-node-id=…>` positioned by `transform: translate(x, y)`; no `left`/`top`. |
+| `src/components/graph/DomWidgets.vue` + `widgets/DomWidget.vue` | DOM widgets live in `[data-testid="dom-widgets"]`, one `.dom-widget` per widget, `visible` from the node's own visibility; the wrapper is positioned in client pixels. |
+| `src/composables/element/useCanvasPositionConversion.ts` | `client = (graph + offset) * scale + canvasRect.left/top` — the arithmetic the tracker's ownership maths inverts. |
+| `src/scripts/domWidget.ts` | `addDOMWidget` defaults `hideOnZoom: true`; `BaseDOMWidgetImpl.draw` paints a placeholder when that and low quality are both set. |
+| `useNodeImage.ts` / `useNodeAnimatedImage.ts` | Core video and animated previews pass `hideOnZoom: false` and never surface in a Vue node. |
+| `LGraphCanvas.drawNode` (LiteGraph) | Returns immediately when `LiteGraph.vueNodesMode` is true. |
+
+What that means for this tool, and what had to change:
+
+| # | Finding | Evidence | Fix |
+| --- | --- | --- | --- |
+| 1 | **The stand-in engine was aimed at nodes the canvas never draws.** `lodFlatNode` already refused every node in Vue mode (correctly), so `lodFlatOn` was true, `lodSnapOn` was true, and the once-a-second lane still walked the graph queueing captures. A capture there draws nothing, so it would be written off as "draws nothing into the canvas" and blocked for the session — a dead end that also polluted the counters. | Reproduced in the fixture: 4 captures queued from `runFinish` alone. | `lodSnapOn()` returns false when the renderer is Vue nodes, with the reason in the code and in the Status line; the enqueue path inherits the guard. Test: *"the stand-in engine does not photograph nodes this renderer cannot draw back"*. |
+| 2 | **The readout blamed the wrong thing.** With flattening switched on and the zoom below it, the Status tab said "snapshots are on but not painting anything: they replace flat boxes, so they need the flatten setting above switched on" — the opposite of the truth — and the flat line offered "collapsed boxes or this tool's own node" as the reason for `0 of 3` nodes flattened. | Panel text in the fixture before the fix. | A Vue-nodes sentence in the Status readout (renderer named in the first line, idle settings explained where their numbers would be) and the same in the copyable report. Test: *"the panel names the renderer instead of blaming the flatten setting"*. |
+| 3 | **The DOM half did work whose answer was guaranteed to be "nothing changed".** With only node flattening switched on, the once-a-second sweep still built the registry and the per-frame pass still walked it; in Vue mode a flat decision cannot mark anything. | `lodSweepDom` / `viewApplyFocus` had no renderer awareness. | One predicate, `lodDomWanted()`, used by the sweep, the frame plan, the settings-apply path and the switch-on path: the focus half (widgets stop answering, the fovea) counts, the stand-in half only counts when this renderer draws nodes. Tests cover both halves — including a component widget (a 3D viewport), which is only reachable through the DOM widget layer. |
+| 4 | **A warm cache survived the switch into this renderer.** The slice that drains the capture lane already stopped when the engine was off, but the bitmaps it had already taken (and a queue with work in it) stayed in memory for a page that can never paint them — a renderer switch is not a reload. | Reproduced: two held bitmaps and their bytes stayed after `enterVueNodes()`. | The slice releases the cache on that transition, the same release as switching the setting off, and counts it as a clear. Test: *"a page that switches to this renderer hands back the pictures it can no longer paint"*. |
+| 5 | **Nothing pinned the flag to the live page.** A rule that latched the renderer at load would look correct in every test that sets the mode once. | — | The flag is read per call, and a test switches the renderer back *on the same page* and holds flattening and the picture engine to returning. |
+
+Two things the pass confirmed rather than changed: the Vue node's **root
+element is never hidden or inerted** (`via: "root"` records are exempt from
+the stand-in classes, and only widget wrappers are marked), and the canvas
+settings that still reach ink — link thinning, straight links, the idle cap —
+behave identically in both renderers.
+
+The fixture (`tests/harness.mjs`, `enterVueNodes()`) is built to the upstream
+shapes quoted above: `data-node-id` roots, the `dom-widgets` layer,
+client-pixel `left`/`top` with `transform: scale()`, and `drawNode()`
+returning early. It is a model of the contract, not a browser: no real
+Vue-nodes page was executed in this pass (see *Still open*).
+
 ## Retired: things that could not work, and were taken out
 
 - **The image-preview thumbnail ladder (v2.1.5).** It kept a second,
@@ -150,6 +190,13 @@ apply, not just in the docs.
   the code paths that read `performance.memory` and long tasks are guarded
   and the panel prints "not available" instead of a number, but no browser
   other than the Node harness was executed in this pass.
+- **The Nodes 2.0 support is verified against upstream sources and the
+  fixture, not against a running Vue-nodes page.** Every claim in the section
+  above is traceable to a file in `Comfy-Org/ComfyUI_frontend` and reproduced
+  by the harness, but a browser was not stood up with the setting on; the
+  areas a fixture cannot model (real Vue re-render timing, a live widget
+  store, the frontend's own `low_quality` transitions) are the ones to
+  watch if the mode is used for real work.
 - **The console-attribution mode** (plan.md, Track L) is still unbuilt. The
   credit for the idea stands; the honest thing is that nothing in the shipped
   code depends on it.
