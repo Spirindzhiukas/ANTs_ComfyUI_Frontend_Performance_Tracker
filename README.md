@@ -6,7 +6,7 @@ for: *which extension's JavaScript is actually costing me frames while I pan
 this graph, and what is eating main-thread time that no draw hook owns?* —
 without opening DevTools and without restarting ComfyUI to bisect.
 
-Version **2.5.6**. Everything runs from page load: no node has to be placed,
+Version **2.6.0**. Everything runs from page load: no node has to be placed,
 nothing executes, and the tool never changes your graph or your workflows.
 
 - **Measure** — per-extension and per-node-type frame cost, canvas draw
@@ -127,8 +127,8 @@ drawing**, and "off" is a real restoration, not a memory of one.
 
 | Setting | Choices | Default | What it does |
 | --- | --- | --- | --- |
-| Replace node previews with bitmap stand-ins at zoom levels | off — draw every node · below 5 · 10 · 15 · 20 · 25 · 30 · 40 · 50 % | **below 50 %** | Below this zoom a node is a flat box instead of a live draw. The decision is the zoom, never a node's pixel size. Hover, selection and a drag keep the picture; a selected node gets a ring; a link drag, a running progress bar and an error still draw live. |
-| Stand-in | plain fill · title bar colour · title + error ring + progress + muted · picture of the node | **picture of the node** | What the box is made of. *plain* is a fill, *title* adds each node's own title bar, *state* adds error rings, progress bars and muted dimming, *picture* stores a bitmap of the node and blits it instead. |
+| Replace node previews with bitmap stand-ins at zoom levels | off — draw every node · below 5 · 10 · 15 · 20 · 25 · 30 · 40 · 50 % | **below 50 %** | Below this zoom a node is a flat box instead of a live draw. The decision is the zoom, never a node's pixel size. In the Nodes 2.0 (Vue-nodes) renderer the same setting blanks the node's own element and the canvas paints the same box in its place — see the section further down. Hover, selection and a drag keep the picture; a selected node gets a ring; a link drag, a running progress bar and an error still draw live. |
+| Stand-in | plain fill · title bar colour · title + error ring + progress + muted · picture of the node | **picture of the node** | What the box is made of. *plain* is a fill, *title* adds each node's own title bar, *state* adds error rings, progress bars and muted dimming, *picture* stores a bitmap of the node and blits it instead. A picture needs a canvas that draws nodes: in the Nodes 2.0 (Vue-nodes) renderer this choice falls back to the box with the *state* marks, and the readout says why. |
 | Keep these node types live | comma-separated node types | empty | Types never served from a picture, however far you zoom out. They keep the painted fill or draw live, and the readout counts them as "kept live on purpose", not as failures. |
 | Stand-in capture resolution | 0.25× · 0.5× · 1× · 2× · 3× | **1×** | Pixels per graph unit in the picture. Below 1× the picture is a quarter (0.25×) or a half (0.5×) of the node's size — that is what makes it cheap to hold a thousand of them, and it is drawn at that size, not at 1× with a smaller name. Half and quarter copies are still made for the screen. Zoomed in past the ratio a picture is softer than live drawing, which is why a node being worked at is never served from one. Changing this value re-captures and re-keys the disk files (see below). |
 | Stand-in memory (RAM) budget | 256 · 512 · 1024 · 2048 · 4096 · 8192 MiB | **4096 MiB** | How much RAM the pictures may hold. A full budget refuses a new capture rather than evicting a picture that is on screen (that is what flicker looks like). On Execute or Run-to-node, at 85 % system RAM the off-screen pictures leave memory; at 95 % all of them do. Disk files stay and are loaded back after the run. |
@@ -187,27 +187,48 @@ setting asked for.
 ### What these settings do in the Nodes 2.0 (Vue) frontend
 
 ComfyUI's newer frontend can render every node as a DOM element
-(`LiteGraph.vueNodesMode`, the **Nodes 2.0** setting). LiteGraph's own
-`drawNode` returns immediately there, so the canvas draws links, groups and
-the grid, and no node chrome at all. Every setting that replaces a *node the
-canvas drew* has nothing to replace, and this tool says so instead of
-pretending:
+(`LiteGraph.vueNodesMode`, the **Nodes 2.0** setting). The canvas then draws
+links, groups and the grid, and no node chrome. There is no picture to take
+there — a DOM node cannot be photographed into a bitmap — but there is a
+stand-in to paint, so the tool runs a second pathway behind the same settings
+and picks it from the frontend's own flag on every call, never latched:
+
+* **canvas renderer** — a picture of the node (or its box) blitted where the
+  canvas would have drawn the node;
+* **Vue-nodes renderer** — the node's own element is *blanked* (one class,
+  `opacity: 0`: the element keeps its place, its layout and its pointer events)
+  and the canvas paints the same box in the same place, with the same detail
+  ladder. LiteGraph still calls `drawNode` for every visible node in this
+  renderer — that is how it keeps slot metrics in sync — so this tool's
+  existing seam fires with the context already in node-local space, and the box
+  lands exactly where a picture lands in the canvas renderer.
+
+Nothing is hidden and nothing is captured: the element is still there — slots,
+widgets, resize handles, the context menu — so clicking, dragging, selecting
+and link-dragging behave exactly as they do in full detail; it just stops
+painting. That makes the saving different from the canvas renderer's: not
+cheaper canvas drawing, but fewer node pixels for the browser to paint, which
+is where a heavy zoomed-out graph spends its frame. Every blanked element is
+handed back the moment the zoom leaves the setting, the setting or the tool is
+switched off, or the renderer changes — the per-frame plan compares one boolean
+in the steady state, so a stale class cannot be left behind.
 
 | Setting | In the Vue-nodes frontend |
 | --- | --- |
-| Replace node previews with bitmap stand-ins at zoom levels | Idle. There is no canvas node to paint as a box, and a capture of one would be blank — the engine reports itself off rather than filling its idle lane with pictures that can never be drawn. Making pictures work *there* is not a matter of reading the same flag differently: the canvas does not draw those nodes, so a picture would have to be an image element this tool positions over the node and the node's own DOM would have to be taken out of the picture — a different feature, with a much smaller saving (the browser still builds and lays out every node), and it is not built. `ANALYSIS.md` records the sketch and the reasons. |
-| Stand-in, capture resolution, RAM budget, disk cache | Idle for the same reason; nothing is captured, held or written. |
-| Keep these node types live | Ignored while idle; your list is kept for when you are back on the canvas renderer. |
+| Replace node previews with bitmap stand-ins at zoom levels | **Works, as boxes.** Below the setting each node's element stops painting and the canvas draws its box; above it, every element is handed back. |
+| Stand-in (plain / title / title + state) | **Works** — the same box ladder, same marks, same colours. *Picture of the node* has no equivalent here: nothing is photographed, so the boxes use the *state* marks and the readout says so. |
+| Capture resolution, RAM budget, disk cache | **Idle**, and the readout says so: a DOM node cannot be drawn into a bitmap, so nothing is captured, held, queued or written. |
+| Keep these node types live | **Works** — a listed type is never blanked and stays in full detail at any zoom. |
 | Link shape, link thinning, Measure link thinning | **Work.** Links are still drawn by the canvas, so the 1 px/no-outline thinning and the straight-line style reach the ink exactly as in canvas mode. |
 | Idle redraw cap | **Works** — it caps the canvas redraws, nodes or not. |
-| Widgets stop answering, off-screen nodes, margin, come back, display scale, how widgets go | **Work.** These act on DOM elements and on the pointer, which exist in both renderers. The node's own root element is never hidden; only its widgets are. |
-| The governor, Timing, Stalls, Nodes, Load, Memory, GPU tabs | Unaffected: they measure timers, main-thread stalls, redraw requests and resources, not node painting. |
+| Widgets stop answering, off-screen nodes, margin, come back, display scale, how widgets go | **Work.** These act on DOM elements and on the pointer, which exist in both renderers. The stand-in pathway is the only thing that blanks a node's own root element, and only below your threshold; the widget and focus settings never touch it. |
+| The governor, Timing, Stalls, Nodes, Load, Memory, GPU tabs | Unaffected: they measure timers, main-thread stalls, redraw requests and resources, not node painting. In this renderer the Nodes tab's per-type table is the frontend's own per-node layout pass (it draws no chrome), and the readout names the renderer next to it. |
 
-The Status tab names the renderer in its first line and explains the idle
-settings in place ("Vue nodes", "this frontend draws nodes as DOM elements"),
-so a setting that is quiet for a structural reason is not mistaken for a
-broken one. Switching Nodes 2.0 off in ComfyUI's settings takes effect on the
-same page — the flag is read per frame, not latched at load.
+The Status tab names the renderer and the pathway in its first line
+("Vue nodes", "blanked", "boxes"), so a setting that is quiet for a structural
+reason is not mistaken for a broken one. Switching Nodes 2.0 off in ComfyUI's
+settings takes effect on the same page — the flag is read per call, not latched
+at load — and the elements this tool blanked are handed back in the same frame.
 
 Retired: the v2.1.5 separate image-preview thumbnail ladder. The node's
 picture *is* the thumbnail — a second, hidden copy of an image that is
@@ -477,7 +498,7 @@ short version:
 ## Development
 
 ```bash
-node tests/run-tests.mjs              # all tests — 189 passing, zero dependencies
+node tests/run-tests.mjs              # all tests — 193 passing, zero dependencies
 node tests/run-tests.mjs <substring>  # one suite or test
 python3 tests/test_init.py            # the Python side (routes, node contract)
 node tests/demo.mjs                   # prints what every tab says, against a synthetic graph

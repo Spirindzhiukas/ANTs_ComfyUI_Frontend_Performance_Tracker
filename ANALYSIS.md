@@ -1,6 +1,6 @@
 # What works, what fails, and what was taken out
 
-An audit of the repository as of v2.5.6, done by reading the sources rather
+An audit of the repository as of v2.6.0, done by reading the sources rather
 than the docs, running the suites, and running the demo. Every claim below
 has a file and (where it matters) a line reference. Found defects were fixed
 in the same pass; retired ideas were removed rather than documented as if
@@ -9,8 +9,8 @@ they still existed.
 ## How this was checked
 
 ```bash
-node tests/run-tests.mjs        # 189 passing (172 before this pass; seventeen added)
-node tests/run-tests.mjs "Nodes 2.0"        # the seven that cover that renderer
+node tests/run-tests.mjs        # 193 passing (172 before the stand-in passes; twenty-one added)
+node tests/run-tests.mjs "Nodes 2.0"        # the eleven that cover that renderer
 node tests/run-tests.mjs "cache on disk"    # the five that cover the picture store
 node tests/run-tests.mjs "stand-in picture" # the five that cover what a picture holds
 python3 tests/test_init.py      # Ran 9 tests ... OK
@@ -114,46 +114,67 @@ What that means for this tool, and what had to change:
 | 4 | **A warm cache survived the switch into this renderer.** The slice that drains the capture lane already stopped when the engine was off, but the bitmaps it had already taken (and a queue with work in it) stayed in memory for a page that can never paint them — a renderer switch is not a reload. | Reproduced: two held bitmaps and their bytes stayed after `enterVueNodes()`. | The slice releases the cache on that transition, the same release as switching the setting off, and counts it as a clear. Test: *"a page that switches to this renderer hands back the pictures it can no longer paint"*. |
 | 5 | **Nothing pinned the flag to the live page.** A rule that latched the renderer at load would look correct in every test that sets the mode once. | — | The flag is read per call, and a test switches the renderer back *on the same page* and holds flattening and the picture engine to returning. |
 
-### Could picture stand-ins work *in* the Vue-nodes renderer?
+### Do stand-ins work *in* the Vue-nodes renderer? Pictures no; boxes yes
 
-The question was asked directly, so here is the answer with its reasoning rather
-than a shrug. Two halves, and they get different answers.
+This was asked twice: first whether it could work at all (v2.5.5: no, and the
+settings said so), then — after the frontend's own sources settled the mechanics
+— whether a second pathway could make the same settings act there, chosen
+automatically. **It can, and since v2.6.0 it does**, with one thing that remains
+impossible and a mechanism that is deliberately not the canvas renderer's.
 
-**What can work there, and does.** Link thinning and straight links (the canvas
-still draws the ink), the idle redraw cap, the widget/focus settings and the
-fovea (they act on DOM elements and the pointer), the governor, and every
-measurement that is not per-node canvas drawing. The node's root element is still
-never hidden for the *stand-in* settings — only the fovea, which is a different
-promise (the node is off screen, so nothing about it is visible either way) and
-works on Vue roots today.
+**What is impossible, and stays impossible.** A *picture* of a node. The canvas
+renderer takes one by drawing the node into an offscreen canvas through its own
+`drawNode` seam. In this renderer `drawNode` draws nothing (it returns after
+`_setConcreteSlots()` and `arrange()` — `LGraphCanvas.ts`), and the node is a DOM
+element, so there is nothing to draw into a bitmap. Producing a picture would
+mean a DOM-to-canvas library (html2canvas-style) or an SVG `foreignObject`
+trick, both of which mis-render real stylesheets and cross-origin images; this
+tool will not pretend otherwise. So the capture, the capture resolution, the RAM
+budget and the disk cache stay idle in this renderer, and the readout says why.
 
-**What cannot work as it is, and why.** The stand-in is a canvas bitmap blitted
-in place of a canvas `drawNode`. In this renderer the canvas draws no node at
-all, so there is nothing to blit *into*, and a capture of one is blank — the same
-blank that used to be written off as "draws nothing into the canvas". A picture
-could still be *shown*, but not through the canvas: it would have to be an
-`<img>` (or a canvas) this tool appends to the vue-nodes container, positioned to
-match the node, with the node's own root element taken out of the picture
-(`visibility: hidden` keeps the box, so selection, drag and menus keep working).
-That is a different feature with a different cost profile:
+**What works, and how.** The two things that do exist are the node's element and
+the canvas, so the stand-in is made of those:
 
-- The frontend re-renders a node's component when its data changes and owns the
-  node's transform, so keeping an overlay in step means reading the root's
-  transform every frame and writing it to our element — per-frame work this tool
-  currently never does.
-- The saving is smaller than in canvas mode: the browser still creates and mounts
-  every node component; hiding a root skips its layout and paint (`content-visibility:
-  hidden` would skip more, at the price of a collapsed box), but it does not skip
-  Vue's own render of that component.
-- Correctness risks are real and new: z-order against selected nodes and groups,
-  the node's own DOM widgets layer (which the frontend positions independently),
-  multi-select, and the frontend's re-mount on graph switch.
+1. **The element is blanked** — one class, `opacity: 0`, on the element the
+   frontend renders the node into (`[data-node-id]`). `opacity: 0` is the whole
+   mechanism and it was chosen for what it does *not* do: the element keeps its
+   layout box, keeps its children (slots, widgets, resize handles) and keeps its
+   pointer events, so clicking, dragging, selecting and link-dragging behave
+   exactly as they do in full detail. It stops painting; nothing is hidden and no
+   frontend state is touched. (`display: none` would collapse the box and
+   `content-visibility: hidden` would take the node's slots out of hit-testing —
+   both break interaction for a saving that is not worth it.)
+2. **The canvas paints the box in its place.** LiteGraph still calls `drawNode`
+   for every visible node in this renderer (line ~5204: `ctx.translate(px, py)`
+   then `this.drawNode(node, ctx)`, with `drawNode` returning early), so this
+   tool's existing seam fires with the context already in node-local space and
+   the box lands exactly where a picture lands in the canvas renderer — the same
+   detail ladder, the same colours, the same progress bar and error ring.
 
-So: **feasible, not built, and not a small change.** It is recorded in `plan.md`
-(Track K) as a design with its open questions, so it can be picked up on evidence
-— the honest evidence being that on a large Vue-nodes graph the measurement shows
-what fraction of a frame the node DOM actually costs, which this tool can already
-report (frame budget plus the Stalls tab) before anybody writes the overlay.
+**Why this is the right target, not a consolation prize.** The frontend's own
+`useTransformState.ts` states its design: all nodes live in one transformed
+container, "O(1) transform updates regardless of node count", so panning and
+zooming are already compositor work. What a zoomed-out heavy graph then spends
+its frame on is *node pixels* — and that is exactly what blanking removes. The
+canvas renderer's saving (cheaper canvas drawing) does not exist here; this
+renderer's saving (fewer DOM pixels) does not exist there. Same setting, same
+threshold, same boxes, two different mechanisms.
+
+**Guarantees that make it safe.** A box is painted only for an element this tool
+has really blanked: a node whose element cannot be reached keeps its own drawing
+(two pictures of one node is the one outcome worse than no stand-in). Every
+blanked element is handed back when the zoom leaves the threshold, when the
+setting or the tool is switched off, when the renderer changes, and on an error
+path — the per-frame plan compares one boolean in the steady state, so nothing
+walks the graph per frame and a stale class cannot survive a frame.
+
+**What is not verified.** The mechanism is verified against the frontend's
+sources and the harness (eleven tests now cover that renderer); it has not been
+run against a live Vue-nodes page in this pass, and the size of the saving on a
+real heavy graph is not measured here — the tool's own frame budget and Stalls
+tab can measure it on the page. One honest nuance: while a node is blanked, its
+accessibility-tree entry is that of a blank element (`opacity: 0` keeps the
+elements rather than removing them).
 
 Two things the Nodes 2.0 pass confirmed rather than changed: the Vue node's
 **root element is never hidden or inerted** (`via: "root"` records are exempt from
@@ -271,20 +292,25 @@ apply, not just in the docs.
   the code paths that read `performance.memory` and long tasks are guarded
   and the panel prints "not available" instead of a number, but no browser
   other than the Node harness was executed in this pass.
-- **A DOM-overlay stand-in for the Vue-nodes renderer** is designed but not
-  built (see above and `plan.md`, Track K). Nothing here depends on it; the
-  renderer is detected, understood and reported either way.
+- **The Vue-nodes stand-in has not been run against a live page.** It is
+  verified against the frontend's sources and the harness (eleven tests), and
+  its failure modes are contained by construction (a box only ever follows a
+  real blanking, and every blanked element is handed back on the frame the
+  setting stops applying) — but the size of the saving and the feel of a
+  blanked-but-interactive node are things only a real heavy graph can show. The
+  tool measures both: the frame budget, the Stalls tab and
+  `lowZoom.snapshots.vueBlanked` / `vueBoxes` / `vueRestored`.
 - **A picture with a cross-origin image in it cannot be written to disk.** The
   browser taints the canvas; blitting still works, so the picture is used from
   memory, and the write is skipped without counting as a disk failure. Not
   exercised in this pass (the harness's images are all same-origin fictions).
-- **The Nodes 2.0 support is verified against upstream sources and the
-  fixture, not against a running Vue-nodes page.** Every claim in the section
-  above is traceable to a file in `Comfy-Org/ComfyUI_frontend` and reproduced
-  by the harness, but a browser was not stood up with the setting on; the
-  areas a fixture cannot model (real Vue re-render timing, a live widget
-  store, the frontend's own `low_quality` transitions) are the ones to
-  watch if the mode is used for real work.
+- **A picture of a Vue node is not obtainable** without a DOM-to-canvas
+  library (or an SVG `foreignObject` trick), which would mis-render real
+  stylesheets and cross-origin images. The Vue pathway is boxes by design, and
+  the readout says so rather than offering a choice that cannot exist. The
+  remaining picture-shaped question — an `<img>` overlay positioned over a node
+  — is not taken: it would add a per-frame transform copy per node to save less
+  than the blanking does (`plan.md`, Track K).
 - **The console-attribution mode** (plan.md, Track L) is still unbuilt. The
   credit for the idea stands; the honest thing is that nothing in the shipped
   code depends on it.

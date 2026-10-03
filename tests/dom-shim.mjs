@@ -192,9 +192,25 @@ class Node {
         tests.push((n) => n._cls && n._cls.has(cls[1]));
         continue;
       }
+      // Tag names, one or a comma-separated list: what the tracker asks for when
+      // it looks inside a widget's element (`img,canvas`, `video`) — the shapes
+      // the real DOM offers and the wrapper cases the docs describe.
+      const tags = /^[a-z][\w-]*(\s*,\s*[a-z][\w-]*)*$/i.exec(part);
+      if (tags) {
+        const want = part.split(",").map((t) => t.trim().toUpperCase()).filter(Boolean);
+        tests.push((n) => n.nodeType === 1 && want.includes(String(n.tagName).toUpperCase()));
+        continue;
+      }
       return [];
     }
     return this.descendants().filter((n) => n.nodeType === 1 && tests.every((t) => t(n)));
+  }
+
+  // The singular form, which the tracker uses to look *inside* a widget's element
+  // (a nested `<video>`, the `<img>` in a wrapper) — the real DOM has it, so the
+  // shim has it too, or those paths are never exercised.
+  querySelector(selector) {
+    return this.querySelectorAll(selector)[0] || null;
   }
 
   descendants() {

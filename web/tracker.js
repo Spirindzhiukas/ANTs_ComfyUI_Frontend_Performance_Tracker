@@ -27,7 +27,7 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.5.6";
+const VERSION = "2.6.0";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
 // The class key ComfyUI stores in a workflow. The old key is still recognised so
 // a graph saved before the rename does not lose this node.
@@ -994,6 +994,12 @@ const LOD = {
   domVerified: 0, // elements this tool looked at with getComputedStyle and found off
   domBroken: 0, // ... and found still reachable, which is what the event gate is for
   domOwners: null, // Map<element, record>: every node DOM element we may hide
+  vueFlat: null, // Set of nodes whose Vue element this tool has blanked
+  vueRoots: null, // Map<node, element>: what the frontend renders a Vue node into
+  vueFlatOn: null, // last frame's answer to "are the boxes standing in?"
+  vueBoxes: 0, // boxes painted in place of a Vue node's own element
+  vueRestored: 0, // elements handed back (threshold, setting, tool, renderer)
+  vueCleared: "", // why the last full hand-back happened, for the readout
   displayScale: 0, // 0 = read it from the browser, otherwise the device-pixel ratio
   display: null, // what the display-scale check found last time it ran
   sweptZoom: NaN, // the zoom the DOM was last swept at
@@ -1124,6 +1130,12 @@ const LOD_DETAIL_ZOOMS = [0, 1, 0.8, 0.6, 0.4, 0.2];
 const LOD_LINK_WIDTH = 1; // graph units; LiteGraph's own default is 3
 const LOD_FULL_LINK_WIDTH = 3; // what ComfyUI draws when nothing is thinned
 const LOD_DOM_CLASS = "ants-lod-box"; // elements hidden while their node is a box
+// A Vue node's own element, blanked while the canvas paints a box in its place.
+// `opacity: 0` is the whole mechanism: the element stops being drawn, keeps its
+// layout box and keeps its pointer events, so its slots, its context menu, its
+// resize handles and its drag still work — the element is there, it just does not
+// paint. Nothing about the frontend's own state is touched.
+const LOD_VUE_CLASS = "ants-vue-standin";
 const LOD_INERT_CLASS = "ants-lod-inert"; // elements switched off while their node is inert
 // Below this zoom nobody can read a node, let alone use one, so its UI is
 // switched off rather than paid for on every pointer event.
@@ -1909,6 +1921,7 @@ function lodDomRegistrySweep(canvas) {
     if (!node) continue;
     seen.add(el);
     viewOwnerRecord(owners, el, node, "root");
+    (LOD.vueRoots || (LOD.vueRoots = new Map())).set(node, el);
   }
   // 3. Every wrapper in the page, wherever it is: the component widgets — the 3D
   //    viewports among them — are only ever reachable this way.
@@ -2559,6 +2572,7 @@ function antsSetEnabled(on) {
     // stored bitmap is only useful to a tool that is running, and switching on
     // again recaptures on the next idle lane.
     if (LOD.snapOn) lodSnapClear("master switch");
+    lodVueUnblankAll("tool off");
     // Nothing of this tool's own UI goes away: the floating pill carries the
     // switch that turns it back on, and closing the panel under someone who is
     // reading it would be its own small bug. The page is what gets handed back.
@@ -2966,6 +2980,23 @@ function lodLoadSettings() {
   }
 }
 
+// Per-node-type render cost: what the Nodes tab's table is built from. In the
+// canvas renderer that is LiteGraph's own drawing; in the Vue-nodes renderer it
+// is the frontend's own per-node layout pass (it draws no chrome there), which is
+// why the readout names the renderer next to the table.
+function lodNoteNodeDraw(node, t0, dt) {
+  if (S.paused) return;
+  const typeName = (node && (node.type || (node.constructor && node.constructor.type))) || "unknown";
+  let bucket = S.nodes.get(typeName);
+  if (!bucket) {
+    bucket = { type: typeName, series: new Ring(), calls: 0 };
+    S.nodes.set(typeName, bucket);
+  }
+  bucket.series.push(t0, dt);
+  bucket.calls++;
+  curNodeStageMs += dt;
+}
+
 function lodAbort(err) {
   LOD.error = (err && err.message) || String(err);
   LOD.flatBelow = 0;
@@ -2974,6 +3005,7 @@ function lodAbort(err) {
   LOD.baseline = null;
   try {
     lodSweepDom(app.canvas);
+    lodVueUnblankAll("error");
   } catch (e) {
     /* unhiding is best-effort; the class is gone with the reload either way */
   }
@@ -3234,6 +3266,7 @@ function lodSet(opts) {
   // happens to draw: the marks follow the setting, whatever the zoom is.
   try {
     lodSweepDom(app.canvas);
+    lodVueUnblankAll("setting");
     // ... and the hover half immediately, not on the next drawn frame: a redraw
     // can be merged by the idle cap, and until one is drawn a 3D viewport whose
     // node has just been switched off would keep its "pointer is over me" flag.
@@ -3399,6 +3432,7 @@ function patchCanvasDraw() {
       // The plan also carries the zoom: focus, the fovea and the picture decision
       // all read it even when no node is being flattened.
       if (S.enabled && lodOn()) lodPlanFrame(this);
+      lodVueFramePlan(this);
       drawDepth++;
       let ret;
       try {
@@ -3462,20 +3496,35 @@ function patchCanvasDraw() {
         if (!snapped) lodSnapEnqueue(node, this);
         return undefined;
       }
+      // The Vue-nodes pathway. LiteGraph still calls this for every visible node
+      // in this renderer — it keeps slot metrics in sync and returns before
+      // drawing any chrome — so the box lands exactly where a picture lands in
+      // the canvas renderer. The frontend's own draw runs first because its
+      // `arrange()` is what the box's geometry reads afterwards.
+      if (ctx && lodVueFlatNode(node, this)) {
+        const tv = performance.now();
+        const retV = originalDrawNode.call(this, node, ctx, ...rest);
+        const dtv = performance.now() - tv;
+        lodNoteNodeDraw(node, tv, dtv);
+        if (lodVueBlank(node, true)) {
+          try {
+            this.current_node = node;
+            lodPaintNode(node, this, ctx);
+            LOD.vueBoxes++;
+            LOD.nodes++;
+            LOD.ms += dtv;
+            if (!S.paused) curNodeStageMs += dtv;
+          } catch (err) {
+            lodVueBlank(node, false); // its own drawing comes back
+            lodAbort(err);
+          }
+        }
+        return retV;
+      }
       const t0 = performance.now();
       const ret = originalDrawNode.call(this, node, ctx, ...rest);
       const dt = performance.now() - t0;
-      if (!S.paused) {
-        const typeName = (node && (node.type || (node.constructor && node.constructor.type))) || "unknown";
-        let bucket = S.nodes.get(typeName);
-        if (!bucket) {
-          bucket = { type: typeName, series: new Ring(), calls: 0 };
-          S.nodes.set(typeName, bucket);
-        }
-        bucket.series.push(t0, dt);
-        bucket.calls++;
-        curNodeStageMs += dt;
-      }
+      lodNoteNodeDraw(node, t0, dt);
       return ret;
     };
     wrappedDrawNode.__antsWrapped = true;
@@ -3643,26 +3692,35 @@ function lodSnapOn(canvas) {
   // nothing for it to replace, and no node's appearance changes because of this
   // setting: the flatten threshold stays the only thing that decides that.
   if (!lodFlatOn(canvas)) return false;
-  // And there is no box at all when the frontend draws nodes as DOM elements
-  // (Nodes 2.0 / Vue nodes): `lodFlatNode` refuses every node there, so a
-  // capture would cost a slice of the idle lane, produce a blank bitmap — the
-  // canvas draws no node in this mode — and then be written off as "draws
-  // nothing into the canvas" and blocked for the session. The engine reports
-  // itself off instead, and the Status tab says which renderer is why.
-  if (lodVueNodesMode()) return false;
   return true;
 }
 
+// Which of the two stand-in pathways this page gets. Read from the frontend's own
+// flag on every call, never latched, so switching renderers takes effect on the
+// same page: "canvas" — a picture of the node, blitted where the canvas would have
+// drawn it; "vue" — the node's own element blanked and the same box painted by the
+// canvas in its place; "off" — the tool, the setting, or the zoom is above it.
+function lodSnapPathway(canvas) {
+  if (!lodSnapOn(canvas)) return "off";
+  return lodVueNodesMode() ? "vue" : "canvas";
+}
+
+// Pictures need a canvas that draws nodes, and only the canvas renderer has one.
+// In the Vue-nodes renderer the bitmap half — capture, mips, the ink probe, the
+// disk store, the budget — must not spend a slice, a byte or a disk write on
+// pictures nothing can ever draw back.
+function lodSnapBitmaps(canvas) {
+  return lodSnapOn(canvas) && !lodVueNodesMode();
+}
+
 // Does the DOM half of the drawing settings have anything to do on this page?
-// The focus half (widgets stop answering, the fovea) acts on DOM elements and
-// works in both renderers. The stand-in half replaces a node the *canvas*
-// draws: in a Vue-nodes frontend the node is the element, so there is nothing
-// to replace and nothing to hide for it — the registry, the once-a-second DOM
-// sweep and the per-frame pass would all be work with a guaranteed answer of
-// "nothing changed".
+// The focus half (widgets stop answering, the fovea) acts on DOM elements. The
+// stand-in half now needs the registry in *both* renderers: the canvas renderer
+// hides a node's widgets under its box, and the Vue-nodes renderer blanks the
+// node's own element — and both have to know which element belongs to which node.
 function lodDomWanted() {
   if (LOD.inertBelow > 0 || LOD.fovea) return true;
-  return LOD.flatBelow > 0 && !lodVueNodesMode();
+  return LOD.flatBelow > 0;
 }
 
 // Is this node one that must be drawn by ComfyUI, right now? Every answer here is
@@ -3691,6 +3749,120 @@ function lodSnapLive(node, canvas) {
     return true;
   }
   return false;
+}
+
+// ---------------------------------------------------------------------------
+// The Vue-nodes pathway (Nodes 2.0). The canvas renderer replaces a box the
+// canvas would have drawn with a picture of the node. This renderer has no such
+// box: the node *is* a DOM element (`[data-node-id]`, positioned inside the
+// frontend's transform pane) and `LGraphCanvas.drawNode()` returns before drawing
+// any chrome. So the stand-in is made of the two things that do exist:
+//
+//   1. the element is blanked — one class, `opacity: 0` — so the browser stops
+//      painting that node's DOM. Its layout, its pointer events and every child
+//      (slots, widgets, resize handles) stay exactly as they were, which is what
+//      keeps clicking, dragging, selecting and link-dragging working while a node
+//      is a stand-in. Nothing is hidden and no frontend state is touched.
+//   2. the canvas paints the same box the canvas renderer would paint, in the
+//      same place and with the same detail ladder — LiteGraph still calls
+//      `drawNode` for every visible node in this renderer (to keep slot metrics
+//      in sync), so this tool's existing seam fires with the context already in
+//      node-local space.
+//
+// There is no picture here: a DOM node cannot be photographed to a bitmap without
+// a DOM-to-canvas library, and this tool will not pretend otherwise. Pictures,
+// the capture resolution and the disk cache all belong to the canvas renderer and
+// are reported idle here. The saving is different too: not cheaper canvas
+// drawing, but fewer node pixels for the browser to paint, which is exactly where
+// a zoomed-out heavy graph spends its frame.
+function lodVueFlatNode(node, canvas) {
+  if (!lodVueNodesMode()) return false;
+  if (!lodFlatOn(canvas)) return false;
+  if (!node) return false;
+  if (node.flags && node.flags.collapsed) return false; // already a small box
+  if (lodOwnNode(node)) return false; // the panel has to stay reachable
+  if (lodSnapLive(node, canvas)) return false; // running, erroring, dragging, video
+  return true;
+}
+
+// The element the frontend renders a node into. Read from the registry the DOM
+// sweep keeps (`data-node-id`), with a direct lookup the first time a node is
+// blanked and a re-lookup when the frontend rebuilds the element.
+function lodVueRootEl(node) {
+  try {
+    const cache = LOD.vueRoots || (LOD.vueRoots = new Map());
+    const hit = cache.get(node);
+    if (hit && (hit.isConnected === undefined || hit.isConnected)) return hit;
+    const id = node && node.id;
+    if (id === undefined || id === null) return null;
+    if (typeof document === "undefined" || typeof document.querySelector !== "function") return null;
+    const el = document.querySelector('[data-node-id="' + String(id).replace(/"/g, "") + '"]');
+    if (el) cache.set(node, el);
+    else cache.delete(node);
+    return el || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Blank (or hand back) one node's element. Answers whether a box may be painted:
+// a box stands in for an element this tool has really blanked, never for one it
+// could not reach — a box over a node that is still drawing itself would be two
+// pictures of the same node.
+function lodVueBlank(node, on) {
+  const el = lodVueRootEl(node);
+  const set = LOD.vueFlat || (LOD.vueFlat = new Set());
+  if (!el || !el.classList) {
+    set.delete(node);
+    return false;
+  }
+  try {
+    el.classList.toggle(LOD_VUE_CLASS, !!on);
+  } catch (e) {
+    return false;
+  }
+  if (on) set.add(node);
+  else set.delete(node);
+  return true; // the class is where it was asked to be, in either direction
+}
+
+// Hand every blanked element back. Called when the zoom leaves the setting, when
+// the renderer changes, and when the tool or the setting is switched off: this
+// tool must never leave a node invisible because a setting moved under it.
+function lodVueUnblankAll(reason) {
+  const set = LOD.vueFlat;
+  if (!set || !set.size) return 0;
+  let n = 0;
+  for (const node of [...set]) if (lodVueBlank(node, false)) n++;
+  if (n) {
+    LOD.vueRestored += n;
+    LOD.vueCleared = String(reason || "off");
+  }
+  return n;
+}
+
+// Once a frame, before the canvas draws. Blanking itself happens on the node the
+// canvas is drawing, so nothing walks the graph here in the steady state; this
+// only turns the whole set back when the boxes stop standing in for anything.
+// Above the threshold (or with the setting or the tool off) the sweep is a single
+// comparison, which is what makes a stale class impossible to leave behind.
+function lodVueFramePlan(canvas) {
+  const flat = !!(S.enabled && LOD.snapOn && LOD.flatBelow > 0 && lodVueNodesMode() && lodFlatOn(canvas));
+  const prev = LOD.vueFlatOn;
+  LOD.vueFlatOn = flat;
+  const set = LOD.vueFlat;
+  if (!set || !set.size) return 0;
+  if (flat && prev === true) return 0; // steady state: the drawn node decides
+  let n = 0;
+  for (const node of [...set]) {
+    if (flat && lodVueFlatNode(node, canvas)) continue; // still standing in
+    if (lodVueBlank(node, false)) n++;
+  }
+  if (n) {
+    LOD.vueRestored += n;
+    LOD.vueCleared = flat ? "one of them came back" : LOD.snapOn ? "zoom" : "setting";
+  }
+  return n;
 }
 
 // Can this node be photographed at all — and if not, why not? Only two answers
@@ -4200,7 +4372,7 @@ async function lodRamFinish() {
   LOD.ramRunning = false;
   const used = await lodRamSample();
   const canvas = typeof app !== "undefined" && app ? app.canvas : null;
-  if (!canvas || !lodSnapOn(canvas)) return 0;
+  if (!canvas || !lodSnapBitmaps(canvas)) return 0;
   const nodes = lodGraphNodes(canvas);
   if (!nodes) return 0;
   const area = viewArea(canvas, 0);
@@ -5016,7 +5188,7 @@ function lodSnapPump() {
 // one visible pause. No second scheduler, no second idle clock.
 function lodSnapSlice() {
   const canvas = typeof app !== "undefined" && app ? app.canvas : null;
-  if (!lodSnapOn(canvas)) {
+  if (!lodSnapBitmaps(canvas)) {
     LOD.snapPumping = false;
     // A renderer that draws no node makes every held picture useless. A page
     // that switches to Nodes 2.0 with a warm cache would otherwise keep the
@@ -5444,7 +5616,7 @@ function lodThumbDiskAsk(node, canvas) {
 }
 
 function lodSnapEnqueue(node, canvas) {
-  if (!lodSnapOn(canvas)) return;
+  if (!lodSnapBitmaps(canvas)) return;
   lodSnapEnsure();
   const rec = LOD.snaps.get(node);
   if (rec && rec.diskPending) return;
@@ -7632,6 +7804,7 @@ tr.ants-details table.ants-sub td { color: #bbb; }
 }
 /* Elements of a node that is currently drawn as a rectangle: see lodSweepDom. */
 .ants-lod-box { display: none !important; }
+.ants-vue-standin { opacity: 0 !important; }
 .ants-off-note {
   border-left: 3px solid #AE7719; padding: 6px 8px; margin: 6px 0;
   background: rgba(174, 119, 25, 0.08); color: #e8e8ee;
@@ -9460,10 +9633,17 @@ function buildTweaksTab(container) {
       if (lodVueNodesMode()) {
         // Which renderer this is decides what most of the drawing settings can
         // do, so it belongs at the top of the readout rather than in a tooltip.
+        // The stand-in setting is not idle here: it is the blanking pathway, and
+        // the readout has to say so in the same breath as the renderer.
         bits.push(
-          "renderer: nodes are DOM elements (Nodes 2.0 / Vue nodes mode) — the canvas draws links, groups and the grid only, so node drawing reads " +
-            "near zero here and every node stand-in setting is idle by design. Everything the tool measures about timers, stalls, redraw requests and links " +
-            "still applies"
+          "renderer: nodes are DOM elements (Nodes 2.0 / Vue nodes mode) — the canvas draws links, groups and the grid only, so there is no node chrome " +
+            "for it to draw cheaper" +
+            (LOD.flatBelow > 0 && LOD.snapOn
+              ? `. The stand-in setting acts here by blanking: below ${Math.round(LOD.flatBelow * 100)}% zoom each node's own element stops painting ` +
+                `(one class, ${LOD.vueFlat ? LOD.vueFlat.size : 0} blanked right now) and the canvas paints that node's box in the same place, with the same ` +
+                `detail ladder as the canvas renderer — fewer node pixels for the browser to paint is where a zoomed-out heavy graph spends its frame. ` +
+                `Pictures, the capture resolution and the disk cache need the canvas renderer: a DOM node cannot be photographed to a bitmap`
+              : "")
         );
       }
       const theirLod = lodFrontendLod(app.canvas);
@@ -9502,15 +9682,17 @@ function buildTweaksTab(container) {
       if (LOD.flatBelow > 0) {
         const pct = (z) => `${(z * 100).toFixed(z < 0.1 ? 1 : 0)}%`;
         if (lodVueNodesMode()) {
-          // The one case where "0 of N" would otherwise read as a bug in this
-          // tool, or be explained away as collapsed nodes: this renderer draws
-          // every node as a DOM element, so there is no canvas node to replace.
-          // Saying it here is the difference between a setting that is quiet for
-          // a reason and one that looks broken.
+          // The same setting, the other pathway: there is no canvas node to
+          // replace and no bitmap to take, so what a stand-in means here is an
+          // element that stops painting and a box the canvas draws in its place.
           bits2.push(
-            `zoom ${pct(LOD.zoom)} is below your ${pct(LOD.flatBelow)} setting, but this frontend draws nodes as DOM elements ` +
-              `(Nodes 2.0 / Vue nodes mode): none of the ${LOD.plan.total} node(s) is drawn by the canvas, so there is no node here to replace and ` +
-              `nothing to photograph. Link ink, the idle redraw cap and the governor are not affected — they act on the canvas this renderer still draws`
+            !LOD.snapOn
+              ? `zoom ${pct(LOD.zoom)} is below your ${pct(LOD.flatBelow)} setting, but the stand-in setting itself is off: the ${LOD.plan.total} ` +
+                `node(s) here are DOM elements, so nothing is blanked and no box is painted`
+              : `zoom ${pct(LOD.zoom)} is below your ${pct(LOD.flatBelow)} setting: ${LOD.vueBoxes} box(es) painted and ` +
+                `${LOD.vueFlat ? LOD.vueFlat.size : 0} node element(s) blanked — those nodes stop painting themselves and the canvas draws their boxes ` +
+                `(same detail ladder as the canvas renderer). No picture is taken here: a DOM node cannot be photographed, so the capture, ratio and disk ` +
+                `settings stay idle. Link ink, the idle redraw cap and the governor are unaffected`
           );
         } else if (lodFlatOn()) {
           bits2.push(
@@ -9529,7 +9711,10 @@ function buildTweaksTab(container) {
         // What the boxes are made of: a stored picture of the node, or the fill.
         // Every number here is a count of something that happened, and the two
         // that could be mistaken for a claim (bytes, capture time) are measured.
-        if (lodSnapOn()) {
+        // Gated on the bitmap half: in the Vue-nodes renderer there are boxes and
+        // there are no pictures, and "0 of 0 remembered nodes have a picture"
+        // would describe an engine that is deliberately idle.
+        if (lodSnapBitmaps()) {
           const pictured = lodSnapPictured();
           const parts = [
             `${pictured} of ${LOD.snaps ? LOD.snaps.size : 0} remembered node(s) have a picture`,
@@ -9615,8 +9800,9 @@ function buildTweaksTab(container) {
         } else if (LOD.snapOn) {
           bits2.push(
             lodVueNodesMode()
-              ? "snapshots are switched on but idle: this frontend draws nodes as DOM elements, so no node is ever a flat box for a picture to " +
-                "replace — nothing is captured, nothing is held and nothing is asked of the disk. They come back with the canvas renderer"
+              ? "snapshots are on: in this renderer they are the box the canvas paints while a node's element is blanked — the bitmap half (capture, " +
+                "ratio, budget, disk) stays idle, because a DOM node cannot be photographed. The boxes appear below the flatten threshold above; above it " +
+                "there is nothing to stand in for"
               : "snapshots are on but not painting anything: they replace flat boxes, so they need the flatten setting above switched on " +
                 "(and a zoom below it)"
           );
@@ -11905,7 +12091,8 @@ function buildTelemetryReport() {
         lodOn()
           ? `on (${
               lodVueNodesMode()
-                ? "node stand-ins idle: this frontend draws nodes as DOM elements, so no node is flattened and no picture is taken (the widget and focus settings below still act)"
+                ? `node stand-ins are boxes: below ${Math.round(LOD.flatBelow * 100)}% zoom each node's own element stops painting and the canvas draws its box ` +
+                  `(no picture is taken in this renderer — the bitmap half of the engine is idle; the widget and focus settings below still act)`
                 : `every node a rectangle below ${Math.round(LOD.flatBelow * 100)}% zoom${LOD.legacyPx ? `, carried over from "nodes under ${LOD.legacyPx}px"` : ""}`
             }, links ${lodLinksStraight() ? "straight (link setting)" : "as drawn"}, idle redraw cap ${LOD.idleCapMs ? LOD.idleCapMs + "ms" : "off"}, box detail ${LOD.boxDetail}, ` +
             `snapshots ${LOD.snapOn ? `on (${LOD.snapDrawn} served, ${LOD.snapCaptured} captured, ${fmtBytes(LOD.snapBytes)} of ${LOD.snapMb} MiB)` : "off"}) ` +
@@ -12269,6 +12456,13 @@ function installDebugApi() {
         get snapshots() {
           return {
             on: lodSnapOn(),
+            // Which of the two pathways is standing in, and what it is doing.
+            pathway: lodSnapPathway(),
+            bitmaps: lodSnapBitmaps(),
+            vueBlanked: LOD.vueFlat ? LOD.vueFlat.size : 0,
+            vueBoxes: LOD.vueBoxes,
+            vueRestored: LOD.vueRestored,
+            vueCleared: LOD.vueCleared,
             wanted: !!LOD.snapOn,
             ratio: LOD.snapRatio,
             budgetMb: LOD.snapMb,
@@ -12579,14 +12773,19 @@ app.registerExtension({
 //    is not attributed by name. It still lands in the frame budget's
 //    "everything else" line, and if it blocks the main thread it also lands in
 //    the Stalls tab — but the panel cannot name it.
-//  * ComfyUI's Vue-nodes frontend (Nodes 2.0) draws no node on the canvas at
-//    all: LiteGraph's drawNode returns immediately and each node is a DOM
-//    element. What remains for this tool is the canvas work it still does —
-//    links, groups, the grid, redraws — plus every timer, stall and resource
-//    measurement, so node-drawing numbers read near zero there and the node
-//    stand-in settings are idle by design (the Status tab names the renderer
-//    and says so). Link thinning, the idle redraw cap, the widget/focus
-//    settings and the governor are unaffected.
+//  * ComfyUI's Vue-nodes frontend (Nodes 2.0) draws no node chrome on the
+//    canvas: LiteGraph's drawNode returns immediately and each node is a DOM
+//    element. The stand-in setting still acts there, through the other
+//    pathway: the node's own element is blanked (one class, `opacity: 0`) and
+//    the canvas paints the same box in its place, so the saving is node pixels
+//    the browser no longer paints rather than cheaper canvas drawing. What it
+//    cannot do is produce a *picture*: a DOM node cannot be drawn into a
+//    bitmap without a DOM-to-canvas library, so the capture, the resolution,
+//    the RAM budget and the disk cache are idle in that renderer and the Status
+//    tab says so. Link thinning, the idle redraw cap, the widget/focus settings
+//    and the governor are unaffected. A box in that renderer is also never
+//    painted over a node whose element this tool could not reach (a node whose
+//    `[data-node-id]` element is missing keeps its own drawing).
 //  * Timing is per redraw of the whole canvas, so a hook's cost is exact but
 //    its "share of frame" is a share of the mean frame in the window, not of
 //    the frame it happened to run in.
@@ -12632,6 +12831,12 @@ app.registerExtension({
 //  * Worker functions cannot capture closures, which is why the lane takes a
 //    job name (or a self-contained function source) plus structured-cloneable
 //    arguments and nothing else.
+//  * In the Vue-nodes renderer a stand-in is a blanked element plus a box: the
+//    element keeps its layout and its pointer events, so interaction is
+//    unchanged, but its accessibility tree entry is that of a blank node while
+//    the box stands in (opacity 0 keeps the elements, it does not remove them).
+//    Not exercised in this pass against a live Vue-nodes page — verified
+//    against the frontend's sources and the harness.
 //  * A stand-in picture is the canvas drawing of the node plus what this tool
 //    could honestly draw of its DOM widgets (an image or a canvas pixel for
 //    pixel; a text field's value re-painted, because page JavaScript cannot

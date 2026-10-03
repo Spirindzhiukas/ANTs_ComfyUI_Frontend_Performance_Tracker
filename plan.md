@@ -288,20 +288,26 @@ signature plus the capture resolution and a theme hash — which is what makes t
 resolution setting behave in both directions. Evidence and the tests are in
 `ANALYSIS.md`.
 
-**K8. Stand-ins in the Vue-nodes renderer — designed, not built (M–L).** The
-canvas-mode mechanism cannot be reused: the canvas draws no node there, so there
-is no surface to blit into. The shape a future version would take: this tool
-appends one `<img>` (or canvas) per node to the vue-nodes container, positioned
-from the node's own transform, and takes the node's root out of the picture
-while its picture is up (`visibility: hidden` keeps the box, so selection, drag
-and the context menu still work). Open questions to answer *with numbers first*:
-(1) how much of a frame the node DOM actually costs on a large graph in that
-renderer — if it is small, the whole feature is not worth its risks; (2) whether
-the frontend's re-render can be kept in step without per-frame transform reads;
-(3) z-order against selected nodes and groups; (4) the frontend's own DOM widget
-layer, which is positioned independently of the node; (5) graph switching and
-re-mount. Ground rule: it would be an explicit, opt-in policy on a renderer, not
-a silent default, and the canvas renderer's behaviour would not change.
+**K8. The Vue-nodes stand-in — built (v2.6.0).** The same setting, the other
+mechanism: below the zoom threshold each node's own element is blanked (`opacity:
+0` on the `[data-node-id]` element — it keeps its layout and its pointer events,
+so interaction is unchanged) and the canvas paints the same box in the same place,
+through the seam LiteGraph still calls in that renderer (`drawNode` with the
+context in node-local space). Pictures are not obtainable there (a DOM node cannot
+be drawn into a bitmap), so the capture, ratio, budget and disk settings report
+themselves idle. The pathway is chosen per call from `LiteGraph.vueNodesMode`, a
+box is painted only after a real blanking, and every blanked element is handed
+back on the frame the setting, the zoom, the tool or the renderer changes.
+
+Open, and deliberately not guessed at: **how much this saves on a real heavy
+Vue-nodes graph.** The frontend composites all nodes in one transformed container
+(O(1) pan/zoom by design — `useTransformState.ts`), so the saving is node pixels,
+not transform work, and only a live page can price it. The tool's own frame
+budget, Stalls tab and `lowZoom.snapshots` counters are the instrument. A second
+open question: the frontend is growing an ECS-based renderer (`arrangeForLegacyRender`,
+`hitTargetAuthority`, `canvasRedrawBudget`), which may itself introduce a
+low-quality node mode — if it does, this pathway should hand that work over rather
+than compete with it.
 
 **Renderer compatibility — checked against the frontend, not assumed
 (v2.5.5).** On ComfyUI's newer frontend (Nodes 2.0 / Vue nodes,

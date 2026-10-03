@@ -28,7 +28,7 @@ this is going. Read the golden rules before the code.
 ## Commands
 
 ```bash
-node tests/run-tests.mjs              # all 189 tests — must be green before any commit
+node tests/run-tests.mjs              # all 193 tests — must be green before any commit
 node tests/run-tests.mjs <substring>  # one suite/test, e.g. ... pill
 python3 tests/test_init.py            # the Python side (route parsing, node contract)
 node tests/demo.mjs                   # prints what the panel says against a synthetic graph
@@ -178,6 +178,16 @@ Seams worth knowing:
   rootFor(node), exit()}`; `exit()` puts the canvas renderer back on the same
   page. The fixture's shapes come from the upstream files listed in
   `ANALYSIS.md` — change it there first if it ever drifts.
+- In that renderer the stand-in is the **blanking pathway**: below the threshold
+  the node's own root element gets `LOD_VUE_CLASS` (`ants-vue-standin`,
+  `opacity: 0`) and `lodPaintNode` paints the same box the canvas renderer
+  paints; `lodVueFramePlan` hands every element back when the setting, the zoom,
+  the tool or the renderer changes, and a box is only painted after a
+  *successful* blanking (`lodVueBlank`). The readout/API name it:
+  `lowZoom.snapshots.pathway` / `.bitmaps` / `.vueBlanked` / `.vueBoxes` /
+  `.vueRestored`. A test in that mode asserts the class, the box ink and the
+  hand-back; the harness shim supports tag selectors and `querySelector` for the
+  nested-`<video>` and wrapper-`<img>` cases.
 
 Rules for tests:
 
