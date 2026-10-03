@@ -6,7 +6,7 @@ for: *which extension's JavaScript is actually costing me frames while I pan
 this graph, and what is eating main-thread time that no draw hook owns?* —
 without opening DevTools and without restarting ComfyUI to bisect.
 
-Version **2.6.0**. Everything runs from page load: no node has to be placed,
+Version **2.6.1**. Everything runs from page load: no node has to be placed,
 nothing executes, and the tool never changes your graph or your workflows.
 
 - **Measure** — per-extension and per-node-type frame cost, canvas draw
@@ -202,6 +202,13 @@ and picks it from the frontend's own flag on every call, never latched:
   renderer — that is how it keeps slot metrics in sync — so this tool's
   existing seam fires with the context already in node-local space, and the box
   lands exactly where a picture lands in the canvas renderer.
+  While the stand-in setting is **picture of the node**, each box also carries
+  what the node is showing, drawn live: its images and canvases pixel for pixel,
+  its text fields re-painted in the theme's colours, at the same rows the canvas
+  renderer's pictures composite them at. That is the same composite, aimed at the
+  frame instead of at an offscreen bitmap — so "which node is this" is answered
+  by the node's own pixels in both renderers. A pack's own HTML stays blank and
+  is counted.
 
 Nothing is hidden and nothing is captured: the element is still there — slots,
 widgets, resize handles, the context menu — so clicking, dragging, selecting
@@ -216,7 +223,8 @@ in the steady state, so a stale class cannot be left behind.
 | Setting | In the Vue-nodes frontend |
 | --- | --- |
 | Replace node previews with bitmap stand-ins at zoom levels | **Works, as boxes.** Below the setting each node's element stops painting and the canvas draws its box; above it, every element is handed back. |
-| Stand-in (plain / title / title + state) | **Works** — the same box ladder, same marks, same colours. *Picture of the node* has no equivalent here: nothing is photographed, so the boxes use the *state* marks and the readout says so. |
+| Stand-in (plain / title / title + state) | **Works** — the same box ladder, same marks, same colours, and no content drawn (that is what "plain" means here too). |
+| Stand-in: *picture of the node* | **Works, as a box that carries the node.** No browser API can draw a DOM element into a canvas, so a photograph of a Vue node is impossible; instead the box is drawn at the picture level (title bar, error ring, progress, dimming) with the node's own content drawn into it live — images and canvases pixel for pixel, text re-painted, a pack's HTML blank and counted. |
 | Capture resolution, RAM budget, disk cache | **Idle**, and the readout says so: a DOM node cannot be drawn into a bitmap, so nothing is captured, held, queued or written. |
 | Keep these node types live | **Works** — a listed type is never blanked and stays in full detail at any zoom. |
 | Link shape, link thinning, Measure link thinning | **Work.** Links are still drawn by the canvas, so the 1 px/no-outline thinning and the straight-line style reach the ink exactly as in canvas mode. |
@@ -498,7 +506,7 @@ short version:
 ## Development
 
 ```bash
-node tests/run-tests.mjs              # all tests — 193 passing, zero dependencies
+node tests/run-tests.mjs              # all tests — 197 passing, zero dependencies
 node tests/run-tests.mjs <substring>  # one suite or test
 python3 tests/test_init.py            # the Python side (routes, node contract)
 node tests/demo.mjs                   # prints what every tab says, against a synthetic graph

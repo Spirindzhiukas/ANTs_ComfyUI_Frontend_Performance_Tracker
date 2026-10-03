@@ -28,7 +28,7 @@ this is going. Read the golden rules before the code.
 ## Commands
 
 ```bash
-node tests/run-tests.mjs              # all 193 tests — must be green before any commit
+node tests/run-tests.mjs              # all 197 tests — must be green before any commit
 node tests/run-tests.mjs <substring>  # one suite/test, e.g. ... pill
 python3 tests/test_init.py            # the Python side (route parsing, node contract)
 node tests/demo.mjs                   # prints what the panel says against a synthetic graph
@@ -188,6 +188,12 @@ Seams worth knowing:
   `.vueRestored`. A test in that mode asserts the class, the box ink and the
   hand-back; the harness shim supports tag selectors and `querySelector` for the
   nested-`<video>` and wrapper-`<img>` cases.
+- `lodVueBoxContent` gives a Vue box the node's own content when the stand-in is
+  *picture of the node*: the same composite the canvas renderer's capture makes
+  (`lodSnapDomInk` with its optional `out`), aimed at the frame canvas, with
+  `lodPaintNode`'s optional `content` / `detailOverride` parameters. The gauge is
+  `lowZoom.snapshots.vueContent` (items drawn on the last frame). Never add a
+  *photograph* claim here: no browser API draws a DOM element into a canvas.
 
 Rules for tests:
 

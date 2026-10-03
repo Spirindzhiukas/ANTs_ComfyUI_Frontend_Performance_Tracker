@@ -2923,6 +2923,96 @@ suite("drawing: the Nodes 2.0 (Vue nodes) frontend", () => {
     assertEqual(api.vueBoxes, 0, "and no box is painted over a node that draws itself");
   });
 
+  // The fixture gives every node a canvas DOM widget (a 3D viewport's shape), so
+  // a test that wants to count content exactly takes those back off first.
+  const stripWidgets = (nodes) => {
+    for (const n of nodes) {
+      n.widgets.length = 0;
+      if (n._domWidgets) n._domWidgets.length = 0;
+    }
+  };
+
+  test("a box carries the node's own image, at the widget's row and at the picture level", async () => {
+    const h = await boot();
+    const { nodes } = vueGraph(h, 2);
+    stripWidgets(nodes);
+    const img = h.document.createElement("img");
+    Object.assign(img, { naturalWidth: 64, naturalHeight: 64, complete: true, src: "a.png", currentSrc: "a.png" });
+    nodes[0].addDOMWidget("image", "image", img, { hideOnZoom: false, y: 20, computedHeight: 60 });
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true });
+    h.canvas.ctx.ops.length = 0;
+    draw(h, 1);
+    const drawn = h.canvas.ctx.ops.filter((o) => o[0] === "drawImage" && o[1] === img);
+    assertEqual(drawn.length, 1, "the node's own image is drawn into its box");
+    const op = drawn[0];
+    // The same row the canvas renderer's capture composites it at — margin 10,
+    // widget.y 20, height 60, node width 200: one geometry, both renderers.
+    assertEqual(op[2], 10, "x is the widget margin");
+    assertEqual(op[3], 30, "y is the margin plus the widget's own row");
+    assertEqual(op[4], 180, "and the width is the node's, minus the margin twice");
+    assertEqual(op[5], 40, "with the height the widget reports, minus the margin twice");
+    assertEqual(h.tracker.lowZoom.snapshots.vueContent, 1, "the gauge counts the content drawn on the frame");
+    // The stand-in setting is "picture of the node", so the box is the picture
+    // level: a title bar drawn above the body, not a plain fill.
+    assert(
+      h.canvas.ctx.ops.some((o) => o[0] === "fillRect" && o[2] < 0),
+      "the picture level is used: the node's title bar is drawn above its body"
+    );
+  });
+
+  test("a box carries a text widget's value, and follows an edit on the next frame", async () => {
+    const h = await boot();
+    const { nodes } = vueGraph(h, 2);
+    stripWidgets(nodes);
+    const ta = h.document.createElement("textarea");
+    ta.value = "a photo of a cat";
+    nodes[0].addDOMWidget("text", "text", ta, { hideOnZoom: true, computedHeight: 80 });
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true });
+    h.canvas.ctx.ops.length = 0;
+    draw(h, 1);
+    const first = h.canvas.ctx.ops.filter((o) => o[0] === "fillText" && String(o[1]).includes("cat"));
+    assertEqual(first.length, 1, "the widget's value is painted into the box");
+    assertEqual(h.tracker.lowZoom.snapshots.vueContent, 1, "counted as content");
+    // No capture, no signature, no invalidation: the box is drawn from what the
+    // widget holds right now, so an edit shows up on the next frame by itself.
+    ta.value = "a photo of a dog";
+    h.canvas.ctx.ops.length = 0;
+    draw(h, 1);
+    assertEqual(h.canvas.ctx.ops.filter((o) => o[0] === "fillText" && String(o[1]).includes("dog")).length, 1, "the edit is in the box on the next drawn frame");
+    assertEqual(h.canvas.ctx.ops.filter((o) => o[0] === "fillText" && String(o[1]).includes("cat")).length, 0, "and the old text is gone");
+  });
+
+  test("a box leaves a pack's own HTML blank, and a node with no content is just a box", async () => {
+    const h = await boot();
+    const { nodes } = vueGraph(h, 2);
+    stripWidgets(nodes);
+    const div = h.document.createElement("div");
+    div.appendChild(h.document.createElement("img")); // two images in a wrapper: a guess, so nothing is drawn
+    div.appendChild(h.document.createElement("img"));
+    nodes[0].addDOMWidget("custom", "div", div, { hideOnZoom: false });
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true });
+    h.canvas.ctx.ops.length = 0;
+    draw(h, 1);
+    assertEqual(h.canvas.ctx.ops.filter((o) => o[0] === "drawImage").length, 0, "a wrapper with two images in it is not guessed at");
+    assertEqual(h.tracker.lowZoom.snapshots.vueContent, 0, "and nothing is counted as content");
+    assertGreater(h.canvas.ctx.ops.filter((o) => o[0] === "fillRect").length, 0, "the node is still a box");
+  });
+
+  test("the stand-in setting off means the box ladder, with no content in the boxes", async () => {
+    const h = await boot();
+    const { nodes } = vueGraph(h, 2);
+    stripWidgets(nodes);
+    const img = h.document.createElement("img");
+    Object.assign(img, { naturalWidth: 64, naturalHeight: 64, complete: true, src: "a.png", currentSrc: "a.png" });
+    nodes[0].addDOMWidget("image", "image", img, { hideOnZoom: false, y: 20, computedHeight: 60 });
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: false, boxDetail: "title" });
+    h.canvas.ctx.ops.length = 0;
+    draw(h, 1);
+    assertEqual(h.canvas.ctx.ops.filter((o) => o[0] === "drawImage" && o[1] === img).length, 0, "no content is drawn for a box detail level");
+    assertEqual(h.tracker.lowZoom.snapshots.vueContent, 0, "and the gauge says so");
+    assertGreater(h.canvas.ctx.ops.filter((o) => o[0] === "fillRect").length, 0, "the title-level box is still drawn");
+  });
+
   test("a node whose element cannot be reached keeps its own drawing", async () => {
     const h = await boot();
     const { nodes, vue } = vueGraph(h, 2);

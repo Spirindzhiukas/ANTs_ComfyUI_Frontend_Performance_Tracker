@@ -299,6 +299,15 @@ themselves idle. The pathway is chosen per call from `LiteGraph.vueNodesMode`, a
 box is painted only after a real blanking, and every blanked element is handed
 back on the frame the setting, the zoom, the tool or the renderer changes.
 
+What the boxes carry (v2.6.1): the node's own content, drawn live at the same
+rows the canvas renderer's capture composites them at — images and canvases pixel
+for pixel, text re-painted, a pack's HTML blank and counted — at the picture
+level (title bar, error ring, progress, dimming). A *photograph* of the node
+remains impossible: no browser API draws a DOM element into a canvas, and the
+`<foreignObject>` route cannot fetch the images that matter. Recorded in
+`ANALYSIS.md` with the two rejected routes, so nobody re-opens it without new
+information.
+
 Open, and deliberately not guessed at: **how much this saves on a real heavy
 Vue-nodes graph.** The frontend composites all nodes in one transformed container
 (O(1) pan/zoom by design — `useTransformState.ts`), so the saving is node pixels,

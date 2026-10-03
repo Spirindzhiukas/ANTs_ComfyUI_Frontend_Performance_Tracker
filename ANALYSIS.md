@@ -1,6 +1,6 @@
 # What works, what fails, and what was taken out
 
-An audit of the repository as of v2.6.0, done by reading the sources rather
+An audit of the repository as of v2.6.1, done by reading the sources rather
 than the docs, running the suites, and running the demo. Every claim below
 has a file and (where it matters) a line reference. Found defects were fixed
 in the same pass; retired ideas were removed rather than documented as if
@@ -9,8 +9,8 @@ they still existed.
 ## How this was checked
 
 ```bash
-node tests/run-tests.mjs        # 193 passing (172 before the stand-in passes; twenty-one added)
-node tests/run-tests.mjs "Nodes 2.0"        # the eleven that cover that renderer
+node tests/run-tests.mjs        # 197 passing (172 before the stand-in passes; twenty-five added)
+node tests/run-tests.mjs "Nodes 2.0"        # the fifteen that cover that renderer
 node tests/run-tests.mjs "cache on disk"    # the five that cover the picture store
 node tests/run-tests.mjs "stand-in picture" # the five that cover what a picture holds
 python3 tests/test_init.py      # Ran 9 tests ... OK
@@ -114,7 +114,7 @@ What that means for this tool, and what had to change:
 | 4 | **A warm cache survived the switch into this renderer.** The slice that drains the capture lane already stopped when the engine was off, but the bitmaps it had already taken (and a queue with work in it) stayed in memory for a page that can never paint them — a renderer switch is not a reload. | Reproduced: two held bitmaps and their bytes stayed after `enterVueNodes()`. | The slice releases the cache on that transition, the same release as switching the setting off, and counts it as a clear. Test: *"a page that switches to this renderer hands back the pictures it can no longer paint"*. |
 | 5 | **Nothing pinned the flag to the live page.** A rule that latched the renderer at load would look correct in every test that sets the mode once. | — | The flag is read per call, and a test switches the renderer back *on the same page* and holds flattening and the picture engine to returning. |
 
-### Do stand-ins work *in* the Vue-nodes renderer? Pictures no; boxes yes
+### Do stand-ins work *in* the Vue-nodes renderer? Boxes that carry the node
 
 This was asked twice: first whether it could work at all (v2.5.5: no, and the
 settings said so), then — after the frontend's own sources settled the mechanics
@@ -122,18 +122,44 @@ settings said so), then — after the frontend's own sources settled the mechani
 automatically. **It can, and since v2.6.0 it does**, with one thing that remains
 impossible and a mechanism that is deliberately not the canvas renderer's.
 
-**What is impossible, and stays impossible.** A *picture* of a node. The canvas
-renderer takes one by drawing the node into an offscreen canvas through its own
-`drawNode` seam. In this renderer `drawNode` draws nothing (it returns after
-`_setConcreteSlots()` and `arrange()` — `LGraphCanvas.ts`), and the node is a DOM
-element, so there is nothing to draw into a bitmap. Producing a picture would
-mean a DOM-to-canvas library (html2canvas-style) or an SVG `foreignObject`
-trick, both of which mis-render real stylesheets and cross-origin images; this
-tool will not pretend otherwise. So the capture, the capture resolution, the RAM
-budget and the disk cache stay idle in this renderer, and the readout says why.
+**What is impossible, and stays impossible: a photograph of the node.** The
+canvas renderer takes one by drawing the node into an offscreen canvas through
+its own `drawNode` seam — LiteGraph draws the node, so the tool gets a real
+screenshot for free. In this renderer `drawNode` draws nothing (it returns after
+`_setConcreteSlots()` and `arrange()` — `LGraphCanvas.ts`) and the node is a DOM
+element, and **no browser API draws a DOM element into a canvas**: not
+`drawImage`, not `createImageBitmap` (its source list is images, video, canvas,
+blobs and ImageData), not `captureStream`. The two routes that exist are worse
+than they look. An SVG `<foreignObject>` serialisation (what the DOM-to-canvas
+libraries do) cannot load the images that matter: an SVG used as an image may not
+fetch external resources, so the node's previews — the whole point — come back
+blank unless every image is fetched and inlined as a data URL first. A vendored
+DOM-to-canvas library would buy a real picture at the cost of the project's
+zero-dependency property, plus per-node serialisation cost on the idle lane, and
+it would still mis-render theme variables, shadows and cross-origin images. So
+the *offscreen* half — stored pictures, the capture resolution, the RAM budget,
+the disk cache — stays idle here and the readout says why. The tool does not
+pretend the setting is broken, and it does not pretend a synthetic chrome is a
+photograph.
 
-**What works, and how.** The two things that do exist are the node's element and
-the canvas, so the stand-in is made of those:
+**What the boxes carry instead, and why that is the honest maximum.** A node's
+*content* is not chrome: an image preview is an `<img>`, a mask editor or a 3D
+viewport is a `<canvas>`, a prompt is a `<textarea>` whose value is text. Those
+three things *are* drawable, and they are what a person recognises a node by at
+10% zoom. So in this renderer the box stands in at the picture level — title bar,
+error ring, progress, dimming — with the node's own content drawn into it, live,
+at the rows the canvas renderer's capture composites them at (`lodVueBoxContent`
+reusing the same composite): images and canvases pixel for pixel, text re-painted
+in the theme's colours, a pack's own HTML left blank and counted, a video node
+never blanked at all. It is the same composite the canvas renderer's *capture*
+makes, aimed at the frame instead of an offscreen bitmap, and it needs no
+signature, no invalidation and no idle lane: a dropped-in image or a typed word
+appears on the next drawn frame by itself. What it is not is a screenshot — it is
+the node's own pixels where they exist and the tool's drawing where they do not,
+and the readout says exactly that.
+
+**How the blanking works.** The two things that do exist are the node's element
+and the canvas, so the stand-in is made of those:
 
 1. **The element is blanked** — one class, `opacity: 0`, on the element the
    frontend renders the node into (`[data-node-id]`). `opacity: 0` is the whole

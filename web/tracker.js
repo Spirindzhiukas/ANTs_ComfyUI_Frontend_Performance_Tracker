@@ -27,7 +27,7 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.6.0";
+const VERSION = "2.6.1";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
 // The class key ComfyUI stores in a workflow. The old key is still recognised so
 // a graph saved before the rename does not lose this node.
@@ -998,6 +998,7 @@ const LOD = {
   vueRoots: null, // Map<node, element>: what the frontend renders a Vue node into
   vueFlatOn: null, // last frame's answer to "are the boxes standing in?"
   vueBoxes: 0, // boxes painted in place of a Vue node's own element
+  vueContentNow: 0, // box contents drawn on the last frame (a gauge, not a total)
   vueRestored: 0, // elements handed back (threshold, setting, tool, renderer)
   vueCleared: "", // why the last full hand-back happened, for the readout
   displayScale: 0, // 0 = read it from the browser, otherwise the device-pixel ratio
@@ -1588,7 +1589,7 @@ function lodBoxAlpha(node) {
 // to the node's origin, which is why this paints at 0,0. What it may paint is the
 // box-detail ladder above: the fill and the selection ring always, the title bar
 // and the state marks only when the user has asked for them.
-function lodPaintNode(node, canvas, ctx) {
+function lodPaintNode(node, canvas, ctx, content, detailOverride) {
   const size = (node && (node.renderingSize || node.size)) || [0, 0];
   const w = Math.abs(Number(size[0])) || 0;
   const h = Math.abs(Number(size[1])) || 0;
@@ -1596,7 +1597,10 @@ function lodPaintNode(node, canvas, ctx) {
   const scale = (canvas && canvas.ds && Number(canvas.ds.scale)) || 1;
   // The ladder is only ever consulted while the tool is on; switched off, nothing
   // here runs at all (the flat path is one of the predicates that answers "no").
-  const detail = S.enabled ? LOD.boxDetail : LOD_BOX_DETAIL_DEFAULT;
+  // `detailOverride` is the Vue-nodes picture level (see the Vue pathway below):
+  // where the canvas renderer blits a photograph, this one draws the node's own
+  // marks and its real content, which is the same intent by other means.
+  const detail = !S.enabled ? LOD_BOX_DETAIL_DEFAULT : detailOverride || LOD.boxDetail;
   // Dimming belongs to `state`. Below it every box looks like every other box,
   // which is what v2.1.16 painted and what an off-by-default tool must keep.
   const alpha = detail === LOD_BOX_DETAIL[2] ? lodBoxAlpha(node) : 1;
@@ -1613,6 +1617,16 @@ function lodPaintNode(node, canvas, ctx) {
     ctx.fillStyle = node.renderingColor || node.color || fill;
     ctx.fillRect(0, -titleH, w, titleH);
     LOD.boxTitles++;
+  }
+  // The node's own content, where the caller has some it can honestly draw. It
+  // goes on the body, under the marks: an error ring or a progress bar is about
+  // the node, not part of its picture.
+  if (drawable && content) {
+    try {
+      content();
+    } catch (e) {
+      /* content that cannot be drawn leaves the box as it was */
+    }
   }
   if (drawable && detail === LOD_BOX_DETAIL[2]) {
     // A node that is running: the frontend draws a green bar from the top-left
@@ -3509,7 +3523,12 @@ function patchCanvasDraw() {
         if (lodVueBlank(node, true)) {
           try {
             this.current_node = node;
-            lodPaintNode(node, this, ctx);
+            // The stand-in setting is "picture of the node": here that is the
+            // state-level box (title bar, error ring, progress, dimming) with the
+            // node's own content drawn into it. With the setting off, the box
+            // ladder the user chose is drawn exactly as documented, no content.
+            const picture = !!LOD.snapOn;
+            lodPaintNode(node, this, ctx, picture ? () => lodVueBoxContent(node, this, ctx) : null, picture ? LOD_BOX_DETAIL[2] : null);
             LOD.vueBoxes++;
             LOD.nodes++;
             LOD.ms += dtv;
@@ -3769,12 +3788,17 @@ function lodSnapLive(node, canvas) {
 //      in sync), so this tool's existing seam fires with the context already in
 //      node-local space.
 //
-// There is no picture here: a DOM node cannot be photographed to a bitmap without
-// a DOM-to-canvas library, and this tool will not pretend otherwise. Pictures,
-// the capture resolution and the disk cache all belong to the canvas renderer and
-// are reported idle here. The saving is different too: not cheaper canvas
-// drawing, but fewer node pixels for the browser to paint, which is exactly where
-// a zoomed-out heavy graph spends its frame.
+// What a box carries here is not a photograph (a DOM node cannot be drawn into a
+// bitmap — no browser API does it, and the canvas renderer's capture works only
+// because LiteGraph itself draws the node) but the node's own content, drawn
+// live: images and canvases pixel for pixel, text fields re-painted, a pack's own
+// HTML left blank. That is the same composite the canvas renderer's capture makes,
+// so a node whose picture is worth looking at is worth looking at in both
+// renderers. The offscreen half — the stored pictures, the capture resolution and
+// the disk cache — belongs to the canvas renderer and is reported idle here.
+// The saving is different too: not cheaper canvas drawing, but fewer node pixels
+// for the browser to paint, which is exactly where a zoomed-out heavy graph spends
+// its frame.
 function lodVueFlatNode(node, canvas) {
   if (!lodVueNodesMode()) return false;
   if (!lodFlatOn(canvas)) return false;
@@ -3826,6 +3850,21 @@ function lodVueBlank(node, on) {
   return true; // the class is where it was asked to be, in either direction
 }
 
+// What can honestly be drawn of a Vue node's content, in the box that stands in
+// for it. This is the same composite the canvas renderer's *capture* makes — an
+// image or a canvas pixel for pixel, a text field's value re-painted in the
+// theme's colours, a pack's own HTML left blank — aimed at the live frame canvas
+// instead of an offscreen bitmap. That is the closest thing to a picture this
+// renderer can have: what the node shows is drawn where the node is. No browser
+// API draws a DOM element into a canvas, so the parts that are neither an image,
+// a canvas nor a plain string stay blank and are counted.
+function lodVueBoxContent(node, canvas, ctx) {
+  const out = { ink: 0, text: 0, skipped: 0 };
+  lodSnapDomInk(node, ctx, canvas, out);
+  if (out.ink) LOD.vueContentNow += out.ink;
+  return out.ink;
+}
+
 // Hand every blanked element back. Called when the zoom leaves the setting, when
 // the renderer changes, and when the tool or the setting is switched off: this
 // tool must never leave a node invisible because a setting moved under it.
@@ -3847,6 +3886,7 @@ function lodVueUnblankAll(reason) {
 // Above the threshold (or with the setting or the tool off) the sweep is a single
 // comparison, which is what makes a stale class impossible to leave behind.
 function lodVueFramePlan(canvas) {
+  LOD.vueContentNow = 0; // a gauge of the last frame, not a running total
   const flat = !!(S.enabled && LOD.snapOn && LOD.flatBelow > 0 && lodVueNodesMode() && lodFlatOn(canvas));
   const prev = LOD.vueFlatOn;
   LOD.vueFlatOn = flat;
@@ -4717,8 +4757,8 @@ function lodSnapTextInk(el, cctx, box) {
 
 // Every DOM widget of this node, drawn into the capture. Reports what it drew and
 // what it could not, so the readout can say both.
-function lodSnapDomInk(node, cctx, canvas) {
-  const out = { ink: 0, text: 0, skipped: 0 };
+function lodSnapDomInk(node, cctx, canvas, into) {
+  const out = into || { ink: 0, text: 0, skipped: 0 };
   if (!cctx || typeof cctx.drawImage !== "function") return out;
   const widgets = (node && node.widgets) || [];
   void canvas;
@@ -9690,9 +9730,14 @@ function buildTweaksTab(container) {
               ? `zoom ${pct(LOD.zoom)} is below your ${pct(LOD.flatBelow)} setting, but the stand-in setting itself is off: the ${LOD.plan.total} ` +
                 `node(s) here are DOM elements, so nothing is blanked and no box is painted`
               : `zoom ${pct(LOD.zoom)} is below your ${pct(LOD.flatBelow)} setting: ${LOD.vueBoxes} box(es) painted and ` +
-                `${LOD.vueFlat ? LOD.vueFlat.size : 0} node element(s) blanked — those nodes stop painting themselves and the canvas draws their boxes ` +
-                `(same detail ladder as the canvas renderer). No picture is taken here: a DOM node cannot be photographed, so the capture, ratio and disk ` +
-                `settings stay idle. Link ink, the idle redraw cap and the governor are unaffected`
+                `${LOD.vueFlat ? LOD.vueFlat.size : 0} node element(s) blanked — those nodes stop painting themselves and the canvas draws their boxes. ` +
+                (LOD.snapOn
+                  ? `Each box carries what the node is showing where it can honestly be drawn: its images and canvases pixel for pixel, its text fields ` +
+                    `re-painted in the theme's colours, a pack's own HTML left blank and counted (${LOD.vueContentNow} content item(s) drawn on the last ` +
+                    `frame). A *photograph* of a node is not obtainable in this renderer — no browser API draws a DOM element into a canvas, and the canvas ` +
+                    `renderer's capture works only because LiteGraph itself draws the node — so the capture, ratio and disk settings stay idle here`
+                  : `The stand-in setting is off: these are your chosen box detail, with no content drawn into them`) +
+                `. Link ink, the idle redraw cap and the governor are unaffected`
           );
         } else if (lodFlatOn()) {
           bits2.push(
@@ -9800,16 +9845,20 @@ function buildTweaksTab(container) {
         } else if (LOD.snapOn) {
           bits2.push(
             lodVueNodesMode()
-              ? "snapshots are on: in this renderer they are the box the canvas paints while a node's element is blanked — the bitmap half (capture, " +
-                "ratio, budget, disk) stays idle, because a DOM node cannot be photographed. The boxes appear below the flatten threshold above; above it " +
-                "there is nothing to stand in for"
+              ? "snapshots are on: in this renderer they are the box the canvas paints while a node's element is blanked, carrying the node's own " +
+                "images, canvases and text where it has any — the bitmap half (capture, ratio, budget, disk) stays idle, because no browser API draws a " +
+                "DOM element into a canvas. The boxes appear below the flatten threshold above; above it there is nothing to stand in for"
               : "snapshots are on but not painting anything: they replace flat boxes, so they need the flatten setting above switched on " +
                 "(and a zoom below it)"
           );
         }
         // What the boxes said, and what saying it cost: the counters are per
         // paint, so "1,027 boxes × 2 marks" is the honest price of the ladder.
-        if (lodFlatOn()) {
+        // The box-detail paragraph describes the canvas renderer's ladder. In the
+        // Vue-nodes renderer the picture level replaces the box entirely (the box
+        // carries the node's content), and the paragraph above has already said
+        // what those boxes are made of.
+        if (lodFlatOn() && !(lodVueNodesMode() && LOD.snapOn)) {
           if (LOD.boxDetail === "plain") {
             bits2.push(
               `the boxes are plain — the box-detail setting next to this one can put each node's own title colour, error ring, ` +
@@ -12460,6 +12509,7 @@ function installDebugApi() {
             pathway: lodSnapPathway(),
             bitmaps: lodSnapBitmaps(),
             vueBlanked: LOD.vueFlat ? LOD.vueFlat.size : 0,
+            vueContent: LOD.vueContentNow,
             vueBoxes: LOD.vueBoxes,
             vueRestored: LOD.vueRestored,
             vueCleared: LOD.vueCleared,
@@ -12779,10 +12829,14 @@ app.registerExtension({
 //    pathway: the node's own element is blanked (one class, `opacity: 0`) and
 //    the canvas paints the same box in its place, so the saving is node pixels
 //    the browser no longer paints rather than cheaper canvas drawing. What it
-//    cannot do is produce a *picture*: a DOM node cannot be drawn into a
-//    bitmap without a DOM-to-canvas library, so the capture, the resolution,
-//    the RAM budget and the disk cache are idle in that renderer and the Status
-//    tab says so. Link thinning, the idle redraw cap, the widget/focus settings
+//    cannot do is produce a *photograph*: no browser API draws a DOM element
+//    into a canvas (not drawImage, not createImageBitmap, not captureStream),
+//    and the canvas renderer's capture works only because LiteGraph itself
+//    draws the node. What the box carries instead is the node's own content —
+//    images and canvases pixel for pixel, text fields re-painted — drawn live
+//    at the same rows the capture composites them at, so the capture, the
+//    resolution, the RAM budget and the disk cache are idle in that renderer
+//    and the Status tab says so. Link thinning, the idle redraw cap, the widget/focus settings
 //    and the governor are unaffected. A box in that renderer is also never
 //    painted over a node whose element this tool could not reach (a node whose
 //    `[data-node-id]` element is missing keeps its own drawing).
