@@ -1,4 +1,4 @@
-# ANTs Nasty Bastards Tracker
+# ANTs_ComfyUI_Frontend_Performance_Tracker
 
 A frontend-side profiler for ComfyUI. Answers "which extension is
 actually costing me FPS while panning this graph?" without needing
