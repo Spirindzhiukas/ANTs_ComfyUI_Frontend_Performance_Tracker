@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MERD Console</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400&display=swap">
+<link rel="stylesheet" href="/ant_merd/web/app.css">
+</head>
+<body>
+
+<!-- ===================================================================== -->
+<!-- FIXED HEAD — never scrolls. Only the field pane scrolls.              -->
+<!-- ===================================================================== -->
+<div class="fixedhead">
+
+  <header class="topbar">
+    <div class="topbar-name">
+      <h1 id="config-name" class="placeholder">no config selected</h1>
+      <p id="config-sub" class="sub">paste a HuggingFace repo below, or pick something on the right</p>
+    </div>
+    <div class="topbar-right">
+      <div class="topbar-stats" id="stats"></div>
+      <div id="validation" class="validation"></div>
+    </div>
+  </header>
+
+  <section class="sourcebar">
+    <label class="linkfield">
+      <img class="linkicon" src="/ant_merd/web/icons/huggingface.svg" alt="">
+      <span class="linklabel">model repo <em class="req">required</em>
+        <i class="hint" title="HuggingFace or ModelScope (modelscope.cn), a URL or org/name (ms:org/name forces ModelScope). If the first host has no configs, MERD tries the other one under the same org/name and says so. LAST RESORT, a folder on disk: download the model's repo folder from wherever it survives (a torrent archive, a mirror...) and paste its path — the weights can be left out, MERD reads only the config files. Keep the folder's structure EXACTLY as downloaded (model_index.json, transformer/, vae/, scheduler/, text_encoder/...): do not rename, flatten or move its subfolders. A HuggingFace cache folder (models--org--name) works as is.">hosts?</i>
+      </span>
+      <input id="link-hf" type="text" spellcheck="false"
+             placeholder="https://huggingface.co/org/model  ·  https://modelscope.cn/models/org/model">
+      <a id="help-hf" class="linkhelp" target="_blank" rel="noopener"
+         title="Open the HuggingFace model index in a new tab">browse&nbsp;&#8599;</a>
+    </label>
+
+    <div id="lookup" class="lookup" hidden></div>
+
+    <label class="linkfield">
+      <img class="linkicon" src="/ant_merd/web/icons/github.svg" alt="">
+      <span class="linklabel">diffusers pipeline <em class="opt">optional</em>
+        <i class="hint" title="Not every model reaches diffusers. Some arrive months later, and vendor or ComfyUI-only models never do. Leaving this blank costs you the pipeline-default fields (max_text_seq_length and friends); everything else still builds.">why?</i>
+      </span>
+      <input id="link-diffusers" type="url" spellcheck="false"
+             placeholder="https://huggingface.co/docs/diffusers/.../pipeline">
+      <a id="help-diffusers" class="linkhelp" target="_blank" rel="noopener"
+         title="Open the diffusers pipeline index in a new tab">browse&nbsp;&#8599;</a>
+    </label>
+
+    <div class="loaderpanel" id="loader-panel">
+      <div class="loaderhead">
+        <img class="linkicon" src="/ant_merd/web/icons/runtime_observations.svg" alt="">
+        <span class="linklabel">loader <em class="opt">ComfyUI's own</em>
+          <i class="hint" title="These are ComfyUI's own loaders, mirrored — the same widgets its UNETLoader, VAELoader, CLIPLoader and CheckpointLoaderSimple show, read live. Whatever they gain on the next release appears here by itself. The node in your graph shows the SAME settings: change either one and the other follows.">what is this?</i>
+        </span>
+        <select id="loader-mode" title="How the components are loaded"></select>
+        <span id="parked-note" class="linkhelp"></span>
+        <button id="btn-testload" class="btn-mini" type="button"
+                title="Load the selected components through ComfyUI right now and report what happened. Writes nothing.">test load</button>
+      </div>
+      <div id="loader-widgets" class="loaderwidgets"></div>
+    </div>
+
+    <div class="actions">
+      <button id="btn-merd" class="btn-primary" disabled>MERD IT UP</button>
+      <button id="btn-save" class="btn-save" disabled>SAVE THE MERD</button>
+    </div>
+  </section>
+
+  <p class="disclaimer">
+    <b>No need to queue anything.</b> Pick components above and MERD IT UP loads
+    them through ComfyUI's own loaders, reads them, and frees them — your
+    workflow's samplers never run. (If the graph <i>has</i> already run with a
+    model wired to the node, that one wins: it is already in VRAM and it is
+    what your samplers will use, so nothing is loaded twice.)
+    &nbsp;·&nbsp;
+    <b>diffusers is optional.</b> Not every model has been added to diffusers —
+    some arrive months after release, and vendor-specific or ComfyUI-only models
+    never will. Without it the pipeline-default fields stay empty and say so;
+    nothing else is affected.
+  </p>
+</div>
+
+<!-- ===================================================================== -->
+<!-- BODY — categories | fields | configs. Each column scrolls alone.      -->
+<!-- ===================================================================== -->
+<main class="shell" id="shell">
+
+  <nav class="rail rail-left" aria-label="MERD categories">
+    <div class="rail-head">
+      <span>categories</span>
+      <span class="legend">
+        <i class="dot green"></i><i class="dot amber"></i><i class="dot red"></i>
+      </span>
+    </div>
+    <label class="probonly" title="Show only fields with a real problem: a conflict between sources, a failed fetch, or a required field nobody filled. Categories without one are hidden. Expected-empty and divergent-by-design fields are not problems.">
+      <input type="checkbox" id="problem-only">
+      <span>show problematic only</span>
+      <span class="tally" id="problem-tally"></span>
+    </label>
+    <ul id="categories" class="catlist"></ul>
+    <div class="rail-foot" id="derived"></div>
+  </nav>
+
+  <div class="splitter" id="split-left" title="Drag to resize. Double-click to reset."></div>
+
+  <section class="pane" aria-label="fields">
+    <div id="pane-head" class="pane-head"></div>
+    <div id="rows" class="rows">
+      <p class="empty">Select a config on the right, or paste a HuggingFace repo
+        above and press MERD IT UP to build one from scratch.</p>
+    </div>
+  </section>
+
+  <div class="splitter" id="split-right" title="Drag to resize. Double-click to reset."></div>
+
+  <aside class="rail rail-right" aria-label="configs">
+    <div class="rail-head">
+      <span>configs</span>
+      <button id="btn-scan" class="btn-ghost" title="Re-scan the ComfyUI install">rescan</button>
+    </div>
+    <div class="searchwrap">
+      <input id="search" type="search" spellcheck="false"
+             placeholder="search configs and models…">
+    </div>
+
+    <!-- Two fixed halves, each with its own scrollbar, so neither list can
+         push the other off the screen. -->
+    <div class="halves">
+      <div class="half">
+        <div class="rail-group">saved in registry <span id="count-saved" class="tally"></span></div>
+        <ul id="configs" class="conflist"></ul>
+      </div>
+      <div class="half">
+        <div class="rail-group">scanned, no config yet <span id="count-new" class="tally"></span></div>
+        <ul id="candidates" class="conflist"></ul>
+      </div>
+    </div>
+
+    <div class="rail-foot" id="scan-note"></div>
+  </aside>
+
+</main>
+
+<div id="toast" class="toast" hidden></div>
+
+<script src="/ant_merd/web/app.js"></script>
+</body>
+</html>

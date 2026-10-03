@@ -1,0 +1,476 @@
+/* ==========================================================================
+   MERD Console — Linear-style dark palette
+   Canvas #08090a / Carbon #0f1011 / Obsidian #161718 / Graphite #23252a
+   Acid Lime #e4f222 is the SINGLE primary action per view (MERD IT UP).
+   Everything else earns its colour from state, never from decoration.
+   ========================================================================== */
+
+:root {
+  --void:      #08090a;
+  --carbon:    #0f1011;
+  --obsidian:  #161718;
+  --graphite:  #23252a;
+  --smoke:     #383b3f;
+  --ash:       #62666d;
+  --fog:       #8a8f98;
+  --mist:      #d0d6e0;
+  --paper:     #ffffff;
+
+  --lime:      #e4f222;
+  --green:     #27a644;
+  --coral:     #eb5757;
+  --darkred:   #a02525;
+  --amber:     #d99a2b;
+  --teal:      #02b8cc;
+  --violet:    #6366f1;
+
+  --r-sm: 2px; --r-badge: 4px; --r-in: 6px; --r-card: 12px; --r-pill: 9999px;
+
+  --ui: Inter, "Inter Variable", -apple-system, BlinkMacSystemFont, "Segoe UI",
+        Roboto, Helvetica, Arial, sans-serif;
+  --mono: "JetBrains Mono", "Berkeley Mono", ui-monospace, SFMono-Regular,
+          Menlo, Consolas, monospace;
+
+  /* 1.5x the first pass. Long category labels wrapped to two lines and long
+     config names truncated at the old widths; both now fit. Drag the splitters
+     to change these — the values are written back onto :root and remembered in
+     localStorage. */
+  --rail-l: 354px;
+  --rail-r: 390px;
+  --rail-min: 200px;
+  --rail-max: 620px;
+}
+
+/* The whole page is dark, so SAY SO. Without this the browser paints every
+   native control — and, crucially, the popup list a <select> opens — on its
+   default WHITE canvas. Our text colour is near-white, so the options were
+   white on white and only became readable when the blue highlight passed over
+   them. A translucent background on the control cannot fix that: the popup is
+   drawn by the browser, not by the box. `color-scheme` is what tells it. */
+:root { color-scheme: dark; }
+
+* { box-sizing: border-box; }
+
+/* The page is a fixed frame: head pinned, three columns beneath it, and
+   ONLY the inner lists and the field pane scroll. Without overflow:hidden here
+   the whole document scrolls and the header walks off the top. */
+html, body {
+  margin: 0; height: 100%; overflow: hidden;
+  background: var(--void); color: var(--mist);
+  font-family: var(--ui); font-size: 14px; line-height: 1.5;
+  font-feature-settings: 'cv01' on, 'ss03' on, 'zero' on;
+  -webkit-font-smoothing: antialiased;
+}
+body { display: flex; flex-direction: column; }
+
+.fixedhead { flex: none; }   /* pinned: never scrolls, never shrinks */
+
+button, input { font: inherit; color: inherit; }
+button { cursor: pointer; }
+a { color: var(--teal); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* --- top bar ------------------------------------------------------------ */
+.topbar {
+  display: flex; align-items: flex-end; justify-content: space-between;
+  gap: 24px; padding: 24px 28px 16px;
+  border-bottom: 1px solid var(--graphite);
+}
+.topbar-name h1 {
+  margin: 0; font-size: 40px; font-weight: 510; line-height: 1.05;
+  letter-spacing: -0.022em; color: var(--paper);
+  font-variant-ligatures: none;
+}
+.topbar-name h1.placeholder { color: var(--ash); font-weight: 400; }
+.sub { margin: 6px 0 0; font-size: 13px; color: var(--ash); }
+
+.topbar-right { display: flex; flex-direction: column; align-items: flex-end; gap: 8px; }
+.topbar-stats { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+
+/* Schema validation. Read-only: merd_checks.validate_doc() takes the parsed
+   dict and never touches disk, which is the only reason the console can show
+   this at all — the old validator rewrote what it inspected. */
+.validation { font-size: 12px; text-align: right; max-width: 46ch; }
+.validation .vhead { display: inline-flex; align-items: center; gap: 6px;
+  border-radius: var(--r-badge); padding: 2px 8px; cursor: default; }
+.validation.pass  .vhead { color: var(--green); background: rgba(39,166,68,.10); }
+.validation.fail  .vhead { color: var(--coral); background: rgba(235,87,87,.12);
+                           cursor: pointer; }
+.validation.warn  .vhead { color: var(--amber); background: rgba(217,154,43,.12);
+                           cursor: pointer; }
+.validation.unk   .vhead { color: var(--ash);  background: rgba(255,255,255,.05); }
+.validation ul { list-style: none; margin: 6px 0 0; padding: 0;
+  font-family: var(--mono); font-size: 11px; color: var(--fog);
+  max-height: 8.5em; overflow-y: auto; text-align: left; }
+.validation li { padding: 1px 0; overflow-wrap: anywhere; }
+.validation li.e { color: var(--coral); }
+.validation li.w { color: var(--amber); }
+.stat {
+  display: inline-flex; align-items: baseline; gap: 6px;
+  background: rgba(255,255,255,.05); border-radius: var(--r-badge);
+  padding: 3px 8px; font-size: 12px; color: var(--fog);
+}
+.stat b { color: var(--mist); font-weight: 510; }
+.stat.bad b { color: var(--coral); }
+.stat.warn b { color: var(--amber); }
+.stat.good b { color: var(--green); }
+
+/* --- source bar --------------------------------------------------------- */
+.sourcebar {
+  display: flex; align-items: flex-end; gap: 16px; flex-wrap: wrap;
+  padding: 16px 28px; border-bottom: 1px solid var(--graphite);
+  background: var(--carbon);
+}
+/* Five inputs plus two buttons will not fit one row on a laptop. Wrapping is
+   fine — the head is fixed height only in the sense that it never scrolls, and
+   a squashed unreadable row would be worse than a taller one. */
+.sourcebar .actions { margin-left: auto; }
+.linkfield {
+  flex: 1 1 320px; min-width: 260px;
+  display: grid; grid-template-columns: 18px 1fr auto; gap: 4px 8px;
+  align-items: center;
+}
+.linkicon { width: 18px; height: 18px; opacity: .65; grid-row: 2; }
+.linklabel {
+  grid-column: 2 / 4; font-size: 12px; color: var(--fog);
+  display: flex; gap: 6px; align-items: center;
+}
+.linklabel em {
+  font-style: normal; font-size: 10px; letter-spacing: .04em;
+  text-transform: uppercase; border-radius: var(--r-badge); padding: 0 4px;
+}
+.linklabel em.req { color: var(--lime); border: 1px solid rgba(228,242,34,.3); }
+.linklabel em.opt { color: var(--ash); border: 1px solid var(--graphite); }
+.linklabel .hint {
+  font-style: normal; font-size: 10px; color: var(--fog);
+  border-bottom: 1px dotted var(--smoke); cursor: help;
+}
+.linkfield.narrow { flex: 0 1 280px; min-width: 220px; }
+
+/* --- the loader panel ----------------------------------------------------
+   Mirrors ComfyUI's own loaders. The number of controls is NOT fixed — a
+   future ComfyUI release can add one — so it is a flow, never a hand-counted
+   grid. Widgets the current mode does not use are dimmed rather than removed:
+   they keep their values, so switching mode and back does not lose the pick. */
+.loaderpanel {
+  flex: 1 1 100%; border: 1px solid var(--graphite);
+  border-radius: var(--r-in); padding: 10px 12px 12px;
+  background: rgba(255,255,255,.015);
+}
+.loaderpanel.passive { opacity: .72; }
+.loaderhead { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.loaderhead .linklabel { grid-column: auto; }
+.loaderhead #loader-mode {
+  background: var(--obsidian); color: var(--mist);
+  border: 1px solid var(--smoke); border-radius: var(--r-in);
+  padding: 5px 8px; font-size: 12px;
+}
+.loaderwidgets {
+  display: flex; flex-wrap: wrap; gap: 8px 14px; margin-top: 10px;
+}
+.loaderfield {
+  display: flex; flex-direction: column; gap: 3px;
+  flex: 1 1 200px; min-width: 170px;
+}
+.loaderfield .lwlabel {
+  font-size: 10.5px; letter-spacing: .04em; text-transform: uppercase;
+  color: var(--ash);
+}
+.loaderfield select, .loaderfield input {
+  /* OPAQUE, not a translucent white: the popup inherits this, and 2% white
+     over the browser's default canvas is white. */
+  background: var(--obsidian); color: var(--mist);
+  border: 1px solid rgba(255,255,255,.08); border-radius: var(--r-in);
+  padding: 7px 9px; width: 100%; font-size: 12.5px;
+}
+.loaderfield select:focus, .loaderfield input:focus {
+  outline: none; border-color: var(--smoke);
+}
+/* Options are painted by the browser in its own popup layer, so they need
+   their colours spelled out — inheriting from the <select> is not reliable
+   across platforms, and Windows is where this broke. */
+.loaderfield select option, #loader-mode option {
+  background: var(--obsidian); color: var(--mist);
+}
+.loaderfield select option:checked, #loader-mode option:checked {
+  background: var(--graphite); color: var(--paper);
+}
+.loaderfield.off { opacity: .34; }
+.loaderfield.off select, .loaderfield.off input { cursor: not-allowed; }
+.btn-mini {
+  background: transparent; border: 1px solid var(--graphite);
+  border-radius: var(--r-in); padding: 4px 10px;
+  font-size: 11.5px; color: var(--fog); margin-left: auto;
+}
+.btn-mini:hover:not(:disabled) { border-color: var(--smoke); color: var(--paper); }
+.disclaimer {
+  margin: 0; padding: 8px 28px 12px; font-size: 11.5px; color: var(--ash);
+  background: var(--carbon); border-bottom: 1px solid var(--graphite);
+}
+.disclaimer b { color: var(--fog); font-weight: 510; }
+.linkfield input {
+  grid-row: 2; background: rgba(255,255,255,.02);
+  border: 1px solid rgba(255,255,255,.08); border-radius: var(--r-in);
+  padding: 10px 12px; color: var(--paper); width: 100%;
+}
+.linkfield input:focus { outline: none; border-color: var(--smoke); background: rgba(255,255,255,.04); }
+.linkhelp { grid-row: 2; font-size: 12px; color: var(--fog); white-space: nowrap; }
+.linkhelp:hover { color: var(--teal); }
+
+.actions { display: flex; gap: 10px; align-items: flex-end; }
+.btn-primary {
+  background: var(--lime); color: var(--void); border: 0;
+  border-radius: var(--r-in); padding: 12px 22px;
+  font-size: 14px; font-weight: 590; letter-spacing: .01em;
+}
+.btn-primary:hover:not(:disabled) { filter: brightness(1.08); }
+.btn-save {
+  background: transparent; color: var(--mist);
+  border: 1px solid var(--smoke); border-radius: var(--r-in);
+  padding: 12px 18px; font-weight: 510;
+}
+.btn-save:hover:not(:disabled) { border-color: var(--fog); color: var(--paper); }
+.btn-save.armed {
+  border-color: var(--green); color: var(--green);
+  box-shadow: 0 0 0 1px rgba(39,166,68,.25) inset;
+}
+.btn-ghost {
+  background: transparent; border: 1px solid var(--graphite);
+  border-radius: var(--r-in); padding: 3px 8px;
+  font-size: 12px; color: var(--fog);
+}
+.btn-ghost:hover { color: var(--mist); border-color: var(--smoke); }
+button:disabled { opacity: .38; cursor: not-allowed; }
+
+/* --- shell -------------------------------------------------------------- */
+.shell {
+  flex: 1; min-height: 0;    /* min-height:0 is what lets the children scroll */
+  display: grid;
+  grid-template-columns: var(--rail-l) 6px minmax(0,1fr) 6px var(--rail-r);
+}
+
+/* drag handles */
+.splitter {
+  cursor: col-resize; background: transparent;
+  border-left: 1px solid var(--graphite);
+  transition: background .12s ease;
+}
+.splitter:hover, .splitter.dragging { background: var(--smoke); }
+body.resizing { cursor: col-resize; user-select: none; }
+.rail {
+  display: flex; flex-direction: column; min-height: 0;
+  background: var(--carbon); overflow: hidden;
+}
+/* borders live on the splitters now, so the rails carry none */
+.rail-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 14px 14px 8px; font-size: 11px; letter-spacing: .08em;
+  text-transform: uppercase; color: var(--ash);
+}
+.rail-group {
+  padding: 12px 14px 4px; font-size: 10px; letter-spacing: .08em;
+  text-transform: uppercase; color: var(--ash);
+}
+.rail-foot {
+  border-top: 1px solid var(--graphite); padding: 10px 14px;
+  font-size: 11px; color: var(--ash); font-family: var(--mono);
+  white-space: pre-wrap;
+}
+.legend { display: flex; gap: 4px; }
+.dot { width: 7px; height: 7px; border-radius: var(--r-pill); display: inline-block; }
+.dot.green { background: var(--green); }
+.dot.amber { background: var(--amber); }
+.dot.red   { background: var(--darkred); }
+
+/* --- SHOW PROBLEMATIC ONLY toggle (2026-09-24) --------------------------- */
+.probonly {
+  display: flex; align-items: center; gap: 8px;
+  padding: 0 14px 8px; font-size: 10px; letter-spacing: .08em;
+  text-transform: uppercase; color: var(--fog); cursor: pointer; user-select: none;
+}
+.probonly input { accent-color: var(--coral); margin: 0; cursor: pointer; }
+.probonly .tally { margin-left: auto; }
+.probonly:has(input:checked) { color: var(--coral); }
+.catcount.bad { color: var(--coral); }
+.catlist li.none { color: var(--ash); cursor: default; font-size: 12px; }
+.catlist li.none:hover { background: none; color: var(--ash); }
+
+/* --- category list ------------------------------------------------------ */
+.catlist, .conflist { list-style: none; margin: 0; padding: 0 8px 8px; overflow-y: auto; }
+.catlist { flex: 1; min-height: 0; }
+
+/* Each list gets exactly half the rail and its own scrollbar, so a 95-entry
+   scanned list can never push the saved configs out of view. */
+.halves { flex: 1; min-height: 0; display: grid; grid-template-rows: 1fr 1fr; }
+.half { min-height: 0; display: flex; flex-direction: column; }
+.half + .half { border-top: 1px solid var(--graphite); }
+.half .conflist { flex: 1; min-height: 0; }
+
+.searchwrap { flex: none; padding: 0 12px 8px; }
+.searchwrap input {
+  width: 100%; background: rgba(255,255,255,.03);
+  border: 1px solid rgba(255,255,255,.08); border-radius: var(--r-in);
+  padding: 7px 10px; font-size: 12px; color: var(--paper);
+}
+.searchwrap input:focus { outline: none; border-color: var(--smoke); }
+.searchwrap input::placeholder { color: var(--ash); }
+.tally { color: var(--ash); font-family: var(--mono); text-transform: none;
+         letter-spacing: 0; }
+.conflist li.hidden { display: none; }
+.conflist li .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.catlist li, .conflist li {
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 8px; border-radius: var(--r-in);
+  color: var(--fog); cursor: pointer; user-select: none;
+}
+.catlist li:hover, .conflist li:hover { background: var(--obsidian); color: var(--mist); }
+.catlist li.on, .conflist li.on {
+  background: var(--obsidian); color: var(--paper);
+  box-shadow: inset 0 0 0 1px var(--graphite);
+}
+.caticon { width: 15px; height: 15px; opacity: .7; flex: none; }
+.catname { flex: 1; font-size: 13px; white-space: nowrap;
+           overflow: hidden; text-overflow: ellipsis; }
+.catcount { font-size: 11px; color: var(--ash); font-family: var(--mono); }
+
+/* status colouring lives on the NAME, as asked: green when everything is
+   populated and consistent, amber when there are inconsistencies, dark red and
+   flashing when something execution-critical is missing or contradictory. */
+.catname.green { color: var(--green); }
+.catname.amber { color: var(--amber); }
+.catname.red   { color: var(--coral); animation: flashred 1.15s ease-in-out infinite; }
+@keyframes flashred {
+  0%, 100% { color: var(--darkred); }
+  50%      { color: var(--coral); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .catname.red { animation: none; color: var(--coral); }
+}
+
+/* --- config list -------------------------------------------------------- */
+.conflist li { justify-content: space-between; font-size: 13px; }
+.conflist li .meta { font-size: 11px; color: var(--ash); font-family: var(--mono); }
+.conflist li.new .meta { color: var(--lime); }
+
+/* --- field pane --------------------------------------------------------- */
+.pane { min-width: 0; min-height: 0; display: flex; flex-direction: column;
+        background: var(--void); overflow: hidden; }
+.pane-head {
+  flex: none;
+  padding: 16px 24px 10px; border-bottom: 1px solid var(--graphite);
+  display: flex; align-items: center; gap: 12px; min-height: 30px;
+}
+.pane-head h2 {
+  margin: 0; font-size: 18px; font-weight: 510; color: var(--paper);
+  letter-spacing: -0.01em;
+}
+.pane-head .why { font-size: 12px; color: var(--ash); }
+.rows { flex: 1; overflow-y: auto; padding: 12px 24px 48px; }
+.empty { color: var(--ash); padding: 40px 0; text-align: center; }
+
+.row {
+  background: var(--carbon); border-radius: var(--r-card);
+  box-shadow: inset 0 0 0 1px var(--graphite);
+  padding: 14px 16px; margin-bottom: 10px;
+}
+.row.critical { box-shadow: inset 0 0 0 1px rgba(235,87,87,.28); }
+.row-top { display: flex; align-items: center; gap: 10px; }
+.row-name { font-family: var(--mono); font-size: 13px; color: var(--mist); flex: 1; }
+.row-name .sec { color: var(--ash); }
+.tag {
+  font-size: 10px; letter-spacing: .05em; text-transform: uppercase;
+  border-radius: var(--r-badge); padding: 1px 6px;
+  background: rgba(255,255,255,.05); color: var(--fog);
+}
+.tag.req      { color: var(--mist); }
+.tag.opp      { color: var(--ash); }
+.tag.crit     { color: var(--coral); background: rgba(235,87,87,.10); }
+.tag.conflict { color: var(--coral); background: rgba(235,87,87,.12); }
+.tag.divergent{ color: var(--amber); background: rgba(217,154,43,.12); }
+.tag.agree    { color: var(--green); background: rgba(39,166,68,.10); }
+
+/* the chain, rendered top to bottom in RESOLUTION_CHAIN order so which slot
+   wins is visible rather than remembered */
+.chain { margin-top: 10px; display: grid; gap: 4px; }
+.slot {
+  display: grid; grid-template-columns: 96px 1fr auto; gap: 10px;
+  align-items: center; padding: 5px 8px; border-radius: var(--r-in);
+  background: rgba(255,255,255,.02);
+}
+.slot.wins { background: rgba(255,255,255,.05); box-shadow: inset 0 0 0 1px var(--graphite); }
+.slot .k { font-size: 11px; color: var(--ash); font-family: var(--mono); }
+.slot.wins .k { color: var(--lime); }
+.slot .v { font-family: var(--mono); font-size: 12px; color: var(--mist);
+           overflow-wrap: anywhere; }
+.slot .v.null { color: var(--ash); font-style: italic; }
+
+.editrow { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+.editrow input {
+  flex: 1; background: rgba(255,255,255,.02);
+  border: 1px solid rgba(255,255,255,.08); border-radius: var(--r-in);
+  padding: 8px 10px; font-family: var(--mono); font-size: 12px; color: var(--paper);
+}
+.editrow input:focus { outline: none; border-color: var(--smoke); }
+.editrow input:disabled { color: var(--ash); background: rgba(255,255,255,.01); }
+
+.icon-btn {
+  background: transparent; border: 1px solid var(--graphite);
+  border-radius: var(--r-in); width: 30px; height: 30px; flex: none;
+  color: var(--fog); font-size: 13px; line-height: 1;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.icon-btn:hover { color: var(--mist); border-color: var(--smoke); }
+.icon-btn.lock.open { color: var(--lime); border-color: rgba(228,242,34,.35); }
+.icon-btn.nullbtn { font-family: var(--mono); font-size: 11px; width: auto; padding: 0 8px; }
+
+/* the confirm tick: hidden until the value is new and unsaved, then pulses.
+   Its colour is the verdict against everything else we know. */
+.icon-btn.tick { display: none; }
+.icon-btn.tick.show { display: inline-flex; animation: pulse 1.1s ease-in-out infinite; }
+.icon-btn.tick.armed { animation: none; }
+.icon-btn.tick.v-agree     { color: var(--green);  border-color: rgba(39,166,68,.45); }
+.icon-btn.tick.v-divergent { color: var(--amber);  border-color: rgba(217,154,43,.45); }
+.icon-btn.tick.v-conflict  { color: var(--coral);  border-color: rgba(235,87,87,.45); }
+.icon-btn.tick.armed.v-agree     { background: rgba(39,166,68,.15); }
+.icon-btn.tick.armed.v-divergent { background: rgba(217,154,43,.15); }
+.icon-btn.tick.armed.v-conflict  { background: rgba(235,87,87,.15); }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+@media (prefers-reduced-motion: reduce) { .icon-btn.tick.show { animation: none; } }
+
+.note { margin-top: 8px; font-size: 12px; color: var(--ash); }
+.note.bad  { color: var(--coral); }
+.note.warn { color: var(--amber); }
+
+/* --- toast -------------------------------------------------------------- */
+.toast {
+  position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%);
+  background: var(--obsidian); color: var(--mist);
+  border: 1px solid var(--graphite); border-radius: var(--r-in);
+  padding: 10px 16px; font-size: 13px; max-width: 70vw;
+  box-shadow: 0 8px 32px rgba(0,0,0,.6); z-index: 50; white-space: pre-wrap;
+}
+.toast.bad  { border-color: rgba(235,87,87,.5); color: var(--coral); }
+.toast.good { border-color: rgba(39,166,68,.5); color: var(--green); }
+.toast[hidden] { display: none; }
+
+@media (max-width: 1180px) {
+  .shell { grid-template-columns: var(--rail-l) 6px minmax(0,1fr); }
+  .rail-right, #split-right { display: none; }
+}
+
+/* "Where else to look" — shown only when no host had the configs. */
+.lookup {
+  flex: 1 1 100%;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--amber); border-radius: var(--r-in);
+  background: rgba(217,154,43,.06);
+}
+.lookup[hidden] { display: none; }
+.lookuphead { flex: 1 1 100%; font-size: 12px; color: var(--mist); }
+.lookupbtn {
+  font-size: 12px; color: var(--mist); text-decoration: none;
+  padding: 3px 8px; border: 1px solid var(--smoke); border-radius: var(--r-pill);
+}
+.lookupbtn:hover { color: var(--teal); border-color: var(--teal); }
+

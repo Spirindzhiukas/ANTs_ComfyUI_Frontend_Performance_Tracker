@@ -1,0 +1,61 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>ANTs tracker — flat boxes, by box-detail level</title>
+<style>
+  body { margin: 0; background: #141416; color: #e8e8ea; font: 14px ui-sans-serif, system-ui; }
+  p.note { max-width: 980px; margin: 16px; color: #9a9aa2; }
+  code { color: #d8d8dc; }
+</style>
+<h2 style="margin:16px">Flat boxes, by box-detail level</h2>
+<p class="note">The setting is <code>box detail</code> in the Tweaks tab, or
+<code>window.__antsTracker.lowZoom.set({ boxDetail: "title" })</code>. Every rectangle below is an
+operation the real paint path (<code>lodPaintNode</code>) issued, recorded from the harness canvas and
+replayed as SVG, in graph units, at the same numbers the code uses. LiteGraph's own node drawing
+(title text, sockets, widgets) is not reproduced — that is the drawing the flat path replaces. At
+10% zoom each box is 20&times;10 css pixels on screen, so the picture is magnified 1.6&times;.</p>
+<svg xmlns="http://www.w3.org/2000/svg" width="2272" height="1175.2" viewBox="0 0 2272 1175.2">
+<rect width="100%" height="100%" fill="#141416"/>
+<text x="16" y="32" fill="#e8e8ea" font-family="DejaVu Sans, Verdana, Geneva, ui-sans-serif, system-ui, sans-serif" font-size="14">plain — one rectangle per node, plus the selection ring: exactly what v2.1.16 painted</text>
+<text x="16" y="50" fill="#9a9aa2" font-family="DejaVu Sans, Verdana, Geneva, ui-sans-serif, system-ui, sans-serif" font-size="11">marks this frame of 6 boxes: 0 title, 0 error ring, 0 progress, 0 dimmed · drawn 1.6x, and each box is 20x10 css px at this 10% zoom</text>
+<g transform="translate(16 132.4)">
+<g transform="translate(0 -70)"><rect x="0" y="0" width="200" height="100" fill="#2b2b2b"/></g><g transform="translate(240 -70)"><rect x="0" y="0" width="200" height="100" fill="#2b2b2b"/></g><g transform="translate(480 -70)"><rect x="0" y="0" width="200" height="100" fill="#2b2b2b"/></g><g transform="translate(720 -70)"><rect x="0" y="0" width="200" height="100" fill="#2b2b2b"/></g><g transform="translate(960 -70)"><rect x="0" y="0" width="200" height="100" fill="#2b2b2b"/></g><g transform="translate(1200 -70)"><rect x="0" y="0" width="200" height="100" fill="#2b2b2b"/><rect x="0" y="0" width="200" height="100" fill="none" stroke="#ffb300" stroke-width="10"/></g>
+</g>
+<text x="176" y="308.4" text-anchor="middle" fill="#9a9aa2" font-family="DejaVu Sans Mono, Menlo, Consolas, ui-monospace, monospace" font-size="10">healthy</text>
+<text x="560" y="308.4" text-anchor="middle" fill="#9a9aa2" font-family="DejaVu Sans Mono, Menlo, Consolas, ui-monospace, monospace" font-size="10">has_errors: true</text>
+<text x="944" y="308.4" text-anchor="middle" fill="#9a9aa2" font-family="DejaVu Sans Mono, Menlo, Consolas, ui-monospace, monospace" font-size="10">progress: 0.4</text>
+<text x="1328" y="308.4" text-anchor="middle" fill="#9a9aa2" font-family="DejaVu Sans Mono, Menlo, Consolas, ui-monospace, monospace" font-size="10">mode: 2 (muted)</text>
+<text x="1712" y="308.4" text-anchor="middle" fill="#9a9aa2" font-family="DejaVu Sans Mono, Menlo, Consolas, ui-monospace, monospace" font-size="10">mode: 4 (bypassed)</text>
+<text x="2096" y="308.4" text-anchor="middle" fill="#9a9aa2" font-family="DejaVu Sans Mono, Menlo, Consolas, ui-monospace, monospace" font-size="10">ghost + selected</text>
+<text x="16" y="348.4" fill="#e8e8ea" font-family="DejaVu Sans, Verdana, Geneva, ui-sans-serif, system-ui, sans-serif" font-size="14">title — + the node's own title-bar colour, above the body, at LiteGraph's 30-unit title height</text>
+<text x="16" y="366.4" fill="#9a9aa2" font-family="DejaVu Sans, Verdana, Geneva, ui-sans-serif, system-ui, sans-serif" font-size="11">marks this frame of 6 boxes: 6 title, 0 error ring, 0 progress, 0 dimmed · drawn 1.6x, and each box is 20x10 css px at this 10% zoom</text>
+<g transform="translate(16 448.8)">
+<g transform="translate(0 -70)"><rect x="0" y="0" width="200" height="100" fill="#2b2b2b"/><rect x="0" y="-30" width="200" height="30" fill="#4a6f8f"/></g><g transform="translate(240 -70)"><rect x="0" y="0" width="200" height="100" fill="#2b2b2b"/><rect x="0" y="-30" width="200" height="30" fill="#8f4a4a"/></g><g transform="translate(480 -70)"><rect x="0" y="0" width="200" height="100" fill="#2b2b2b"/><rect x="0" y="-30" width="200" height="30" fill="#4a8f6f"/></g><g transform="translate(720 -70)"><rect x="0" y="0" width="200" height="100" fill="#2b2b2b"/><rect x="0" y="-30" width="200" height="30" fill="#6f6f6f"/></g><g transform="translate(960 -70)"><rect x="0" y="0" width="200" height="100" fill="#2b2b2b"/><rect x="0" y="-30" width="200" height="30" fill="#6f6f3f"/></g><g transform="translate(1200 -70)"><rect x="0" y="0" width="200" height="100" fill="#2b2b2b"/><rect x="0" y="-30" width="200" height="30" fill="#8f4a8f"/><rect x="0" y="0" width="200" height="100" fill="none" stroke="#ffb300" stroke-width="10"/></g>
+</g>
+<text x="176" y="624.8" text-anchor="middle" fill="#9a9aa2" font-family="DejaVu Sans Mono, Menlo, Consolas, ui-monospace, monospace" font-size="10">healthy</text>
+<text x="560" y="624.8" text-anchor="middle" fill="#9a9aa2" font-family="DejaVu Sans Mono, Menlo, Consolas, ui-monospace, monospace" font-size="10">has_errors: true</text>
+<text x="944" y="624.8" text-anchor="middle" fill="#9a9aa2" font-family="DejaVu Sans Mono, Menlo, Consolas, ui-monospace, monospace" font-size="10">progress: 0.4</text>
+<text x="1328" y="624.8" text-anchor="middle" fill="#9a9aa2" font-family="DejaVu Sans Mono, Menlo, Consolas, ui-monospace, monospace" font-size="10">mode: 2 (muted)</text>
+<text x="1712" y="624.8" text-anchor="middle" fill="#9a9aa2" font-family="DejaVu Sans Mono, Menlo, Consolas, ui-monospace, monospace" font-size="10">mode: 4 (bypassed)</text>
+<text x="2096" y="624.8" text-anchor="middle" fill="#9a9aa2" font-family="DejaVu Sans Mono, Menlo, Consolas, ui-monospace, monospace" font-size="10">ghost + selected</text>
+<text x="16" y="664.8" fill="#e8e8ea" font-family="DejaVu Sans, Verdana, Geneva, ui-sans-serif, system-ui, sans-serif" font-size="14">state — + the frontend's own marks: error stroke (#E00, 10 units wide, 12 units out), the green progress bar, and its own dimming for a muted (0.4), bypassed (0.2) or ghosted (0.3) node</text>
+<text x="16" y="682.8" fill="#9a9aa2" font-family="DejaVu Sans, Verdana, Geneva, ui-sans-serif, system-ui, sans-serif" font-size="11">marks this frame of 6 boxes: 6 title, 1 error ring, 1 progress, 3 dimmed · drawn 1.6x, and each box is 20x10 css px at this 10% zoom</text>
+<g transform="translate(16 765.2)">
+<g transform="translate(0 -70)"><rect x="0" y="0" width="200" height="100" fill="#2b2b2b"/><rect x="0" y="-30" width="200" height="30" fill="#4a6f8f"/></g><g transform="translate(240 -70)"><rect x="0" y="0" width="200" height="100" fill="#2b2b2b"/><rect x="0" y="-30" width="200" height="30" fill="#8f4a4a"/><rect x="-12" y="-12" width="224" height="124" fill="none" stroke="#E00" stroke-width="10"/></g><g transform="translate(480 -70)"><rect x="0" y="0" width="200" height="100" fill="#2b2b2b"/><rect x="0" y="-30" width="200" height="30" fill="#4a8f6f"/><rect x="0" y="0" width="80" height="30" fill="green"/></g><g transform="translate(720 -70)"><rect x="0" y="0" width="200" height="100" fill="#2b2b2b" opacity="0.4"/><rect x="0" y="-30" width="200" height="30" fill="#6f6f6f" opacity="0.4"/></g><g transform="translate(960 -70)"><rect x="0" y="0" width="200" height="100" fill="#2b2b2b" opacity="0.2"/><rect x="0" y="-30" width="200" height="30" fill="#6f6f3f" opacity="0.2"/></g><g transform="translate(1200 -70)"><rect x="0" y="0" width="200" height="100" fill="#2b2b2b" opacity="0.3"/><rect x="0" y="-30" width="200" height="30" fill="#8f4a8f" opacity="0.3"/><rect x="0" y="0" width="200" height="100" fill="none" stroke="#ffb300" stroke-width="10" opacity="0.3"/></g>
+</g>
+<text x="176" y="941.2" text-anchor="middle" fill="#9a9aa2" font-family="DejaVu Sans Mono, Menlo, Consolas, ui-monospace, monospace" font-size="10">healthy</text>
+<text x="560" y="941.2" text-anchor="middle" fill="#9a9aa2" font-family="DejaVu Sans Mono, Menlo, Consolas, ui-monospace, monospace" font-size="10">has_errors: true</text>
+<text x="944" y="941.2" text-anchor="middle" fill="#9a9aa2" font-family="DejaVu Sans Mono, Menlo, Consolas, ui-monospace, monospace" font-size="10">progress: 0.4</text>
+<text x="1328" y="941.2" text-anchor="middle" fill="#9a9aa2" font-family="DejaVu Sans Mono, Menlo, Consolas, ui-monospace, monospace" font-size="10">mode: 2 (muted)</text>
+<text x="1712" y="941.2" text-anchor="middle" fill="#9a9aa2" font-family="DejaVu Sans Mono, Menlo, Consolas, ui-monospace, monospace" font-size="10">mode: 4 (bypassed)</text>
+<text x="2096" y="941.2" text-anchor="middle" fill="#9a9aa2" font-family="DejaVu Sans Mono, Menlo, Consolas, ui-monospace, monospace" font-size="10">ghost + selected</text>
+<text x="16" y="981.2" fill="#e8e8ea" font-family="DejaVu Sans, Verdana, Geneva, ui-sans-serif, system-ui, sans-serif" font-size="14">what a snapshot covers — the dashed rect is the bitmap: the body, LiteGraph's 30-unit title bar above it, and 24 units of padding on every side</text>
+<text x="16" y="999.2" fill="#9a9aa2" font-family="DejaVu Sans, Verdana, Geneva, ui-sans-serif, system-ui, sans-serif" font-size="11">drawn to scale, in graph units. The padding is what keeps the frontend's own error stroke (12 units outside the node, 10 wide) inside the picture; a capture that covered only the body would clip it</text>
+<rect x="16" y="1011.2" width="396.8" height="284.8" fill="none" stroke="#AE7719" stroke-width="1.5" stroke-dasharray="6 5"/>
+<rect x="54.4" y="1097.6" width="320" height="160" fill="#3a3a40"/>
+<rect x="54.4" y="1049.6" width="320" height="48" fill="#4a6f8f"/>
+<rect x="35.2" y="1078.4" width="358.4" height="198.4" fill="none" stroke="#E00" stroke-width="16"/>
+<text x="214.4" y="1181.6" text-anchor="middle" fill="#9a9aa2" font-family="DejaVu Sans Mono, Menlo, Consolas, ui-monospace, monospace" font-size="10">the node's own drawing</text>
+<text x="418.8" y="1023.2" text-anchor="start" fill="#9a9aa2" font-family="DejaVu Sans Mono, Menlo, Consolas, ui-monospace, monospace" font-size="10">padding 24</text>
+<text x="418.8" y="1077.6" text-anchor="start" fill="#9a9aa2" font-family="DejaVu Sans Mono, Menlo, Consolas, ui-monospace, monospace" font-size="10">title bar (30)</text>
+<text x="29.2" y="1292.8" text-anchor="end" fill="#9a9aa2" font-family="DejaVu Sans Mono, Menlo, Consolas, ui-monospace, monospace" font-size="10">error stroke: 10 wide, 12 out — inside the picture</text>
+</svg>

@@ -1,0 +1,734 @@
+// Prints what the v2 panel actually says, without ComfyUI, a browser, or a GPU.
+//
+//   node tests/demo.mjs
+//
+// The graph is synthetic (four node types, two extension packs, a status
+// heartbeat and a long animation frame per second), but every number below is
+// produced by web/tracker.js going through its real code paths: real hook
+// wrapping, real per-frame accounting, real sampled stacks, real panel DOM.
+// Use it to see what the panel reports and to eyeball changes to the UI.
+//
+// Nothing here is a benchmark of ComfyUI itself — the costs are simulated with
+// the harness clock (`h.busy`), so treat the magnitudes as illustrative and the
+// structure as the point.
+
+import vm from "node:vm";
+import { createHarness, FRAME_MS } from "./harness.mjs";
+
+const h = createHarness();
+
+// ---------------------------------------------------------------- scenario ---
+// Two packs with different costs, one node type instrumented by each.
+const nasty = { fg: 1.6, bg: 0.5 }; // per node, per frame
+const nice = { fg: 0.06, bg: 0.25 };
+
+function pack(name, cost, owns) {
+  return h.registerExtension(name, {
+    beforeRegisterNodeDef(nodeType, nodeData) {
+      if (!owns.includes(nodeData.name)) return;
+      nodeType.prototype.onDrawForeground = function () {
+        h.busy(cost.fg);
+      };
+      nodeType.prototype.onDrawBackground = function () {
+        h.busy(cost.bg);
+      };
+    },
+  });
+}
+await pack("NastyBastards", nasty, ["NastyBastardsThing", "NastyBastardsOtherThing"]);
+await pack("NicePack", nice, ["NiceWidget"]);
+
+const NastyA = h.registerNodeType("NastyBastardsThing");
+const NastyB = h.registerNodeType("NastyBastardsOtherThing");
+const NiceThing = h.registerNodeType("NiceWidget");
+
+// A core-style node that draws with its own instance hook — invisible to
+// anything that only wraps node prototypes (the v1 blind spot).
+const Preview = h.registerNodeType("PreviewImage");
+const preview = h.makeNode(Preview);
+preview.onDrawForeground = function () {
+  h.busy(0.45);
+};
+preview.onDrawBackground = function () {
+  h.busy(0.15);
+};
+
+const nodes = [h.makeNode(NastyA), h.makeNode(NastyA), h.makeNode(NastyB), h.makeNode(NiceThing), preview];
+
+// The pattern that produces paired rows in real graphs: a node's own hook
+// delegates to the (already wrapped) prototype method. The Timing tab must show
+// the cost once, on the outer hook, with a "nested" tag on the inner one.
+const niceNode = nodes[3];
+niceNode.onDrawBackground = function (...args) {
+  return NiceThing.prototype.onDrawBackground.apply(this, args);
+};
+h.canvas.nodes = nodes;
+h.app.graph._nodes = nodes; // what the panel counts and the Nodes tab walks
+
+h.canvas.costs = { background: 0.35, connections: 1.2, chrome: 0.4 };
+
+// Staggered start times, because that is what makes "load span" different from
+// "sum of durations" (the v1 bug this lane now avoids).
+for (const [url, startTime, duration, transferSize] of [
+  ["http://localhost:8188/extensions/NastyBastards/js/main.js", 0, 42, 184000],
+  ["http://localhost:8188/extensions/NastyBastards/js/status.js", 38, 12, 26000],
+  ["http://localhost:8188/extensions/NastyBastards/js/panel.css", 44, 3, 4200],
+  ["http://localhost:8188/extensions/NicePack/js/nice.js", 18, 9, 19000],
+]) {
+  h.addResource(url, { startTime, duration, transferSize, encodedBodySize: transferSize });
+}
+
+h.fetchRoutes.set("/system_stats", {
+  devices: [{ name: "cuda:0 NVIDIA GeForce RTX 4090", vram_total: 25757220864, vram_free: 24159000000, torch_vram_total: 4200000000, torch_vram_free: 3900000000 }],
+});
+h.fetchRoutes.set("/ants_tracker/gpu", {
+  available: true,
+  gpus: [{ index: 0, name: "NVIDIA GeForce RTX 4090", utilization_gpu: 14, memory_used: 1598, memory_total: 24564, temperature_gpu: 61, power_draw: 96.4, power_limit: 450 }],
+  processes: [{ pid: 4211, name: "python3", used_memory: 1590 }],
+});
+
+// --------------------------------------------------------- the bad citizen ---
+// A page script that asks for a redraw on its own clock. Its real URL is what
+// the panel attributes the requests to, via the sampled setDirty stack.
+vm.runInContext(
+  `globalThis.__nastyTick = function () { __ants.app.canvas.setDirty(true, true); };`,
+  h.sandbox,
+  { filename: "http://localhost:8188/extensions/NastyBastards/js/status.js" }
+);
+
+// A heartbeat from an extension that burns real time on every tick, and forces
+// layout while it is at it — the pattern the Governor exists for, and the one
+// the report that prompted this layer actually found (`clamp` in a curve
+// equalizer extension, 3 seconds of forced style/layout over a session).
+h.sandbox.__antsCost = (ms) => h.busy(ms);
+vm.runInContext(
+  `setInterval(function clamp() { __antsCost(3.2); }, 20);`,
+  h.sandbox,
+  { filename: "http://localhost:8188/extensions/ANT_NODES/ant_loras_equalizer_curve.js" }
+);
+
+// ------------------------------------------------------------------- drive ---
+for (const ext of h.app.extensions) if (ext.setup) await ext.setup();
+await h.flush();
+h.document.getElementById("ants-corner-btn").click(); // open the panel
+
+let nextStallAt = 0;
+function run(wallMs) {
+  const until = h.clock.now + wallMs;
+  let i = 0;
+  while (h.clock.now < until) {
+    if (i++ % 3 === 0) {
+      h.sandbox.__nastyTick(); // ~20 redraw requests/second
+      h.sandbox.__nastyTick(); // and a second source asking for the same frame
+    }
+    if (h.clock.now >= nextStallAt) {
+      nextStallAt = h.clock.now + 1000;
+      // one second of blocked main thread, from the same page script
+      h.emitPerformance("long-animation-frame", [
+        {
+          startTime: h.clock.now - 140,
+          duration: 140,
+          blockingDuration: 95,
+          scripts: [
+            {
+              sourceURL: "http://localhost:8188/assets/settingStore-DDHzGrHr.js",
+              sourceFunctionName: "renderFrame",
+              invoker: "user-callback",
+              duration: 90,
+              forcedStyleAndLayoutDuration: 55,
+            },
+            {
+              sourceURL: "http://localhost:8188/extensions/ANT_NODES/ant_loras_equalizer_curve.js",
+              sourceFunctionName: "clamp",
+              invoker: "TimerHandler:setInterval",
+              duration: 42,
+              forcedStyleAndLayoutDuration: 30,
+            },
+            {
+              sourceURL: "http://localhost:8188/extensions/NastyBastards/js/status.js",
+              sourceFunctionName: "refreshStatusBadge",
+              invoker: "TimerHandler:setInterval",
+              duration: 130,
+              forcedStyleAndLayoutDuration: 70,
+            },
+          ],
+        },
+      ]);
+    }
+    h.performanceShim.memory.usedJSHeapSize += 4096; // a slow climb, as a demo trend
+    // Jitter, so the p95/p99 rows are not identical to the mean (a real graph
+    // never draws every node at exactly the same cost).
+    h.canvas.costs.chrome = 0.4 + (i % 17) * 0.06;
+    h.canvas.costs.background = i % 23 === 0 ? 1.4 : 0.35;
+    h.advance(FRAME_MS);
+    h.canvas.draw(true, true);
+  }
+}
+
+async function pump() {
+  await h.flush();
+  await new Promise((r) => setImmediate(r));
+}
+
+run(6000); // six seconds of realistic traffic (everything untouched: "normal")
+await pump();
+
+// Then the scheduler layer does something about it: the extension heartbeat is
+// dropped to a quarter speed and redraw requests are merged, and the page runs
+// for two more seconds so the Governor tab below shows the same source measured
+// at a quarter of its runs, with the skipped ticks counted rather than hidden.
+const gov = h.tracker.governor;
+const clampSource = gov.sources.find((r) => r.name === "clamp");
+if (clampSource) gov.policy(clampSource.key, "quarter");
+gov.control("coalesce", true);
+
+// A repaint timer of the kind the autopilot exists for: it asks for every 100ms
+// but each run costs 20ms, so it is a real 167 ms/s of main thread. The autopilot
+// is pointed at the same 150 ms/s target a user would pick, and gets one interval
+// to notice and cap it.
+vm.runInContext(
+  `setInterval(function checkAndRepaint() { __antsCost(20); }, 100);`,
+  h.sandbox,
+  { filename: "http://localhost:8188/assets/vendor-vueuse-gYZjo854.js" }
+);
+gov.control("autoLimit", true);
+gov.control("autoTargetMsPerSec", 150);
+run(2000);
+await pump();
+run(6000); // one autopilot round, plus room for the table to re-measure
+await pump();
+// ------------------------------------------------------------------- print ---
+const WIDTH = 100;
+const rule = (ch = "-") => ch.repeat(WIDTH);
+function bullets(title) {
+  console.log(`\n${rule("=")}\n${title}\n${rule("=")}`);
+}
+
+// The shim has no layout engine, so "render" here means: walk the subtree and
+// emit one line per block, joining inline children into their parent's line.
+const INLINE = new Set(["SPAN", "B", "CODE", "EM", "I", "SMALL", "A", "BR"]);
+const pad = (d) => "  ".repeat(d);
+
+function textWithoutTables(node) {
+  if (node.tagName === "TABLE") return "";
+  if (node.tagName === "SELECT") return node.value || "(unset)";
+  return [node._text, ...node.children.map(textWithoutTables)].join(" ").replace(/\s+/g, " ").trim();
+}
+
+function linesOf(node, depth = 0) {
+  const tag = node.tagName;
+  // The shim has no layout, so hidden blocks are skipped by hand: the printer
+  // should show what the user sees, not what is merely in the DOM.
+  if (node.style && node.style.display === "none") return [];
+  if (node._cls && node._cls.has("ants-more") && node.style && node.style.display === "none") return [];
+  if (tag === "TABLE" || tag === "THEAD" || tag === "TBODY") {
+    return node.children.flatMap((c) => linesOf(c, depth));
+  }
+  if (tag === "TR") {
+    const out = [`${pad(depth)}| ${node.children.map((c) => textWithoutTables(c)).join(" | ")} |`];
+    for (const cell of node.children) {
+      for (const nested of cell.children) if (nested.tagName === "TABLE") out.push(...linesOf(nested, depth + 1));
+    }
+    return out;
+  }
+  if (tag === "SELECT") return [`${pad(depth)}[ select: ${node.value || "(unset)"} ]`];
+  const inline = node.children.filter((c) => INLINE.has(c.tagName));
+  const blocks = node.children.filter((c) => !INLINE.has(c.tagName));
+  const out = [];
+  const own = [node._text, ...inline.map((c) => c.textContent)].join(" ").replace(/\s+/g, " ").trim();
+  if (own) out.push(`${pad(depth)}${own}`);
+  for (const b of blocks) out.push(...linesOf(b, depth + 1));
+  return out;
+}
+
+function dump(container) {
+  if (!container) return;
+  for (const line of linesOf(container)) if (line.trim()) console.log(line);
+}
+
+// Expand the two heaviest owners, plus anything tagged nested, so the per-hook
+// breakdown (including the nested-call accounting) is in the output.
+const rowsToOpen = h.document.body
+  .descendants()
+  .filter((n) => n.tagName === "TR")
+  .filter((tr, i) => i < 2 || tr.textContent.includes("nested"));
+for (const tr of rowsToOpen) {
+  const caret = tr.descendants().find((n) => n._cls && n._cls.has("ants-caret"));
+  if (caret) caret.click();
+}
+await pump();
+
+// ------------------------------------------------------- low-zoom drawing ---
+// The other half of the answer for a big graph: at zoom 0.10 every node is on
+// screen (so culling cannot remove anything) and the frame is dominated by
+// drawing them properly. Six nodes that land ~20px wide, links between them, and
+// the mode switched on — the Nodes tab and the report below then show the frame
+// budget with the cheap path in it.
+h.canvas.ds.scale = 0.1;
+h.canvas.nodes = [];
+h.canvas.links = [];
+for (let i = 0; i < 6; i++) {
+  h.canvas.nodes.push({ type: "KSampler", pos: [i * 240, 0], size: [200, 100], selected: false });
+  h.canvas.links.push({ color: "#888888", from: [i * 240, 0], to: [i * 240 + 200, 100] });
+}
+h.app.graph._nodes = h.canvas.nodes; // in ComfyUI the graph the canvas draws is canvas.graph
+
+// One of those nodes carries a DOM widget — the shape ComfyUI uses for Vue
+// nodes, image/video previews and custom node UIs. Its element lives in the page,
+// on top of the canvas, and is sized for a readable zoom whatever the canvas
+// does, so it is hidden while its node is a rectangle and comes back when it is
+// not. (h.document is the harness DOM; the class is the only thing touched.)
+const demoWidget = h.document.createElement("div");
+demoWidget.className = "dom-widget";
+demoWidget.appendChild(h.document.createElement("canvas"));
+h.document.body.appendChild(demoWidget);
+// Two shapes of DOM content on one node: a widget with an element (a curve
+// editor) and a Vue-component widget (how the core 3D viewer nodes are built —
+// no element of its own, the frontend renders the wrapper).
+h.canvas.nodes[3].widgets = [
+  { name: "curve", element: demoWidget.children[0], options: { hideOnZoom: false } },
+  { name: "model_file", type: "load3D", component: {}, options: {} },
+];
+// The third shape: what a core 3D node actually puts on screen — a wrapper in the
+// frontend's DOM widget layer, positioned at its node's origin, with the widget
+// object holding no reference to it at all.
+const demoLayer = h.document.createElement("div");
+demoLayer._attrs["data-testid"] = "dom-widgets";
+const demoViewport = h.document.createElement("div");
+demoViewport.className = "dom-widget size-full";
+demoViewport._cls = demoViewport._cls || new Set();
+demoLayer.appendChild(demoViewport);
+h.document.body.appendChild(demoLayer);
+const placeViewport = () => {
+  const pos = h.canvas.nodes[3].pos;
+  const scale = h.canvas.ds.scale;
+  demoViewport.style.left = `${(pos[0] + h.canvas.ds.offset[0]) * scale}px`;
+  demoViewport.style.top = `${(pos[1] + h.canvas.ds.offset[1]) * scale}px`;
+};
+placeViewport();
+
+h.tracker.lowZoom.set({ flatBelow: 0.2, idleCapMs: 500, detailZoom: 0.6, linkStyle: "spline" });
+
+// One node with a 4096px image in it, drawn the way a preview/load/compare node
+// draws: the first frame paints the full bitmap, the next one is served from the
+// copy the ladder made for this zoom.
+const demoImg = { naturalWidth: 4096, naturalHeight: 4096 };
+h.canvas.nodes[0].size = [600, 300];
+h.canvas.nodes[0].img = demoImg;
+h.canvas.nodes[0].onDrawBackground = function (ctx) {
+  ctx.drawImage(this.img, 0, 0, 400, 200);
+};
+// The separate image-preview ladder is retired. Below the flatten zoom the node
+// itself is the thumbnail: one picture, not a second copy of the image inside it.
+h.canvas.ds.scale = 0.1;
+h.tracker.lowZoom.set({ flatBelow: 0.2, snapshots: true });
+
+bullets("LOW-ZOOM MODE: WHAT IT DID TO THIS PAGE");
+const frame = (n) => {
+  for (let i = 0; i < (n || 1); i++) {
+    h.advance(FRAME_MS);
+    h.canvas.setDirty(true, true);
+    h.canvas.draw();
+  }
+};
+const lodBoxed = () => demoWidget.classList.contains("ants-lod-box");
+frame(2);
+run(500);
+await pump(); // the thumbnail is built asynchronously, like createImageBitmap in a browser
+frame(2);
+run(500);
+await pump();
+const s = h.tracker.lowZoom.state;
+console.log(
+  `  zoom ${Math.round(s.zoom * 100)}% is below the 20% setting: ${s.plan.flat}/${s.plan.total} nodes painted as flat rectangles ` +
+    `(the decision is the zoom, not how big a node is — the widest node here is ${s.plan.medPx}px on screen)`
+);
+// A box that says nothing is a placeholder nobody can read: at this zoom a node
+// with a validation error, a node that is muted and a node that is running all
+// look like the same rectangle. The box-detail ladder puts those marks back, and
+// every mark comes from a field on the node itself (has_errors, mode, progress).
+const demoNodes = h.canvas.nodes; // the nodes this section draws (not the earlier ones)
+demoNodes[0].has_errors = true;
+demoNodes[1].mode = 2; // muted (LGraphEventMode.NEVER)
+demoNodes[2].progress = 0.5; // running
+const boxesBefore = h.tracker.lowZoom.flat;
+// The idle redraw cap is on in this scenario and would merge a single frame away,
+// so it is lifted for the one frame that is being counted and put straight back.
+h.tracker.lowZoom.set({ boxDetail: "state", idleCapMs: 0 });
+frame(1);
+const boxesAfter = h.tracker.lowZoom.flat;
+console.log(
+  `  box detail "state": one frame of ${boxesAfter.flatNodes} flat node(s) drew ` +
+    `${boxesAfter.boxTitles - boxesBefore.boxTitles} title bar(s), ${boxesAfter.boxErrors - boxesBefore.boxErrors} error ring(s), ` +
+    `${boxesAfter.boxBars - boxesBefore.boxBars} progress bar(s) and ${boxesAfter.boxMuted - boxesBefore.boxMuted} dimmed box(es) — ` +
+    `the same nodes are flat as before the ladder was touched (${boxesBefore.flatNodes === boxesAfter.flatNodes}), ` +
+    `and every mark is read from the node, not guessed`
+);
+h.tracker.lowZoom.set({ boxDetail: "plain", idleCapMs: 500 });
+
+// Node snapshots: the same boxes, but a picture of each node instead of a fill.
+// Captured on the idle lane through the node's own draw path, reused as one
+// drawImage, and never for a node that is selected, hovered, broken, running or
+// being dragged — those keep their live drawing. Every node the canvas can draw
+// gets a picture (v2.4.0): a DOM widget or an image preview means the picture is
+// the canvas part only, counted apart.
+const snapsBefore = h.tracker.lowZoom.snapshots;
+const flatNodes = h.tracker.lowZoom.flat.flatNodes;
+h.tracker.lowZoom.set({ snapshots: true, idleCapMs: 0 });
+frame(1); // the flat path queues what it painted
+run(400);
+await pump(); // the idle lane: a capture slice per timer, driven by the fake clock
+run(400);
+await pump();
+const snaps = h.tracker.lowZoom.snapshots;
+const d = (k) => snaps[k] - snapsBefore[k];
+h.canvas.ctx.ops.length = 0;
+frame(1);
+const blits = h.canvas.ctx.ops.filter((o) => o[0] === "drawImage").length;
+const snapsAfter = h.tracker.lowZoom.snapshots;
+const d2 = (k) => snapsAfter[k] - snaps[k]; // that one frame, not the whole run
+console.log(
+  `  node snapshots: ${snaps.pictured} of ${snaps.records} remembered node(s) have a picture (${snaps.partial} of them are the canvas part only: the ` +
+    `browser draws the rest of that node), ${snaps.keptLive} kept live on purpose; ${snaps.slow} blocked as too slow to capture, ${snaps.large} too ` +
+    `big at any ratio, ${snaps.blank} drawing nothing into a canvas, ${snaps.churn} changing on every attempt; ${d("captured")} node(s) captured off ` +
+    `the frame clock, in ${d("captureMs").toFixed(1)}ms of this tool's own work (a capture runs the packs' hooks but does not attribute their time to ` +
+    `them), ${(snaps.bytes / 1024).toFixed(0)} KB held inside a ${snaps.budgetMb} MiB budget at ${snaps.ratio}x per graph unit, ` +
+    `${snaps.fit + snaps.coarse} picture(s) coarser than that`
+);
+console.log(
+  `  and the next frame: ${blits} of ${flatNodes} flat node(s) came back as one drawImage each — ${d2("drawn")} reuse(s) counted in it, ` +
+    `${d2("misses")} box(es) painted because no picture of that node was ready, ${d2("flips")} switch(es) between picture and box in that frame ` +
+    `(the flicker counter), ${d2("full")} capture(s) refused for budget`
+);
+h.tracker.lowZoom.set({ snapshots: false, idleCapMs: 500 });
+demoNodes[0].has_errors = false;
+demoNodes[1].mode = 0;
+demoNodes[2].progress = 0;
+
+// The node setting is flattening the whole graph, and the links are still drawn
+// by ComfyUI's own renderer, as curves: nothing but the node setting's own
+// subject is affected.
+console.log(
+  `  and with the whole graph flattened, links still went through ComfyUI's renderer ${h.canvas.linkDraws} time(s) ` +
+    `(${h.canvas.ctx.ops.filter((o) => o[0] === "bezierCurveTo").length} bezier segment(s)) — the node setting does not touch links`
+);
+console.log(
+  `  DOM content of a boxed node hidden: ${lodBoxed()} (${h.tracker.lowZoom.dom.hidden} element(s) of ${h.tracker.lowZoom.dom.nodes} boxed node(s);` +
+    ` ${h.tracker.lowZoom.dom.layer} of them through the frontend's DOM widget layer — the 3D viewport wrappers nothing else can reach;` +
+    ` ${h.tracker.lowZoom.dom.markedWidgets} widget(s) carry a hide-on-zoom flag, which the frontend only honours in its own low-quality mode)` +
+    ` | frame quality flag touched: ${h.canvas._isLowQuality === false ? "no" : "yes"}`
+);
+console.log(
+  `  the 3D viewport wrapper: hidden ${demoViewport._cls.has("ants-lod-box")} (class added by the layer sweep, no element handle anywhere)`
+);
+
+// Link ink on its own: curves kept, stroke paid for once. Nothing else changes —
+// the nodes are drawn in full and the canvas's quality flag is untouched.
+h.tracker.lowZoom.set({ flatBelow: 0, linkStyle: "spline" });
+h.canvas.linkSettings.length = 0;
+h.canvas.ctx.ops.length = 0;
+const thinBefore = h.tracker.lowZoom.detail.thinLinks;
+frame(2);
+run(500);
+await pump();
+const last = h.canvas.linkSettings[h.canvas.linkSettings.length - 1];
+console.log(
+  `  link ink only: ${h.tracker.lowZoom.detail.thinLinks - thinBefore} link segment(s) stroked ${last && last.width}px with ` +
+    `border ${last && last.border}, bezier segments drawn: ${h.canvas.ctx.ops.filter((o) => o[0] === "bezierCurveTo").length} ` +
+    `(the curves are all still there), canvas setting back to ${h.canvas.connections_width}/${h.canvas.render_connections_border}, ` +
+    `nodes drawn in full and not in low quality: ${h.canvas.nodeDraws > 0 && h.canvas._isLowQuality === false}`
+);
+
+// And the only way to get straight links: ask for them. The node setting plays
+// no part in it.
+h.tracker.lowZoom.set({ linkStyle: "straight" });
+h.canvas.ctx.ops.length = 0;
+frame(2);
+run(500);
+await pump();
+console.log(
+  `  links: always straight lines (asked for): ${h.canvas.ctx.ops.filter((o) => o[0] === "bezierCurveTo").length} bezier segment(s) ` +
+    `at ${h.tracker.lowZoom.state.zoom.toFixed(2)} zoom, node setting still off (${h.tracker.lowZoom.state.flatBelow})`
+);
+h.tracker.lowZoom.set({ linkStyle: "spline" });
+
+// Viewport focus, half one: below the zoom nobody can read a node, so its widget
+// UI is switched off — by four mechanisms that do not depend on each other, since
+// the first version of this did not reach the widgets on a real page. A slider
+// drawn on the canvas is hit-tested by arithmetic; a 3D viewport's render loop
+// hangs off the *node's* hover flag, which the canvas calls from its own hit
+// testing and no CSS can reach.
+h.canvas.ds.scale = 0.1;
+// A node with the two seams the frontend really uses: a widget drawn on the
+// canvas, and the mouse hooks a 3D viewport hangs its "is the pointer over me"
+// flag on. `h.node()` is a node out of that class, the way a real one is.
+const probe = h.node({ pos: [0, 0], size: [200, 100], widgets: [{ name: "steps", last_y: 60, computedHeight: 20 }] });
+h.canvas.nodes.push(probe);
+h.canvas.graph._nodes = h.canvas.nodes;
+const slider = probe.widgets[0];
+let viewportHovered = false;
+probe.onMouseEnter = () => {
+  viewportHovered = true;
+};
+probe.onMouseLeave = () => {
+  viewportHovered = false;
+};
+placeViewport();
+// The idle cap from earlier in this demo merges redraws, and a merged redraw is
+// not a drawn frame — this block is about what a drawn frame does, so it is off.
+h.tracker.lowZoom.set({ idleCapMs: 0 });
+const widgetBefore = probe.getWidgetOnPos(50, 60) === slider;
+h.tracker.lowZoom.set({ inertBelow: 0.4 });
+h.canvas.setDirty(true, true);
+h.canvas.draw();
+h.canvas.hover(50, 60); // the canvas walks over the node, exactly as it does on mousemove
+const widgetNow = probe.getWidgetOnPos(50, 60) === slider;
+const selectable = h.canvas.graph.getNodeOnPos(50, 60) === probe;
+const focus = h.tracker.lowZoom.focus;
+console.log(
+  `  focus mode below 40%: the canvas widget is ${widgetBefore ? "grabbed" : "not grabbed"} while the mode is off and ${widgetNow ? "grabbed" : "not grabbed"} ` +
+    `with it on (${focus.canvasWidgetsBlocked} hit-test(s) answered with "no widget"), the node is still found by the frontend's own hit-test (${selectable}), ` +
+    `${focus.hoverBlocked} node hover callback(s) held back so a 3D viewport's "pointer is over me" flag stays ${viewportHovered}, ` +
+    `${focus.inertElements} element(s) of node DOM switched off, ${focus.eventsBlocked} pointer event(s) swallowed at the document`
+);
+// The floating controls: the switch and the gear, in one rounded frame pinned to
+// the screen, marked as this tool's own so no sweep can hide them — and never
+// taken away by the switch, because it is the way back. The node carries the same
+// pair as its own widget.
+const floatPill = h.document.getElementById("ants-corner-pill");
+const floatButtons = floatPill ? floatPill.children.filter((c) => c.tagName === "BUTTON") : [];
+console.log(
+  `  the floating pill: ${floatButtons.length} button(s) (${floatButtons.map((b) => b.tagName + "." + [...b._cls].join(".")).join(", ")}), ` +
+    `marked own: ${floatPill ? floatPill._cls.has("ants-own") : "no pill"}, the panel's own button: ` +
+    `${h.document.getElementById("ants-corner-btn") === floatButtons[1] ? "the gear" : "MISSING"}`
+);
+
+// The node's own controls: the switch and the gear, in one rounded frame, marked
+// as this tool's own so no sweep can hide them. The switch is the master switch.
+const NodeType = h.registerNodeType("ANTsNastyBastardsTracker");
+const ownNode = h.makeNode(NodeType);
+ownNode.pos = [0, 0];
+ownNode.size = [220, 110];
+ownNode.onNodeCreated();
+h.canvas.nodes.push(ownNode);
+h.canvas.graph._nodes = h.canvas.nodes;
+const ownWidget = (ownNode._domWidgets || [])[0];
+const pill = ownWidget && ownWidget.element;
+const pillButtons = pill ? pill.children.filter((c) => c.tagName === "BUTTON") : [];
+console.log(
+  `  the node's controls: ${pillButtons.length} button(s) in the pill (${pillButtons.map((b) => b.tagName + "." + [...b._cls].join(".")).join(", ")}), ` +
+    `pill marked own: ${pill ? pill._cls.has("ants-own") : "no pill"}, hidden or inert by any sweep: ` +
+    `${pill ? pill._cls.has("ants-lod-box") || pill._cls.has("ants-lod-inert") : "n/a"}`
+);
+
+// Switching the tracker off at that checkbox leaves the page to ComfyUI: nothing
+// recorded, nothing drawn differently, every element handed back.
+const framesBefore = h.tracker.totals.frames;
+h.tracker.lowZoom.setEnabled(false);
+const panelWasOpen = !!(h.panel() && h.panel()._cls.has("open"));
+h.canvas.ds.scale = 0.1;
+const wrapperAfter = [...demoWidget._cls].join("+");
+for (let i = 0; i < 5; i++) {
+  h.advance(FRAME_MS);
+  h.canvas.setDirty(true, true);
+  h.canvas.draw();
+}
+console.log(
+  `  switched off: ${h.tracker.totals.frames - framesBefore} frame(s) recorded in 5 draws (nothing is being measured), the webcam-style wrapper's ` +
+    `classes are "${wrapperAfter}" (the low-zoom box was handed back), drawing settings kept: flat ${h.tracker.lowZoom.state.flatBelow}, focus ` +
+    `${h.tracker.lowZoom.state.inertBelow}, fovea ${h.tracker.lowZoom.state.fovea}`
+);
+console.log(
+  `  and the UI is still there: float pill ${floatPill ? "present" : "GONE"}, ` +
+    `hidden or inert ${floatPill ? floatPill._cls.has("ants-lod-box") || floatPill._cls.has("ants-lod-inert") : "n/a"}, ` +
+    `switch reads ${floatButtons[0] ? floatButtons[0].getAttribute("aria-checked") : "n/a"}, ` +
+    `panel open before/after: ${panelWasOpen}/${!!(h.panel() && h.panel()._cls.has("open"))}`
+);
+h.tracker.lowZoom.setEnabled(true);
+console.log(`  switched on again: ${h.tracker.lowZoom.on ? "the same settings are in force" : "NOTHING is in force (a bug)"}`);
+h.canvas.nodes = h.canvas.nodes.filter((n) => n !== ownNode);
+h.canvas.graph._nodes = h.canvas.nodes;
+
+// And the last resort: an event aimed at a widget that is switched off never
+// reaches any handler, whatever the page's CSS says about it.
+const gateTarget = h.document.createElement("button");
+demoWidget.appendChild(gateTarget);
+let gateClicks = 0;
+gateTarget.addEventListener("click", () => {
+  gateClicks++;
+});
+gateTarget._fire("click");
+console.log(
+  `  the event gate: a click aimed at a switched-off widget reached its own handler ${gateClicks} time(s); ` +
+    `${h.tracker.lowZoom.focus.eventsBlocked} event(s) swallowed at the document so far`
+);
+demoWidget.removeChild(gateTarget);
+h.canvas.nodes = h.canvas.nodes.filter((n) => n !== probe);
+h.canvas.graph._nodes = h.canvas.nodes;
+h.tracker.lowZoom.set({ inertBelow: 0 });
+
+// Half two: off-screen node DOM is boxed and inert at any zoom, and what comes
+// back does so on a budget — one element per drawn frame by default, so panning
+// keeps the graph boxed instead of rebuilding every widget it passes.
+h.canvas.ds.scale = 1;
+// The idle cap from earlier in this demo merges redraws, and a merged redraw is
+// not a drawn frame — what this block counts is drawn frames, so it is off here.
+h.tracker.lowZoom.set({ idleCapMs: 0 });
+h.canvas.setDirty(true, true);
+h.canvas.draw();
+// Where "far" and "in the margin" are is measured against what the canvas is
+// showing, not guessed: the margin is half a screen of it.
+const shown = h.canvas.visible_area;
+const farX = shown[0] + shown[2] * 3;
+const marginX = shown[0] + shown[2] * (1 + 0.25);
+h.canvas.nodes[3].pos = [farX, shown[1] + 40];
+h.canvas.nodes[2].pos = [farX, shown[1] + 40];
+placeViewport(); // the frontend repositions a DOM widget every frame; so does this
+h.tracker.lowZoom.set({ flatBelow: 0, fovea: true });
+h.canvas.setDirty(true, true);
+h.canvas.draw();
+console.log(
+  `  foveated at 100% zoom: ${h.tracker.lowZoom.focus.foveaElements} element(s) of far off-screen nodes boxed and switched off ` +
+    `(node setting involved: ${h.tracker.lowZoom.state.flatBelow}; margin ${h.tracker.lowZoom.focus.margin} screen, i.e. ${h.tracker.lowZoom.focus.registered - h.tracker.lowZoom.focus.foveaElements} ` +
+    `of ${h.tracker.lowZoom.focus.registered} registered elements still live)`
+);
+h.canvas.nodes[3].pos = [marginX, shown[1] + 40];
+h.canvas.nodes[2].pos = [marginX + 40, shown[1] + 140];
+placeViewport();
+h.canvas.setDirty(true, true);
+h.canvas.draw();
+const afterOne = h.tracker.lowZoom.focus.foveaElements;
+h.canvas.setDirty(true, true);
+h.canvas.draw();
+console.log(
+  `  coming back is rationed: ${afterOne} element(s) after the first drawn frame, ${h.tracker.lowZoom.focus.foveaElements} after the second ` +
+    `(${h.tracker.lowZoom.focus.cameBack} handed back so far)`
+);
+// A Windows display at 200%: the canvas backing store is twice the box the
+// element occupies, which is the difference between a viewport 1600 graph units
+// wide and one 3200 wide. The check reads the browser and the canvas, and says
+// which unit the frontend's own rectangle is in.
+h.canvas.canvas.width = h.canvas.canvas.clientWidth * 2;
+h.canvas.canvas.height = h.canvas.canvas.clientHeight * 2;
+h.window.devicePixelRatio = 2;
+h.canvas.setDirty(true, true);
+h.canvas.draw(); // a drawn frame is what keeps the frontend's own rectangle current
+const disp = h.tracker.lowZoom.checkDisplay();
+console.log(
+  `  display scale: browser ${disp.win}\u00d7, canvas backing store ${disp.backing}\u00d7 its ${disp.css}px CSS box, and the frontend's visible area ` +
+    `${disp.reported} vs our own ${disp.ours} graph units (${disp.factor}\u00d7, ${disp.unit}) \u2014 this is the check that runs at startup for a ` +
+    `Windows display set to 200%`
+);
+h.canvas.canvas.width = h.canvas.canvas.clientWidth;
+h.canvas.canvas.height = h.canvas.canvas.clientHeight;
+h.canvas.nodes[3].pos = [shown[0] + 40, shown[1] + 40];
+h.canvas.nodes[2].pos = [shown[0] + shown[2] * 0.6, shown[1] + 40];
+placeViewport();
+h.tracker.lowZoom.set({ fovea: false });
+
+// The measured answer to "does thinning do anything on this page": the panel
+// button runs exactly this, alternating the setting and comparing.
+h.canvas.costs.link = 1.5; // make the ink expensive enough to measure in a demo
+h.tracker.lowZoom.set({ detailZoom: 1 });
+h.canvas.ds.scale = 0.1;
+placeViewport();
+h.advance(1500);
+h.tracker.lowZoom.measureLinks();
+for (let i = 0; i < 30; i++) {
+  h.advance(400);
+  h.canvas.setDirty(true, true);
+  h.canvas.draw();
+}
+console.log(`  ${h.tracker.lowZoom.state.ab.text}`);
+
+// And the same moment one zoom level up: nothing is degraded, the DOM element is
+// back on screen, the canvas object is exactly as ComfyUI left it. This is the
+// check that matters — the mode has to give the page back as it found it.
+h.tracker.lowZoom.set({ flatBelow: 0.2 });
+h.canvas.ds.scale = 0.9;
+placeViewport();
+const thinBefore2 = h.tracker.lowZoom.detail.thinLinks;
+frame(2);
+run(500);
+await pump();
+console.log(
+  `  at 90% zoom (above the setting): nodes flattened ${h.tracker.lowZoom.state.plan.flat}, links thinned ${h.tracker.lowZoom.detail.thinLinks - thinBefore2} (none),` +
+    ` DOM widget hidden ${lodBoxed()} (false), canvas link width ${h.canvas.connections_width}, border ${h.canvas.render_connections_border}`
+);
+
+// The point of a zoom rule: a node that is small on screen is left alone while
+// the camera is above the setting. Under the old per-node pixel rule a node this
+// size was flattened at any zoom.
+h.canvas.ds.scale = 0.25;
+h.canvas.nodes.forEach((n) => {
+  n.size = [60, 30];
+});
+frame(2);
+run(500);
+await pump();
+console.log(
+  `  at 25% zoom with 60-unit nodes (15px on screen): flattened ${h.tracker.lowZoom.state.plan.flat} of ` +
+    `${h.tracker.lowZoom.state.plan.total} — a node size can no longer flatten anything on its own`
+);
+h.canvas.ds.scale = 0.1;
+frame(2);
+run(500);
+await pump();
+
+bullets("SUMMARY BAR (always visible)");
+dump(h.document.getElementById("ants-tracker-summary"));
+
+const TABS = ["tweaks", "timing", "nodes", "stalls", "governor", "load", "memory", "gpu", "testing"];
+const tabBar = h.document.getElementById("ants-tracker-tabs");
+const body = h.document.getElementById("ants-tracker-body");
+for (let i = 0; i < TABS.length; i++) {
+  tabBar.children[i].click();
+  run(TABS[i] === "gpu" ? 2600 : 700); // the GPU tab polls /system_stats every 2.5s while open
+  await pump();
+  if (TABS[i] === "governor") {
+    // Collapsed detail rows are skipped by the printer, and the trace detail
+    // ("this frame's scripts, the ticks inside it, who asked for the redraw") is
+    // the point of the card, so open the first few here.
+    const carets = body.children[i].descendants().filter((n) => n._cls && n._cls.has("ants-caret"));
+    for (const caret of carets.slice(0, 3)) caret.click();
+    await pump();
+  }
+  bullets(`${TABS[i].toUpperCase()} TAB`);
+  dump(body.children[i]);
+}
+
+// The one-click text report, exactly as the Copy button produces it.
+const copyBtn = h.document.body.descendants().find((n) => n._cls && n._cls.has("ants-hbtn") && n.textContent.includes("Copy"));
+copyBtn.click();
+await pump();
+bullets("TEXT REPORT (Copy button)");
+console.log(h.clipboardWrites[h.clipboardWrites.length - 1] || "(clipboard empty)");
+
+console.log(
+  "\nnote: the tail of the run above has limits applied — the extension's `clamp` heartbeat capped by" +
+    "\n      hand at quarter speed, and the repaint timer capped by the AUTOPILOT (target 150 ms/s, one" +
+    "\n      round every 5s) — so the GOVERNOR TAB above shows both: a source limited by hand, and the" +
+    "\n      autopilot's own line saying which source it capped, at what gap, and what it was costing." +
+    "\nnote: the LOW-ZOOM DRAWING section of the Tweaks tab and the report line above are the other" +
+    "\n      answer for this kind of page: every node is inside the viewport at zoom 0.10, so culling has" +
+    "\n      nothing to remove and the cost is drawing a thousand nodes properly several times a second." +
+    "\n      The mode paints every node as one rectangle below the zoom you pick, and caps redraws while" +
+    "\n      nobody is touching the page — opt-in, and off the moment you say so." +
+    "\n      Its preview setting is the other half: image, preview and compare nodes blit a full-resolution bitmap every" +
+    "\n      redraw, so below the zoom you set (60% by default) those draws are served from a cached copy of about the" +
+    "\n      resolution the screen can show — 64px on the long side at 10% zoom, 512px around 60% for a big node." +
+    "\nnote: the three settings are independent, and each one only changes its own subject. The node setting decides what a" +
+    "\n      NODE costs; the link setting decides a LINK's shape (curves, or straight lines if you ask for them — nothing else" +
+    "\n      can turn a link straight); the thinning setting decides how much INK a curve uses (1px instead of 3, without the" +
+    "\n      dark outline ComfyUI draws under every link) and touches nothing else — no frame-level low-quality flag, no node" +
+    "\n      paint, no widget. The DOM content of a node that is currently a rectangle — previews, curve editors, Vue and" +
+    "\n      custom node UIs — is hidden with the .ants-lod-box class until that node is drawn properly again." +
+    "\nnote: in this simulation the clock only advances with h.advance(), so the tracker's own" +
+    "\n      per-render cost reads 0 — a real browser spends real time rendering the panel." +
+    "\n      Everything else above is what web/tracker.js computes from the synthetic traffic."
+);
+
+if (h.errors().length) {
+  bullets("TRACKER ERRORS (should be empty)");
+  for (const e of h.errors()) console.log(e);
+}

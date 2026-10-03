@@ -1,0 +1,610 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ANTs Frontend Optimizer</title>
+<style>
+  :root {
+    --bg: #1a1a1e;
+    --bg-2: #141418;
+    --line: #2e2e36;
+    --text: #e6e6ea;
+    --muted: #9a9aa3;
+    --gold: #ae7719;
+    --gold-dim: #6a5520;
+    --bad: #d45b5b;
+    --ok: #7dcea0;
+    --warn: #e0b15a;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 13px/1.45 -apple-system, "Segoe UI", sans-serif;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  header {
+    flex: none;
+    background: var(--bg-2);
+    border-bottom: 1px solid var(--line);
+    padding: 12px 16px 10px;
+    display: flex;
+    gap: 16px;
+    align-items: flex-start;
+    justify-content: space-between;
+  }
+  h1 { font-size: 15px; font-weight: 600; margin: 0; }
+  h1 b { color: var(--gold); }
+  .sub { margin: 3px 0 0; color: var(--muted); font-size: 12px; max-width: 62ch; }
+  .live { margin: 8px 0 0; font-variant-numeric: tabular-nums; }
+  .live span { color: var(--gold); }
+  .actions { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
+  button, select {
+    font: inherit;
+    color: var(--text);
+    background: #2a2a32;
+    border: 1px solid #4a4a55;
+    border-radius: 4px;
+    padding: 5px 9px;
+  }
+  button { cursor: pointer; }
+  button:hover, select:hover { border-color: var(--gold); }
+  button:disabled, select:disabled { opacity: 0.45; cursor: default; }
+  button.on { border-color: var(--gold); color: var(--gold); }
+  #banner {
+    display: none;
+    flex: none;
+    padding: 8px 16px;
+    background: #3a2a12;
+    color: #f0d8a0;
+  }
+  nav {
+    flex: none;
+    display: flex;
+    gap: 0;
+    border-bottom: 1px solid var(--line);
+    padding: 0 8px;
+    background: var(--bg-2);
+  }
+  nav button {
+    background: transparent;
+    border: 0;
+    border-bottom: 2px solid transparent;
+    border-radius: 0;
+    padding: 9px 12px;
+    color: var(--muted);
+  }
+  nav button.on { color: var(--text); border-bottom-color: var(--gold); }
+  main { flex: 1; overflow: auto; padding: 8px 16px 28px; }
+  .pane { display: none; }
+  .pane.on { display: block; }
+  h2 {
+    margin: 16px 0 4px;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+    font-weight: 600;
+  }
+  .row {
+    display: grid;
+    grid-template-columns: minmax(200px, 36%) minmax(160px, 1fr);
+    gap: 6px 18px;
+    align-items: center;
+    padding: 8px 0;
+    border-bottom: 1px solid var(--line);
+  }
+  .row .name { color: var(--text); }
+  select, .row button { width: 100%; max-width: 420px; }
+  .note { margin: 8px 0 0; color: var(--muted); min-height: 1.2em; }
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+  th, td {
+    text-align: left;
+    padding: 5px 8px;
+    border-bottom: 1px solid var(--line);
+    vertical-align: top;
+  }
+  th { color: var(--muted); font-weight: 500; font-size: 11px; letter-spacing: 0.04em; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .empty { color: var(--muted); padding: 18px 0; }
+  .muted { color: var(--muted); }
+  @media (max-width: 640px) {
+    header { flex-direction: column; }
+    .row { grid-template-columns: 1fr; }
+    .actions { justify-content: flex-start; }
+  }
+</style>
+</head>
+<body id="ants-window">
+<header>
+  <div>
+    <h1><b>ANTs</b> Frontend Optimizer <span id="ver"></span></h1>
+    <p class="sub">This is its own page. It is not on the graph canvas. Settings go to the ComfyUI page through <span class="muted">/ants_optimizer/ui</span>, and the numbers come back the same way. Resize this window from its edges — the edge you drag is the edge that moves.</p>
+    <p class="live" id="live">waiting for the ComfyUI page…</p>
+  </div>
+  <div class="actions">
+    <button id="power" type="button" disabled>⏻ Off</button>
+    <button id="pause" type="button" disabled>⏸ Pause</button>
+    <button id="reset" type="button">⟲ Reset</button>
+    <button id="copy" type="button">📋 Copy</button>
+  </div>
+</header>
+<div id="banner"></div>
+<nav>
+  <button type="button" data-tab="settings" class="on">Node Rendering Settings</button>
+  <button type="button" data-tab="status">Status</button>
+  <button type="button" data-tab="timing">Timing</button>
+  <button type="button" data-tab="nodes">Nodes</button>
+  <button type="button" data-tab="stalls">Stalls</button>
+</nav>
+<main>
+  <section class="pane on" id="pane-settings"></section>
+  <section class="pane" id="pane-status"></section>
+  <section class="pane" id="pane-timing"></section>
+  <section class="pane" id="pane-nodes"></section>
+  <section class="pane" id="pane-stalls"></section>
+</main>
+<script>
+(function () {
+  "use strict";
+  var API = "/ants_optimizer/ui";
+  var last = { rev: -1, commandRev: -1, settings: null, limits: null, telemetry: null, origin: "" };
+  var built = false;
+  var controls = {};
+  var miss = 0;
+  var copiedReport = "";
+
+  function $(id) { return document.getElementById(id); }
+  function say(text) {
+    var banner = $("banner");
+    banner.style.display = text ? "block" : "none";
+    banner.textContent = text || "";
+  }
+  function num(n, d) {
+    return Number.isFinite(n) ? n.toFixed(d == null ? 0 : d) : "—";
+  }
+  function ms(n) {
+    if (!Number.isFinite(n)) return "—";
+    if (Math.abs(n) >= 100) return n.toFixed(0) + " ms";
+    if (Math.abs(n) >= 10) return n.toFixed(1) + " ms";
+    return n.toFixed(2) + " ms";
+  }
+  function bytes(n) {
+    if (!Number.isFinite(n)) return "—";
+    if (n >= 1048576) return (n / 1048576).toFixed(1) + " MiB";
+    if (n >= 1024) return (n / 1024).toFixed(0) + " KiB";
+    return Math.round(n) + " B";
+  }
+  function el(tag, attrs, text) {
+    var node = document.createElement(tag);
+    if (attrs) {
+      Object.keys(attrs).forEach(function (k) {
+        if (k === "class") node.className = attrs[k];
+        else if (k === "title") node.title = attrs[k];
+        else node.setAttribute(k, attrs[k]);
+      });
+    }
+    if (text != null) node.textContent = text;
+    return node;
+  }
+  function clear(node) {
+    while (node.firstChild) node.removeChild(node.firstChild);
+  }
+  function showTab(name) {
+    document.querySelectorAll("nav button").forEach(function (b) {
+      b.classList.toggle("on", b.getAttribute("data-tab") === name);
+    });
+    document.querySelectorAll("main .pane").forEach(function (p) {
+      p.classList.toggle("on", p.id === "pane-" + name);
+    });
+  }
+  document.querySelectorAll("nav button").forEach(function (b) {
+    b.addEventListener("click", function () { showTab(b.getAttribute("data-tab")); });
+  });
+
+  function post(body) {
+    return fetch(API, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }).then(function (res) {
+      if (!res.ok) throw new Error(String(res.status));
+      return res.json();
+    });
+  }
+  function postSettings(change) {
+    if (!last.settings) return Promise.resolve();
+    var next = Object.assign({}, last.settings, change || {});
+    last.settings = next;
+    last.origin = "window";
+    return post({ origin: "window", settings: next }).catch(function (e) {
+      say("Could not send that setting: " + e.message);
+    });
+  }
+
+  function zoomLabel(z, below) {
+    z = Number(z) || 0;
+    if (z === 0) return below ? "off — draw every node" : "off";
+    return "below " + Math.round(z * 100) + "%";
+  }
+  function fill(sel, options, value) {
+    if (!sel) return;
+    var sig = options.map(function (o) { return o.value + "\0" + o.text; }).join("\n");
+    if (sel.getAttribute("data-sig") !== sig) {
+      clear(sel);
+      options.forEach(function (o) {
+        var opt = el("option", { value: o.value }, o.text);
+        sel.appendChild(opt);
+      });
+      sel.setAttribute("data-sig", sig);
+    }
+    if (document.activeElement !== sel && sel.value !== String(value)) sel.value = String(value);
+  }
+  function row(host, name, control, title) {
+    var wrap = el("div", { class: "row" });
+    var lab = el("div", { class: "name", title: title || "" }, name);
+    wrap.appendChild(lab);
+    wrap.appendChild(control);
+    host.appendChild(wrap);
+    return wrap;
+  }
+  function select(id) {
+    var sel = el("select", { id: id });
+    controls[id] = sel;
+    return sel;
+  }
+  function heading(host, text) {
+    host.appendChild(el("h2", null, text));
+  }
+
+  function build(limits) {
+    var host = $("pane-settings");
+    clear(host);
+    heading(host, "Nodes");
+    var flat = select("flat");
+    flat.addEventListener("change", function () {
+      var z = Number(flat.value) || 0;
+      if (controls.link && controls.link.checked) postSettings({ flatBelow: z, inertBelow: z });
+      else postSettings({ flatBelow: z });
+    });
+    row(host, "Replace node previews with bitmap stand-ins at zoom levels", flat,
+      "Below this zoom a node is one picture instead of a live draw. Hover, selection and a drag keep the picture. A selected node gets a ring, not a box. While the link below is on, this zoom and the widget-stop zoom are the same, and the higher one wins.");
+    var stand = select("stand");
+    stand.addEventListener("change", function () {
+      if (stand.value === "picture") postSettings({ snapshots: true });
+      else postSettings({ snapshots: false, boxDetail: stand.value });
+    });
+    row(host, "Stand-in", stand, "What replaces the node. A picture is a bitmap of the node itself. Until one is ready, the painted fill stands in.");
+    var ratio = select("ratio");
+    ratio.addEventListener("change", function () { postSettings({ snapRatio: Number(ratio.value) || 1 }); });
+    row(host, "Stand-in capture resolution", ratio,
+      "Pixels per graph unit in the photograph. 1x is the default. Half and quarter copies are still made for the screen. Changing this drops the pictures in memory so the next ones match.");
+    var budget = select("budget");
+    budget.addEventListener("change", function () { postSettings({ snapMb: Number(budget.value) || 0 }); });
+    row(host, "Stand-in memory (ram) budget", budget,
+      "How much RAM the stand-in pictures may hold. A picture on screen is not released to make room for another picture. On Execute, off-screen stand-ins leave memory at 85% system RAM, and all of them at 95%. Disk files stay.");
+    var disk = select("disk");
+    disk.addEventListener("change", function () { postSettings({ diskOn: disk.value === "on" }); });
+    row(host, "Keep stand-in previews on disk", disk,
+      "Loaded from ComfyUI's temp/ANTs_Frontend_Optimizer_THUMBNAILS next time. A change overwrites the file. Deleting the node deletes the file. Files older than a week are removed.");
+    var idle = select("idle");
+    idle.addEventListener("change", function () { postSettings({ idleCapMs: Number(idle.value) || 0 }); });
+    row(host, "Idle redraw cap", idle, "While nobody is touching the page, redraws are limited to this rate. Touch the page and the cap lifts at once.");
+
+    heading(host, "Links");
+    var shape = select("shape");
+    shape.addEventListener("change", function () { postSettings({ linkStyle: shape.value }); });
+    row(host, "Link shape", shape, "The shape of a link, and only that. It never paints a node.");
+    var thin = select("thin");
+    thin.addEventListener("change", function () { postSettings({ detailZoom: Number(thin.value) || 0 }); });
+    row(host, "Link thinning", thin, "Below this zoom, links are stroked 1px wide instead of 3 and lose the dark outline. Link ink and nothing else.");
+    var measure = el("button", { type: "button", id: "measure" }, "Measure link thinning");
+    measure.addEventListener("click", function () {
+      post({ origin: "window", command: "measure-links" }).catch(function (e) { say(e.message); });
+    });
+    row(host, "Measure link thinning", measure, "A few seconds of thinned links, then the same with full ink, on this page. The verdict shows under this row.");
+    host.appendChild(el("p", { class: "note", id: "ab" }, ""));
+
+    heading(host, "Widgets");
+    var inert = select("inert");
+    inert.addEventListener("change", function () {
+      var z = Number(inert.value) || 0;
+      if (controls.link && controls.link.checked) postSettings({ inertBelow: z, flatBelow: z });
+      else postSettings({ inertBelow: z });
+    });
+    row(host, "Widgets stop answering", inert, "Below this zoom a node's widgets ignore the pointer. The nodes themselves stay selectable, draggable and editable.");
+    var link = el("input", { type: "checkbox", id: "link" });
+    controls.link = link;
+    link.addEventListener("change", function () {
+      if (link.checked) {
+        var z = Math.max(Number(last.settings && last.settings.flatBelow) || 0, Number(last.settings && last.settings.inertBelow) || 0);
+        postSettings({ linkZoom: true, flatBelow: z, inertBelow: z });
+      } else {
+        postSettings({ linkZoom: false });
+      }
+    });
+    row(host, "Widget's threshold linked to the Nodes preview threshold", link,
+      "On by default. The higher of the two zooms wins, so a drag past either one still shows pictures.");
+    var fovea = select("fovea");
+    fovea.addEventListener("change", function () { postSettings({ fovea: fovea.value === "on" }); });
+    row(host, "Off-screen nodes", fovea, "Off-screen nodes get the same boxed, inert treatment at every zoom, past the margin on the next row.");
+    var margin = select("margin");
+    margin.addEventListener("change", function () { postSettings({ foveaMargin: Number(margin.value) || 0 }); });
+    row(host, "Off-screen margin", margin, "How far outside the visible area a node has to be before its widgets are taken away. Half a screen by default.");
+    var restore = select("restore");
+    restore.addEventListener("change", function () { postSettings({ foveaRestore: Number(restore.value) || 0 }); });
+    row(host, "Come back", restore, "How many off-screen nodes may be handed back per drawn frame. Whatever is on screen comes back immediately.");
+    var scale = select("scale");
+    scale.addEventListener("change", function () { postSettings({ displayScale: Number(scale.value) || 0 }); });
+    row(host, "Display scale", scale, "Windows display scaling. Auto reads it once at start. Pin it if the status line disagrees.");
+    var widgets = select("widgets");
+    widgets.addEventListener("change", function () { postSettings({ focusDom: widgets.value }); });
+    row(host, "How widgets go", widgets, "Hidden outright cannot be clicked or hovered. Inert only takes pointer events away and leaves the widget on screen.");
+    var back = el("button", { type: "button" }, "Back to full drawing");
+    back.addEventListener("click", function () {
+      postSettings({
+        flatBelow: 0,
+        boxDetail: "plain",
+        snapshots: false,
+        idleCapMs: 0,
+        detailZoom: 0,
+        linkStyle: "spline",
+        inertBelow: 0,
+        fovea: false,
+      });
+    });
+    row(host, "Way back", back, "Turns the drawing changes off. The disk cache is left as you set it.");
+    built = true;
+    writeLimits(limits);
+  }
+
+  function writeLimits(limits) {
+    limits = limits || {};
+    fill(controls.flat, (limits.flatZoom || [0]).map(function (z) {
+      return { value: String(z), text: zoomLabel(z, true) };
+    }), controls.flat.value);
+    var stand = (limits.boxDetail || ["plain", "title", "state"]).map(function (id) {
+      return { value: id, text: id === "plain" ? "plain fill" : id === "title" ? "title bar colour" : "title, error ring, progress, muted" };
+    });
+    stand.push({ value: "picture", text: "picture of the node" });
+    fill(controls.stand, stand, controls.stand.value);
+    fill(controls.ratio, (limits.snapRatios || [1]).map(function (r) {
+      return { value: String(r), text: "capture " + r + "x per graph unit" };
+    }), controls.ratio.value);
+    fill(controls.budget, (limits.snapBudgets || [4096]).map(function (mb) {
+      return { value: String(mb), text: mb + " MiB" };
+    }), controls.budget.value);
+    fill(controls.disk, [{ value: "on", text: "on" }, { value: "off", text: "off — memory only" }], controls.disk.value);
+    fill(controls.idle, (limits.idleCapMs || [0]).map(function (ms) {
+      return { value: String(ms), text: ms === 0 ? "redraw as often as asked" : Math.round(1000 / ms) + "/s while nothing is touched" };
+    }), controls.idle.value);
+    fill(controls.shape, (limits.linkStyles || ["spline", "straight"]).map(function (id) {
+      return { value: id, text: id === "straight" ? "links: always straight lines" : "links: keep every curve" };
+    }), controls.shape.value);
+    fill(controls.thin, (limits.detailZoom || [0]).map(function (z) {
+      return { value: String(z), text: z === 0 ? "full link and node detail" : "links thinned below " + Math.round(z * 100) + "%" };
+    }), controls.thin.value);
+    fill(controls.inert, (limits.inertZoom || [0]).map(function (z) {
+      return { value: String(z), text: z === 0 ? "off" : "below " + Math.round(z * 100) + "%" };
+    }), controls.inert.value);
+    fill(controls.fovea, [{ value: "off", text: "off" }, { value: "on", text: "on" }], controls.fovea.value);
+    fill(controls.margin, (limits.foveaMargins || [0.5]).map(function (m) {
+      var text = m === 0.5 ? "margin: ½ screen" : m === 0.25 ? "margin: ¼ screen" : "margin: " + m + " screen" + (m > 1 ? "s" : "");
+      return { value: String(m), text: text };
+    }), controls.margin.value);
+    fill(controls.restore, (limits.foveaRestores || [1]).map(function (r) {
+      return { value: String(r), text: r === 0 ? "come back: all at once" : "come back: " + r + " per frame" };
+    }), controls.restore.value);
+    fill(controls.scale, (limits.displayScales || [0]).map(function (d) {
+      return { value: String(d), text: d === 0 ? "display scale: auto" : "display scale: " + Math.round(d * 100) + "%" };
+    }), controls.scale.value);
+    fill(controls.widgets, (limits.focusDom || ["hide", "inert"]).map(function (m) {
+      return { value: m, text: m === "hide" ? "widgets: hidden outright" : "widgets: inert only" };
+    }), controls.widgets.value);
+  }
+
+  function editing() {
+    var a = document.activeElement;
+    return !!(a && a.closest && a.closest("#pane-settings"));
+  }
+  function writeSettings(s) {
+    if (!s || editing()) return;
+    fill(controls.flat, optionsOf(controls.flat), s.flatBelow);
+    fill(controls.stand, optionsOf(controls.stand), s.snapshots ? "picture" : (s.boxDetail || "plain"));
+    fill(controls.ratio, optionsOf(controls.ratio), s.snapRatio);
+    fill(controls.budget, optionsOf(controls.budget), s.snapMb);
+    fill(controls.disk, optionsOf(controls.disk), s.diskOn ? "on" : "off");
+    fill(controls.idle, optionsOf(controls.idle), s.idleCapMs);
+    fill(controls.shape, optionsOf(controls.shape), s.linkStyle || "spline");
+    fill(controls.thin, optionsOf(controls.thin), s.detailZoom);
+    fill(controls.inert, optionsOf(controls.inert), s.inertBelow);
+    if (controls.link && document.activeElement !== controls.link) controls.link.checked = !!s.linkZoom;
+    fill(controls.fovea, optionsOf(controls.fovea), s.fovea ? "on" : "off");
+    fill(controls.margin, optionsOf(controls.margin), s.foveaMargin);
+    fill(controls.restore, optionsOf(controls.restore), s.foveaRestore);
+    fill(controls.scale, optionsOf(controls.scale), s.displayScale);
+    fill(controls.widgets, optionsOf(controls.widgets), s.focusDom || "hide");
+    var power = $("power");
+    power.disabled = false;
+    power.textContent = s.enabled === false ? "⏻ On" : "⏻ Off";
+    power.classList.toggle("on", s.enabled === false);
+    var pause = $("pause");
+    pause.disabled = false;
+    pause.textContent = s.paused ? "▶ Resume" : "⏸ Pause";
+  }
+  function optionsOf(sel) {
+    if (!sel) return [];
+    return Array.prototype.map.call(sel.options, function (o) { return { value: o.value, text: o.textContent }; });
+  }
+
+  function table(host, headers, rows) {
+    clear(host);
+    if (!rows.length) {
+      host.appendChild(el("p", { class: "empty" }, "Nothing recorded in this window yet. Pan the graph on the ComfyUI page."));
+      return;
+    }
+    var t = el("table");
+    var head = el("tr");
+    headers.forEach(function (h) {
+      head.appendChild(el("th", { class: h.num ? "num" : "" }, h.text));
+    });
+    var thead = el("thead");
+    thead.appendChild(head);
+    t.appendChild(thead);
+    var body = el("tbody");
+    rows.forEach(function (r) { body.appendChild(r); });
+    t.appendChild(body);
+    host.appendChild(t);
+  }
+  function cell(text, numeric) {
+    return el("td", { class: numeric ? "num" : "" }, text);
+  }
+  function renderTelemetry(tel) {
+    var snap = (tel && tel.snapshot) || {};
+    var frame = snap.frame || {};
+    var drawing = (tel && tel.drawing) || {};
+    var fps = Number.isFinite(frame.fps) ? String(Math.round(frame.fps)) : "—";
+    var zoom = Number.isFinite(drawing.zoom) ? Math.round(drawing.zoom * 100) + "%" : "—";
+    $("live").textContent = "fps " + fps + "  ·  frame " + ms(frame.meanFrameMs) + "  ·  zoom " + zoom +
+      "  ·  stand-ins " + (drawing.snapDrawn || 0) + " served, " + bytes(drawing.snapBytes || 0);
+    if (drawing.version) $("ver").textContent = "v" + drawing.version;
+    var ab = $("ab");
+    if (ab) ab.textContent = drawing.ab || "";
+
+    var status = $("pane-status");
+    clear(status);
+    var lines = [
+      "fps " + fps + "   mean " + ms(frame.meanFrameMs) + "   p95 " + ms(frame.p95) + "   max " + ms(frame.maxFrameMs),
+      "display " + (Number.isFinite(frame.displayHz) ? frame.displayHz.toFixed(0) + " Hz" : "—") +
+        "   redraws per displayed frame " + (Number.isFinite(frame.drawsPerRaf) ? frame.drawsPerRaf.toFixed(2) : "—"),
+      "zoom " + zoom + "   preview below " + Math.round((drawing.flatBelow || 0) * 100) + "%" +
+        "   pictures " + (drawing.snapOn ? "on" : "off") +
+        "   " + (drawing.snapCaptured || 0) + " captured, " + (drawing.snapMisses || 0) + " misses",
+      "disk " + (drawing.diskOn ? "on" : "off") + "   loaded " + (drawing.diskLoaded || 0) +
+        "   saved " + (drawing.diskSaved || 0) + (drawing.diskDir ? "   " + drawing.diskDir : ""),
+      "sampling " + (drawing.paused ? "paused" : "on") + "   tool " + (drawing.enabled === false ? "off" : "on"),
+    ];
+    if (snap.env) {
+      lines.push("graph " + (snap.env.nodes != null ? snap.env.nodes : "—") + " nodes / " +
+        (snap.env.links != null ? snap.env.links : "—") + " links   canvas " + (snap.env.canvas || "—"));
+    }
+    if (snap.memory) lines.push("JS heap " + bytes(snap.memory.used) + " of " + bytes(snap.memory.limit));
+    lines.forEach(function (line) { status.appendChild(el("p", null, line)); });
+
+    var hooks = (snap.hooks || []).slice().sort(function (a, b) { return (b.insideMs || 0) - (a.insideMs || 0); }).slice(0, 16);
+    table($("pane-timing"), [
+      { text: "owner" }, { text: "in frame", num: true }, { text: "calls", num: true }, { text: "" },
+    ], hooks.map(function (r) {
+      var tr = el("tr");
+      tr.appendChild(cell(r.label || ""));
+      tr.appendChild(cell(ms(r.insideMs), true));
+      tr.appendChild(cell(String(r.insideCalls || 0), true));
+      var td = el("td");
+      var b = el("button", { type: "button" }, r.muted ? "Unmute" : "Mute");
+      b.addEventListener("click", function () {
+        post({ origin: "window", command: r.muted ? "unmute" : "mute", label: r.label }).catch(function (e) { say(e.message); });
+      });
+      td.appendChild(b);
+      tr.appendChild(td);
+      return tr;
+    }));
+
+    var types = (snap.nodeTypes || []).slice(0, 16);
+    table($("pane-nodes"), [
+      { text: "node type" }, { text: "ms", num: true }, { text: "calls", num: true }, { text: "ms/call", num: true },
+    ], types.map(function (r) {
+      var tr = el("tr");
+      tr.appendChild(cell(r.type || ""));
+      tr.appendChild(cell(ms(r.ms), true));
+      tr.appendChild(cell(String(r.calls || 0), true));
+      tr.appendChild(cell(ms(r.msPerCall), true));
+      return tr;
+    }));
+
+    var stalls = ((snap.stalls && snap.stalls.sources) || []).slice(0, 12);
+    table($("pane-stalls"), [
+      { text: "source" }, { text: "blocking", num: true }, { text: "count", num: true },
+    ], stalls.map(function (r) {
+      var tr = el("tr");
+      tr.appendChild(cell(r.sig || r.fn || r.file || ""));
+      tr.appendChild(cell(ms(r.blockingMs), true));
+      tr.appendChild(cell(String(r.count || 0), true));
+      return tr;
+    }));
+    if (snap.stalls) {
+      $("pane-stalls").appendChild(el("p", { class: "note" },
+        num(snap.stalls.blockingMsPerSec, 1) + " ms/s blocking   " + num(snap.stalls.perSec, 2) + "/s"));
+    }
+  }
+
+  function apply(body) {
+    if (!body || body.ok === false) return;
+    if (body.settings) last.settings = body.settings;
+    if (body.limits && !built) build(body.limits);
+    else if (body.limits && built) writeLimits(body.limits);
+    var rev = Number(body.rev) || 0;
+    if (body.settings && rev !== last.rev && body.origin !== "window") {
+      last.rev = rev;
+      last.origin = body.origin || "";
+      writeSettings(body.settings);
+    } else if (rev !== last.rev) {
+      last.rev = rev;
+    }
+    if (body.telemetry) {
+      last.telemetry = body.telemetry;
+      renderTelemetry(body.telemetry);
+      var report = body.telemetry.report;
+      if (report && report !== copiedReport) {
+        copiedReport = report;
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(report).catch(function () { say("Report is ready, but the clipboard refused it."); });
+        }
+        say("Report copied.");
+      }
+    }
+  }
+
+  function poll() {
+    if (document.hidden) return Promise.resolve();
+    return fetch(API + "?from=window").then(function (res) {
+      if (!res.ok) throw new Error(String(res.status));
+      return res.json();
+    }).then(function (body) {
+      if (miss > 0) say("");
+      miss = 0;
+      apply(body);
+      if (!last.settings && !last.telemetry) {
+        $("live").textContent = "waiting for the ComfyUI page to send its settings…";
+      }
+    }).catch(function () {
+      miss += 1;
+      if (miss > 2) say("The ComfyUI page is not answering /ants_optimizer/ui. Leave that page open, and open this window from the gear.");
+    });
+  }
+
+  $("power").addEventListener("click", function () {
+    if (!last.settings) return;
+    postSettings({ enabled: last.settings.enabled === false });
+  });
+  $("pause").addEventListener("click", function () {
+    if (!last.settings) return;
+    postSettings({ paused: !last.settings.paused });
+  });
+  $("reset").addEventListener("click", function () {
+    post({ origin: "window", command: "reset" }).catch(function (e) { say(e.message); });
+  });
+  $("copy").addEventListener("click", function () {
+    copiedReport = "";
+    post({ origin: "window", command: "report" }).catch(function (e) { say(e.message); });
+  });
+
+  poll();
+  setInterval(poll, 400);
+})();
+</script>
+</body>
+</html>
