@@ -27,7 +27,7 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.5.5";
+const VERSION = "2.5.6";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
 // The class key ComfyUI stores in a workflow. The old key is still recognised so
 // a graph saved before the rename does not lose this node.
@@ -909,7 +909,10 @@ const LOD = {
   snapEvicted: 0,
   snapInvalid: 0, // bitmaps dropped because the node changed
   snapKept: 0, // kept live on purpose: this tool's own node, a type you excluded
-  snapPartial: 0, // pictures that are the canvas part only (the browser draws the rest)
+  snapPartial: 0, // pictures of nodes that have DOM widgets (the canvas part is not all of them)
+  snapDomInk: 0, // DOM widget contents drawn into pictures (images, canvases, text)
+  snapDomText: 0, // of those, text widgets re-painted from their value
+  snapDomSkipped: 0, // widget contents that could not be drawn (HTML, or an image not loaded yet)
   snapFit: 0, // captures made coarser than your ratio so they fit the size cap
   snapCoarse: 0, // captures made coarser than your ratio because the budget was full
   snapChurn: 0, // nodes left as boxes: they changed on every attempt
@@ -3675,6 +3678,8 @@ function lodSnapLive(node, canvas) {
     // clickable either way.
     if (node.has_errors) return true; // the error stroke is live state
     if (Number(node.progress) > 0) return true; // a running node draws a bar
+    // A video widget is never a still picture, however idle the graph is.
+    if (lodSnapHasVideo(node)) return true;
     const c = canvas || null;
     if (c) {
       if (c.connecting_node) return true; // a link is being dragged from a node
@@ -3714,9 +3719,11 @@ function lodSnapKeepLive(node) {
   return "";
 }
 
-// Is part of this node drawn by the browser instead of the canvas? The picture is
-// then the canvas part only, and the readout says so out loud: a picture with a
-// blank where an image preview sits is still a better stand-in than a rectangle.
+// Is part of this node drawn by the browser instead of the canvas? Then the
+// capture has to composite that part in (lodSnapDomInk), and the readout says
+// what it managed to draw and what it could not — a picture with a blank where an
+// image preview sits is still a better stand-in than a rectangle, and one with
+// the image in it is better again.
 function lodSnapPartial(node) {
   const widgets = node && node.widgets;
   if (!widgets) return false;
@@ -3778,6 +3785,19 @@ function lodSnapFitRatio(geom, want) {
 
 function lodSnapBytesFor(geom, ratio) {
   return Math.ceil(geom.w * ratio) * Math.ceil(geom.h * ratio) * 4;
+}
+
+// The pixels-per-graph-unit a capture is actually drawn at. This used to be
+// `Math.max(1, ratio)` — correct while every ratio on the ladder was 1 or more,
+// and a silent lie the moment 0.25x and 0.5x became settings (v2.5.2): the canvas
+// was built at 1x whatever the user asked, so the picture cost four to sixteen
+// times the memory the budget had been told to reserve for it, and the setting
+// below 1x did nothing at all. Both the render and the ink probe use this, so
+// they always agree about the surface they are looking at.
+function lodSnapPixelRatio(ratio) {
+  const r = Number(ratio);
+  if (!Number.isFinite(r) || r <= 0) return LOD_SNAP_RATIO_DEFAULT;
+  return Math.min(LOD_SNAP_RATIOS[LOD_SNAP_RATIOS.length - 1], Math.max(LOD_SNAP_RATIOS[0], r));
 }
 
 // One record, marked so the node is never attempted again this session, plus the
@@ -3932,6 +3952,34 @@ function lodSnapSignature(node, canvas) {
   // an empty frame in the picture for as long as the signature matched. `complete`
   // is the moment the drawing changes, and the source is hashed by its ends (a
   // data URL is long, and its ends are what differ).
+  // The DOM widgets are part of the picture (lodSnapDomInk draws them in), so
+  // what they are *showing* has to invalidate it the same way a widget value
+  // does. `w.value` covers what the frontend syncs; this covers the rest — an
+  // image whose source changed, a canvas that resized, a textarea whose text has
+  // not been committed to the widget yet. Bounded per widget, and hashed by the
+  // same head-and-tail rule as any other string.
+  if (widgets) {
+    for (let i = 0; i < widgets.length && i < LOD_SNAP_DOM_MAX; i++) {
+      const w2 = widgets[i];
+      const el = w2 && (w2.element || w2.inputEl);
+      if (!el || typeof el !== "object" || !el.tagName) continue;
+      const tag = String(el.tagName).toUpperCase();
+      mix(tag.length);
+      if (tag === "IMG") {
+        str(el.currentSrc || el.src);
+        flag(el.complete);
+        num(el.naturalWidth);
+        num(el.naturalHeight);
+      } else if (tag === "CANVAS") {
+        num(el.width);
+        num(el.height);
+      } else if (tag === "TEXTAREA" || tag === "INPUT") {
+        str(el.value);
+      }
+      flag(!!el.hidden);
+    }
+  }
+
   const imgs = node.imgs || node.images;
   if (imgs && imgs.length) {
     // v2.5.1: the capture waits one turn so a preview that draws its image in a
@@ -4238,6 +4286,10 @@ function lodSnapEvict(force) {
     if (LOD.snapBytes <= budget) break;
     if (!rec.canvas) continue; // a record can exist before its bitmap does
     if (!force && lodSnapProtected(rec)) continue; // in use: never released
+    // Same rule as the RAM release: a bitmap that leaves memory must be able to
+    // come back from its file, or the eviction would cost a fresh capture of a
+    // node that already has a perfectly good picture on disk.
+    lodThumbDiskForget(node);
     lodSnapRelease(rec);
     LOD.snaps.delete(node);
     LOD.snapEvicted++;
@@ -4306,7 +4358,10 @@ function lodSnapInk(el, geom, ratio) {
   try {
     const cctx = el && typeof el.getContext === "function" ? el.getContext("2d") : null;
     if (!cctx || typeof cctx.getImageData !== "function") return true;
-    const r = Math.max(1, Number(ratio) || 1);
+    // The same ratio the capture was drawn at (see lodSnapPixelRatio): probing a
+    // 0.25x surface with 1x coordinates reads outside it and would call every
+    // small picture blank.
+    const r = lodSnapPixelRatio(ratio);
     const bodyX = -geom.x * r;
     const bodyY = -geom.y * r;
     const bodyW = geom.bodyW * r;
@@ -4334,9 +4389,246 @@ function lodSnapInk(el, geom, ratio) {
   }
 }
 
+// ------------------------------------------------------------- the DOM half ---
+// What a picture is missing without this: the DOM widgets. In both renderers
+// ComfyUI puts a widget's content in an element over the canvas — a multiline
+// text widget (CLIPTextEncode's prompt) is a textarea, an image preview is an
+// <img>, a 3D viewport is a canvas — and the canvas row underneath is blank
+// (BaseDOMWidgetImpl.draw paints a placeholder only in the frontend's own
+// low-quality mode). So a capture of a text or image node showed the node's
+// chrome and nothing else, which is what the user reported: the stand-in is
+// there, but the image or the text inside the node is not.
+//
+// Three kinds of content, three answers, and each one says what it is:
+//   * <img> and <canvas> — drawn into the picture pixel for pixel. Their own
+//     pixels are the truth; nothing is invented.
+//   * <textarea> and <input> — page JavaScript cannot screenshot rendered text,
+//     so the *value* is re-painted the way LiteGraph paints its own text widgets
+//     (same colours, same clip). It is a rendering of the text the widget holds,
+//     not a copy of the browser's, and the readout counts it as such.
+//   * anything else (a pack's own HTML) — left blank and counted. Drawing a
+//     picture of arbitrary DOM would be inventing ink.
+// A video, or an element holding one, is never photographed at all: see
+// lodSnapLive.
+const LOD_SNAP_WIDGET_MARGIN = 10; // BaseDOMWidgetImpl.DEFAULT_MARGIN
+const LOD_SNAP_WIDGET_H = 50; // the frontend's `computedHeight ?? 50`
+const LOD_SNAP_DOM_MAX = 12; // widget elements looked at per node, per capture
+const LOD_SNAP_TEXT_CHARS = 2000; // characters of a text widget that are painted
+const LOD_SNAP_TEXT_LINES = 12; // and lines; past that it is clipped like the row is
+
+function lodSnapElementKind(el) {
+  const tag = String((el && el.tagName) || "").toUpperCase();
+  if (tag === "IMG") return "image";
+  if (tag === "CANVAS") return "canvas";
+  if (tag === "TEXTAREA") return "text";
+  if (tag === "INPUT") {
+    const t = String(el.type || "text").toLowerCase();
+    if (t === "checkbox" || t === "radio" || t === "range" || t === "file" || t === "color" || t === "button" || t === "submit") return "other";
+    return "text";
+  }
+  return "other";
+}
+
+// The row a DOM widget occupies, in node units — the same arithmetic
+// DomWidgets.vue uses to position the wrapper (`node.pos + margin`,
+// `widget.width ?? node.width`, `widget.computedHeight ?? 50`). The capture draws
+// in node units, so this needs no canvas rectangle, no zoom and no layout read —
+// and it keeps working while this tool's own classes have the wrapper hidden,
+// which is exactly the state a flat node is in when its picture is taken.
+function lodSnapWidgetBox(node, w) {
+  const margin = Number.isFinite(Number(w && w.margin)) ? Math.max(0, Number(w.margin)) : LOD_SNAP_WIDGET_MARGIN;
+  const size = (node && (node.renderingSize || node.size)) || [0, 0];
+  const nodeW = Math.abs(Number(size[0])) || 0;
+  const wq = Number(w && w.width);
+  const width = wq > 0 ? wq : nodeW;
+  const wy = Number.isFinite(Number(w && w.y)) ? Number(w.y) : Number(w && w.last_y) || 0;
+  const ch = Number(w && w.computedHeight);
+  const height = ch > 0 ? ch : LOD_SNAP_WIDGET_H;
+  return { x: margin, y: margin + wy, w: width - margin * 2, h: height - margin * 2 };
+}
+
+function lodSnapMeasureText(cctx, text, size) {
+  try {
+    if (cctx && typeof cctx.measureText === "function") {
+      const m = cctx.measureText(String(text));
+      const w = Number(m && m.width);
+      if (Number.isFinite(w) && w > 0) return w;
+    }
+  } catch (e) {
+    /* the estimate below is the fallback, not a guess about the font */
+  }
+  return String(text).length * size * 0.55;
+}
+
+// Words wrapped to the row, at most `maxLines` of them, with the last line marked
+// with an ellipsis when the text does not fit — the same thing the browser does to
+// a textarea's overflow, done by hand because there is no other way to get it.
+function lodSnapWrapText(raw, maxW, maxLines, size, cctx) {
+  const text = String(raw == null ? "" : raw).replace(/\r\n?/g, "\n");
+  const out = [];
+  const paragraphs = text.split("\n");
+  for (let p = 0; p < paragraphs.length && out.length < maxLines; p++) {
+    const words = paragraphs[p].split(/\s+/).filter(Boolean);
+    if (!words.length) {
+      out.push("");
+      continue;
+    }
+    let line = "";
+    for (let i = 0; i < words.length && out.length < maxLines; i++) {
+      const next = line ? `${line} ${words[i]}` : words[i];
+      if (line && lodSnapMeasureText(cctx, next, size) > maxW) {
+        out.push(line);
+        line = words[i];
+      } else {
+        line = next;
+      }
+    }
+    if (line && out.length < maxLines) out.push(line);
+  }
+  if ((text.length > LOD_SNAP_TEXT_CHARS || out.length >= maxLines) && out.length) {
+    const last = out[out.length - 1];
+    out[out.length - 1] = last.length > 1 ? `${last.slice(0, Math.max(1, last.length - 1))}\u2026` : "\u2026";
+  }
+  return out;
+}
+
+// A text widget's value, painted into the row. Returns false when there is
+// nothing to paint, which leaves the row as the canvas drew it.
+function lodSnapTextInk(el, cctx, box) {
+  let raw = "";
+  try {
+    raw = el.value != null ? String(el.value) : String(el.textContent || "");
+  } catch (e) {
+    return false;
+  }
+  if (!raw.trim()) return false;
+  const LG = typeof LiteGraph !== "undefined" && LiteGraph ? LiteGraph : null;
+  const size = Math.max(8, Math.min(24, Number(LG && LG.NODE_TEXT_SIZE) || 14));
+  const font = `${size}px ${(LG && LG.NODE_FONT) || "Arial"}`;
+  const bg = (LG && LG.WIDGET_BGCOLOR) || "#222";
+  const line = (LG && LG.WIDGET_OUTLINE_COLOR) || "#666";
+  const fg = (LG && LG.WIDGET_TEXT_COLOR) || "#DDD";
+  try {
+    if (typeof cctx.save === "function") cctx.save();
+    if (typeof cctx.beginPath === "function" && typeof cctx.clip === "function") {
+      cctx.beginPath();
+      cctx.rect(box.x, box.y, box.w, box.h);
+      cctx.clip();
+    }
+    cctx.fillStyle = bg;
+    cctx.fillRect(box.x, box.y, box.w, box.h);
+    if (typeof cctx.strokeRect === "function") {
+      cctx.strokeStyle = line;
+      cctx.lineWidth = 1;
+      cctx.strokeRect(box.x + 0.5, box.y + 0.5, Math.max(1, box.w - 1), Math.max(1, box.h - 1));
+    }
+    cctx.fillStyle = fg;
+    cctx.font = font;
+    cctx.textAlign = "left";
+    if ("textBaseline" in cctx) cctx.textBaseline = "top";
+    const lines = lodSnapWrapText(raw.slice(0, LOD_SNAP_TEXT_CHARS), Math.max(4, box.w - 6), LOD_SNAP_TEXT_LINES, size, cctx);
+    const lineH = size * 1.25;
+    for (let i = 0; i < lines.length; i++) {
+      if (typeof cctx.fillText === "function") cctx.fillText(lines[i], box.x + 3, box.y + 3 + i * lineH);
+    }
+  } catch (e) {
+    return false;
+  } finally {
+    try {
+      if (typeof cctx.restore === "function") cctx.restore();
+    } catch (e) {
+      /* the ink is already on the surface */
+    }
+  }
+  return true;
+}
+
+// Every DOM widget of this node, drawn into the capture. Reports what it drew and
+// what it could not, so the readout can say both.
+function lodSnapDomInk(node, cctx, canvas) {
+  const out = { ink: 0, text: 0, skipped: 0 };
+  if (!cctx || typeof cctx.drawImage !== "function") return out;
+  const widgets = (node && node.widgets) || [];
+  void canvas;
+  for (let i = 0; i < widgets.length && i < LOD_SNAP_DOM_MAX; i++) {
+    const w = widgets[i];
+    if (!w) continue;
+    let el = w.element || w.inputEl;
+    if (!el || typeof el !== "object" || !el.tagName) continue;
+    if (w.hidden) continue;
+    const box = lodSnapWidgetBox(node, w);
+    if (!(box.w > 0) || !(box.h > 0)) continue;
+    let kind = lodSnapElementKind(el);
+    if (kind === "other") {
+      // A wrapper with the real thing inside it: one element is enough to trust,
+      // two would be a guess about which one the user is looking at.
+      try {
+        if (typeof el.querySelector === "function") {
+          const inner = el.querySelector("img,canvas");
+          if (inner && inner !== el) {
+            const innerKind = lodSnapElementKind(inner);
+            if (innerKind === "image" || innerKind === "canvas") {
+              el = inner;
+              kind = innerKind;
+            }
+          }
+        }
+      } catch (e) {
+        /* a hostile lookup leaves it as HTML we cannot draw */
+      }
+    }
+    try {
+      if (kind === "image" || kind === "canvas") {
+        const wpx = Number(el.naturalWidth || el.width) || 0;
+        const hpx = Number(el.naturalHeight || el.height) || 0;
+        // An image that has not arrived yet would draw as nothing; the signature
+        // carries its `complete` flag, so the picture is re-made when it lands.
+        if (!(wpx > 0) || !(hpx > 0)) {
+          out.skipped++;
+          continue;
+        }
+        cctx.drawImage(el, box.x, box.y, box.w, box.h);
+        out.ink++;
+      } else if (kind === "text") {
+        if (lodSnapTextInk(el, cctx, box)) {
+          out.ink++;
+          out.text++;
+        } else {
+          out.skipped++;
+        }
+      } else {
+        out.skipped++;
+      }
+    } catch (e) {
+      out.skipped++;
+    }
+  }
+  return out;
+}
+
+// A node showing a video is never photographed: a picture of a video is one
+// frame presented as if it were the node, and the user asked for exactly that
+// line to hold — "if it doesn't play video" it may be captured.
+function lodSnapHasVideo(node) {
+  const widgets = node && node.widgets;
+  if (!widgets) return false;
+  for (let i = 0; i < widgets.length && i < LOD_SNAP_DOM_MAX; i++) {
+    const w = widgets[i];
+    const el = w && (w.element || w.inputEl);
+    if (!el || typeof el !== "object" || !el.tagName) continue;
+    if (String(el.tagName).toUpperCase() === "VIDEO") return true;
+    try {
+      if (typeof el.querySelector === "function" && el.querySelector("video")) return true;
+    } catch (e) {
+      /* a hostile lookup is not a video */
+    }
+  }
+  return false;
+}
+
 function lodSnapRender(node, canvas, geom, ratio) {
   if (!lodSnapOriginalDrawNode || !geom) return null;
-  const r = Math.max(1, Number(ratio) || 1);
+  const r = lodSnapPixelRatio(ratio);
   const px = Math.ceil(geom.w * r);
   const py = Math.ceil(geom.h * r);
   const doc = typeof document !== "undefined" ? document : null;
@@ -4425,7 +4717,7 @@ function lodSnapRender(node, canvas, geom, ratio) {
       }
     }
   }
-  return { canvas: el, x: geom.x, y: geom.y, w: geom.w, h: geom.h, ratio: r, bytes: px * py * 4 };
+  return { canvas: el, ctx: cctx, x: geom.x, y: geom.y, w: geom.w, h: geom.h, ratio: r, bytes: px * py * 4 };
 }
 
 // One turn of the microtask queue, then `fn`. ComfyUI's image preview does not
@@ -4580,6 +4872,17 @@ function lodSnapCaptureNode(node, canvas) {
     lodSnapNoteWhy(node, "draws nothing into the canvas (all DOM)");
     return false;
   }
+  // The node's DOM widgets are drawn into the picture now — after the ink probe,
+  // so a node whose whole visual is DOM still keeps its box (a picture of nothing
+  // but a composited widget, blitted over nothing, would be a sticker floating on
+  // the canvas) — and before the mip chain and the file are made from it, so the
+  // smaller copies and the disk PNG contain it too.
+  let domInk = null;
+  if (lodSnapPartial(node)) {
+    const dc0 = nowMs();
+    domInk = lodSnapDomInk(node, made.ctx, canvas);
+    LOD.snapMs += nowMs() - dc0;
+  }
   if (!lodSnapMakeRoom(made.bytes)) {
     // The budget is full of bitmaps that are being looked at. Refusing is the
     // honest answer: releasing one would take a picture off the screen, and
@@ -4629,6 +4932,11 @@ function lodSnapCaptureNode(node, canvas) {
   if (coarse) LOD.snapCoarse++;
   else if (made.ratio < want) LOD.snapFit++;
   if (lodSnapPartial(node)) LOD.snapPartial++;
+  if (domInk) {
+    if (domInk.ink) LOD.snapDomInk += domInk.ink;
+    if (domInk.text) LOD.snapDomText += domInk.text;
+    if (domInk.skipped) LOD.snapDomSkipped += domInk.skipped;
+  }
   return true;
 }
 
@@ -4854,6 +5162,58 @@ function lodSnapAttachMips(rec) {
 
 const THUMB_DISK_PREFIX = "/ants_optimizer/thumbs";
 
+// The name a picture is stored under has to say what is *inside* it. The node
+// signature alone does not: it deliberately leaves the capture ratio and the
+// theme out (see lodSnapSignature), because in RAM a ratio change and a theme
+// change both clear the whole cache — there is nothing stale to catch. A file
+// outlives both. A page that starts at 0.25x used to be served yesterday's 1x
+// files under the same name (sixteen times the memory the user had just asked to
+// spend, and no re-capture, because a record existed); a page that started at 2x
+// was served 0.25x pictures and never asked for better ones; and a file written
+// in a light theme was served in a dark one. The ratio and a hash of the theme
+// are therefore part of the disk key, which also means a change of either one
+// re-keys it — the change is followed in both directions, which is what the
+// setting promises.
+function lodSnapToken(text) {
+  let h = 2166136261;
+  const s = String(text == null ? "" : text);
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0).toString(36);
+}
+
+function lodSnapRatioToken(ratio) {
+  const r = Number(ratio);
+  const known = LOD_SNAP_RATIOS.indexOf(r) >= 0 ? r : LOD_SNAP_RATIO_DEFAULT;
+  return String(known).replace(/[^0-9.]/g, "");
+}
+
+function lodSnapThemeToken() {
+  try {
+    if (!LOD.snapTheme) LOD.snapTheme = lodSnapThemeSig();
+    return lodSnapToken(LOD.snapTheme);
+  } catch (e) {
+    return "0";
+  }
+}
+
+function lodSnapDiskSig(node, canvas, ratio) {
+  const base = lodSnapSignature(node, canvas);
+  if (!base) return "";
+  return `${base}r${lodSnapRatioToken(ratio)}t${lodSnapThemeToken()}`;
+}
+
+// The ratio a stored file was drawn at, read back out of its own key. A file
+// whose key has no ratio token (written before this existed) reads as the default
+// and is re-made on the next capture rather than trusted.
+function lodSnapDiskRatio(sig) {
+  const m = /r([0-9]+(?:\.[0-9]+)?)t[0-9a-z]+$/.exec(String(sig || ""));
+  const r = m ? Number(m[1]) : 0;
+  return LOD_SNAP_RATIOS.indexOf(r) >= 0 ? r : LOD_SNAP_RATIO_DEFAULT;
+}
+
 function lodThumbId(node) {
   try {
     if (!node || node.id == null || node.id === "") return "";
@@ -4902,7 +5262,14 @@ function lodThumbDiskSave(node, rec) {
   const id = lodThumbId(node);
   if (!id) return;
   const canvas = rec.canvas;
-  const sig = rec.sig;
+  // A picture the budget forced coarser than the setting is not written: the file
+  // would carry the setting's name and somebody else's pixels, and the next page
+  // would load it as if the setting had produced it. It stays in RAM for this
+  // session and is re-made when it is asked for again — the same rule as the
+  // capture itself, which only ever promises what it drew.
+  const want = lodSnapPixelRatio(LOD.snapRatio);
+  if (lodSnapPixelRatio(rec.ratio) !== want) return;
+  const sig = lodSnapDiskSig(node, null, want);
   const send = (blob) => {
     if (!blob) return;
     try {
@@ -4933,8 +5300,13 @@ function lodThumbDiskInstall(node, canvas, sig, blob) {
   const paint = (bmp) => {
     try {
       let live = "";
+      // The file's own key is the check: node state *and* the ratio and theme the
+      // file was drawn for. Comparing the bare node signature would accept a file
+      // this page has no business using (that is the whole point of the token in
+      // the name); comparing the whole key also catches a theme change between
+      // the request and the answer.
       try {
-        live = lodSnapSignature(node, canvas);
+        live = lodSnapDiskSig(node, canvas, lodSnapDiskRatio(sig));
       } catch (e) {
         return;
       }
@@ -4977,7 +5349,9 @@ function lodThumbDiskInstall(node, canvas, sig, blob) {
       rec.at = rec.checkedAt;
       rec.usedFrame = LOD.snapFrame;
       rec.shadows = !!(canvas && canvas.render_shadows);
-      rec.ratio = 1;
+      // What the file was drawn at, read from its key — not a hardcoded 1, which
+      // is what it used to say for every file no matter which ratio it held.
+      rec.ratio = lodSnapDiskRatio(sig);
       rec.blocked = false;
       rec.failed = false;
       rec.diskPending = false;
@@ -5012,7 +5386,12 @@ function lodThumbDiskAsk(node, canvas) {
   if (!id) return false;
   let sig = "";
   try {
-    sig = lodSnapSignature(node, canvas);
+    // The key of the picture this page would *use*: the ratio the setting asks
+    // for, in the theme the page is in right now. Anything stored for another
+    // ratio or another theme is a miss, which is what makes changing the setting
+    // do something in both directions — and the "already asked" mark below is
+    // keyed the same way, so a change re-arms the disk read too.
+    sig = lodSnapDiskSig(node, canvas, LOD.snapRatio);
   } catch (e) {
     return false;
   }
@@ -9161,10 +9540,20 @@ function buildTweaksTab(container) {
           if (LOD.snapQueue && LOD.snapQueue.size) parts.push(`${LOD.snapQueue.size} waiting for the idle lane`);
           if (LOD.snapMs > 0) parts.push(`${fmtMs(LOD.snapMs)} spent capturing so far`);
           if (LOD.snapPartial) {
+            // A node's widgets live in DOM elements in both renderers (a prompt
+            // textarea, an image preview, a 3D viewport). The picture now carries
+            // what can honestly be drawn of them, so say what that was rather
+            // than leaving the old "canvas part only" claim standing.
             parts.push(
-              `${LOD.snapPartial} picture(s) are the canvas part only: the browser draws the rest of that node (an image preview, a DOM widget), and no ` +
-                `bitmap of the canvas can hold what the browser draws`
+              `${LOD.snapPartial} pictured node(s) have DOM widgets: ${LOD.snapDomInk} widget content(s) are drawn into those pictures ` +
+                `(${LOD.snapDomText} of them text re-painted from the widget's value, not a screenshot of the browser's rendering)`
             );
+            if (LOD.snapDomSkipped) {
+              parts.push(
+                `${LOD.snapDomSkipped} widget content(s) could not be drawn (a pack's own HTML, or an image that had not loaded when the picture was ` +
+                  `taken) — those stay blank in the picture and the DOM still covers them while the node is live`
+              );
+            }
           }
           if (LOD.snapFit) {
             parts.push(
@@ -11897,6 +12286,16 @@ function installDebugApi() {
             evicted: LOD.snapEvicted,
             invalidated: LOD.snapInvalid,
             keptLive: LOD.snapKept,
+            // The disk half, so a script (or a test) can hold the cache to what it
+            // claims: one file per node, keyed by the ratio and theme inside it.
+            diskOn: !!LOD.diskOn,
+            diskLoaded: LOD.diskLoaded,
+            diskSaved: LOD.diskSaved,
+            diskFail: LOD.diskFail,
+            diskDead: !!LOD.diskDead,
+            domInk: LOD.snapDomInk,
+            domText: LOD.snapDomText,
+            domSkipped: LOD.snapDomSkipped,
             partial: LOD.snapPartial,
             fit: LOD.snapFit,
             coarse: LOD.snapCoarse,
@@ -12233,6 +12632,14 @@ app.registerExtension({
 //  * Worker functions cannot capture closures, which is why the lane takes a
 //    job name (or a self-contained function source) plus structured-cloneable
 //    arguments and nothing else.
+//  * A stand-in picture is the canvas drawing of the node plus what this tool
+//    could honestly draw of its DOM widgets (an image or a canvas pixel for
+//    pixel; a text field's value re-painted, because page JavaScript cannot
+//    screenshot rendered text; a pack's own HTML left blank and counted). A
+//    video, and an element holding one, is never photographed. A picture that
+//    includes an image from another origin is tainted by the browser, which is
+//    allowed to blit but not to read back: such a picture works in memory and
+//    simply cannot be written to disk.
 //  * Node snapshots reuse a bitmap that was checked against the node's signature
 //    at most LOD_SNAP_SIG_MS ago (100ms), so a change that happens between two
 //    checks can be shown stale for that long. Anything the panel can see cheaply

@@ -6,7 +6,7 @@ for: *which extension's JavaScript is actually costing me frames while I pan
 this graph, and what is eating main-thread time that no draw hook owns?* —
 without opening DevTools and without restarting ComfyUI to bisect.
 
-Version **2.5.5**. Everything runs from page load: no node has to be placed,
+Version **2.5.6**. Everything runs from page load: no node has to be placed,
 nothing executes, and the tool never changes your graph or your workflows.
 
 - **Measure** — per-extension and per-node-type frame cost, canvas draw
@@ -130,9 +130,9 @@ drawing**, and "off" is a real restoration, not a memory of one.
 | Replace node previews with bitmap stand-ins at zoom levels | off — draw every node · below 5 · 10 · 15 · 20 · 25 · 30 · 40 · 50 % | **below 50 %** | Below this zoom a node is a flat box instead of a live draw. The decision is the zoom, never a node's pixel size. Hover, selection and a drag keep the picture; a selected node gets a ring; a link drag, a running progress bar and an error still draw live. |
 | Stand-in | plain fill · title bar colour · title + error ring + progress + muted · picture of the node | **picture of the node** | What the box is made of. *plain* is a fill, *title* adds each node's own title bar, *state* adds error rings, progress bars and muted dimming, *picture* stores a bitmap of the node and blits it instead. |
 | Keep these node types live | comma-separated node types | empty | Types never served from a picture, however far you zoom out. They keep the painted fill or draw live, and the readout counts them as "kept live on purpose", not as failures. |
-| Stand-in capture resolution | 0.25× · 0.5× · 1× · 2× · 3× | **1×** | Pixels per graph unit in the picture. Half and quarter copies are still made for the screen. Zoomed in past the ratio a picture is softer than live drawing, which is why a node being worked at is never served from one. |
+| Stand-in capture resolution | 0.25× · 0.5× · 1× · 2× · 3× | **1×** | Pixels per graph unit in the picture. Below 1× the picture is a quarter (0.25×) or a half (0.5×) of the node's size — that is what makes it cheap to hold a thousand of them, and it is drawn at that size, not at 1× with a smaller name. Half and quarter copies are still made for the screen. Zoomed in past the ratio a picture is softer than live drawing, which is why a node being worked at is never served from one. Changing this value re-captures and re-keys the disk files (see below). |
 | Stand-in memory (RAM) budget | 256 · 512 · 1024 · 2048 · 4096 · 8192 MiB | **4096 MiB** | How much RAM the pictures may hold. A full budget refuses a new capture rather than evicting a picture that is on screen (that is what flicker looks like). On Execute or Run-to-node, at 85 % system RAM the off-screen pictures leave memory; at 95 % all of them do. Disk files stay and are loaded back after the run. |
-| Keep stand-in previews on disk | on · off | **on** | Store those pictures under `temp/ANTs_Frontend_Optimizer_THUMBNAILS/` and load them back next session, keyed by node id and a signature of what the node draws. A change overwrites the file; deleting the node deletes it. Disabled after 8 failures; the memory cache keeps working. |
+| Keep stand-in previews on disk | on · off | **on** | Store those pictures under `temp/ANTs_Frontend_Optimizer_THUMBNAILS/` and load them back next session. One file per node, named by the node's id and a key of what is *inside* the picture: the node's own signature **plus the capture resolution it was drawn at and a hash of the theme**. The key is the whole promise — a file written at 3× is never served to a page asking for 0.25×, and a file drawn in a light theme is never served in a dark one; a change of either re-keys the file, so the setting is followed in both directions. A picture the budget forced coarser than your setting is **not** written, because it is not what the setting asked for. A change overwrites the file; deleting the node deletes it. Disabled after 8 failures; the memory cache keeps working. |
 | Idle redraw cap | 0 · 250 · 500 · 1000 ms | **0 (off)** | While nobody is touching the page, redraws are limited to this rate. One input event lifts the cap at once. |
 | Link shape | spline · straight | **spline** | The shape of a link and nothing else. There is deliberately no "auto" that follows the node setting: a link must not change shape because a *node* threshold was crossed. |
 | Link thinning | full link and node detail · links thinned below 100 · 80 · 60 · 40 · 20 % zoom | **links thinned below 60 % zoom** | Below this zoom links are stroked 1 px instead of 3 and lose the dark outline. Curves stay where they were — this is ink, and only ink. |
@@ -146,6 +146,44 @@ drawing**, and "off" is a real restoration, not a memory of one.
 | How widgets go | hide · inert | **hide** | *hide* takes the element out of the picture as well as out of the pointer's way; *inert* only takes pointer events away and leaves it on screen. Both add a CSS class and restore exactly what was there. |
 | Way back | button | — | Back to full drawing: every drawing change off, the disk cache left as you set it. |
 
+### What is inside a stand-in picture
+
+A node is not only what the canvas draws. In both frontends a widget's content
+lives in a DOM element *over* the canvas — a prompt is a `<textarea>`, an image
+preview an `<img>`, a 3D viewport a `<canvas>` — and the canvas row underneath
+is blank (ComfyUI paints a placeholder there only in its own low-quality
+mode). A picture of the canvas alone therefore showed a text or image node's
+chrome and nothing else. The capture composites what is honestly drawable:
+
+| The widget's content | What the picture gets |
+| --- | --- |
+| An image (`<img>`, and an image inside a wrapping `<div>`) | The image itself, drawn at the widget's row — pixel for pixel. |
+| A canvas (a 3D viewport, a mask editor, a curve editor) | The canvas as it stands at that moment, pixel for pixel. |
+| A text field (`<textarea>`, `<input>`) | Its value **re-painted** in the theme's widget colours, wrapped and clipped to the row — a rendering of the text the widget holds, not a screenshot of the browser's rendering. The readout counts these separately for exactly that reason. |
+| Anything else (a pack's own HTML) | Nothing: the row stays blank and the count of what could not be drawn goes up. Inventing a picture of arbitrary DOM would be inventing ink. |
+| A wrapper with the real thing inside it | The image or canvas inside, if there is exactly one (`widget.element` holding the `<img>`). Two is a guess about which one you are looking at, so it is left blank and counted. |
+| A `<video>` (or an element holding one) | The node is never photographed at all: a still picture of a video is one frame presented as if it were the node. |
+
+The picture is re-made when anything it contains changes. The signature covers
+the node's own fields (title, size, colours, mode, error, progress, widget
+values, the images a node draws into itself) **and** what its DOM widgets are
+showing — an image's source, its `complete` flag and its size, a text field's
+value — so dropping a new image into a loader, typing in a prompt or a mask
+editor redrawing invalidates the picture and the idle lane photographs the
+node again. A picture taken before an image finished loading has a blank where
+the image will be, and is replaced as soon as it arrives.
+
+The lookup is the frontend's own contract — `widget.element` / `widget.inputEl`,
+which is where ComfyUI's own nodes put their previews and text fields — so a
+pack that keeps a preview element off its widget list, or that paints into a
+detached canvas, is not reachable and stays blank and counted.
+
+Two things this deliberately does not do: it never makes a node's picture out
+of *live* state (a running progress bar, an error, a link drag and a video
+keep the node live, as the table above says), and it never writes a picture it
+could not fully make to disk when the budget forced it coarser than your
+setting asked for.
+
 ### What these settings do in the Nodes 2.0 (Vue) frontend
 
 ComfyUI's newer frontend can render every node as a DOM element
@@ -157,7 +195,7 @@ pretending:
 
 | Setting | In the Vue-nodes frontend |
 | --- | --- |
-| Replace node previews with bitmap stand-ins at zoom levels | Idle. There is no canvas node to paint as a box, and a capture of one would be blank — the engine reports itself off rather than filling its idle lane with pictures that can never be drawn. |
+| Replace node previews with bitmap stand-ins at zoom levels | Idle. There is no canvas node to paint as a box, and a capture of one would be blank — the engine reports itself off rather than filling its idle lane with pictures that can never be drawn. Making pictures work *there* is not a matter of reading the same flag differently: the canvas does not draw those nodes, so a picture would have to be an image element this tool positions over the node and the node's own DOM would have to be taken out of the picture — a different feature, with a much smaller saving (the browser still builds and lays out every node), and it is not built. `ANALYSIS.md` records the sketch and the reasons. |
 | Stand-in, capture resolution, RAM budget, disk cache | Idle for the same reason; nothing is captured, held or written. |
 | Keep these node types live | Ignored while idle; your list is kept for when you are back on the canvas renderer. |
 | Link shape, link thinning, Measure link thinning | **Work.** Links are still drawn by the canvas, so the 1 px/no-outline thinning and the straight-line style reach the ink exactly as in canvas mode. |
@@ -439,7 +477,7 @@ short version:
 ## Development
 
 ```bash
-node tests/run-tests.mjs              # all tests — 179 passing, zero dependencies
+node tests/run-tests.mjs              # all tests — 189 passing, zero dependencies
 node tests/run-tests.mjs <substring>  # one suite or test
 python3 tests/test_init.py            # the Python side (routes, node contract)
 node tests/demo.mjs                   # prints what every tab says, against a synthetic graph

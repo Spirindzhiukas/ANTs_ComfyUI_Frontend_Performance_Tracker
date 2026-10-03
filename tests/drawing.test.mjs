@@ -2878,4 +2878,344 @@ suite("drawing: the Nodes 2.0 (Vue nodes) frontend", () => {
     assertGreater(h.tracker.lowZoom.state.nodes, 0, "switching the renderer off brings node flattening straight back");
     assertEqual(h.tracker.lowZoom.snapshots.on, true, "and the picture engine with it");
   });
+
+});
+
+// The picture store on disk. One file per node id, named by the node's signature
+// *plus* the two things a file outlives that the in-RAM signature leaves out: the
+// capture ratio the pixels were drawn at, and the theme they were drawn in. These
+// tests play the thumb store's part (the route code is in __init__.py and is
+// tested by tests/test_init.py) so the frontend's half of the contract is pinned:
+// what it asks for, what it writes, and what it refuses to be served.
+suite("drawing: the stand-in cache on disk — keyed by what is inside the file", () => {
+  const draw = (h, n = 1) => {
+    for (let i = 0; i < n; i++) {
+      h.advance(FRAME_MS);
+      h.canvas.setDirty(true, true);
+      h.canvas.draw();
+    }
+  };
+  const idle = async (h, ms = 1000) => {
+    h.advance(ms);
+    await h.flush();
+    h.advance(ms);
+    await h.flush();
+  };
+  const snapApi = (h) => h.tracker.lowZoom.snapshots;
+
+  // A stand-in for the server's half: one file per node id, replaced on write,
+  // served only for the exact key it was written under.
+  function fakeDisk(h) {
+    const files = new Map(); // id -> { sig, blob }
+    h.fetchRoutes.set("/ants_optimizer/thumbs/sweep", { removed: 0 });
+    h.fetchRoutes.set("/ants_optimizer/thumbs/info", { dir: "/tmp", count: 0 });
+    h.fetchRoutes.set("/ants_optimizer/thumbs/*", (req) => {
+      const m = /\/thumbs\/([^/?]+)(?:\?sig=(.*))?$/.exec(req.url);
+      if (!m) return { ok: false, status: 404, json: async () => ({}), blob: async () => null };
+      const id = decodeURIComponent(m[1]);
+      const sig = m[2] ? decodeURIComponent(m[2]) : "";
+      if (req.method === "PUT") {
+        files.set(id, { sig, blob: req.body });
+        return { ok: true, status: 204, json: async () => ({}) };
+      }
+      if (req.method === "DELETE") {
+        files.delete(id);
+        return { ok: true, status: 200, json: async () => ({ removed: 1 }) };
+      }
+      const f = files.get(id);
+      if (!f || f.sig !== sig) return { ok: false, status: 404, json: async () => ({}), blob: async () => null };
+      return { ok: true, status: 200, json: async () => ({}), blob: async () => f.blob };
+    });
+    return files;
+  }
+  const asksFor = (h) => h.fetchUrls().filter((c) => c.method === "GET" && c.url.includes("/ants_optimizer/thumbs/"));
+  const putsFor = (h) => h.fetchUrls().filter((c) => c.method === "PUT" && c.url.includes("/ants_optimizer/thumbs/"));
+  const sigOf = (url) => {
+    const raw = /sig=([^&]*)/.exec(url);
+    return raw ? decodeURIComponent(raw[1]) : "";
+  };
+  const oneNode = (h) => {
+    h.canvas.ds.scale = 0.1;
+    h.canvas.links = [];
+    const n = h.node({ type: "SnapThing", pos: [0, 0], size: [200, 100], widgets: [] });
+    n.id = 3; // the disk file is named after it, so a node without one has no file
+    h.canvas.nodes = [n];
+    h.app.graph._nodes = [n];
+    return n;
+  };
+
+  test("a ratio below 1 is drawn at that ratio, not at 1x with a smaller name", async () => {
+    const h = await boot();
+    const n = oneNode(h);
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true, diskOn: false, snapRatio: 0.25 });
+    draw(h, 1);
+    await idle(h);
+    const api = snapApi(h);
+    assertEqual(api.captured, 1, "the node was captured");
+    // The capture surface: geometry is 200x100 plus padding, so a quarter-size
+    // picture is a quarter of the pixels. At 1x it was 248x192 whatever the name
+    // said, which is sixteen times the memory the budget had been told to keep.
+    const cap = h.canvases.find((c) => c._ctx && c.width > 0 && c.width < 100);
+    assert(cap, "the picture was drawn on a canvas smaller than the node");
+    assertLess(cap.width, 100, `a 248-unit-wide row at 0.25x is about 62px, not ${cap.width}px`);
+    assertLess(api.bytes, 100 * 100 * 4 * 2, "and the budget is charged what was actually allocated");
+    assertEqual(n.imgs, undefined, "the node itself is unchanged");
+  });
+
+  test("the file is written under the ratio and the theme it was drawn with", async () => {
+    const h = await boot();
+    fakeDisk(h);
+    oneNode(h);
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true, diskOn: true, snapRatio: 1 });
+    draw(h, 1);
+    await idle(h);
+    const puts = putsFor(h);
+    assertGreater(puts.length, 0, "the picture was written to disk");
+    const sig = sigOf(puts[0].url);
+    assert(/r1t[0-9a-z]+$/.test(sig), `the key carries the ratio and the theme: ${sig}`);
+    // A theme change makes every stored picture a lie, and the key has to say so
+    // or the next page load is served pictures drawn in the old theme.
+    const before = sigOf(asksFor(h)[0].url);
+    h.LiteGraph.NODE_TITLE_COLOR = "#ff0000";
+    h.advance(3000);
+    await h.flush();
+    h.tracker.lowZoom.set({ snapRatio: 1 }); // re-arm the queue without changing anything else
+    draw(h, 1);
+    await idle(h);
+    const after = sigOf(asksFor(h)[asksFor(h).length - 1].url);
+    assert(before !== after, "a theme change re-keys the pictures");
+  });
+
+  test("changing the capture resolution re-asks in both directions, and a matching file is served", async () => {
+    const h = await boot();
+    const files = fakeDisk(h);
+    const n = oneNode(h);
+    const askedWith = (tag) => asksFor(h).filter((c) => sigOf(c.url).includes(tag));
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true, diskOn: true, snapRatio: 1 });
+    draw(h, 1);
+    await idle(h);
+    assertGreater(askedWith("r1t").length, 0, "the first load asked for a 1x picture");
+    const first = files.get(String(n.id));
+    assert(first && /r1t/.test(first.sig), `and one was written under a 1x key (${first && first.sig})`);
+    assertEqual(snapApi(h).diskLoaded, 0, "nothing was on disk to load the first time");
+
+    // Down: 0.25x. The stored 1x file is not what the setting asked for, so it
+    // must not be served — a new key is asked for, misses, and is captured.
+    h.tracker.lowZoom.set({ snapRatio: 0.25 });
+    draw(h, 1);
+    await idle(h);
+    assertGreater(askedWith("r0.25t").length, 0, "the page asked the disk again after the ratio changed");
+    assertEqual(snapApi(h).diskLoaded, 0, "and the 1x file was not accepted for it");
+    const quarter = files.get(String(n.id));
+    assert(quarter && /r0\.25t/.test(quarter.sig), `the file was replaced with the 0.25x picture (${quarter && quarter.sig})`);
+
+    // Back up: 1x. The 0.25x file cannot satisfy it either, so this is a fresh
+    // capture and the file ends up matching the setting again.
+    const captured = snapApi(h).captured;
+    h.tracker.lowZoom.set({ snapRatio: 1 });
+    draw(h, 1);
+    await idle(h);
+    assertGreater(snapApi(h).captured, captured, "back at 1x, the quarter-size picture did not satisfy it: a capture was made");
+    const back = files.get(String(n.id));
+    assert(back && /r1t/.test(back.sig), `and the file is a 1x picture again (${back && back.sig})`);
+  });
+
+  test("a file for another ratio is a miss, and a file for this one is loaded and used", async () => {
+    const h = await boot();
+    const files = fakeDisk(h);
+    const n = oneNode(h);
+    // What a previous session left behind, at the *other* ratio.
+    files.set(String(n.id), { sig: "stale-key-r3tzzz", blob: { type: "image/png", width: 744, height: 576 } });
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true, diskOn: true, snapRatio: 1 });
+    draw(h, 1);
+    await idle(h);
+    assertEqual(snapApi(h).diskLoaded, 0, "the 3x file was refused for a 1x page");
+    assertGreater(snapApi(h).captured, 0, "so the node was photographed instead");
+    assertGreater(putsFor(h).length, 0, "and the page wrote its own file");
+
+    // Now the same page again, with the file this setting asked for in place.
+    const sig = files.get(String(n.id)).sig;
+    assert(/r1t/.test(sig), "the 1x file is what was written");
+    const h2 = await boot({ storage: h.localStorage });
+    const files2 = fakeDisk(h2);
+    const n2 = oneNode(h2);
+    files2.set(String(n2.id), files.get(String(n.id)));
+    h2.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true, diskOn: true, snapRatio: 1 });
+    draw(h2, 1);
+    await h2.flush();
+    assertEqual(snapApi(h2).diskLoaded, 1, "the matching file was loaded");
+    assertEqual(snapApi(h2).captured, 0, "and nothing had to be captured");
+    h2.canvas.ctx.ops.length = 0;
+    draw(h2, 1);
+    assert(
+      h2.canvas.ctx.ops.filter((o) => o[0] === "drawImage").length > 0,
+      "the node is drawn from the loaded picture"
+    );
+  });
+
+  test("a picture the budget forced coarser than the setting is not written to disk", async () => {
+    const h = await boot();
+    fakeDisk(h);
+    h.canvas.ds.scale = 0.1;
+    h.canvas.links = [];
+    const nodes = [];
+    for (let i = 0; i < 25; i++) {
+      const n = h.node({ type: "SnapThing", pos: [i * 700, 0], size: [600, 400], widgets: [] });
+      n.id = 100 + i;
+      nodes.push(n);
+    }
+    h.canvas.nodes = nodes;
+    h.app.graph._nodes = nodes;
+    // 3x on 600x400 nodes fills the floor; what fits is kept, and what does not is
+    // taken coarser (1x) rather than skipped.
+    h.tracker.lowZoom.set({ flatBelow: 0.2, snapshots: true, diskOn: true, snapRatio: 3, snapMb: 256 });
+    draw(h, 1);
+    await idle(h, 8000);
+    const api = snapApi(h);
+    assertGreater(api.coarse, 0, "at least one picture was taken coarser than the setting");
+    const putKeys = putsFor(h).map((c) => sigOf(c.url));
+    assert(putKeys.length > 0, "the ones at the setting's ratio were written");
+    assert(
+      putKeys.every((k) => /r3t/.test(k)),
+      `and every file says 3x, because a coarser picture must not sit under the 3x name (${putKeys.join(", ")})`
+    );
+  });
+});
+
+// A stand-in picture is the node as the canvas would have drawn it *plus* what
+// the browser draws over the canvas: a prompt textarea, an image preview, a 3D
+// viewport. The canvas row under a DOM widget is blank (the frontend paints a
+// placeholder only in its own low-quality mode), so without this the picture of a
+// text or image node was the node's chrome and nothing else.
+suite("drawing: what a stand-in picture contains", () => {
+  const draw = (h, n = 1) => {
+    for (let i = 0; i < n; i++) {
+      h.advance(FRAME_MS);
+      h.canvas.setDirty(true, true);
+      h.canvas.draw();
+    }
+  };
+  const idle = async (h, ms = 1000) => {
+    h.advance(ms);
+    await h.flush();
+    h.advance(ms);
+    await h.flush();
+  };
+  const snapApi = (h) => h.tracker.lowZoom.snapshots;
+  const boxes = (h) => h.canvas.ctx.ops.filter((o) => o[0] === "fillRect" && Number(o[3]) === 200);
+  const capturesWith = (h, test) => h.canvases.filter((c) => c._ctx && c._ctx.ops.some(test));
+
+  function gateBooter() {
+    return { flatBelow: 0.5, snapshots: true, diskOn: false };
+  }
+  function domNode(h, type, size = [200, 100]) {
+    h.canvas.ds.scale = 0.1;
+    h.canvas.links = [];
+    const n = h.node({ type, pos: [0, 0], size, widgets: [] });
+    n.id = 11;
+    h.canvas.nodes = [n];
+    h.app.graph._nodes = [n];
+    return n;
+  }
+
+  test("an image preview in the node's DOM is drawn into the picture, at the widget's row", async () => {
+    const h = await boot();
+    const n = domNode(h, "LoadImage");
+    const img = h.document.createElement("img");
+    Object.assign(img, { naturalWidth: 64, naturalHeight: 64, complete: true, src: "a.png", currentSrc: "a.png" });
+    n.addDOMWidget("image", "image", img, { hideOnZoom: false, y: 20, computedHeight: 60 });
+    h.tracker.lowZoom.set(gateBooter());
+    draw(h, 1);
+    await idle(h);
+    assertEqual(snapApi(h).captured, 1, "the node was captured");
+    const pics = capturesWith(h, (o) => o[0] === "drawImage" && o[1] === img);
+    assertEqual(pics.length, 1, "the preview image is in the picture");
+    const op = pics[0]._ctx.ops.find((o) => o[0] === "drawImage" && o[1] === img);
+    // The row DomWidgets.vue positions it on: margin 10, widget.y 20, height 60.
+    assertEqual(op[2], 10, "x is the widget margin");
+    assertEqual(op[3], 30, "y is the margin plus the widget's own row");
+    assertEqual(op[4], 180, "and the width is the node's, minus the margin twice");
+    assertEqual(op[5], 40, "with the height the widget reports, minus the margin twice");
+    assertGreater(snapApi(h).domInk, 0, "and the readout counts it as DOM content drawn in");
+    assertEqual(snapApi(h).domText, 0, "nothing here was re-painted text");
+  });
+
+  test("a text widget's value is painted into the picture, and editing it makes a new one", async () => {
+    const h = await boot();
+    const n = domNode(h, "CLIPTextEncode");
+    const ta = h.document.createElement("textarea");
+    ta.value = "a photo of a cat";
+    n.addDOMWidget("text", "text", ta, { hideOnZoom: true, computedHeight: 80 });
+    h.tracker.lowZoom.set(gateBooter());
+    draw(h, 1);
+    await idle(h);
+    assertEqual(snapApi(h).captured, 1, "the node was captured");
+    const first = capturesWith(h, (o) => o[0] === "fillText" && String(o[1]).includes("cat"));
+    assertEqual(first.length, 1, "the text the widget holds is in the picture");
+    assertGreater(snapApi(h).domText, 0, "and the readout says it was re-painted, not screenshotted");
+
+    // The text changes: the signature carries the element's value, so the picture
+    // is dropped on the next drawn frame and a new one is taken. This is the
+    // "regenerate the stand-in when the node changes" the user asked for, for the
+    // case the node's own fields do not cover.
+    ta.value = "a photo of a dog";
+    h.advance(200); // past the signature's 100ms window
+    draw(h, 1);
+    await idle(h);
+    assertGreater(snapApi(h).invalidated, 0, "the old picture was dropped");
+    assertEqual(
+      capturesWith(h, (o) => o[0] === "fillText" && String(o[1]).includes("dog")).length,
+      1,
+      "and the new picture has the new text in it"
+    );
+  });
+
+  test("an image that has not loaded yet is left out, and drawn in when it arrives", async () => {
+    const h = await boot();
+    const n = domNode(h, "LoadImage");
+    const img = h.document.createElement("img");
+    Object.assign(img, { naturalWidth: 0, naturalHeight: 0, complete: false, src: "b.png" });
+    n.addDOMWidget("image", "image", img, { hideOnZoom: false });
+    h.tracker.lowZoom.set(gateBooter());
+    draw(h, 1);
+    await idle(h);
+    assertEqual(snapApi(h).captured, 1, "the node is pictured even before its image arrives");
+    assertEqual(capturesWith(h, (o) => o[0] === "drawImage" && o[1] === img).length, 0, "with a blank where the image will be");
+    assertGreater(snapApi(h).domSkipped, 0, "and the readout counts the content it could not draw");
+
+    // `complete` is part of the signature: the picture is re-made when it lands.
+    Object.assign(img, { naturalWidth: 64, naturalHeight: 64, complete: true });
+    h.advance(200);
+    draw(h, 1);
+    await idle(h);
+    assertEqual(capturesWith(h, (o) => o[0] === "drawImage" && o[1] === img).length, 1, "the image is drawn in once it is there");
+  });
+
+  test("a node playing a video is never photographed, however idle it is", async () => {
+    const h = await boot();
+    const n = domNode(h, "LoadVideo");
+    const video = h.document.createElement("video");
+    video.src = "clip.mp4";
+    n.addDOMWidget("video", "video", video, { hideOnZoom: false });
+    h.tracker.lowZoom.set(gateBooter());
+    draw(h, 2);
+    await idle(h);
+    assertEqual(snapApi(h).captured, 0, "no picture was taken of a video");
+    assertEqual(snapApi(h).held, 0, "and none is held");
+    assertGreater(boxes(h).length, 0, "the node keeps its box instead");
+  });
+
+  test("a widget whose content cannot be drawn is left blank and counted, not invented", async () => {
+    const h = await boot();
+    const n = domNode(h, "SomeCustomNode");
+    const div = h.document.createElement("div");
+    div.textContent = "fancy HTML widget";
+    n.addDOMWidget("custom", "dom", div, { hideOnZoom: false });
+    h.tracker.lowZoom.set(gateBooter());
+    draw(h, 1);
+    await idle(h);
+    assertEqual(snapApi(h).captured, 1, "the node is still pictured");
+    assertEqual(snapApi(h).domInk, 0, "with nothing invented for the HTML widget");
+    assertGreater(snapApi(h).domSkipped, 0, "and it is counted as content that could not be drawn");
+  });
 });

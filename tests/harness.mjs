@@ -184,6 +184,13 @@ export function createHarness(options = {}) {
       if (src && src._ctx && src._ctx.__antsImage) rec.imageReady = true;
       this.ops.push(rec);
     }
+    // The same approximation lodSnapMeasureText falls back to, parsed from the
+    // current font, so wrapping is deterministic in both branches.
+    measureText(text) {
+      const m = /(\d+(?:\.\d+)?)px/.exec(this.font || "");
+      const size = m ? Number(m[1]) : 14;
+      return { width: String(text).length * size * 0.55 };
+    }
     getImageData(x, y, w, h) {
       // What the snapshot engine's ink probe reads. Opaque by default, so the
       // probe's happy path runs in every test that captures anything; a test can
@@ -212,6 +219,9 @@ export function createHarness(options = {}) {
     "translate",
     "scale",
     "clearRect",
+    // The DOM-widget composite paints a text widget's value; the ops list is how
+    // a test sees that it reached the picture.
+    "fillText",
   ]) {
     FakeCanvasRenderingContext2D.prototype[name] = function (...args) {
       this.ops.push([name, ...args]);
@@ -220,11 +230,17 @@ export function createHarness(options = {}) {
   const makeStubCtx = () => new FakeCanvasRenderingContext2D(opts.ink !== "none");
 
   // createImageBitmap with the resize options, recording what was asked for.
+  // A blob that came out of this document's own canvas carries the canvas it came
+  // from, so the disk round trip (canvas -> toBlob -> PUT -> GET -> blob ->
+  // createImageBitmap -> canvas) can be exercised end to end in a test: the
+  // pixels are not re-encoded here, but the dimensions — which is what the
+  // capture ratio, the mip chain and the budget are all decided from — are real.
   const imageBitmaps = [];
   function createImageBitmapStub(img, opts) {
     const optsObj = opts || {};
-    const w = Number(optsObj.resizeWidth) || Number(img && (img.naturalWidth || img.width)) || 0;
-    const h = Number(optsObj.resizeHeight) || Number(img && (img.naturalHeight || img.height)) || 0;
+    const from = img && img.__antsCanvasNode;
+    const w = Number(optsObj.resizeWidth) || Number(from && from.width) || Number(img && (img.naturalWidth || img.width)) || 0;
+    const h = Number(optsObj.resizeHeight) || Number(from && from.height) || Number(img && (img.naturalHeight || img.height)) || 0;
     imageBitmaps.push({ src: img, width: w, height: h, quality: optsObj.resizeQuality || null });
     return Promise.resolve({ width: w, height: h, close() {}, __antsThumbOf: img });
   }
@@ -270,7 +286,23 @@ export function createHarness(options = {}) {
       wrapper.className = "dom-widget size-full";
       wrapper.appendChild(element);
       layer.appendChild(wrapper);
-      const widget = { name, type, element, options: options || {}, node: this, wrapper };
+      // The row this widget occupies, in node units: `DomWidgets.vue` positions
+      // the wrapper at `node.pos + margin` and sizes it from these two fields
+      // (`widget.width ?? node.width`, `widget.computedHeight ?? 50`), so a test
+      // that cares where the content lands sets them the way a real widget does.
+      const opts = options || {};
+      const widget = {
+        name,
+        type,
+        element,
+        options: opts,
+        node: this,
+        wrapper,
+        y: Number(opts.y) || 0,
+        computedHeight: opts.computedHeight != null ? Number(opts.computedHeight) : 50,
+        margin: opts.margin != null ? Number(opts.margin) : 10,
+        width: opts.width != null ? Number(opts.width) : undefined,
+      };
       this.widgets.push(widget);
       this._domWidgets = this._domWidgets || [];
       this._domWidgets.push(widget);
@@ -452,16 +484,42 @@ export function createHarness(options = {}) {
   const LiteGraphShim = { registered_node_types: {}, LGraphCanvas: FakeLGraphCanvas };
 
   // ---------------------------------------------------------- fetch stub ---
+  // Routes are keyed by path (`/ants_optimizer/thumbs/3`), which is what most
+  // tests want, or by the whole URL when a test is about the query — the disk
+  // cache keys its files by what is in that query, so those tests read the calls
+  // out of `fetchUrls` and can serve a blob for one exact key. A route value that
+  // is a function is called with `{ url, method, body }` and its return value is
+  // used as the response, so a test can play the thumb store's part completely.
   const fetchRoutes = new Map();
   let fetchCalls = 0;
-  const fetchShim = async (url) => {
+  const fetchUrls = []; // every call, in order: { url, method, body }
+  const fetchShim = async (url, init) => {
     fetchCalls++;
-    const key = String(url).split("?")[0];
-    if (fetchRoutes.has(key)) {
-      const body = fetchRoutes.get(key);
-      return { ok: true, status: 200, json: async () => body };
+    const full = String(url);
+    const key = full.split("?")[0];
+    const req = { url: full, method: (init && init.method) || "GET", body: init && init.body };
+    fetchUrls.push(req);
+    let route = fetchRoutes.has(full) ? fetchRoutes.get(full) : fetchRoutes.has(key) ? fetchRoutes.get(key) : undefined;
+    if (route === undefined) {
+      // A key ending in `*` is a prefix route: one handler for a family of URLs
+      // (the thumb store is one route per node id, and a test does not want to
+      // register one per id).
+      for (const [k, v] of fetchRoutes) {
+        if (k.endsWith("*") && key.startsWith(k.slice(0, -1))) {
+          route = v;
+          break;
+        }
+      }
     }
-    return { ok: false, status: 404, json: async () => ({}) };
+    if (typeof route === "function") {
+      const res = route(req);
+      if (res !== undefined) return res;
+    } else if (route && route.__blob) {
+      return { ok: true, status: 200, json: async () => ({}), blob: async () => route.__blob };
+    } else if (route !== undefined) {
+      return { ok: true, status: 200, json: async () => route };
+    }
+    return { ok: false, status: 404, json: async () => ({}), blob: async () => null };
   };
 
   // ------------------------------------------------------------- sandbox ---
@@ -714,6 +772,7 @@ export function createHarness(options = {}) {
     infos: () => consoleCalls.filter(([lvl]) => lvl === "info").map(([, msg]) => msg),
     fetchRoutes,
     fetchCalls: () => fetchCalls,
+    fetchUrls: () => fetchUrls.slice(),
     registerExtension,
     registerNodeType,
     makeNode,

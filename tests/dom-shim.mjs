@@ -236,6 +236,14 @@ export function createDocument(options = {}) {
         }
         return node._ctx;
       };
+      // Real canvases have toBlob, and the tracker's disk cache is built on it.
+      // The blob carries the canvas it came from instead of encoded pixels: a
+      // test can then follow a picture to a file and back (the dimensions — what
+      // the ratio and the budget are decided from — survive the trip).
+      node.toBlob = (cb, type) => {
+        if (typeof cb !== "function") return;
+        Promise.resolve().then(() => cb({ type: type || "image/png", __antsCanvasNode: node }));
+      };
     }
     return node;
   };

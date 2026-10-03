@@ -278,6 +278,31 @@ nodes. Its own README and reports show the consequences (long warm-up, nodes lef
 live when the budget runs out). Our version keeps the engine, changes the storage
 strategy, and credits every byte of it (Track M).
 
+**K7. Pictures that contain the node (v2.5.6).** A capture is the canvas plus
+what can honestly be drawn of the node's DOM widgets: images and canvases pixel
+for pixel, a text field's value re-painted in the theme's colours, a pack's HTML
+left blank and counted, and a video node never photographed. The signature
+covers the elements' own content, so a new image or an edited prompt makes a new
+picture. The disk cache is keyed by what is inside the file — the node's
+signature plus the capture resolution and a theme hash — which is what makes the
+resolution setting behave in both directions. Evidence and the tests are in
+`ANALYSIS.md`.
+
+**K8. Stand-ins in the Vue-nodes renderer — designed, not built (M–L).** The
+canvas-mode mechanism cannot be reused: the canvas draws no node there, so there
+is no surface to blit into. The shape a future version would take: this tool
+appends one `<img>` (or canvas) per node to the vue-nodes container, positioned
+from the node's own transform, and takes the node's root out of the picture
+while its picture is up (`visibility: hidden` keeps the box, so selection, drag
+and the context menu still work). Open questions to answer *with numbers first*:
+(1) how much of a frame the node DOM actually costs on a large graph in that
+renderer — if it is small, the whole feature is not worth its risks; (2) whether
+the frontend's re-render can be kept in step without per-frame transform reads;
+(3) z-order against selected nodes and groups; (4) the frontend's own DOM widget
+layer, which is positioned independently of the node; (5) graph switching and
+re-mount. Ground rule: it would be an explicit, opt-in policy on a renderer, not
+a silent default, and the canvas renderer's behaviour would not change.
+
 **Renderer compatibility — checked against the frontend, not assumed
 (v2.5.5).** On ComfyUI's newer frontend (Nodes 2.0 / Vue nodes,
 `LiteGraph.vueNodesMode`) every node is a DOM element and `drawNode` returns
