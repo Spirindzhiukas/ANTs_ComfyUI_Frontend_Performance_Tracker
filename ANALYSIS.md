@@ -119,8 +119,10 @@ What that means for this tool, and what had to change:
 This was asked twice: first whether it could work at all (v2.5.5: no, and the
 settings said so), then — after the frontend's own sources settled the mechanics
 — whether a second pathway could make the same settings act there, chosen
-automatically. **It can, and since v2.6.0 it does**, with one thing that remains
-impossible and a mechanism that is deliberately not the canvas renderer's.
+automatically. **It can, and since v2.6.0 it does** — and since v2.6.1 the boxes
+it draws carry the node's own content — with one thing that remains impossible
+(a photograph of the node) and a mechanism that is deliberately not the canvas
+renderer's.
 
 **What is impossible, and stays impossible: a photograph of the node.** The
 canvas renderer takes one by drawing the node into an offscreen canvas through
