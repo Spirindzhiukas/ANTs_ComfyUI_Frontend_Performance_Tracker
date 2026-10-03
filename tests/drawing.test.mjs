@@ -3013,6 +3013,89 @@ suite("drawing: the Nodes 2.0 (Vue nodes) frontend", () => {
     assertGreater(h.canvas.ctx.ops.filter((o) => o[0] === "fillRect").length, 0, "the title-level box is still drawn");
   });
 
+  test("a node's own rendered image is in its box, at the position the layout gives it", async () => {
+    const h = await boot();
+    const { nodes, vue } = vueGraph(h, 2);
+    stripWidgets(nodes);
+    // The shape ImagePreview.vue has: the node renders its own <img> inside its
+    // own DOM, mounted nowhere near a widget — so the widget route cannot see it.
+    const img = h.document.createElement("img");
+    Object.assign(img, { naturalWidth: 512, naturalHeight: 512, complete: true, src: "shot.png", currentSrc: "shot.png" });
+    vue.addMedia(nodes[0], img, { x: 10, y: 40, w: 180, h: 220 });
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true });
+    h.canvas.ctx.ops.length = 0;
+    draw(h, 1);
+    const drawn = h.canvas.ctx.ops.filter((o) => o[0] === "drawImage" && o[1] === img);
+    assertEqual(drawn.length, 1, "the node's own image is drawn into its box");
+    const op = drawn[0];
+    // Node-local units, recovered from layout: the node's element sits one title
+    // bar above the node's own origin in that pane, and the conversion takes that
+    // off — so what comes back is the position the fixture laid the image out at.
+    assertEqual(op[2], 10, "x is the position the layout gave it, in the node's own units");
+    assertEqual(op[3], 40, "y is the same, 40 below the node's origin");
+    assertEqual(op[4], 180, "and the width is the element's own");
+    assertEqual(op[5], 220, "with the height the layout gave it");
+    assertEqual(h.tracker.lowZoom.snapshots.vueMedia, 1, "the gauge counts the node's own media drawn");
+    assertEqual(h.tracker.lowZoom.snapshots.vueContent, 1, "and the content total with it");
+  });
+
+  test("the layout is read on a change, not on every frame", async () => {
+    const h = await boot();
+    const { nodes, vue } = vueGraph(h, 2);
+    stripWidgets(nodes);
+    const img = h.document.createElement("img");
+    Object.assign(img, { naturalWidth: 64, naturalHeight: 64, complete: true, src: "a.png", currentSrc: "a.png" });
+    vue.addMedia(nodes[0], img, { x: 10, y: 40, w: 100, h: 100 });
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true });
+    draw(h, 2);
+    const readsAfterFirst = h.rectReads;
+    draw(h, 4); // nothing about the node has changed
+    assertEqual(h.rectReads, readsAfterFirst, "four more frames with an unchanged node read no layout at all");
+    // A zoom is a change: the node's box is different, so the layout is read again.
+    h.canvas.ds.scale = 0.35;
+    vue.place();
+    draw(h, 1);
+    assertGreater(h.rectReads, readsAfterFirst, "a zoom re-reads the layout, because the box it draws into has changed");
+  });
+
+  test("a canvas a node renders itself is drawn too, and an unloaded image is not", async () => {
+    const h = await boot();
+    const { nodes, vue } = vueGraph(h, 2);
+    stripWidgets(nodes);
+    const cv = h.document.createElement("canvas");
+    cv.width = 300;
+    cv.height = 200;
+    vue.addMedia(nodes[0], cv, { x: 20, y: 30, w: 160, h: 120 }); // a 3D viewport's shape
+    const pending = h.document.createElement("img");
+    Object.assign(pending, { naturalWidth: 0, naturalHeight: 0, complete: false, src: "later.png", currentSrc: "later.png" });
+    vue.addMedia(nodes[0], pending, { x: 20, y: 160, w: 160, h: 100 });
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true });
+    h.canvas.ctx.ops.length = 0;
+    draw(h, 1);
+    assertEqual(h.canvas.ctx.ops.filter((o) => o[0] === "drawImage" && o[1] === cv).length, 1, "a canvas the node renders itself is drawn");
+    assertEqual(h.canvas.ctx.ops.filter((o) => o[0] === "drawImage" && o[1] === pending).length, 0, "an image that has not arrived is not");
+    assertEqual(h.tracker.lowZoom.snapshots.vueMedia, 1, "one media item drawn");
+    // The node's box clips its content: nothing spills out of a node.
+    assert(h.canvas.ctx.ops.some((o) => o[0] === "clip"), "the content is clipped to the node's box");
+  });
+
+  test("an element both routes can see is drawn exactly once", async () => {
+    const h = await boot();
+    const { nodes, vue } = vueGraph(h, 2);
+    stripWidgets(nodes);
+    // One image that is both the widget's own element and a child of the node's
+    // DOM — the two routes overlap on it. The widget route knows its row; the
+    // media pass knows its layout; drawing both would put it in twice.
+    const img = h.document.createElement("img");
+    Object.assign(img, { naturalWidth: 64, naturalHeight: 64, complete: true, src: "a.png", currentSrc: "a.png" });
+    vue.addMedia(nodes[0], img, { x: 10, y: 30, w: 180, h: 40 });
+    nodes[0].widgets.push({ name: "preview", element: img, y: 20, computedHeight: 60, margin: 10, node: nodes[0] });
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true });
+    h.canvas.ctx.ops.length = 0;
+    draw(h, 1);
+    assertEqual(h.canvas.ctx.ops.filter((o) => o[0] === "drawImage" && o[1] === img).length, 1, "the image is drawn exactly once");
+  });
+
   test("a node whose element cannot be reached keeps its own drawing", async () => {
     const h = await boot();
     const { nodes, vue } = vueGraph(h, 2);

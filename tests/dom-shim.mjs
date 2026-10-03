@@ -166,8 +166,22 @@ class Node {
     return null;
   }
 
+  // A test can lay an element out (`el._rect = {left, top, width, height}`, what
+  // the harness's Vue-nodes fixture does from real node geometry) and anything
+  // that reads layout sees it. Without one, the element has no box — which is
+  // also what the real DOM says about a detached or hidden element.
   getBoundingClientRect() {
-    return { top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 };
+    if (this._doc && this._doc._rectReads !== undefined) this._doc._rectReads++;
+    const r = this._rect;
+    if (!r) return { top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 };
+    return {
+      left: Number(r.left) || 0,
+      top: Number(r.top) || 0,
+      right: (Number(r.left) || 0) + (Number(r.width) || 0),
+      bottom: (Number(r.top) || 0) + (Number(r.height) || 0),
+      width: Number(r.width) || 0,
+      height: Number(r.height) || 0,
+    };
   }
 
   // What the tracker asks for: an attribute (with or without a value), a class,
@@ -239,8 +253,10 @@ export function createDocument(options = {}) {
   // built on it fails open — which is also the contract a real page needs.
   const ctxFactory = options.ctxFactory || null;
   doc._canvases = [];
+  doc._rectReads = 0; // how much layout the page read, so a test can hold the cache to it
   doc.createElement = (tag) => {
     const node = new Node(tag);
+    node._doc = doc;
     if (String(tag).toLowerCase() === "canvas") {
       node.width = 300;
       node.height = 150;

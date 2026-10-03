@@ -28,7 +28,7 @@ this is going. Read the golden rules before the code.
 ## Commands
 
 ```bash
-node tests/run-tests.mjs              # all 197 tests — must be green before any commit
+node tests/run-tests.mjs              # all 201 tests — must be green before any commit
 node tests/run-tests.mjs <substring>  # one suite/test, e.g. ... pill
 python3 tests/test_init.py            # the Python side (route parsing, node contract)
 node tests/demo.mjs                   # prints what the panel says against a synthetic graph
@@ -189,11 +189,18 @@ Seams worth knowing:
   hand-back; the harness shim supports tag selectors and `querySelector` for the
   nested-`<video>` and wrapper-`<img>` cases.
 - `lodVueBoxContent` gives a Vue box the node's own content when the stand-in is
-  *picture of the node*: the same composite the canvas renderer's capture makes
-  (`lodSnapDomInk` with its optional `out`), aimed at the frame canvas, with
-  `lodPaintNode`'s optional `content` / `detailOverride` parameters. The gauge is
-  `lowZoom.snapshots.vueContent` (items drawn on the last frame). Never add a
-  *photograph* claim here: no browser API draws a DOM element into a canvas.
+  *picture of the node*, from the two routes content takes to the page:
+  `lodSnapDomInk` for widget-borne elements (textarea values re-painted, img and
+  canvas blitted) and `lodVueMediaBoxes` for what the node renders itself
+  (`img`/`canvas` children of the node's element, drawn at their laid-out
+  position — `(childRect - rootRect)/zoom` in graph units, minus the title bar).
+  `lodPaintNode` gained optional `content` / `detailOverride` for this and clips
+  content to the node's box; the canvas renderer passes neither. Gauges:
+  `lowZoom.snapshots.vueContent` / `.vueMedia`. The layout read is cached per node
+  and keyed on zoom/pos/size (400 ms backstop), and elements the widget route drew
+  are skipped, so nothing is drawn twice. If you touch this, keep it that way:
+  a photograph of a DOM element is impossible (no browser API), and the harness
+  shim supports `el._rect` + `h.rectReads` for testing layout.
 
 Rules for tests:
 

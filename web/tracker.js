@@ -27,7 +27,7 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.6.1";
+const VERSION = "2.6.2";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
 // The class key ComfyUI stores in a workflow. The old key is still recognised so
 // a graph saved before the rename does not lose this node.
@@ -999,6 +999,8 @@ const LOD = {
   vueFlatOn: null, // last frame's answer to "are the boxes standing in?"
   vueBoxes: 0, // boxes painted in place of a Vue node's own element
   vueContentNow: 0, // box contents drawn on the last frame (a gauge, not a total)
+  vueMediaNow: 0, // of those, the node's own images and canvases drawn from layout
+  vueMedia: null, // Map<node, {root, key, at, items}>: the layout read, cached per node
   vueRestored: 0, // elements handed back (threshold, setting, tool, renderer)
   vueCleared: "", // why the last full hand-back happened, for the readout
   displayScale: 0, // 0 = read it from the browser, otherwise the device-pixel ratio
@@ -1137,6 +1139,10 @@ const LOD_DOM_CLASS = "ants-lod-box"; // elements hidden while their node is a b
 // resize handles and its drag still work — the element is there, it just does not
 // paint. Nothing about the frontend's own state is touched.
 const LOD_VUE_CLASS = "ants-vue-standin";
+// How long a Vue box may draw a layout read that is older than the node's own
+// state. Long enough that the reads happen on a change rather than on a frame,
+// short enough that a child which resized on its own comes right quickly.
+const LOD_VUE_MEDIA_MS = 400;
 const LOD_INERT_CLASS = "ants-lod-inert"; // elements switched off while their node is inert
 // Below this zoom nobody can read a node, let alone use one, so its UI is
 // switched off rather than paid for on every pointer event.
@@ -1620,11 +1626,24 @@ function lodPaintNode(node, canvas, ctx, content, detailOverride) {
   }
   // The node's own content, where the caller has some it can honestly draw. It
   // goes on the body, under the marks: an error ring or a progress bar is about
-  // the node, not part of its picture.
+  // the node, not part of its picture. Clipped to the node's own box, because
+  // that is how the node shows its content — nothing spills out of a node.
   if (drawable && content) {
     try {
+      if (typeof ctx.save === "function") ctx.save();
+      if (typeof ctx.beginPath === "function" && typeof ctx.rect === "function" && typeof ctx.clip === "function") {
+        ctx.beginPath();
+        ctx.rect(0, 0, w, h);
+        ctx.clip();
+      }
       content();
+      if (typeof ctx.restore === "function") ctx.restore();
     } catch (e) {
+      try {
+        if (typeof ctx.restore === "function") ctx.restore();
+      } catch (e2) {
+        /* nothing left to restore */
+      }
       /* content that cannot be drawn leaves the box as it was */
     }
   }
@@ -3791,10 +3810,22 @@ function lodSnapLive(node, canvas) {
 // What a box carries here is not a photograph (a DOM node cannot be drawn into a
 // bitmap — no browser API does it, and the canvas renderer's capture works only
 // because LiteGraph itself draws the node) but the node's own content, drawn
-// live: images and canvases pixel for pixel, text fields re-painted, a pack's own
-// HTML left blank. That is the same composite the canvas renderer's capture makes,
-// so a node whose picture is worth looking at is worth looking at in both
-// renderers. The offscreen half — the stored pictures, the capture resolution and
+// live from two sources, because a node's content reaches the page by two routes:
+//
+//   * widgets that carry their own element (a prompt's textarea, a pack's
+//     component widget) are mounted into the node's DOM by the frontend's
+//     WidgetDOM.vue, and their row geometry is the frontend's own rule;
+//   * everything the node renders itself — the frontend's ImagePreview.vue puts
+//     the node's pictures in <img> elements inside the node, and a custom node
+//     may render a <canvas> — is found by walking the node's element and drawn at
+//     the position the browser laid it out in, which opacity: 0 keeps readable
+//     while the node is a stand-in.
+//
+// The second route is why this exists at all: the legacy image preview *widget*
+// is canvas-drawn (`surfaces: { canvas: 'shown', vueNode: 'never' }`), so in this
+// renderer it is mounted nowhere and the canvas draws no widget — the images in
+// the node's DOM are the only copy on the page. Text fields were never affected
+// (they are widget-borne), which is exactly why text stood-ins worked first. The offscreen half — the stored pictures, the capture resolution and
 // the disk cache — belongs to the canvas renderer and is reported idle here.
 // The saving is different too: not cheaper canvas drawing, but fewer node pixels
 // for the browser to paint, which is exactly where a zoomed-out heavy graph spends
@@ -3838,6 +3869,9 @@ function lodVueBlank(node, on) {
   const set = LOD.vueFlat || (LOD.vueFlat = new Set());
   if (!el || !el.classList) {
     set.delete(node);
+    // Nothing of this node is on screen any more: the layout read it left behind
+    // goes with it, so the cache only ever holds nodes that are stand-ins.
+    if (LOD.vueMedia) LOD.vueMedia.delete(node);
     return false;
   }
   try {
@@ -3846,8 +3880,85 @@ function lodVueBlank(node, on) {
     return false;
   }
   if (on) set.add(node);
-  else set.delete(node);
+  else {
+    set.delete(node);
+    if (LOD.vueMedia) LOD.vueMedia.delete(node);
+  }
   return true; // the class is where it was asked to be, in either direction
+}
+
+// The node's own rendered media, at the position the browser laid it out in.
+//
+// This is the half the widget route cannot see. In this renderer the frontend
+// renders a node's pictures *itself* — `ImagePreview.vue` puts the node's images
+// in `<img>` elements inside the node's DOM, and a custom node may render a
+// `<canvas>` (a 3D viewport, a curve editor) — while the legacy preview *widget*
+// is a canvas-drawn one with `surfaces: { canvas: 'shown', vueNode: 'never' }`,
+// so it is mounted nowhere here. The canvas renderer's capture never has this
+// problem: the widget's own `drawWidget` puts those images on the canvas and the
+// capture takes the canvas. Here the canvas draws no widget, so the box draws the
+// elements themselves.
+//
+// Geometry is read from the layout rather than guessed. `opacity: 0` (the
+// blanking) keeps every box intact, so `getBoundingClientRect` is answerable
+// while the node is a stand-in; both the node's element and its children sit in
+// the frontend's one transformed pane, so their difference divided by the zoom is
+// a distance in graph units. The read happens only when the node's own layout key
+// changes (zoom, position, size, the elements and their sources), so the steady
+// state costs nothing: a key comparison per drawn box, no layout read.
+function lodVueMediaBoxes(node, canvas) {
+  const root = lodVueRootEl(node);
+  if (!root || typeof root.querySelectorAll !== "function") return null;
+  const scale = Number(canvas && canvas.ds && canvas.ds.scale) || 1;
+  const pos = (node && node.pos) || [0, 0];
+  const size = (node && (node.renderingSize || node.size)) || [0, 0];
+  const key = [scale, Number(pos[0]) || 0, Number(pos[1]) || 0, Number(size[0]) || 0, Number(size[1]) || 0].join("|");
+  if (!LOD.vueMedia) LOD.vueMedia = new Map();
+  const cache = LOD.vueMedia;
+  const hit = cache.get(node);
+  const now = nowMs();
+  // A node whose layout key is unchanged is re-read at most this often: cheap
+  // insurance against a child that changed size without touching the node.
+  if (hit && hit.root === root && hit.key === key && now - hit.at < LOD_VUE_MEDIA_MS) return hit.items;
+  let els = [];
+  try {
+    els = root.querySelectorAll("img,canvas") || [];
+  } catch (e) {
+    els = [];
+  }
+  const title = Number((typeof LiteGraph !== "undefined" && LiteGraph && LiteGraph.NODE_TITLE_HEIGHT) || 30);
+  let rr = null;
+  try {
+    rr = typeof root.getBoundingClientRect === "function" ? root.getBoundingClientRect() : null;
+  } catch (e) {
+    rr = null;
+  }
+  const items = [];
+  if (rr) {
+    for (const el of els) {
+      const tag = String((el && el.tagName) || "").toUpperCase();
+      if (tag !== "IMG" && tag !== "CANVAS") continue;
+      let r = null;
+      try {
+        r = typeof el.getBoundingClientRect === "function" ? el.getBoundingClientRect() : null;
+      } catch (e) {
+        r = null;
+      }
+      if (!r) continue;
+      const w = Number(r.width) / scale;
+      const h = Number(r.height) / scale;
+      // A box with no area is a hidden or detached element: nothing to draw.
+      if (!(w > 1) || !(h > 1)) continue;
+      const x = (Number(r.left) - Number(rr.left)) / scale;
+      // The node's element starts one title bar above the node's own origin, and
+      // the box is drawn at that origin (LiteGraph translates to node.pos).
+      const y = (Number(r.top) - Number(rr.top)) / scale - title;
+      if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+      items.push({ el, x, y, w, h });
+    }
+  }
+  cache.set(node, { root, key, at: now, items });
+  return items;
 }
 
 // What can honestly be drawn of a Vue node's content, in the box that stands in
@@ -3859,9 +3970,35 @@ function lodVueBlank(node, on) {
 // API draws a DOM element into a canvas, so the parts that are neither an image,
 // a canvas nor a plain string stay blank and are counted.
 function lodVueBoxContent(node, canvas, ctx) {
-  const out = { ink: 0, text: 0, skipped: 0 };
+  const out = { ink: 0, text: 0, skipped: 0, els: [] };
+  // 1. The widgets that carry their own element (a prompt's textarea and anything
+  //    a pack added), at the row geometry the frontend positions them by.
   lodSnapDomInk(node, ctx, canvas, out);
+  // 2. The node's own rendered pictures and canvases, at the position the browser
+  //    laid them out in. What the widget route already blitted is skipped, so an
+  //    image is never drawn twice.
+  const boxes = lodVueMediaBoxes(node, canvas);
+  if (boxes) {
+    for (const it of boxes) {
+      const el = it.el;
+      if (out.els.indexOf(el) >= 0) continue;
+      const wpx = Number(el.naturalWidth || el.width) || 0;
+      const hpx = Number(el.naturalHeight || el.height) || 0;
+      if (!(wpx > 0) || !(hpx > 0)) {
+        out.skipped++; // an image that has not arrived yet, or a canvas with no surface
+        continue;
+      }
+      try {
+        ctx.drawImage(el, it.x, it.y, it.w, it.h);
+        out.ink++;
+        out.media = (out.media || 0) + 1;
+      } catch (e) {
+        out.skipped++;
+      }
+    }
+  }
   if (out.ink) LOD.vueContentNow += out.ink;
+  if (out.media) LOD.vueMediaNow += out.media;
   return out.ink;
 }
 
@@ -3886,7 +4023,8 @@ function lodVueUnblankAll(reason) {
 // Above the threshold (or with the setting or the tool off) the sweep is a single
 // comparison, which is what makes a stale class impossible to leave behind.
 function lodVueFramePlan(canvas) {
-  LOD.vueContentNow = 0; // a gauge of the last frame, not a running total
+  LOD.vueContentNow = 0; // gauges of the last frame, not running totals
+  LOD.vueMediaNow = 0;
   const flat = !!(S.enabled && LOD.snapOn && LOD.flatBelow > 0 && lodVueNodesMode() && lodFlatOn(canvas));
   const prev = LOD.vueFlatOn;
   LOD.vueFlatOn = flat;
@@ -4759,6 +4897,7 @@ function lodSnapTextInk(el, cctx, box) {
 // what it could not, so the readout can say both.
 function lodSnapDomInk(node, cctx, canvas, into) {
   const out = into || { ink: 0, text: 0, skipped: 0 };
+  if (!out.els) out.els = []; // what was blitted, so another pass does not draw it twice
   if (!cctx || typeof cctx.drawImage !== "function") return out;
   const widgets = (node && node.widgets) || [];
   void canvas;
@@ -4801,6 +4940,7 @@ function lodSnapDomInk(node, cctx, canvas, into) {
         }
         cctx.drawImage(el, box.x, box.y, box.w, box.h);
         out.ink++;
+        if (out.els && out.els.indexOf(el) < 0) out.els.push(el);
       } else if (kind === "text") {
         if (lodSnapTextInk(el, cctx, box)) {
           out.ink++;
@@ -9732,10 +9872,11 @@ function buildTweaksTab(container) {
               : `zoom ${pct(LOD.zoom)} is below your ${pct(LOD.flatBelow)} setting: ${LOD.vueBoxes} box(es) painted and ` +
                 `${LOD.vueFlat ? LOD.vueFlat.size : 0} node element(s) blanked — those nodes stop painting themselves and the canvas draws their boxes. ` +
                 (LOD.snapOn
-                  ? `Each box carries what the node is showing where it can honestly be drawn: its images and canvases pixel for pixel, its text fields ` +
-                    `re-painted in the theme's colours, a pack's own HTML left blank and counted (${LOD.vueContentNow} content item(s) drawn on the last ` +
-                    `frame). A *photograph* of a node is not obtainable in this renderer — no browser API draws a DOM element into a canvas, and the canvas ` +
-                    `renderer's capture works only because LiteGraph itself draws the node — so the capture, ratio and disk settings stay idle here`
+                  ? `Each box carries what the node is showing: the pictures and canvases the node renders itself, drawn from the very elements the ` +
+                    `browser laid out (at their real position in the node — ${LOD.vueMediaNow} of the ${LOD.vueContentNow} content item(s) on the last ` +
+                    `frame), its text fields re-painted in the theme's colours from the values they hold, and a pack's own HTML left blank and counted. ` +
+                    `A *photograph* of the node's chrome is not obtainable in this renderer — no browser API draws a DOM element into a canvas, and the ` +
+                    `canvas renderer's capture works only because LiteGraph itself draws the node — so the capture, ratio and disk settings stay idle here`
                   : `The stand-in setting is off: these are your chosen box detail, with no content drawn into them`) +
                 `. Link ink, the idle redraw cap and the governor are unaffected`
           );
@@ -12510,6 +12651,7 @@ function installDebugApi() {
             bitmaps: lodSnapBitmaps(),
             vueBlanked: LOD.vueFlat ? LOD.vueFlat.size : 0,
             vueContent: LOD.vueContentNow,
+            vueMedia: LOD.vueMediaNow,
             vueBoxes: LOD.vueBoxes,
             vueRestored: LOD.vueRestored,
             vueCleared: LOD.vueCleared,

@@ -1,6 +1,6 @@
 # What works, what fails, and what was taken out
 
-An audit of the repository as of v2.6.1, done by reading the sources rather
+An audit of the repository as of v2.6.2, done by reading the sources rather
 than the docs, running the suites, and running the demo. Every claim below
 has a file and (where it matters) a line reference. Found defects were fixed
 in the same pass; retired ideas were removed rather than documented as if
@@ -9,8 +9,8 @@ they still existed.
 ## How this was checked
 
 ```bash
-node tests/run-tests.mjs        # 197 passing (172 before the stand-in passes; twenty-five added)
-node tests/run-tests.mjs "Nodes 2.0"        # the fifteen that cover that renderer
+node tests/run-tests.mjs        # 201 passing (172 before the stand-in passes; twenty-nine added)
+node tests/run-tests.mjs "Nodes 2.0"        # the nineteen that cover that renderer
 node tests/run-tests.mjs "cache on disk"    # the five that cover the picture store
 node tests/run-tests.mjs "stand-in picture" # the five that cover what a picture holds
 python3 tests/test_init.py      # Ran 9 tests ... OK
@@ -144,21 +144,50 @@ the disk cache — stays idle here and the readout says why. The tool does not
 pretend the setting is broken, and it does not pretend a synthetic chrome is a
 photograph.
 
-**What the boxes carry instead, and why that is the honest maximum.** A node's
-*content* is not chrome: an image preview is an `<img>`, a mask editor or a 3D
-viewport is a `<canvas>`, a prompt is a `<textarea>` whose value is text. Those
-three things *are* drawable, and they are what a person recognises a node by at
-10% zoom. So in this renderer the box stands in at the picture level — title bar,
-error ring, progress, dimming — with the node's own content drawn into it, live,
-at the rows the canvas renderer's capture composites them at (`lodVueBoxContent`
-reusing the same composite): images and canvases pixel for pixel, text re-painted
-in the theme's colours, a pack's own HTML left blank and counted, a video node
-never blanked at all. It is the same composite the canvas renderer's *capture*
-makes, aimed at the frame instead of an offscreen bitmap, and it needs no
-signature, no invalidation and no idle lane: a dropped-in image or a typed word
-appears on the next drawn frame by itself. What it is not is a screenshot — it is
-the node's own pixels where they exist and the tool's drawing where they do not,
-and the readout says exactly that.
+**The user's report, reproduced and explained: text nodes had content, nothing
+else did.** The symptom was precise — "some custom text nodes and CLIP Text
+Encode (Prompt) seem to have them but nothing else" — and the upstream sources
+say why, exactly.
+
+| Route a node's content takes to the page | In the Vue-nodes renderer | What a box could see |
+| --- | --- | --- |
+| **DOM widgets** (`multilineTextarea` for a prompt, anything added with `addDOMWidget`): the widget owns an element | `WidgetDOM.vue` mounts `widget.element` **into the node's DOM** (`domEl.replaceChildren(widget.element)`) | `node.widgets[i].element` — the widget route. **Text worked from the first pass.** |
+| **Canvas-drawn widgets** (the image preview: `ImagePreviewWidget.drawWidget` → `renderPreview(ctx, node, y, computedHeight, node.imgs, width)`) | Registered `surfaces: { canvas: 'shown', vueNode: 'never', panel: 'never' }`, so the Vue renderer mounts it **nowhere**, and `drawNode` returns before drawing widgets — the canvas does not draw it either | nothing: no element, and the canvas is blank. This is why image nodes had no picture. |
+| **The frontend's own Vue preview** (`ImagePreview.vue`): `<img>` elements inside the node's DOM, one per image, grid or single view | Rendered **inside the node's element** | not through a widget — but reachable by walking the node's own element, which is the fix. |
+
+So the shape of the bug: the canvas renderer's *capture* never had this problem
+(the canvas-drawn widget puts the images on the canvas, and the capture takes the
+canvas), and a Vue box could not see them because it looked only where widgets
+put things. What it needed was to look where the *node* puts things.
+
+**The fix (v2.6.2).** `lodVueMediaBoxes` walks the node's own element for `img`
+and `canvas` children and draws them in the box at the position the browser laid
+them out in. Two properties make that honest rather than clever: `opacity: 0`
+keeps every box intact, so the layout is readable while a node is a stand-in;
+and the node's element and its children sit in the frontend's one transformed
+pane, so the difference between two client rects divided by the zoom is a
+distance in graph units (`(childRect - rootRect) / scale`, minus the title bar the
+node's element starts above the node's origin). The read happens on a change —
+zoom, node position, node size, the elements and their sources — with a 400 ms
+backstop for a child that resized on its own, so the steady state is one key
+comparison per drawn box and no layout read at all (pinned by a test that counts
+layout reads). Elements the widget route already drew are skipped, so an image
+shown by both routes is drawn once. The content is clipped to the node's box,
+because nothing spills out of a node.
+
+**What the boxes carry instead, and why that is the honest maximum.** A node's *content* is not chrome: an image preview is an `<img>` (or, in the
+canvas renderer, an image drawn by a widget), a mask editor or a 3D viewport is a
+`<canvas>`, a prompt is a `<textarea>` whose value is text. Those things *are*
+drawable, and they are what a person recognises a node by at 10% zoom. So the box
+stands in at the picture level — title bar, error ring, progress, dimming — with
+the node's own content drawn into it, live, from whichever route the content took
+to the page (the table above): the widget route for elements a widget owns, the
+layout route for everything the node renders itself. It needs no signature, no
+invalidation and no idle lane — a dropped-in image or a typed word appears on the
+next drawn frame by itself. What it is not is a screenshot: it is the node's own
+pixels where they exist (an `<img>`/`<canvas>` blitted pixel for pixel) and the
+tool's drawing where they do not (text re-painted from the value a field holds, a
+pack's HTML blank and counted), and the readout says exactly that.
 
 **How the blanking works.** The two things that do exist are the node's element
 and the canvas, so the stand-in is made of those:
@@ -327,11 +356,26 @@ apply, not just in the docs.
   setting stops applying) — but the size of the saving and the feel of a
   blanked-but-interactive node are things only a real heavy graph can show. The
   tool measures both: the frame budget, the Stalls tab and
-  `lowZoom.snapshots.vueBlanked` / `vueBoxes` / `vueRestored`.
+  `lowZoom.snapshots.vueBlanked` / `vueBoxes` / `vueMedia` / `vueContent` /
+  `vueRestored`.
+- **The Vue box's media positions come from layout**, read when a node's own
+  state changes (zoom, position, size, the elements and their sources) and at
+  most every 400 ms otherwise. A child that resizes with no signal at all (a font
+  loading, a CSS animation) can therefore be drawn where it was for up to 400 ms.
+  The alternative — reading layout every frame for every blanked node — is the
+  cost this whole feature exists to avoid.
 - **A picture with a cross-origin image in it cannot be written to disk.** The
   browser taints the canvas; blitting still works, so the picture is used from
   memory, and the write is skipped without counting as a disk failure. Not
   exercised in this pass (the harness's images are all same-origin fictions).
+- **A pack's *canvas-drawn* widget content is still invisible in the Vue-nodes
+  renderer** — the widget has no element to walk and the canvas draws no widget,
+  so a pack that draws its preview with `drawWidget` (as the frontend's own image
+  preview does) shows a box with no picture there. The frontend's own preview is
+  covered because the frontend also renders it in the DOM (`ImagePreview.vue`);
+  a pack that does not gets nothing, and the box says so by being empty rather
+  than by inventing ink. A pack that wants the box to carry its content can add a
+  DOM widget; the tool cannot take what was never on the page.
 - **A picture of a Vue node is not obtainable** without a DOM-to-canvas
   library (or an SVG `foreignObject` trick), which would mis-render real
   stylesheets and cross-origin images. The Vue pathway is boxes by design, and

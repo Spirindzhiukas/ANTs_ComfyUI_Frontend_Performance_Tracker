@@ -680,6 +680,21 @@ export function createHarness(options = {}) {
       container.appendChild(root);
       roots.set(String(n.id), root);
     }
+    // What the node renders *itself* — the shape ImagePreview.vue has: a
+    // container inside the node's own DOM holding the node's images, laid out by
+    // the browser, not mounted through a widget. `box` is in node-local units
+    // (the same space the canvas draws a node in), which is what the client rect
+    // is derived from below.
+    const media = []; // { el, node, box }
+    const addMedia = (node, el, box) => {
+      const root = roots.get(String(node.id));
+      if (root) root.appendChild(el);
+      else container.appendChild(el);
+      media.push({ el, node, box: { x: Number(box.x) || 0, y: Number(box.y) || 0, w: Number(box.w) || 0, h: Number(box.h) || 0 } });
+      place();
+      return el;
+    };
+
     const place = () => {
       const scale = Number(canvas.ds.scale) || 1;
       const ox = Number(canvas.ds.offset[0]) || 0;
@@ -692,6 +707,31 @@ export function createHarness(options = {}) {
         originY = r ? Number(r.top) || 0 : 0;
       } catch (e) {
         /* the shim's rect is always 0,0 */
+      }
+      // The frontend's own conversion: client = (graph + offset) * scale + rect.
+      // A node element is placed one title bar above the node's origin, which is
+      // exactly what LGraphNode.vue's transform does.
+      for (const n of nodes()) {
+        const root = roots.get(String(n.id));
+        if (root) {
+          root._rect = {
+            left: (n.pos[0] + ox) * scale + originX,
+            top: (n.pos[1] - 30 + oy) * scale + originY,
+            width: (Math.abs(Number(n.size && n.size[0])) || 0) * scale,
+            height: (Math.abs(Number(n.size && n.size[1])) || 0) * scale,
+          };
+        }
+      }
+      for (const m of media) {
+        const n = m.node;
+        const root = roots.get(String(n.id));
+        if (!root || !root._rect) continue;
+        m.el._rect = {
+          left: (n.pos[0] + m.box.x + ox) * scale + originX,
+          top: (n.pos[1] + m.box.y + oy) * scale + originY,
+          width: m.box.w * scale,
+          height: m.box.h * scale,
+        };
       }
       for (const n of nodes()) {
         for (const w of n._domWidgets || []) {
@@ -714,6 +754,8 @@ export function createHarness(options = {}) {
       wrappers,
       place,
       rootFor: (n) => roots.get(String(n.id)) || null,
+      addMedia,
+      media,
       // What the frontend does with a widget while its node is off screen
       // (DomWidgets.vue's `isNodeVisible`) — a test can hand it back.
       exit: () => {
@@ -778,6 +820,9 @@ export function createHarness(options = {}) {
     makeNode,
     node,
     enterVueNodes,
+    get rectReads() {
+      return document._rectReads || 0;
+    },
     addResource,
     panel,
     textOf,

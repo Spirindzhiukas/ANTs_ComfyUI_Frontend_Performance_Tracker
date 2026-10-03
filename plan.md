@@ -299,14 +299,23 @@ themselves idle. The pathway is chosen per call from `LiteGraph.vueNodesMode`, a
 box is painted only after a real blanking, and every blanked element is handed
 back on the frame the setting, the zoom, the tool or the renderer changes.
 
-What the boxes carry (v2.6.1): the node's own content, drawn live at the same
-rows the canvas renderer's capture composites them at — images and canvases pixel
-for pixel, text re-painted, a pack's HTML blank and counted — at the picture
-level (title bar, error ring, progress, dimming). A *photograph* of the node
-remains impossible: no browser API draws a DOM element into a canvas, and the
-`<foreignObject>` route cannot fetch the images that matter. Recorded in
+What the boxes carry (v2.6.1, completed in v2.6.2): the node's own content,
+drawn live from the two routes it takes to the page — widget-borne elements
+(`WidgetDOM.vue` mounts `widget.element` into the node) and everything the node
+renders itself (`ImagePreview.vue`'s `<img>` elements, a custom node's
+`<canvas>`), the latter drawn at its laid-out position through `lodVueMediaBoxes`
+(rect arithmetic, cached on the node's own layout key). A *photograph* of the
+node remains impossible: no browser API draws a DOM element into a canvas, and
+the `<foreignObject>` route cannot fetch the images that matter. Recorded in
 `ANALYSIS.md` with the two rejected routes, so nobody re-opens it without new
 information.
+
+Remaining gap, deliberately not closed: a pack whose preview is a *canvas* widget
+(`drawWidget`) with no DOM rendering has nothing on the page for the box to
+carry in this renderer — unlike the frontend's own preview, which `ImagePreview.vue`
+also renders as DOM. Closing it would mean running a pack's canvas draw against
+the live frame context for every blanked node, which is exactly the per-frame
+cost this pathway exists to remove.
 
 Open, and deliberately not guessed at: **how much this saves on a real heavy
 Vue-nodes graph.** The frontend composites all nodes in one transformed container
