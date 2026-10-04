@@ -386,7 +386,8 @@ own painting of the stand-in nodes is skipped (`visibility`, and `vuePaintSkippe
 counts it), the picture carries the node's structure, and the capture waits for the
 node to settle; since v2.6.7 it is not dropped while it is out of date either, so
 the saving is not paid back as a box on screen (1020 of 1800 frames with a box in
-the A/B, 17 after). What is still not measurable from here is the rasteriser's bill on
+the A/B, 17 after; an average of 7.14 boxed nodes a frame against 0.45, and 23.8
+blits a frame against 20.4). What is still not measurable from here is the rasteriser's bill on
 the user's machine (Electron, GPU/hardware acceleration off) — DevTools' paint
 flashing is the direct way to see it, and the frame budget plus the Stalls tab are
 the tool's own instruments. Each report has been a state the harness could model only after the fact:
