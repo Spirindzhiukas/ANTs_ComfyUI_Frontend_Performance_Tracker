@@ -10,7 +10,7 @@ they still existed.
 
 ```bash
 node tests/run-tests.mjs        # 220 passing (172 before the stand-in passes; forty-eight added)
-node tests/run-tests.mjs "Nodes 2.0"        # the thirty-six that cover that renderer
+node tests/run-tests.mjs "Nodes 2.0"        # the thirty-seven that cover that renderer
 node tests/run-tests.mjs "cache on disk"    # the six that cover the picture store
 node tests/run-tests.mjs "stand-in picture" # the five that cover what a picture holds
 python3 tests/test_init.py      # Ran 9 tests ... OK
@@ -490,7 +490,7 @@ pathway token dropped from the key → three fail; the no-element refusal remove
 test fails; the text keeping the title-bar offset → the text test fails.
 
 **What is not verified.** The mechanism is verified against the frontend's
-sources and the harness (thirty-six tests now cover that renderer); it had not
+sources and the harness (thirty-seven tests now cover that renderer); it had not
 been run against a live Vue-nodes page by this project when the fourth report
 arrived, and that report is exactly why the defects above were invisible from
 here — the harness put a class on an element nothing rewrote, it reported
@@ -565,17 +565,19 @@ takes the frontend's own paint away while the picture stands in. That is
 "screenshot the node the way the user sees it" by construction: the picture and
 the live node can no longer disagree, because the live node is not painted.
 
-*Four tests, and the mutations that bind them.* The new tests: the paint-skip rule
+*Five tests, and the mutations that bind them.* The new tests: the paint-skip rule
 is in the stylesheet and the element's layout is untouched (a box that changes
 inside a stand-in is still reported); the picture carries the node's structure
 (frame at the element's own rect, dots as arcs) both live and in the capture; a
-node is photographed only after the window (nothing captured inside it, the lane
-reports the wait, the picture lands after it); and a change re-opens the window
-(the picture is dropped, no replacement inside the window, a fresh one after it).
-A eight-mutation battery was run over the tracker — the gate bypassed, the
-re-arming removed, the structure not drawn, the stylesheet rule removed, the slot
-dots not drawn, the first-time window never opened, the structure reader reduced
-to the frame — and **all eight are caught**.
+widget's own row is in the picture at its measured box with the browser's radius,
+in the live box and in the picture; a node is photographed only after the window
+(nothing captured inside it, the lane reports the wait, the picture lands after
+it); and a change re-opens the window (the picture is dropped, no replacement
+inside the window, a fresh one after it). A nine-mutation battery was run over the
+tracker — the gate bypassed, the re-arming removed, the structure not drawn, the
+stylesheet rule removed, the slot dots not drawn, the first-time window never
+opened, the structure reader reduced to the frame, the widget row's surface not
+read, the widget rows not drawn — and **all nine are caught**.
 
 Two things the Nodes 2.0 pass confirmed rather than changed: the Vue node's
 **root element is never hidden or inerted** (`via: "root"` records are exempt from
@@ -695,7 +697,7 @@ apply, not just in the docs.
   other than the Node harness was executed in this pass.
 - **The Vue-nodes stand-in has not been run against a live page *by this
   project*.** It is verified against the frontend's sources and the harness
-  (thirty-six tests), and its failure modes are contained by construction (a box
+  (thirty-seven tests), and its failure modes are contained by construction (a box
   only ever follows a real blanking, and every blanked element is handed back on
   the frame the setting stops applying) — but the user's page is the live test, and
   it has already caught four defects this harness could not: a class that Vue

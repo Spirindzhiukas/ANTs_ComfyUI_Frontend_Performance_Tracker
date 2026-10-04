@@ -335,7 +335,19 @@ costs one picture at the end of it instead of one picture per step. That is the
 answer to a node being photographed while the frontend was still filling it in —
 the frontend mounts a node and then writes its parts over the following frames,
 and an image is decoded when it is decoded, so "capture immediately" is a picture
-of a half-built node. Everything downstream is therefore identical: the capture
+of a half-built node. **The capture lane is this tool's own, and that is
+deliberate**: it runs on the idle lane (32 ms between slices, a 12 ms budget per
+slice, nothing while the page has had input in the last 400 ms) rather than on the
+frontend's own tick, because upstream has no per-node tick to ride — in this
+renderer nodes are Vue components, the transform is one property on one pane
+(`useTransformState.ts`), and what looks like tiers is the frontend mounting a node
+in passes (the component, then `NodeSlots`' watcher, then the layout store's size,
+then `NodeWidgets`, then `NodeContent` and the media) with its own notion of a
+settled gesture (`useTransformSettling(…, { settleDelay: 256 })`, which is why the
+window is 300 ms). A browser's incremental rasterisation is not observable from
+page JavaScript, so the honest form of "capture the node the way the user sees it"
+is to read what the browser laid out and computed, which is what this does.
+Everything downstream is therefore identical: the capture
 resolution ladder (0.25× → 3×), the half and quarter mip copies blitted on
 screen, the RAM budget, the disk cache and its key, and the files in
 `temp/ANTs_Frontend_Optimizer_THUMBNAILS/`. **The key names the pathway** —
@@ -356,7 +368,7 @@ picture and counted, exactly as in the canvas renderer.
 | --- | --- |
 | Replace node previews with bitmap stand-ins at zoom levels | **Works, as boxes.** Below the setting each node's element stops *painting* — its contents are `visibility: hidden`, which an engine skips in the paint phase, and it stays in the layout and in every observer — and the canvas draws its box; above it, every element is handed back. |
 | Stand-in (plain / title / title + state) | **Works** — the same box ladder, same marks, same colours, and no content drawn (that is what "plain" means here too). Choosing one of these instead of *picture* changes nothing else: the elements stay handed over and the boxes keep standing, frame after frame. |
-| Stand-in: *picture of the node* | **Works, drawn rather than photographed.** No browser API can draw a DOM element into a canvas, so a screenshot of a Vue node is impossible; the picture is instead *drawn* — the box at the picture level (title bar, error ring, progress, dimming) with the node's own structure (surface, header bar, body panel, slot dots, at their laid-out rects and computed colours) and its content: the images and canvases the node renders (the frontend's preview `<img>` elements among them) at their real laid-out position, text fields re-painted, a pack's HTML blank and counted. A node is photographed only after it has stood still (300 ms, re-opened by every change), so the picture is of a finished node, never of one still being filled in. Until the idle lane has that picture, the box carries the same content live. |
+| Stand-in: *picture of the node* | **Works, drawn rather than photographed.** No browser API can draw a DOM element into a canvas, so a screenshot of a Vue node is impossible; the picture is instead *drawn* — the box at the picture level (title bar, error ring, progress, dimming) with the node's own structure (surface, header bar, body panel, each widget's own row, slot dots, at their laid-out rects and computed colours) and its content: the images and canvases the node renders (the frontend's preview `<img>` elements among them) at their real laid-out position, text fields re-painted, a pack's HTML blank and counted. A node is photographed only after it has stood still (300 ms, re-opened by every change), so the picture is of a finished node, never of one still being filled in. Until the idle lane has that picture, the box carries the same content live. |
 | Capture resolution, RAM budget, disk cache | **Work.** The picture is made on the same idle lane, at the same resolution ladder, with the same mip chain, RAM budget and disk files (`temp/ANTs_Frontend_Optimizer_THUMBNAILS/`, keyed by signature + ratio + theme + pathway). Switching renderer releases the pictures the other renderer made and builds them again, because the box, the padding and the content route all differ. |
 | Keep these node types live | **Works** — a listed type is never blanked and stays in full detail at any zoom. |
 | Link shape, link thinning, Measure link thinning | **Work.** Links are still drawn by the canvas, so the 1 px/no-outline thinning and the straight-line style reach the ink exactly as in canvas mode. |
