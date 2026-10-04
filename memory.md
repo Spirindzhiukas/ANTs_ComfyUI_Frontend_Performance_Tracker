@@ -5,7 +5,10 @@ rules for changing the code; `plan.md` is where it is going. This file is the pa
 what was built, what was rejected, and what the evidence was.
 
 Last updated at **v2.7.3**, 240 tests green, PR #2 on
-`Spirindzhiukas/ANTs_ComfyUI_Frontend_Performance_Tracker`.
+`Spirindzhiukas/ANTs_ComfyUI_Frontend_Performance_Tracker` (merged into `main`).
+
+**Not the end of the work: `task_continuation.md` opens with what the user is still
+waiting for and the first thing the next session should do.**
 
 ---
 
