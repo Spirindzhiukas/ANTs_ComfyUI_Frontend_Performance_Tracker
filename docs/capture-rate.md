@@ -1,4 +1,4 @@
-# How the v2.7.2 capture-rate fix was found
+# How the capture-rate fixes were found
 
 **The question.** The thirteenth report (75 nodes, zoom 0.10, Electron/Chromium,
 GPU disabled) measured 20 fps, a p50 frame of 2.30 ms and a mean of 24.5 ms —
@@ -81,9 +81,43 @@ three tests that **fail on the pre-fix file**:
   attributes through this tool's pass-through wrapper (743 calls, 55.6 s, 4.3 s of
   forced layout). That is not the capture lane and needs its own attribution pass on
   a real page — `plan.md`, K12.
-- The churn probe still shows ~31.6 rects/frame in the *no-picture* scenario. That
-  is the live boxes' insurance re-measure at their own beat (`LOD_VUE_MEDIA_MS` for
-  an unpictured node, `LOD_VUE_MEDIA_MS_IDLE` for one holding a picture, rationed by
-  `LOD_VUE_MEDIA_BUDGET`) — one node per frame, not a scene-wide pass, and it
-  disappears for a node whose picture is held. It is bounded by design and is the
-  first number to look at if the frame cost is still high after the floor.
+- The churn probe still shows ~31.6 rects/frame — and, measured properly, that is
+  **not** the live boxes' insurance re-measure. An instrumented copy
+  (`/tmp/instr-rects.mjs` driven by `churn-meas.mjs`) records who every rect read
+  belongs to: in steady state **every read is of a *pictured* node** — a page report
+  marks a node stale (`lodVueStaleNode`), the next slice re-measures it and
+  `lodSnapSignature` compares the result, so a node that did not really change costs
+  one re-measure and **no new picture** (`captures Δ0`). Live-verdict reads happen
+  during warm-up only: 30 nodes/24 rows/6 churns ⇒ 31.64 rects/frame, **pictured
+  168 / live 90 / skip 36**; 30/24/0 ⇒ 11.30, **60/90/60**; 12/60/2 ⇒ 23.99,
+  **56/36/2**. The skips are `lodVueMediaBudget`'s one ration per frame
+  (`LOD_VUE_MEDIA_BUDGET`, reset each frame), not a scene-wide pass. This is the
+  first paragraph to revisit if the frame cost is still high after the floor.
+
+## The next finding in the same lane: the theme signature (v2.7.3)
+
+The attribution pass above left an instrument running, and the instrument found a
+second cost that had nothing to do with the floor. `lodSnapThemeSig` compared the
+roots' `className` and inline styles — so a *transient* class the frontend toggles
+on `<body>` during a drag, a toast or a modal was read as a theme change, and a
+theme change clears the whole picture store; while a palette that actually moved
+through a computed colour was invisible to it. The probe
+(`/tmp/probe/theme.mjs`, 20-node scene, 300 frames after warm-up):
+
+| Scenario | captures Δ | clears Δ | rects Δ |
+| --- | --- | --- | --- |
+| transient class, **pre-fix** | **120** | 6 | 15 600 |
+| moved colour, pre-fix | 0 | 0 | 0 |
+| transient class, **post-fix** | **0** | 0 | 1 300 |
+| moved colour, post-fix | **120** | 6 | 15 600 |
+
+The fix keeps the names as a cheap **doorbell** and makes the resolved palette the
+signature: when the class/inline-property key moves, `lodSnapThemeColors` re-samples
+`getComputedStyle().backgroundColor|color` per root (inside a `try`, so an
+unreadable palette is not a change) and the sample is compared. Because a palette
+can move with the capture lane idle, `lodVueFramePlan` also re-samples on a 2 s
+beat. The test that binds both halves is *a class the page toggles is not a theme
+change, and a moved colour is*; it fails on the pre-fix file. The pitfall has an
+independent witness in NodeSnapshots, whose `theme_signature()` filters root class
+names to `/(^|[-_])(dark|light|theme)([-_]|$)/i` for the same reason (see
+`node-snapshots.md`).

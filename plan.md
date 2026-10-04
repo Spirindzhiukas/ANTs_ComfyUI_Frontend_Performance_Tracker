@@ -688,15 +688,35 @@ worth doing, each only with evidence from the user's own page:
 **K12. After the capture floor, what else the lane costs (S, ongoing).** v2.7.2
 bounded the *rate* (600 ms between two pictures of one node, 5 s between two files
 while it churns) and measured what the harness can measure. What is left to prove on
-the user's own page, in the order it is worth doing: the **live-box** measurement
-beat (an unpictured box re-reads its node's layout at `LOD_VUE_MEDIA_MS`, one node
-per frame's ration) — correct by design and bounded, but the first number to look at
+the user's own page, in the order it is worth doing: the re-measure that follows a
+**page report** for a node that already holds a picture (attributed 30/24/6 ⇒
+pictured 168 / live 90 / skip 36, captures Δ0, with `lodVueMediaBudget`'s one ration
+per frame explaining the skips) — bounded by design, but the first number to look at
 if the frame cost is still high after the floor; the frontend's own `renderFrame`
 stalls the report attributes through this tool's pass-through wrapper (743 calls,
 55.6 s, 4.3 s of forced layout in the thirteenth report), which is *not* the capture
 lane and needs its own attribution pass on a real page; and the per-setting price of
 the stand-in pathway once the graph is quiet, which the panel's abortable A/B
 (`lowZoom.measureLinks`'s sibling for node drawing) does not yet cover.
+
+**K13. The containment lever: `content-visibility: auto` on node bodies (M).**
+NodeSnapshots ships this as its Nodes 2.0 optimization (`vue.mjs`): the browser then
+may skip layout/paint of a body that is offscreen, so the cost falls on the browser's
+own render path rather than on a picture this tool draws, and the node is *not*
+photographed at all. It is the one lever of theirs this tool leaves unused, and the
+reason is not preference — it interacts with two things this project has already
+been burned by. (1) A skipped body's intrinsic size must be pinned
+(`contain-intrinsic-size` from a measured value) and the frontend's own resize
+observer re-fires while the browser churns, which re-makes pictures here through the
+signature; their README records exactly that churn and a long warm-up as the price.
+(2) A subtree the browser is not laying out is a subtree the reader cannot measure,
+and this project's rule is that a node is measured when the page reports a change —
+so the lever needs a *paid-for* exception path for the node the user is pointing at
+(`:hover`/`:focus-within`/state outline, as theirs does). To try it: on the user's
+graph, with the invalidation counters and the stall counters visible, compare
+pictures-warm + rects/frame + `renderFrame` stalls for bodies with and without
+containment, at 10 % zoom and at 100 %. Ship only if the counters improve and a
+picture is never made from a skipped body.
 
 **K10. A real pixel screenshot — speculative, needs a machine with a browser
 (S–M).** The twelfth report asked for the capture to be "simple screenshots of the

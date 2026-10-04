@@ -6,7 +6,7 @@ for: *which extension's JavaScript is actually costing me frames while I pan
 this graph, and what is eating main-thread time that no draw hook owns?* —
 without opening DevTools and without restarting ComfyUI to bisect.
 
-Version **2.7.2**. Everything runs from page load: no node has to be placed,
+Version **2.7.3**. Everything runs from page load: no node has to be placed,
 nothing executes, and the tool never changes your graph or your workflows.
 
 - **Measure** — per-extension and per-node-type frame cost, canvas draw
@@ -775,7 +775,7 @@ short version:
 ## Development
 
 ```bash
-node tests/run-tests.mjs              # all tests — 239 passing, zero dependencies
+node tests/run-tests.mjs              # all tests — 240 passing, zero dependencies
 node tests/run-tests.mjs <substring>  # one suite or test
 python3 tests/test_init.py            # the Python side (routes, node contract)
 node tests/demo.mjs                   # prints what every tab says, against a synthetic graph

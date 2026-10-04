@@ -4828,6 +4828,45 @@ suite("drawing: the Nodes 2.0 (Vue nodes) frontend", () => {
     assertEqual(snapApi(h).queue, 0, "and the queue drains: the postponement never became a drop");
   });
 
+  // A page toggles classes on its roots for all sorts of reasons — a drag, a toast,
+  // a modal, a theme — and a picture is drawn with *colours*, not with class names.
+  // Hashing the class list meant a transient class dropped every picture in the
+  // session (measured in the harness: six class flips on <body> re-photographed a
+  // twenty-node scene 120 times — every node, six times), while a palette moved
+  // through a computed colour was not noticed at all. The signature now samples the
+  // colours the page resolves for itself and re-samples them only when the cheap key
+  // (the class list and the inline properties) moves; the frame hook watches the same
+  // thing at a slow beat, because a palette can move while the lane is idle.
+  test("a class the page toggles is not a theme change, and a moved colour is", async () => {
+    const h = await boot();
+    const { nodes } = vueGraph(h, 4);
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true, diskOn: false });
+    draw(h, 2);
+    await idle(h, 1200);
+    const api = snapApi(h);
+    assertEqual(api.captured, nodes.length, "every node is pictured");
+    const held = api.held;
+    for (let i = 0; i < 6; i++) {
+      h.document.body.className = "app-state-" + i;
+      h.advance(500);
+      await h.flush();
+      draw(h, 1);
+    }
+    assertEqual(snapApi(h).captured, api.captured, "a class the page toggles is not a theme change");
+    assertEqual(snapApi(h).clears, api.clears, "so the store is not swept");
+    assertEqual(snapApi(h).held, held, "and the pictures that were there are still the pictures");
+    // A palette change that *is* one: the colour the page resolves for itself. The
+    // frame hook notices it even with nothing queued, which is what a theme switch on
+    // a quiet graph looks like.
+    h.document.body.style.backgroundColor = "rgb(9, 9, 9)";
+    h.advance(2200);
+    await h.flush();
+    draw(h, 1);
+    await idle(h, 800);
+    assertGreater(snapApi(h).clears, api.clears, "a moved colour sweeps the store");
+    assertGreater(snapApi(h).captured, api.captured, "and every picture is made again");
+  });
+
   // The grace period is per change, not per node for the session. The settle
   // window's ceiling lets a node that *never* stands still be photographed — and once
   // that ceiling had passed, every later change was photographed on the next slice,

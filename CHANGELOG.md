@@ -4,6 +4,39 @@ Version history for ANTs_ComfyUI_Frontend_Performance_Tracker. Newest first.
 The current behaviour is in `README.md`; the reasoning behind each release is in
 `memory.md`; the rules for changing the code are in `CLAUDE.md`.
 
+## What changed in v2.7.3
+
+- **The theme signature was backwards: it reacted to class names and was blind to
+  colours.** The capture lane drops the picture store when the page's palette
+  moves, and the signature it compared was the roots' `className` plus their inline
+  styles. So a page that toggles a *transient* class on `<body>` — a drag, a toast,
+  a modal, anything Tailwind-flavoured — re-photographed every node, while a theme
+  that changed through a **computed colour** was invisible to it. A probe
+  (`/tmp/probe/theme.mjs`: 20-node scene, 40 warm-up frames, then 300 frames with
+  `<body>` flipped every 50th) measured the wrong direction in both halves: a class
+  flip ⇒ **120 captures / 6 clears / 15 600 rects**; a background colour moved ⇒
+  **0 / 0 / 0**.
+
+- **The resolved colours are the signature now; the names are only a doorbell.**
+  `lodSnapThemeSig` builds a cheap key from the roots' class names and every inline
+  style name/value; only when that key moves does it re-sample the roots'
+  `getComputedStyle().backgroundColor|color` (guarded, so an unreadable palette is
+  not a change) — and *that sample* is what the signature compares. Inline `--*`
+  properties still go straight into the signature. A palette can also move while the
+  capture lane is idle, so `lodVueFramePlan` re-samples on a 2 s beat and clears
+  then if it must. New state: `snapThemeAt`, `snapThemeKey`, `snapThemeCols`.
+
+- **After the fix the same probe measures the same two scenarios exactly
+  inverted:** class ⇒ **0 captures / 0 clears / 1 300 rects**, colour ⇒ **120 / 6 /
+  15 600**. The new test (*a class the page toggles is not a theme change, and a
+  moved colour is*) fails on the pre-fix file and passes here; the suite is **240**.
+
+- The pitfall is real enough that the reference implementation guards it from the
+  other side: `NodeSnapshots`' `theme_signature()` filters root class names to
+  `/(^|[-_])(dark|light|theme)([-_]|$)/i` for exactly this reason (see
+  `docs/node-snapshots.md`, and note that it also ignores a colour that moves — the
+  lesson here is to compare the resolved palette, not the names).
+
 ## What changed in v2.7.2
 
 - **The Nodes 2.0 stand-in pathway's per-frame cost was a capture loop, and it is fixed — measured, not explained away.** The thirteenth report's numbers (75 nodes, 20 fps, 124 ms of stalls per second, most of the frame budget outside drawing) sent this pass into the capture lane itself with an instrumented harness instead of a theory: a synthetic Vue-nodes scene was driven frame by frame and the captures, the layout reads and the host time per frame were recorded, with and without the page changing anything. A quiet scene cost 0.91–1.36 ms/frame at 0.06 captures/frame. A scene where the page rewrites a widget value on every frame — a poller: the signature changes, the picture is dropped, the node re-enters the queue — cost **2.79–6.80 ms/frame at 1.39 captures/frame**, and twelve nodes with sixty live rows cost **15.37 ms/frame at 5.00 captures/frame**.

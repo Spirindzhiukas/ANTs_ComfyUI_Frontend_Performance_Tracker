@@ -27,7 +27,7 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.7.2";
+const VERSION = "2.7.3";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
 // The class key ComfyUI stores in a workflow. The old key is still recognised so
 // a graph saved before the rename does not lose this node.
@@ -932,6 +932,9 @@ const LOD = {
   snapModes: null, // WeakMap<node, "snap"|"box">, kept across records so a flip is seen
   snapFailStreak: 0,
   snapTheme: "",
+  snapThemeAt: 0, // last frame-time theme watch (see lodVueFramePlan)
+  snapThemeKey: "", // the class list + inline properties the colour sample was taken with
+  snapThemeCols: "", // the colours that sample resolved to: what a theme change is
   snapPumping: false,
   snapTimer: null,
   snapExclude: [], // node types the user has asked to keep live
@@ -6495,6 +6498,22 @@ function lodVueFramePlan(canvas) {
   LOD.vueTextNow = 0;
   LOD.vueMediaLeft = LOD_VUE_MEDIA_BUDGET; // this frame's layout-read ration
   // The same predicate the draw loop uses, not a second opinion about it.
+  // A palette can move while the capture lane is idle — the user switches theme in
+  // the settings UI, which repaints the page without queueing a picture — so the
+  // theme is also watched here, at a slow beat: one string comparison per frame, and
+  // a colour sample only when the class list or an inline property actually moved.
+  if (LOD.snapOn) {
+    const t = nowMs();
+    if (!LOD.snapThemeAt || t - LOD.snapThemeAt >= 2000) {
+      LOD.snapThemeAt = t;
+      const theme = lodSnapThemeSig();
+      if (!LOD.snapTheme) LOD.snapTheme = theme;
+      else if (LOD.snapTheme !== theme) {
+        LOD.snapTheme = theme;
+        lodSnapClear("theme");
+      }
+    }
+  }
   const flat = lodVuePathOn(canvas);
   const prev = LOD.vueFlatOn;
   LOD.vueFlatOn = flat;
@@ -6963,6 +6982,25 @@ function lodSnapSignature(node, canvas) {
 // A whole-theme signature, checked on the idle lane rather than per node. A theme
 // change repaints every node differently, so every stored bitmap is worthless —
 // and finding that out one signature at a time would cost a frame of boxes each.
+// The two colours a palette change moves first, read from the page's own roots. An
+// unreadable or absent style is not a change: it must never be able to sweep every
+// picture in the session on its own.
+function lodSnapThemeColors(roots) {
+  let out = "";
+  try {
+    if (typeof getComputedStyle !== "function") return out;
+    for (const el of roots) {
+      if (!el) continue;
+      const cs = getComputedStyle(el);
+      if (!cs) continue;
+      out += `${cs.backgroundColor}|${cs.color}|`;
+    }
+  } catch (e) {
+    /* an unreadable palette is not a change */
+  }
+  return out;
+}
+
 function lodSnapThemeSig() {
   try {
     let s = "";
@@ -6984,16 +7022,35 @@ function lodSnapThemeSig() {
       }
     }
     const doc = typeof document !== "undefined" && document ? document : null;
-    for (const el of [doc && doc.documentElement, doc && doc.body]) {
+    const roots = [doc && doc.documentElement, doc && doc.body];
+    // The cheap key: what the palette is *carried* by — the class list and the inline
+    // properties. It is not what a picture is drawn with; it is only how we know
+    // whether the sample below could have moved, because reading a computed style is
+    // the one part of this check that is not free.
+    let key = "";
+    for (const el of roots) {
       if (!el) continue;
-      s += `${el.className || ""}|`;
+      key += `${el.className || ""}|`;
       const style = el.style;
       if (style) {
-        // Inline custom properties (`--p-*`): the palettes set these inline, which
-        // is why reading them does not need getComputedStyle.
+        for (const k of Object.keys(style)) key += `${k}:${style[k]};`;
+        // Inline custom properties (`--p-*`): the palettes set these inline, which is
+        // why reading them does not need getComputedStyle — and an inline variable
+        // *is* the palette this page draws with, so it goes in the signature proper.
         for (const k of Object.keys(style)) if (k.indexOf("--") === 0) s += `${k}:${style[k]};`;
       }
     }
+    // What a theme change *is*: the colours the page resolves for itself. Hashing the
+    // class names meant a transient class dropped every picture in the session —
+    // measured in the harness, six class flips on <body> re-photographed a twenty-node
+    // scene 120 times — while a palette moved through a computed colour was not
+    // noticed at all. The sample is taken only when the key above moves, so a class
+    // flip that changes nothing costs one style read and no picture.
+    if (LOD.snapThemeKey !== key) {
+      LOD.snapThemeKey = key;
+      LOD.snapThemeCols = lodSnapThemeColors(roots);
+    }
+    s += LOD.snapThemeCols || "";
     return s;
   } catch (e) {
     return "";

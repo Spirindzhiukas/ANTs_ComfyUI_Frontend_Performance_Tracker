@@ -861,11 +861,37 @@ anything.
 synthetic fixture, not the user's 4K window: the fix removes work (captures,
 measurements, encodes), so the direction is not in doubt, but the size on a
 75-node Electron page is the user's next report, not this table. What the churn
-probe still shows — 31.6 rects/frame, 0.28 layouts/frame — is the *live* boxes'
-insurance re-measure at their own beat (`LOD_VUE_MEDIA_MS` for an unpictured node,
-`LOD_VUE_MEDIA_MS_IDLE` for one holding a picture, rationed by
-`LOD_VUE_MEDIA_BUDGET`), i.e. one node per frame rather than a scene-wide pass, and
-it disappears for a node whose picture is held.
+probe still shows — 31.6 rects/frame, 0.28 layouts/frame — is a *pictured* node's
+re-measure after a page report, not the live boxes' insurance beat. An instrumented
+copy of the tracker (`/tmp/instr-rects.mjs`) attributes each read: in steady state
+**every read is of a node that holds a picture** — the report marks it stale
+(`lodVueStaleNode`), the next slice re-measures it and `lodSnapSignature` compares;
+a signature that matches costs the re-measure and **no new capture** (captures Δ0).
+Scene 30 nodes/24 rows/6 churns: 31.64 rects/frame, **pictured 168 / live 90 / skip
+36**; 30/24/0: 11.30, **60/90/60**; 12/60/2: 23.99, **56/36/2**. The skips are
+`lodVueMediaBudget`'s one ration per frame (`LOD_VUE_MEDIA_BUDGET`, reset each
+frame). Live-verdict reads are warm-up only.
+
+### The sixteenth pass (v2.7.3): the theme signature was watching words, not colours
+
+The fifteenth pass was re-measured after the fix — and the instrument that attributes
+every `getBoundingClientRect` to a node verdict turned up a second defect in the same
+lane, unrelated to the floor.
+
+| # | What was measured | What it actually was | What changed |
+| --- | --- | --- | --- |
+| 1 | A probe scene (`/tmp/probe/theme.mjs`, 20 nodes, 300 frames after warm-up) lost its whole picture store — **120 captures, 6 clears, 15 600 rects** — when the page flipped a transient class on `<body>` every 50 frames. | The lane's theme signature *was* the roots' `className` plus their inline styles (`lodSnapThemeSig`). Every drag/toast/modal class the frontend toggles read as a new theme, and the only action a theme change knows is to clear the store. | The class/inline-property list is now only a cheap **key**: when it moves, `lodSnapThemeSig` re-samples the roots' `getComputedStyle().backgroundColor\|color` (guarded by a `try`, so an unreadable palette is not a change) via `lodSnapThemeColors`, and **that sample is the signature**. Inline `--*` properties still go into the signature directly. |
+| 2 | The same probe measured **0 captures / 0 clears / 0 rects** for a background colour actually moving from `rgb(20,20,20)` to `rgb(9,9,9)` — the case the signature exists for. | Reading class names as a theme is not merely noisy; it is blind in the direction that matters. A palette can move through a computed colour with no class change at all. | Covered by (1): the colour sample is the signature. A palette can also move while the capture lane is idle, so `lodVueFramePlan` re-samples on a 2 s beat (`snapThemeAt`) and clears then if it must. |
+
+After: the same probe measures **class ⇒ 0 / 0 / 1 300, colour ⇒ 120 / 6 /
+15 600** — exactly inverted from before. New state fields `snapThemeAt`,
+`snapThemeKey`, `snapThemeCols`; new test *a class the page toggles is not a theme
+change, and a moved colour is* (4 nodes, 6 × 500 ms flips, then a colour at
+`advance(2200)`), which fails on the pre-fix file. Suite **240**. The pitfall has an
+independent witness: NodeSnapshots' `theme_signature()` filters root class names to
+`/(^|[-_])(dark|light|theme)([-_]|$)/i` for the same reason — though it stays blind
+to a moved colour, which is the half this tool now reads (see
+`docs/node-snapshots.md`).
 
 ## The stand-in pictures: what a capture actually contains, and where the cache went wrong
 
