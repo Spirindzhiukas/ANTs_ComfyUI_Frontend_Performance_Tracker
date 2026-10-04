@@ -6,7 +6,7 @@ for: *which extension's JavaScript is actually costing me frames while I pan
 this graph, and what is eating main-thread time that no draw hook owns?* —
 without opening DevTools and without restarting ComfyUI to bisect.
 
-Version **2.7.1**. Everything runs from page load: no node has to be placed,
+Version **2.7.2**. Everything runs from page load: no node has to be placed,
 nothing executes, and the tool never changes your graph or your workflows.
 
 - **Measure** — per-extension and per-node-type frame cost, canvas draw
@@ -442,7 +442,23 @@ the session — the readout counts the cooldowns and says when the next try is. 
 answer to a node being photographed while the frontend was still filling it in —
 the frontend mounts a node and then writes its parts over the following frames,
 and an image is decoded when it is decoded, so "capture immediately" is a picture
-of a half-built node. **The capture lane is this tool's own, and that is
+of a half-built node. **A picture also has a floor under its rate, not only a
+window before it.** A node the page keeps changing — a poller writing a widget
+value, a live counter — has an ask in the lane on every slice, and a capture is the
+most expensive thing the tool does: it re-reads the node's laid-out boxes and
+re-composites them. Past the settle ceiling, every one of those asks used to buy a
+full capture, which on the user's graph was the per-frame cost they measured. A
+node photographed a moment ago (`LOD_SNAP_PHOTO_MS`, 600 ms) is now postponed the
+same way a node that has not stood still is — *in the lane's picker*, so it stays
+queued and the slice sleeps for the longer of the two windows instead of the node
+being dropped — and a successful capture re-arms the settle window, so every later
+change gets the same 300 ms grace the first one did rather than being photographed
+mid-render. The disk copy has its own floor (5 s) while a node churns: the file is
+a cache for the next page load, and the signature check would make a churning
+node's file a miss anyway. Measured on the harness scene: a scene whose widget
+values are rewritten on every frame went from 2.79–6.80 ms/frame at 1.39
+captures/frame to 0.92–1.53 at 0.17, and twelve nodes with sixty live rows from
+15.37 ms/frame to 3.00. **The capture lane is this tool's own, and that is
 deliberate**: it runs on the idle lane (32 ms between slices, a 12 ms budget per
 slice, nothing while the page has had input in the last 400 ms) rather than on the
 frontend's own tick, because upstream has no per-node tick to ride — in this
@@ -759,7 +775,7 @@ short version:
 ## Development
 
 ```bash
-node tests/run-tests.mjs              # all tests — 236 passing, zero dependencies
+node tests/run-tests.mjs              # all tests — 239 passing, zero dependencies
 node tests/run-tests.mjs <substring>  # one suite or test
 python3 tests/test_init.py            # the Python side (routes, node contract)
 node tests/demo.mjs                   # prints what every tab says, against a synthetic graph

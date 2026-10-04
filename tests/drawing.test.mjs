@@ -4771,6 +4771,94 @@ suite("drawing: the Nodes 2.0 (Vue nodes) frontend", () => {
     assert(fills.indexOf("rgba(28, 32, 40, 1)") >= 0, "and the footer in its own");
   });
 
+  // A node the page rewrites on every frame — a poller writing a widget value, a
+  // live counter, a progress readout — used to be photographed as fast as the idle
+  // lane could manage. The change dropped the picture, the drop put the node back in
+  // the queue, and nothing rationed the asks: once the settle window's ceiling had
+  // passed, every slice in the lane bought a full capture, and a capture is the most
+  // expensive thing this tool does (it re-reads the node's laid-out boxes and
+  // re-composites them). On the user's 75-node graph that was the per-frame cost
+  // they measured. A picture of a churning node is still worth having — the ceiling
+  // is what guarantees one exists — but not one per slice.
+  test("a node the page keeps changing is photographed at a floor, not once per slice", async () => {
+    const h = await boot();
+    const { nodes } = vueGraph(h, 1);
+    const n = nodes[0];
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true, diskOn: false });
+    draw(h, 1);
+    h.advance(600);
+    await h.flush();
+    assertEqual(snapApi(h).captured, 1, "the node is pictured once it has stood still");
+    // The page rewrites the node's widget on every frame, forever: the picture is
+    // stale the moment it is made, so there is an ask on every slice.
+    const w = n.widgets[0];
+    const r0 = h.document._counts.rects;
+    let asks = 0;
+    for (let i = 1; i <= 20; i++) {
+      w.value = i;
+      draw(h, 1);
+      h.advance(150);
+      await h.flush();
+      h.advance(150);
+      asks++;
+    }
+    const api = snapApi(h);
+    // The floor is about work, so the works is counted too: twenty asks must not buy
+    // a layout read each. The completeness gate reads the measurement the capture
+    // would take anyway (`lodVueRootMetrics(node, canvas, false)`), rather than
+    // forcing a fresh one per ask and paying a node's worth of rects to then refuse
+    // the node.
+    const rects = h.document._counts.rects - r0;
+    assertLess(rects, asks + 10, `${asks} asks read the page's layout ${rects} times: a postponed node is not re-measured only to be refused`);
+    assertGreater(asks, 15, "every frame of the loop asked the lane for a fresh picture");
+    // Six seconds of churn. The floor is 600 ms, so about ten pictures are honest;
+    // one per ask (what the lane did before) is twenty-one.
+    assert(api.captured <= 16, `${asks} asks over 6s took ${api.captured} pictures: a node that keeps changing is photographed at a floor, not once per slice`);
+    assertGreater(api.captured, 1, "and pictures keep being taken: the floor delays them, it does not stop them");
+    assertGreater(api.pictured + api.held, 0, "the node is never left without a picture or a box while it churns");
+
+    // The floor is a postponement, not a drop: once the node stops changing the lane
+    // still owes it a picture made from the final state, and it takes it without
+    // anybody touching the node again.
+    const before = api.captured;
+    w.value = "final";
+    draw(h, 1);
+    await idle(h, 2000);
+    assertGreater(snapApi(h).captured, before, "the postponed picture is taken once the node has stood still again");
+    assertEqual(snapApi(h).queue, 0, "and the queue drains: the postponement never became a drop");
+  });
+
+  // The grace period is per change, not per node for the session. The settle
+  // window's ceiling lets a node that *never* stands still be photographed — and once
+  // that ceiling had passed, every later change was photographed on the next slice,
+  // with no grace at all: a picture of the node mid-render, which is the "captured
+  // too early" the user reported twice. A successful capture has to arm the next
+  // change's window exactly the way the first change's was armed.
+  test("every change gets its own grace period, not only the first one", async () => {
+    const h = await boot();
+    const { nodes } = vueGraph(h, 1);
+    const n = nodes[0];
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true, diskOn: false });
+    draw(h, 1);
+    h.advance(600);
+    await h.flush();
+    assertEqual(snapApi(h).captured, 1, "the node is pictured once it has stood still");
+    // A change a second later — well past the settle ceiling that lets a burst be
+    // photographed without ever standing still.
+    h.advance(1000);
+    await h.flush();
+    const armed = snapApi(h).vueSettleArms;
+    n.widgets[0].value = "second";
+    draw(h, 1);
+    assertGreater(snapApi(h).vueSettleArms, armed, "the change armed a window: a capture cleared the last one");
+    h.advance(120);
+    await h.flush();
+    assertEqual(snapApi(h).captured, 1, "no picture is taken inside the change's own grace period, though the ceiling that lets a burst be photographed has long passed");
+    h.advance(600);
+    await h.flush();
+    assertGreater(snapApi(h).captured, 1, "and the picture is replaced once the change has stood still for the window");
+  });
+
 });
 
 // The picture store on disk. One file per node id, named by the node's signature
@@ -5015,6 +5103,42 @@ suite("drawing: the stand-in cache on disk — keyed by what is inside the file"
       putKeys.every((k) => /r3t/.test(k)),
       `and every file says 3x, because a coarser picture must not sit under the 3x name (${putKeys.join(", ")})`
     );
+  });
+
+  // The file is a cache for the *next* page load, and a page that is rewriting the
+  // node will not be served it — the signature check makes it a miss. So encoding
+  // and storing every picture of a churning node is the most expensive and least
+  // useful part of a capture: a PNG write plus a request, per slice, for a file that
+  // is already stale. At most one file per node every few seconds while the node
+  // churns; a node that is photographed once writes its file immediately.
+  test("a node that keeps changing writes its file at a floor, not on every capture", async () => {
+    const h = await boot();
+    fakeDisk(h);
+    const n = oneNode(h);
+    n.id = 7;
+    n.widgets.push({ name: "v", type: "number", value: 0 });
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true, diskOn: true, snapRatio: 1 });
+    const vue = h.enterVueNodes();
+    vue.place();
+    draw(h, 1);
+    h.advance(600);
+    await h.flush();
+    assertGreater(snapApi(h).captured, 0, "the node is pictured once it has stood still");
+    const firstPuts = putsFor(h).length;
+    assertGreater(firstPuts, 0, "and the first copy goes to disk");
+    // Two seconds of churn: three or four pictures at the floor, and the file is
+    // written once at most.
+    for (let i = 1; i <= 10; i++) {
+      n.widgets[0].value = i;
+      draw(h, 1);
+      h.advance(200);
+      await h.flush();
+    }
+    const api = snapApi(h);
+    assertGreater(api.captured, 1, "the churning node is still photographed (the memory picture follows it)");
+    const wrote = putsFor(h).length - firstPuts;
+    assert(wrote <= 1, `${api.captured} pictures of a changing node wrote ${wrote} files: the disk copy is written at a floor while one node churns`);
+    assertGreater(api.diskSaved, 0, "and the readout counts the file that was written");
   });
 });
 

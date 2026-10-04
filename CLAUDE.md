@@ -112,6 +112,22 @@ bug that was reported by a user, and most have a regression test.
     noticing, and every picture quietly loses a surface. An anchor the frontend puts
     a test id on (the Comfy badge, a footer tab) plus its parent/siblings is stable;
     a class selector is a silent hole waiting for a rebuild.
+18. **A capture's rate is rationed in the lane's picker, never at the enqueue, and
+    never by a counter the node cannot see.** A node the page rewrites on every
+    frame re-enters the queue on every slice, and a capture is the most expensive
+    thing this tool does (it re-measures the node's laid-out boxes and re-composites
+    them): without a floor it is a capture loop for as long as the page keeps
+    changing, which is what a user measures as "the stand-ins cost performance".
+    The floor goes in `lodSnapTake`
+    (`Math.max(lodVueSettleLeft(node, now), lodSnapPhotoLeft(node, now))`) so the
+    node **stays queued** and the slice sleeps for the longer window — a floor at
+    the enqueue drops the node instead, and it is then only photographed again if
+    something else makes it change. A successful capture **re-arms** the settle
+    window (`LOD.vueSettle.delete(node)`), so every later change gets the same grace
+    the first one did; the disk copy has its own floor (`LOD_SNAP_DISK_MS`), because
+    a file a churning page would miss is not worth an encode; and a gate that asks
+    "wait or not" must read the **cached** measurement — the capture itself measures
+    fresh.
 
 ## Architecture map of `web/tracker.js`
 

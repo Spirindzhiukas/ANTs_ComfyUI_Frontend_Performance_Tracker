@@ -840,6 +840,33 @@ dynamically added icon, and it closes on the node's next change. Closing it with
 per-frame query would be a per-frame cost in exactly the pathway that exists to
 remove one.
 
+### The fifteenth pass (v2.7.2): the per-frame cost is a capture loop
+
+The thirteenth report's numbers (75 nodes, 20 fps, 59 401 node draws, 124 ms of
+stalls per second, most of the frame budget outside drawing) had been answered with
+the *explanation* of where a Vue stand-in's frame goes. This pass went after the
+number itself: a synthetic Vue-nodes scene was driven frame by frame in the
+harness with the capture lane instrumented, and captures/frame, rects/frame and
+host ms/frame were recorded per scenario, with and without the page changing
+anything.
+
+| # | What was measured | What it actually was | What changed |
+| --- | --- | --- | --- |
+| 1 | **A scene where the page rewrites a widget value on every frame costs 2.79–6.80 ms/frame at 1.39 captures/frame** (quiet: 0.91–1.36 ms at 0.06). Twelve nodes with sixty live rows: 15.37 ms/frame at 5.00 captures/frame. | The lane's own bookkeeping. A successful capture clears `rec.staleAt` *and* the node's entry in the settle map; `lodVueSettleLeft`'s ceiling (`LOD_SNAP_SETTLE_MAX_MS`, the rule that lets a node which never stands still be photographed) is **one-shot** — `first` is the first change of a burst and is never re-armed — so once it had passed, `lodSnapTake` had no reason left to defer the node. Every later ask bought a full re-capture, and a poller rewriting a value produces an ask on every slice. | `LOD_SNAP_PHOTO_MS` (600 ms) and `lodSnapPhotoLeft`, folded into the picker: `Math.max(lodVueSettleLeft(node, now), lodSnapPhotoLeft(node, now))`. The node **stays queued** and the slice sleeps for the larger window. The same floor is checked in `lodSnapCaptureNode` for callers that reach the lane directly. Measured after: live values 0.92–1.53 ms/frame at 0.17 captures/frame; twelve nodes/60 rows 3.00 ms/frame at 0.20. |
+| 2 | **A later change was photographed with no grace at all.** Past the ceiling, a change made a second after the first picture was captured on the next slice — mid-render. | The ceiling was being read as a verdict about the node rather than about the burst: nothing re-armed it, so from the second change of the session onwards the grace period did not exist. | A successful capture deletes the node's settle entry (`LOD.vueSettle.delete(node)`), so the next change arms a fresh window with its own 300 ms floor and its own 900 ms ceiling. Pinned by a test that fails on the pre-fix file. |
+| 3 | **Every ask forced a measurement.** 4.2 measurements/frame on a page whose values change. | `lodVueShotWait` — the completeness gate — called `lodVueRootMetrics(node, canvas, true)`, a forced re-measure per ask, for a question ("is this node laid out, are its images here, are the fonts loaded") that is answered by a stamp, an age and `document.fonts.status`. Every deferred slice paid a whole node's worth of computed styles and rects for a node it then refused to photograph. | The gate reads the **cached** measurement (`force = false`); the capture itself still takes the fresh one it works from. |
+| 4 | **The disk write ran on every picture of a churning node.** | The file is a cache for the *next* page load, and the signature check makes a churning node's file a miss on the next load anyway: an encode plus a request per capture, for nothing. | `LOD_SNAP_DISK_MS` (5 s) while a node churns; a node photographed once still writes its file immediately. Pinned by a test (nine pictures wrote eight files before, at most one now). |
+
+**What the harness cannot say.** These are host-side JavaScript numbers on the
+synthetic fixture, not the user's 4K window: the fix removes work (captures,
+measurements, encodes), so the direction is not in doubt, but the size on a
+75-node Electron page is the user's next report, not this table. What the churn
+probe still shows — 31.6 rects/frame, 0.28 layouts/frame — is the *live* boxes'
+insurance re-measure at their own beat (`LOD_VUE_MEDIA_MS` for an unpictured node,
+`LOD_VUE_MEDIA_MS_IDLE` for one holding a picture, rationed by
+`LOD_VUE_MEDIA_BUDGET`), i.e. one node per frame rather than a scene-wide pass, and
+it disappears for a node whose picture is held.
+
 ## The stand-in pictures: what a capture actually contains, and where the cache went wrong
 
 The user's report was specific: image loaders and mask editors show a stand-in

@@ -27,7 +27,7 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.7.1";
+const VERSION = "2.7.2";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
 // The class key ComfyUI stores in a workflow. The old key is still recognised so
 // a graph saved before the rename does not lose this node.
@@ -1140,6 +1140,23 @@ const LOD_SNAP_TITLE_H = 30; // graph units above the body: LiteGraph's title ba
 const LOD_SNAP_MAX_DIM = 2048; // px; a capture is fitted down to this, or the node stays a box
 const LOD_SNAP_SLOW_MS = 60; // slower than this: stop, cool down, and try again later
 const LOD_SNAP_SIG_MS = 100; // a signature is re-checked at most this often
+// The floor between two pictures *of the same node*. A node whose content changes
+// on every frame used to be photographed as fast as the idle lane could manage —
+// measured in the harness at 1.4 captures per frame for ten changing nodes (83
+// photographs and 250 full measurements per second), because the settle window's
+// ceiling is a one-shot: once it has passed, every later ask goes through, and each
+// successful capture clears the staleness the churn guard accumulates. On a page
+// where a widget value changes (a sampler's step, a progress readout, a log node)
+// that is a per-node capture loop for as long as the change keeps coming.
+// A picture that is at most this old is a picture of the node the user is looking
+// at: half a second of lag on a node that is being rewritten faster than the screen
+// can show it is not a claim about a wrong moment, and the held picture is a blit
+// while the box under it would be a full content draw on every frame.
+const LOD_SNAP_PHOTO_MS = 600;
+// …and the same floor for the file. A churning node's picture is served from RAM;
+// re-encoding and re-writing a PNG that is about to be replaced is the expensive
+// tail of a capture and the least useful part of it.
+const LOD_SNAP_DISK_MS = 5000;
 const LOD_SNAP_IDLE_MS = 400; // input within this many ms stops the capture lane
 const LOD_SNAP_GAP_MS = 32; // between capture slices, once the page is idle
 // Execute / Run and Run-to-node. System RAM, not the canvas budget. A missing
@@ -4754,6 +4771,18 @@ function lodVueSettleLeft(node, t) {
   return left;
 }
 
+// How much longer this node has to wait before it may be photographed *again*.
+// Zero for a node that has no picture yet (the first picture is never delayed) and
+// for one whose last picture is older than the floor. Not a refusal: the node stays
+// in the queue and the next slice takes it when the floor expires, exactly like the
+// settle window.
+function lodSnapPhotoLeft(node, t) {
+  const rec = LOD.snaps ? LOD.snaps.get(node) : null;
+  if (!rec || !rec.canvas || !rec.photoAt) return 0;
+  const left = LOD_SNAP_PHOTO_MS - ((t || nowMs()) - rec.photoAt);
+  return left > 0 ? left : 0;
+}
+
 // A stable number per element, for the signature. A replaced <img> is a different
 // object at the same selector, and a picture made from the old one is not a
 // picture of the new one even when every string on it matches.
@@ -7791,7 +7820,12 @@ function lodVueShotWait(node, canvas) {
   if (!at) return "";
   const age = nowMs() - at;
   if (age >= LOD_SNAP_SETTLE_MAX_MS) return ""; // waited long enough: photograph it
-  const m = lodVueRootMetrics(node, canvas, true);
+  // The *cached* measurement, deliberately: this gate is asked on every slice while
+  // a node is inside its window, and a forced re-measure per ask is a whole node's
+  // worth of computed styles and rects (measured in the harness: 4.2 measurements
+  // per frame on a page whose values change). What it decides is only "wait or not";
+  // the capture itself takes the fresh measurement it works from.
+  const m = lodVueRootMetrics(node, canvas, false);
   if (!m) return ""; // no element to measure: the caller's own check answers
   if (!(Number(m.boxH) > 0)) {
     LOD.vueWaitLayout++;
@@ -7847,6 +7881,10 @@ function lodSnapCaptureNode(node, canvas) {
   // un-pictured), and this is the line that keeps the lane from hammering a node
   // whose own draw is too expensive to run.
   if (rec && rec.cooldownUntil && nowMs() < rec.cooldownUntil) return false;
+  // The same floor as the enqueue, checked where the work actually happens: a
+  // caller that reaches the lane directly (the disk-ask path, a settings change)
+  // must not be able to buy a capture per frame for a node that keeps changing.
+  if (rec && rec.canvas && rec.photoAt && nowMs() - rec.photoAt < LOD_SNAP_PHOTO_MS) return false;
   if (lodSnapHasVideoProbe(node)) {
     // A video is never photographed: a still frame presented as the node is the
     // one thing the user asked to be excluded, and this check is the fresh one —
@@ -8048,6 +8086,7 @@ function lodSnapCaptureNode(node, canvas) {
   rec.blocked = false;
   rec.failed = false;
   rec.staleAt = 0; // the picture that is up is the node again
+  rec.photoAt = rec.checkedAt; // the rate floor: the next picture of this node waits
   rec.slowTries = 0; // and the capture was inside its budget this time
   rec.cooldownUntil = 0;
   LOD.snaps.set(node, rec);
@@ -8055,6 +8094,12 @@ function lodSnapCaptureNode(node, canvas) {
   LOD.snapCaptured++;
   LOD.snapFailStreak = 0;
   lodSnapAttachMips(rec);
+  // The settle window is a window *before a picture*, not a verdict about a node:
+  // re-arm it, so the ceiling ("photograph it anyway") applies again to whatever
+  // the node does next. Without this the ceiling is a one-shot — after the first
+  // burst of changes, every later ask is past it — and a node that changes
+  // continuously is photographed for as long as it changes.
+  if (LOD.vueSettle) LOD.vueSettle.delete(node);
   // The disk file is the bitmap after any image draw that was already queued
   // before this capture (that one is not in the list we drained). One turn, then
   // the copies are redrawn from the canvas and the file is written.
@@ -8075,6 +8120,15 @@ function lodSnapCaptureNode(node, canvas) {
 function lodSnapSettleImages(node, rec, canvas) {
   if (!rec || rec.canvas !== canvas) return;
   lodSnapRefreshMips(rec);
+  // A node that keeps changing gets a new picture every LOD_SNAP_PHOTO_MS; writing
+  // each of them to disk is the most expensive part of the capture and the least
+  // useful — the file is a cache for the *next* page load, and a page that is
+  // rewriting the node will not be served it anyway (the signature check makes it a
+  // miss). At most one file per node per LOD_SNAP_DISK_MS while it churns; a node
+  // that is photographed once writes its file immediately.
+  const t = nowMs();
+  if (rec.savedAt && t - rec.savedAt < LOD_SNAP_DISK_MS) return;
+  rec.savedAt = t;
   try {
     lodThumbDiskSave(node, rec);
   } catch (e) {
@@ -8194,7 +8248,11 @@ function lodSnapTake(canvas, t) {
     // A node that changed less than the settle window ago is not photographed yet.
     // On-screen nodes are preferred among those that *are* ready; a node waiting
     // out its window is remembered only for how long the slice should sleep.
-    const left = lodVueSettleLeft(node, now);
+    // Two windows can hold a node back, and both mean "not yet, try again later",
+    // never "no": the settle window (the node is still being written) and the photo
+    // floor (this node was photographed a moment ago). Taking the larger of the two
+    // is what keeps a slice from waking up for the shorter one.
+    const left = Math.max(lodVueSettleLeft(node, now), lodSnapPhotoLeft(node, now));
     if (left > 0) {
       if (!wait || left < wait) wait = left;
       continue;
@@ -15212,7 +15270,7 @@ function buildTelemetryReport() {
                       `(no picture is taken while the snapshots setting is off — the bitmap half of the engine is idle; the widget and focus settings below still act)`)
                 : `every node a rectangle below ${Math.round(LOD.flatBelow * 100)}% zoom${LOD.legacyPx ? `, carried over from "nodes under ${LOD.legacyPx}px"` : ""}`
             }, links ${lodLinksStraight() ? "straight (link setting)" : "as drawn"}, idle redraw cap ${LOD.idleCapMs ? LOD.idleCapMs + "ms" : "off"}, box detail ${LOD.boxDetail}, ` +
-            `snapshots ${LOD.snapOn ? `on (${LOD.snapDrawn} served, ${LOD.snapCaptured} captured, ${fmtBytes(LOD.snapBytes)} of ${LOD.snapMb} MiB${LOD.snapStaleHeld ? `, ${LOD.snapStaleHeld} kept while a fresh one was made` : ""}${LOD.snapCooldown ? `, ${LOD.snapCooldown} slow-capture cooldown(s)` : ""}${LOD.vueSettleHeld ? `, ${LOD.vueSettleHeld} slice(s) held for the settle window` : ""})` : "off"}) ` +
+            `snapshots ${LOD.snapOn ? `on (${LOD.snapDrawn} served, ${LOD.snapCaptured} captured, ${fmtBytes(LOD.snapBytes)} of ${LOD.snapMb} MiB${LOD.snapStaleHeld ? `, ${LOD.snapStaleHeld} kept while a fresh one was made` : ""}${LOD.snapCooldown ? `, ${LOD.snapCooldown} slow-capture cooldown(s)` : ""}${LOD.vueSettleHeld ? `, ${LOD.vueSettleHeld} slice(s) held until a node was ready (settling, or inside the floor between two pictures)` : ""})` : "off"}) ` +
             `— ${LOD.nodes} node draw(s) and ${LOD.links} link draw(s) simplified, ${LOD.capped} redraw(s) merged` +
             (LOD.linkCalls > 0 && LOD.linkMs > 0
               ? `, link strokes ${fmtMs((LOD.linkMs / Math.max(1, LOD.linkCalls)) * 1000, 0)}\u00b5s each over ${LOD.linkCalls} call(s) ` +
@@ -16020,7 +16078,19 @@ app.registerExtension({
 //    picture drawn in the fallback font is dropped and re-made when the webfont
 //    arrives. The ceiling still applies: past LOD_SNAP_SETTLE_MAX_MS a node that
 //    never settles is photographed anyway, because a picture of a node that is
-//    still arriving beats a box that never becomes one.
+//    still arriving beats a box that never becomes one. There is also a floor
+//    *under the rate* (LOD_SNAP_PHOTO_MS, 600ms): a node photographed a moment ago
+//    is postponed in the lane's picker exactly like one that has not stood still —
+//    it stays queued, the slice sleeps, and the picture is taken when the floor
+//    expires. Without it a node the page rewrites on every frame (a poller writing
+//    a widget value) bought a full capture per slice for as long as it changed:
+//    measured in the harness at 1.4 captures per frame for ten changing nodes and
+//    15.4ms per frame for twelve nodes with sixty live rows, against 0.17 captures
+//    and 3.0ms with the floor. A successful capture re-arms the settle window, so
+//    every later change gets the same grace the first one did, and the disk copy
+//    has its own floor (LOD_SNAP_DISK_MS, 5s) while a node churns — the file is a
+//    cache for the next page load, and the signature check would make a churning
+//    node's file a miss anyway.
 //  * What a Vue-nodes stand-in cannot be is a *screenshot*: no browser API
 //    draws a DOM element into a canvas (not drawImage, not createImageBitmap,
 //    not captureStream). The picture is therefore *drawn* — the box, its title

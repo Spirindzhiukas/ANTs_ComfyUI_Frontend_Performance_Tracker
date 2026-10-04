@@ -685,6 +685,19 @@ worth doing, each only with evidence from the user's own page:
   draw, and the readout counts it (`vueRestored` / the stand-in counters). If a user
   reports seeing a stale picture during a run, the answer is in the counters first.
 
+**K12. After the capture floor, what else the lane costs (S, ongoing).** v2.7.2
+bounded the *rate* (600 ms between two pictures of one node, 5 s between two files
+while it churns) and measured what the harness can measure. What is left to prove on
+the user's own page, in the order it is worth doing: the **live-box** measurement
+beat (an unpictured box re-reads its node's layout at `LOD_VUE_MEDIA_MS`, one node
+per frame's ration) — correct by design and bounded, but the first number to look at
+if the frame cost is still high after the floor; the frontend's own `renderFrame`
+stalls the report attributes through this tool's pass-through wrapper (743 calls,
+55.6 s, 4.3 s of forced layout in the thirteenth report), which is *not* the capture
+lane and needs its own attribution pass on a real page; and the per-setting price of
+the stand-in pathway once the graph is quiet, which the panel's abortable A/B
+(`lowZoom.measureLinks`'s sibling for node drawing) does not yet cover.
+
 **K10. A real pixel screenshot — speculative, needs a machine with a browser
 (S–M).** The twelfth report asked for the capture to be "simple screenshots of the
 nodes as the frontend is showing them to the human". A DOM element cannot be drawn
