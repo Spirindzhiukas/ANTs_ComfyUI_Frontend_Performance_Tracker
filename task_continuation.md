@@ -101,4 +101,6 @@ repeat the user's empty-thumbnail-folder renderer-switch test.
 ## Branch
 
 This session stays on `arena/01a1089b-ants-comfyui-frontend-performa`. Do not switch
-branches. The change has not been committed or pushed as of this handover.
+branches. Commit `1e1253c` has been pushed there; draft PR #3 is open at
+https://github.com/Spirindzhiukas/ANTs_ComfyUI_Frontend_Performance_Tracker/pull/3.
+The PR is not merged. Keep any follow-up commit and push on this same branch.

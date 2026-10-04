@@ -4,9 +4,9 @@ A running record for whoever picks this up next (including me). `CLAUDE.md` is t
 rules for changing the code; `plan.md` is where it is going. This file is the past:
 what was built, what was rejected, and what the evidence was.
 
-Last updated at **v2.7.4**, 246 Node tests green. Current work is on
-`arena/01a1089b-ants-comfyui-frontend-performa`; the live Electron checks below
-remain open, and this update is not yet merged into `main`.
+Last updated at **v2.7.4**, 246 Node tests green. Commit `1e1253c` is pushed on
+`arena/01a1089b-ants-comfyui-frontend-performa`; draft PR #3 is open and not yet
+merged into `main`. The live Electron checks below remain open.
 
 `task_continuation.md` is the current handover: the code-level criteria that are
 closed, the checks still to run, and the user's two remaining live-page questions.
