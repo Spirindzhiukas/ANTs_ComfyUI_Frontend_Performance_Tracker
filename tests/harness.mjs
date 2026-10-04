@@ -989,6 +989,13 @@ export function createHarness(options = {}) {
     warnings: () => consoleCalls.filter(([lvl]) => lvl === "warn").map(([, msg]) => msg),
     errors: () => consoleCalls.filter(([lvl]) => lvl === "error").map(([, msg]) => msg),
     infos: () => consoleCalls.filter(([lvl]) => lvl === "info").map(([, msg]) => msg),
+    // A DOM change, reported the way the page reports it — with the nodes that
+    // arrived, or, called with nothing, the way an implementation that omits them
+    // would (a listener that only sweeps has to cope with both).
+    fireMutation: (target, added, removed) => fireMutation(target, added, removed),
+    // Runs `fn` with every observer report suppressed: what the fixture does to set
+    // a scene up is not a change the page would report.
+    withQuiet: (fn) => withQuiet(fn),
     fetchRoutes,
     fetchCalls: () => fetchCalls,
     fetchUrls: () => fetchUrls.slice(),

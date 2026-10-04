@@ -6,7 +6,7 @@ for: *which extension's JavaScript is actually costing me frames while I pan
 this graph, and what is eating main-thread time that no draw hook owns?* —
 without opening DevTools and without restarting ComfyUI to bisect.
 
-Version **2.6.9**. Everything runs from page load: no node has to be placed,
+Version **2.7.0**. Everything runs from page load: no node has to be placed,
 nothing executes, and the tool never changes your graph or your workflows.
 
 - **Measure** — per-extension and per-node-type frame cost, canvas draw
@@ -379,6 +379,25 @@ not a reason to stop standing in, so nothing is handed back and forth while the
 setting rests — which is what a per-frame fight between the two would look like,
 nodes flickering between a box and the frontend's own rendering.
 
+**A mark is put back the moment the frontend reports the element it belongs on,
+not on the next frame.** That sentence is the answer to the flicker the twelfth
+report showed on some nodes, and it took three rules: a cached element is trusted
+only while the `data-node-id` it carries still equals the node's own id (this
+frontend reuses elements, and a box painted for one node while another node's
+element was blanked is a node fighting its own stand-in); the container the
+frontend renders node elements into is watched (`MutationObserver`, `childList`
+only), and the report's own `addedNodes` are resolved back to a node and
+re-marked **inside the observer callback — a microtask after the DOM change,
+before the browser paints** (`vueRedressed`); and a node that has just lost its
+element is remembered for half a second, because Vue can deliver a replacement as
+a removal in one task and an addition in the next (`vueOrphan`). The same ledger
+decides the other direction: an element the frontend takes off *this* node is
+handed back (a reused element must not come back invisible), and an element it
+has given to *another* node keeps that node's mark (`lodVueClaimsOther`) — taking
+it off would show that node through its own box. The readout counts the re-marks,
+the stale elements and the pane watchers, so the claim is visible from the user's
+own page (`vueRedressed`, `vueStaleEls`, `vuePaneWatches`).
+
 **Pictures work here as well, and so do the disk files.** Below the threshold
 the idle lane builds a stand-in *picture* for each boxed node — not a
 screenshot of the element, which no browser API can make, but the same drawing
@@ -395,7 +414,16 @@ on every change the page reports or the signature notices, so a burst of renderi
 costs one picture at the end of it instead of one picture per step. The window
 is a grace period and not a veto: a node that keeps changing past
 `LOD_SNAP_SETTLE_MAX_MS` (900 ms, measured from the first change of the burst) is
-photographed anyway. **And a change no longer takes the picture away**: what is on
+photographed anyway. **Inside that window the lane also checks that the node is
+*finished*, and says what it is waiting for**: an element with no laid-out box
+yet (`vueWaitLayout`), a node whose own `<img>` still reports `complete === false`
+(`vueWaitMedia`), or a node with content of its own while the page's fonts are
+still loading (`vueWaitFonts`, `document.fonts.status === "loading"`) is left for
+the next slice, named in the report the readout prints (`waiting: its images are
+still arriving`, `waiting: the page's fonts are still loading`). The page's font
+state is also part of the picture's signature, so a picture made in the fallback
+font is dropped and re-made the moment the webfont arrives rather than served for
+the rest of the session. **And a change no longer takes the picture away**: what is on
 screen is a complete picture of the moment before, so it stays there while its
 replacement is made — a node whose value changed used to fall back to a plain box
 until the new picture arrived, and a node whose value changes often was never
@@ -441,7 +469,7 @@ picture and counted, exactly as in the canvas renderer.
 | --- | --- |
 | Replace node previews with bitmap stand-ins at zoom levels | **Works, as boxes.** Below the setting each node's element stops *painting* — its contents are `visibility: hidden`, which an engine skips in the paint phase, and it stays in the layout and in every observer — and the canvas draws its box; above it, every element is handed back. |
 | Stand-in (plain / title / title + state) | **Works** — the same box ladder, same marks, same colours, and no content drawn (that is what "plain" means here too). Choosing one of these instead of *picture* changes nothing else: the elements stay handed over and the boxes keep standing, frame after frame. |
-| Stand-in: *picture of the node* | **Works, drawn rather than photographed.** No browser API can draw a DOM element into a canvas, so a screenshot of a Vue node is impossible; the picture is instead *drawn* — the box at the picture level (title bar, error ring, progress, dimming) with the node's own structure (surface, header bar, body panel, each widget's own row, slot dots, at their laid-out rects and computed colours) and its content: the images and canvases the node renders (the frontend's preview `<img>` elements among them) at their real laid-out position, text fields re-painted, a pack's HTML blank and counted. A node is photographed only after it has stood still (300 ms, re-opened by every change), so the picture is of a finished node, never of one still being filled in. Until the idle lane has that picture, the box carries the same content live. |
+| Stand-in: *picture of the node* | **Works, drawn rather than photographed.** No browser API can draw a DOM element into a canvas, so a screenshot of a Vue node is impossible; the picture is instead *drawn* — the box at the picture level (title bar, error ring, progress, dimming) with the node's own structure (surface, header bar, body panel, each widget's own row, slot dots, at their laid-out rects and computed colours) and its content: the images and canvases the node renders (the frontend's preview `<img>` elements among them) at their real laid-out position, text fields re-painted, a pack's HTML blank and counted. A node is photographed only after it has stood still (300 ms, re-opened by every change) *and* only once it is finished: not before its element has a laid-out box, not while one of its own images is still arriving, and not while the page's fonts are still loading — and a picture made in the fallback font is dropped the moment they arrive. Until the idle lane has the picture, the box carries the same content live. |
 | Capture resolution, RAM budget, disk cache | **Work.** The picture is made on the same idle lane, at the same resolution ladder, with the same mip chain, RAM budget and disk files (`temp/ANTs_Frontend_Optimizer_THUMBNAILS/`, keyed by signature + ratio + theme + pathway). Switching renderer releases the pictures the other renderer made and builds them again, because the box, the padding and the content route all differ. |
 | Keep these node types live | **Works** — a listed type is never blanked and stays in full detail at any zoom. |
 | Link shape, link thinning, Measure link thinning | **Work.** Links are still drawn by the canvas, so the 1 px/no-outline thinning and the straight-line style reach the ink exactly as in canvas mode. |
@@ -725,7 +753,7 @@ short version:
 ## Development
 
 ```bash
-node tests/run-tests.mjs              # all tests — 228 passing, zero dependencies
+node tests/run-tests.mjs              # all tests — 232 passing, zero dependencies
 node tests/run-tests.mjs <substring>  # one suite or test
 python3 tests/test_init.py            # the Python side (routes, node contract)
 node tests/demo.mjs                   # prints what every tab says, against a synthetic graph

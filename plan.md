@@ -644,6 +644,41 @@ must never be entangled with node stand-ins, and must prove its own value in the
 link A/B (the thinned-link work already has that harness). Deliberately after K2,
 and only if K2 shows that bitmap reuse survives real graphs.
 
+**K9. The flicker ledger and the completeness gate — built (v2.7.0).** The
+twelfth report's two defects and one question, all landed: a node's element is
+identified by the `data-node-id` it carries (a cached element is trusted only
+while it still says it is this node's), the mark is re-applied inside the
+observer callback that reports the frontend's new element — additions first, so a
+removal cannot answer for a node whose replacement is already in the report —
+with a 500 ms memory for a replacement split across tasks (`lodVueOrphan`), two
+explicit hand-back rules (an element taken off this node is handed back; an
+element given to another node keeps that node's mark), and a capture only taken
+once the node is finished (`lodVueShotWait`: laid out, its own images arrived, the
+page's fonts loaded — each wait named in the readout and counted, with the settle
+ceiling still the backstop). The page's font state joined the signature, so a
+fallback-font picture cannot outlive the font. Tests and the mutation battery are
+in `CHANGELOG.md`; the one edit that survives (the ordering inside one callback) is
+recorded there as unobservable in a harness that delivers one record per DOM
+operation.
+
+**K10. A real pixel screenshot — speculative, needs a machine with a browser
+(S–M).** The twelfth report asked for the capture to be "simple screenshots of the
+nodes as the frontend is showing them to the human". A DOM element cannot be drawn
+into a canvas by any page API; the only route is a rasteriser: clone the node,
+inline its computed styles with a diff (the `getDiffStyle` pattern
+`modern-screenshot` uses), wrap it in `<svg><foreignObject>`, encode it as a data
+URL, `createImageBitmap` it and `drawImage` it onto the capture surface. Written
+out against documented behaviour and **not shipped** — a picture path that cannot
+be A/B'd is exactly the change this feature's live page has caught five times. To
+try it: on the user's own Electron, compare a rasterised node against the drawing
+this tool already makes, per node type, at the capture ratios, on a CPU-only
+machine — the question is not whether it looks better in one case but whether it
+is *cheaper* than the DOM read plus the settle gate, per capture, at 40+ nodes.
+The same experiment answers the other half: whether the tool can hand the
+rasterised node to the compositor instead of blanking the element (`plan.md`'s
+old "an `<img>` overlay" note), which is the only version of a screenshot that
+could also stop the paint.
+
 ## Track L — Console: attribution before silencing (M)
 
 [DisableBrowserLogs](https://github.com/SparknightLLC/ComfyUI-DisableBrowserLogs)

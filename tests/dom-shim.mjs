@@ -76,7 +76,7 @@ class Node {
     if (child.parentNode) child.parentNode.removeChild(child);
     child.parentNode = this;
     this.children.push(child);
-    fireMutation(this);
+    fireMutation(this, child);
     return child;
   }
   insertBefore(child, ref) {
@@ -86,7 +86,7 @@ class Node {
     if (child.parentNode) child.parentNode.removeChild(child);
     child.parentNode = this;
     this.children.splice(i, 0, child);
-    fireMutation(this);
+    fireMutation(this, child);
     return child;
   }
   removeChild(child) {
@@ -94,7 +94,7 @@ class Node {
     if (i >= 0) {
       this.children.splice(i, 1);
       child.parentNode = null;
-      fireMutation(this);
+      fireMutation(this, null, child);
     }
     return child;
   }
@@ -435,6 +435,17 @@ export function createDocument(options = {}) {
     return n;
   };
   doc.getElementById = (id) => doc.descendants().find((n) => n.id === id || n._attrs.id === id) || null;
+  // The page's own font loading state, as a browser exposes it. The tool reads it
+  // before it photographs a node: while the page's font is still loading, the
+  // element's computed font stack is the fallback, and a picture drawn with it would
+  // keep the wrong font for the session. A test sets `status` to model both states.
+  doc.fonts = {
+    status: "loaded",
+    ready: Promise.resolve(),
+    check: () => true,
+    addEventListener: () => {},
+    removeEventListener: () => {},
+  };
   doc.execCommand = () => true;
   // Counted, so a test can hold the tracker to "the page is discovered on a
   // budget, not per frame": a pan must not re-walk the DOM.
@@ -484,10 +495,21 @@ function observedBy(obs, target, subtree) {
   return false;
 }
 
-export function fireMutation(target) {
+// A childList report, with the nodes that arrived and left — what a browser's
+// MutationRecord carries, so a listener can act on the *added* subtree instead of
+// scanning. Both lists are always present (a report with no nodes added is a real
+// report); a caller that wants the shape of an implementation which omits them can
+// call this with no nodes at all.
+export function fireMutation(target, added, removed) {
   if (quiet || !mutationObservers.size || !target) return;
+  const entry = {
+    target,
+    type: "childList",
+    addedNodes: added ? [added] : [],
+    removedNodes: removed ? [removed] : [],
+  };
   for (const o of [...mutationObservers]) {
-    if (observedBy(o, target, true)) o._deliver([{ target, type: "childList" }]);
+    if (observedBy(o, target, true)) o._deliver([entry]);
   }
 }
 

@@ -27,7 +27,7 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.6.9";
+const VERSION = "2.7.0";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
 // The class key ComfyUI stores in a workflow. The old key is still recognised so
 // a graph saved before the rename does not lose this node.
@@ -1014,6 +1014,15 @@ const LOD = {
   vueSettleArms: 0, // settle windows opened or restarted (a node that just changed)
   vueSettleHeld: 0, // capture slices postponed because the queue was still settling
   vuePaintSkipped: 0, // nodes whose subtree the browser is told to skip painting (gauge)
+  vueRedressed: 0, // marks put back on elements the frontend replaced (see lodVuePaneWatch)
+  // Why a capture was asked to wait, per reason. A node that is photographed while
+  // it is still arriving is a picture of a node half-way through being built, which
+  // is the one thing the lane is not allowed to produce.
+  vueWaitLayout: 0,
+  vueWaitMedia: 0,
+  vueWaitFonts: 0,
+  vueStaleEls: 0, // cached elements that turned out to belong to another node
+  vuePaneWatches: 0, // node containers the pane watcher has been attached to
   vueElSeq: null, // WeakMap<element, serial>: what the signature uses to see a replaced element
   vueElNext: 0,
   vuePathway: "", // which pathway the held pictures were made for
@@ -4084,8 +4093,30 @@ function lodVueRootEl(node) {
   try {
     const cache = LOD.vueRoots || (LOD.vueRoots = new Map());
     const hit = cache.get(node);
-    if (hit && (hit.isConnected === undefined || hit.isConnected)) return hit;
     const id = node && node.id;
+    // A cached element is only this node's element while it still says so. The
+    // frontend reuses elements: a node is deleted and another takes the slot, a
+    // graph is replaced under the same pane. Blanking the *wrong* node's element
+    // while a box is painted for this one is exactly the "fighting" a user sees —
+    // the other node's preview survives unblanked behind our box, and this node's
+    // own element (still painted) shows through. `data-node-id` is the identity the
+    // frontend itself renders, so it is the identity to check before trusting a
+    // cached element — one attribute read per boxed node per frame, and only when
+    // there is a cached element at all.
+    if (hit && (hit.isConnected === undefined || hit.isConnected)) {
+      let same = true;
+      try {
+        if (id !== undefined && id !== null && typeof hit.getAttribute === "function") {
+          same = String(hit.getAttribute("data-node-id")) === String(id);
+        }
+      } catch (e) {
+        same = false;
+      }
+      if (same) return hit;
+      LOD.vueStaleEls = (LOD.vueStaleEls || 0) + 1;
+      cache.delete(node);
+    }
+    if (hit && !(hit.isConnected === undefined || hit.isConnected)) cache.delete(node);
     if (id === undefined || id === null) return null;
     if (typeof document === "undefined" || typeof document.querySelector !== "function") return null;
     // The node the user sees is a child of the frontend's transform pane. Asked
@@ -4109,13 +4140,52 @@ function lodVueRootEl(node) {
   }
 }
 
+// Does this element say it belongs to a node that is not the one asking? A recycled
+// element is the *other* node's stand-in now: its mark is that node's, and taking it
+// off here would show that node through its own box until its next dress — the
+// "fighting" again, from the other side. The element the frontend has just handed to
+// somebody else is therefore left alone; that node's own dress or lift decides.
+function lodVueClaimsOther(el, node) {
+  if (!el || typeof el.getAttribute !== "function") return false;
+  let id = null;
+  try {
+    id = el.getAttribute("data-node-id");
+  } catch (e) {
+    return false;
+  }
+  if (id === null || id === undefined || id === "") return false;
+  // Compared as strings: `data-node-id` is a string in the DOM and a number on the
+  // node, and `"7" === 7` is false — which would read as "belongs to somebody else".
+  return String(id) !== String(node && node.id);
+}
+
 // Blank (or hand back) one node's element. Answers whether a box may be painted:
 // a box stands in for an element this tool has really blanked, never for one it
 // could not reach — a box over a node that is still drawing itself would be two
 // pictures of the same node.
 function lodVueBlank(node, on) {
   const els = LOD.vueEls || (LOD.vueEls = new Map()); // the element each node was dressed on
+  // A hand-back is a decision: the node is not a stand-in any more, so the memory of
+  // an element it lost is no reason to dress it again.
+  if (!on && LOD.vueOrphan) LOD.vueOrphan.delete(node);
   let el = lodVueRootEl(node);
+  // Hand back the element this node *was* dressed on whenever it is no longer the
+  // element this node is dressed on (or would be): the frontend reuses elements and
+  // rewrites their `data-node-id` (a slot given to another node, a graph swapped
+  // under the same pane), and a mark left on one of those hides a node that nothing
+  // is standing in for. Compared first, written on the transition only, so a
+  // steady-state call costs one Map lookup.
+  const was = els.get(node);
+  if (was && was !== el && !lodVueClaimsOther(was, node)) {
+    try {
+      if (typeof was.hasAttribute === "function" && was.hasAttribute(LOD_VUE_ATTR)) {
+        was.removeAttribute(LOD_VUE_ATTR);
+        LOD.vueDomWrites++;
+      }
+    } catch (e) {
+      /* an element that cannot be handed back is still dropped from the bookkeeping */
+    }
+  }
   if (!el && !on) {
     // Handing back. The element may have been unmounted rather than hidden — a
     // re-render, or the frontend switching renderers (`GraphCanvas.vue` renders
@@ -4129,10 +4199,16 @@ function lodVueBlank(node, on) {
   const set = LOD.vueFlat || (LOD.vueFlat = new Set());
   if (!el || typeof el.setAttribute !== "function") {
     set.delete(node);
+    els.delete(node);
     // Nothing of this node is on screen any more: the layout read it left behind
     // goes with it, so the cache only ever holds nodes that are stand-ins.
     if (LOD.vueMedia) LOD.vueMedia.delete(node);
-    if (on) LOD.vueUnreached++;
+    // Remember the loss, for a moment. The frontend may add the node's new element
+    // in the next report or the next task, and a node that was standing in then is
+    // still one now: the pane observer dresses it on arrival. A node that was
+    // already in this state is not a new failure, so it is not counted again —
+    // otherwise a pane rebuild reports every node as unreachable.
+    if (on && !lodVueOrphan(node, true)) LOD.vueUnreached++;
     return false;
   }
   // The mark is written *once*, on the transition, and read (not written) on every
@@ -4157,6 +4233,7 @@ function lodVueBlank(node, on) {
       set.add(node);
       els.set(node, el);
       lodVueWatchKeep(node, el);
+      lodVuePaneWatch(el);
     } else {
       set.delete(node);
       els.delete(node);
@@ -4176,6 +4253,7 @@ function lodVueBlank(node, on) {
     set.add(node);
     els.set(node, el);
     lodVueWatchKeep(node, el);
+    lodVuePaneWatch(el);
   } else {
     set.delete(node);
     els.delete(node);
@@ -4289,6 +4367,17 @@ function lodVueWatchKeep(node, el) {
 // cap is there so a custom node that renders a thousand elements cannot turn a scan
 // into a stall.
 const LOD_VUE_WATCH_MAX = 24;
+// How stale the data-node-id -> node lookup may be. Rebuilt lazily and at most this
+// often, because a workflow load adds a whole graph's worth of elements at once.
+const LOD_VUE_BYID_MS = 250;
+// How many standing-in nodes one pane report without added nodes looks at.
+const LOD_VUE_PANE_SWEEP_MAX = 256;
+// How long a node whose element the frontend took away is remembered, so that the
+// element arriving for it next — in a later report, a later task — is dressed on
+// arrival exactly like one that arrived in the same report as the removal. Vue can
+// do either: a keyed swap replaces in one patch, a `v-if` branch or a component
+// change unmounts and mounts around a paint.
+const LOD_VUE_ORPHAN_MS = 500;
 
 function lodVueWatch(node, el) {
   if (!node || !el || typeof el !== "object") return;
@@ -4368,6 +4457,164 @@ function lodVueWatchInside(node, el) {
     }
   }
   LOD.vueWatch++;
+}
+
+// ------------------------------------------------- the mark is re-applied at once ---
+// A stand-in is a mark on a DOM element, and the frontend owns that element's
+// lifetime: it replaces a node's element when it re-renders the pane, when a
+// workflow is loaded, when a node swaps its template. The tool used to re-apply the
+// mark on the next canvas draw, and a draw is neither guaranteed (the canvas is
+// drawn when something dirties it) nor immediate (a frame later at best). So
+// between the frontend putting its element on the page and the tool marking it, the
+// *real* node was on screen, and then the box took its place: the "fighting" a user
+// reported on some nodes — a flicker, then a settle into the stand-in.
+//
+// The page says when an element arrives: the frontend's own node container reports
+// the new child to a MutationObserver, whose callback runs as a microtask after the
+// DOM change and *before* the browser paints. Marking there means the element is
+// never painted unmarked at all: no flicker, no frame of the real node, no fight.
+function lodVueNodeById(id) {
+  if (id === undefined || id === null || id === "") return null;
+  const key = String(id);
+  const now = nowMs();
+  let map = LOD.vueById;
+  // The lookup is rebuilt at most this often: a workflow load adds hundreds of
+  // elements in one task, and a scan of the graph per element would be a stall.
+  if (!map || now - (Number(LOD.vueByIdAt) || 0) > LOD_VUE_BYID_MS) {
+    map = new Map();
+    const nodes = lodGraphNodes(null) || [];
+    for (const n of nodes) {
+      if (!n || n.id === undefined || n.id === null) continue;
+      map.set(String(n.id), n);
+    }
+    LOD.vueById = map;
+    LOD.vueByIdAt = now;
+  }
+  return map.get(key) || null;
+}
+
+// Did this node just lose its element? Answered from a short-lived memory, with
+// `note` recording the loss. Pruning happens here, on the only path that adds to it,
+// so the map cannot grow with the session: it holds the nodes that lost an element
+// in the last `LOD_VUE_ORPHAN_MS`, which is a handful at most.
+function lodVueOrphan(node, note) {
+  const m = LOD.vueOrphan || (LOD.vueOrphan = new Map());
+  const now = nowMs();
+  let seen = false;
+  for (const [n, at] of m) {
+    if (now - at > LOD_VUE_ORPHAN_MS) m.delete(n);
+    else if (n === node) seen = true;
+  }
+  if (note && !seen) m.set(node, now);
+  return seen;
+}
+
+// Put the mark back on, for a node that was standing in when its element was
+// replaced. Only those nodes are touched — a node the tool never blanked is the draw
+// path's business, not this one's — and only a mark that was really written is
+// counted, so the readout's "re-marks" number is marks, not visits.
+function lodVueRedress(node) {
+  if (!node) return false;
+  const orphan = lodVueOrphan(node, false);
+  if (!orphan && (!LOD.vueFlat || !LOD.vueFlat.has(node))) return false;
+  const writes = LOD.vueDomWrites;
+  if (!lodVueBlank(node, true)) return false;
+  if (LOD.vueOrphan) LOD.vueOrphan.delete(node);
+  if (LOD.vueDomWrites === writes) return false; // already dressed: nothing to re-apply
+  LOD.vueRedressed++;
+  return true;
+}
+
+// The node root inside an element the frontend added to its container.
+function lodVuePaneNodeOf(el) {
+  let n = el;
+  for (let i = 0; n && i < 32; i++) {
+    if (n.getAttribute && n.getAttribute("data-node-id") !== null && n.getAttribute("data-node-id") !== undefined) return n;
+    n = n.parentNode;
+  }
+  return null;
+}
+
+// Watch the container the frontend puts its node elements in: additions and
+// replacements are the one event that can take the mark off a node, and this is
+// where the page reports them. `childList` only, no subtree: the container's
+// children *are* the node roots, and every change inside a node is already watched
+// by the measurement observers.
+function lodVuePaneWatch(el) {
+  if (!lodVueWatchOn()) return false;
+  const parent = el && el.parentNode;
+  if (!parent || parent === LOD.vuePaneNode) return false;
+  try {
+    if (!LOD.vuePaneMO && typeof MutationObserver === "function") {
+      LOD.vuePaneMO = new MutationObserver((entries) => {
+        if (!lodVueNodesMode()) return;
+        if ((!LOD.vueFlat || !LOD.vueFlat.size) && !(LOD.vueOrphan && LOD.vueOrphan.size)) return;
+        // Additions first, whatever order the records arrived in. A replacement is a
+        // removal *and* an addition, and the addition is the newer truth: dressing it
+        // first means the removal that came with it cannot answer for a node whose
+        // element is already back — the shape of the report an observer delivers
+        // while the page is still mid-change, which is exactly the case a synchronous
+        // delivery creates (one record per DOM operation) and the case that made a
+        // node go unmarked between two draws: the flicker between the real node and
+        // the stand-in. On a browser's own batched delivery the DOM is already final
+        // by the time the callback runs, and this ordering costs one comparison.
+        let unnamed = false;
+        for (const e of entries) {
+          const added = e && e.addedNodes;
+          if (added && added.length) {
+            for (let i = 0; i < added.length; i++) {
+              const child = added[i];
+              if (!child || child.nodeType !== 1) continue;
+              const rootEl = lodVuePaneNodeOf(child);
+              if (!rootEl) continue;
+              const node = lodVueNodeById(rootEl.getAttribute("data-node-id"));
+              if (node) lodVueRedress(node);
+            }
+          } else {
+            unnamed = true;
+          }
+        }
+        // An observer implementation that reports the change without the added nodes
+        // still has to be answered: the nodes that are standing in are checked
+        // directly, which is the whole set this feature marks.
+        if (unnamed) {
+          let n = 0;
+          for (const node of [...(LOD.vueFlat || [])]) {
+            if (n++ >= LOD_VUE_PANE_SWEEP_MAX) break;
+            lodVueRedress(node);
+          }
+        }
+      });
+    }
+    if (!LOD.vuePaneMO) return false;
+    LOD.vuePaneMO.disconnect();
+    LOD.vuePaneMO.observe(parent, { childList: true });
+    LOD.vuePaneNode = parent;
+    LOD.vuePaneWatches = (LOD.vuePaneWatches || 0) + 1;
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+// The pane itself can be replaced (the frontend remounts `GraphCanvas`), and an
+// observer watching a detached element reports nothing. Checked once per frame,
+// only while something is standing in — a property read, not a layout read.
+function lodVuePaneStill() {
+  const pane = LOD.vuePaneNode;
+  if (!pane || !LOD.vuePaneMO) return false;
+  try {
+    if (pane.isConnected === undefined || pane.isConnected) return false;
+  } catch (e) {
+    return false;
+  }
+  LOD.vuePaneNode = null;
+  LOD.vuePaneMO.disconnect();
+  for (const node of LOD.vueFlat ? [...LOD.vueFlat] : []) {
+    const el = lodVueRootEl(node);
+    if (el) lodVuePaneWatch(el);
+  }
+  return true;
 }
 
 function lodVueUnwatch(node, el) {
@@ -5822,6 +6069,7 @@ function lodVueFramePlan(canvas) {
   LOD.vueFlatOn = flat;
   const set = LOD.vueFlat;
   if (!set || !set.size) return 0;
+  lodVuePaneStill(); // the pane may have been remounted under us: watch the new one
   if (flat && prev === true) return 0; // steady state: the drawn node decides
   let n = 0;
   for (const node of [...set]) {
@@ -6090,6 +6338,10 @@ function lodSnapSignature(node, canvas) {
     // was concerned, that first picture was served for the rest of the session.
     // That is the "captured too early, never fully" a user sees.
     const metrics = lodVueRootMetrics(node, canvas, false);
+    // The picture is drawn in the font the page has *now*: while the page's own font
+    // is still loading, the element's computed font stack is the fallback, and a
+    // picture made with it would keep the fallback for the rest of the session.
+    str(lodFontsReady() ? "fonts:ready" : "fonts:loading");
     num(metrics && metrics.boxH ? metrics.boxH : 0);
     // The composited opacity is part of the picture now (it is baked into the
     // capture), so it invalidates it: mute, bypass and the drag ghost each change
@@ -7101,6 +7353,69 @@ function lodSnapCancel() {
   LOD.snapPumping = false;
 }
 
+// Is this Vue node finished enough to be photographed? Empty answer = yes, take the
+// picture. Anything else is the reason to wait, and it is named in the readout.
+//
+// A node is rendered in pieces by this frontend: the element exists before the layout
+// store has given it a size, an `<img>` exists before its bytes have arrived, and the
+// page's own webfont can land after the first paint. A capture taken in any of those
+// windows is a picture of a node half-way through being built — the "captured at the
+// wrong moment" a user sees — and because the picture is keyed on what it drew, it
+// would stay wrong until something else about the node changed.
+//
+// The wait is bounded by the settle ceiling: past it the picture is taken anyway,
+// because a picture of a node that is still arriving is worth more than a box that
+// never becomes one. Every reason is counted and named, so a report can say which
+// one is holding nodes back on a real page.
+function lodVueShotWait(node, canvas) {
+  const stamp = LOD.vueSettle ? LOD.vueSettle.get(node) : null;
+  const at = stamp && Number(stamp.at) ? Number(stamp.at) : 0;
+  // No stamp at all: this node was never reported as changing, so there is no window
+  // to be inside of and nothing to wait for.
+  if (!at) return "";
+  const age = nowMs() - at;
+  if (age >= LOD_SNAP_SETTLE_MAX_MS) return ""; // waited long enough: photograph it
+  const m = lodVueRootMetrics(node, canvas, true);
+  if (!m) return ""; // no element to measure: the caller's own check answers
+  if (!(Number(m.boxH) > 0)) {
+    LOD.vueWaitLayout++;
+    return "not laid out yet";
+  }
+  const items = m.items || [];
+  for (let i = 0; i < items.length && i < LOD_SNAP_DOM_MAX; i++) {
+    const el = items[i] && items[i].el;
+    if (!el) continue;
+    const tag = String(el.tagName || "").toUpperCase();
+    // An image that has not arrived is not a detail: it is the whole content of an
+    // image loader or a preview node. A canvas has no such flag — it is as ready as
+    // whoever draws into it says.
+    if (tag === "IMG" && el.complete === false) {
+      LOD.vueWaitMedia++;
+      return "its images are still arriving";
+    }
+  }
+  if (items.length && !lodFontsReady()) {
+    // Only nodes with content of their own wait for the page's fonts: a node with
+    // nothing to write in them cannot care which font is loaded.
+    LOD.vueWaitFonts++;
+    return "the page's fonts are still loading";
+  }
+  return "";
+}
+
+// Is the page's own font loading finished? `document.fonts` is the page's own
+// answer, and it is a property read, not a layout read. An engine without the API
+// answers "ready": there is nothing to wait for.
+function lodFontsReady() {
+  try {
+    const f = typeof document !== "undefined" && document ? document.fonts : null;
+    if (!f || typeof f.status !== "string") return true;
+    return f.status !== "loading";
+  } catch (e) {
+    return true;
+  }
+}
+
 function lodSnapCaptureNode(node, canvas) {
   lodSnapEnsure();
   let rec = LOD.snaps.get(node);
@@ -7144,6 +7459,15 @@ function lodSnapCaptureNode(node, canvas) {
     LOD.vueNoElement++;
     lodSnapNoteWhy(node, "element not on the page");
     return false;
+  }
+  if (lodVueNodesMode()) {
+    const wait = lodVueShotWait(node, canvas);
+    if (wait) {
+      // Left un-pictured on purpose, and asked for again by the next frame that
+      // paints this node as a box: the wait is a *when*, not a refusal.
+      lodSnapNoteWhy(node, `waiting: ${wait}`);
+      return false;
+    }
   }
   // In this renderer the picture *is* the measurement. Take it once, here, and use
   // that one number for the surface, the box and the ink: sizing the surface from
@@ -12044,7 +12368,14 @@ function buildTweaksTab(container) {
                       : `. Pictures are being made here: ${LOD.snaps.size} held, ${LOD.snapCaptured} captured so far`) +
                     `. While a node is a stand-in the browser is told to skip its DOM's paint (visibility, not opacity: an opacity-0 subtree is ` +
                     `still painted) — ${LOD.vueFlat ? LOD.vueFlat.size : 0} subtree(s) right now — and a node is photographed only after it has stood ` +
-                    `still (${LOD_SNAP_SETTLE_MS}ms, re-opened by every change it reports, ${LOD.vueSettleHeld} capture slice(s) waited so far). This ` +
+                    `still (${LOD_SNAP_SETTLE_MS}ms, re-opened by every change it reports, ${LOD.vueSettleHeld} capture slice(s) waited so far), and only once the node ` +
+                    `is *finished*: within the same window a node that is not laid out yet, whose own images are still arriving, or whose fonts are still loading is ` +
+                    `left for the next slice rather than photographed half-built` +
+                    (LOD.vueWaitLayout || LOD.vueWaitMedia || LOD.vueWaitFonts
+                      ? ` (${LOD.vueWaitLayout} wait(s) for layout, ${LOD.vueWaitMedia} for its images, ${LOD.vueWaitFonts} for the page's fonts)`
+                      : "") +
+                    `. An element the frontend replaces is marked again by the page's own report of the new child — before it is painted, not on the next frame ` +
+                    `(${LOD.vueRedressed} re-mark(s) so far). This ` +
                     `pathway's cost to the page so far: ${LOD.vueDomWrites} DOM write(s) (a mark is written once, never re-written) and ` +
                     `${LOD.vueLayoutReads} layout read(s) — both stop moving in the steady state` +
                     (lodVueWatchOn()
@@ -14829,6 +15160,12 @@ function installDebugApi() {
             pathway: lodSnapPathway(),
             bitmaps: lodSnapBitmaps(),
             vueBlanked: LOD.vueFlat ? LOD.vueFlat.size : 0,
+            vueRedressed: LOD.vueRedressed,
+            vueStaleEls: LOD.vueStaleEls,
+            vuePaneWatches: LOD.vuePaneWatches,
+            vueWaitLayout: LOD.vueWaitLayout,
+            vueWaitMedia: LOD.vueWaitMedia,
+            vueWaitFonts: LOD.vueWaitFonts,
             // The node's own structure — frame, header, body panel, slot dots —
             // read out of the DOM and drawn into the boxes and the pictures. A
             // picture without it is the sketch a user described as "semi".
@@ -15251,7 +15588,16 @@ app.registerExtension({
 //    picture of a node that is still being built; that is a *when*, not a
 //    screenshot API, and it is what a user meant by "photographed too early".
 //    Nothing is read or written while a node is quiet: the window is a floor on
-//    how late the lane may be, never a poll.
+//    how late the lane may be, never a poll. Inside that window the lane also
+//    checks that the node is *finished* and names what it is waiting for: an
+//    element with no laid-out box yet, one of the node's own `<img>` elements
+//    still arriving, or a node with content of its own while the page's fonts are
+//    loading (`lodVueShotWait`, counted as vueWaitLayout / vueWaitMedia /
+//    vueWaitFonts). The page's font state is part of the picture's signature, so a
+//    picture drawn in the fallback font is dropped and re-made when the webfont
+//    arrives. The ceiling still applies: past LOD_SNAP_SETTLE_MAX_MS a node that
+//    never settles is photographed anyway, because a picture of a node that is
+//    still arriving beats a box that never becomes one.
 //  * What a Vue-nodes stand-in cannot be is a *screenshot*: no browser API
 //    draws a DOM element into a canvas (not drawImage, not createImageBitmap,
 //    not captureStream). The picture is therefore *drawn* — the box, its title
@@ -15284,6 +15630,22 @@ app.registerExtension({
 //    (measured from its own width, not read from canvas.ds.scale — a capture
 //    sets that to 1 while the DOM keeps its transform), so a capture during a
 //    zoom still puts the content where it belongs.
+//  * The mark that blanks a node's element is owned by an identity, and the page
+//    reports when the element it belongs on is replaced. A cached element is
+//    trusted only while the `data-node-id` it carries still equals the node's own
+//    id (this frontend reuses elements and rewrites that attribute, and a box
+//    painted for one node while another node's element was blanked is a node
+//    fighting its own stand-in — counted as vueStaleEls). A new element inside
+//    the container the frontend renders nodes into is reported by a MutationObserver
+//    (`childList`, additions answered before the sweep), resolved back to a node
+//    through `data-node-id` and re-marked **in the callback — a microtask after
+//    the DOM change, before the browser paints** (vueRedressed), so the element is
+//    never painted unmarked for a frame. A replacement split across two tasks is
+//    covered by remembering the loss briefly (lodVueOrphan); an element the
+//    frontend takes off *this* node is handed back, and an element it has given to
+//    *another* node keeps that node's mark. The pane itself can be remounted
+//    (`lodVuePaneStill` re-attaches the watcher), and the readout counts all of it
+//    (`vueRedressed`, `vueStaleEls`, `vuePaneWatches`).
 //  * That measurement is one read per node, and it is taken when the page
 //    *reports* a change rather than on a timer (ResizeObserver + MutationObserver
 //    over the element; the harness models both), with a 5 s insurance read

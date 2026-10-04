@@ -793,6 +793,29 @@ the picture replaced the live box. It asks the same function now, which a test p
 node the frontend renders 420 units taller than its graph size (the ring is more than 300
 units tall and is not the graph size; mutation-checked).
 
+### The thirteenth pass (v2.7.0): the flicker, the wrong moment, and what a screenshot can be
+
+The twelfth *report* — three complaints, one of them a question about the browser
+rather than about this code. All three were re-read against the frontend's own behaviour before anything
+was changed.
+
+| # | Complaint | What it actually was | What changed |
+| --- | --- | --- | --- |
+| 1 | "Some nodes flicker / fight between the real node and the stand-in" | Three separate ownership bugs in the blanking mark. The cached element could belong to another node (this frontend reuses elements and rewrites `data-node-id`); the mark was re-applied on the next *canvas draw*, so an element the frontend had just put on the page was painted unmarked for a frame and the box took its place; and a replacement delivered as two reports (removal in one task, addition in the next) left the node forgotten. | `lodVueRootEl` trusts a cached element only while it still says it is this node's (`vueStaleEls`); `lodVuePaneWatch` reads the frontend's own report of a new child (`childList`, no subtree), resolves it through `data-node-id` (`lodVueNodeById`, a 250 ms lookup cache) and re-marks it **in the observer callback, before the paint** (`vueRedressed`); `lodVueOrphan` remembers a node whose element vanished for `LOD_VUE_ORPHAN_MS` so the element arriving in a later report is dressed on arrival. The reverse direction is explicit too: an element taken off this node is handed back, and an element the frontend gave to another node keeps *that* node's mark (`lodVueClaimsOther`). Four tests. |
+| 2 | "Still captured at the wrong moment" | The settle window held a node that was being *written*; nothing held one that was still *arriving* — a node whose element had no laid-out box yet, whose own `<img>` had not loaded, or whose text was laid out in the fallback font while the page's webfont was still loading. | `lodVueShotWait`, called in the capture lane after the element check: no change stamp → nothing to wait for; inside the window, a node that is not laid out (`vueWaitLayout`), whose images are still arriving (`vueWaitMedia`), or that has content while `document.fonts.status === "loading"` (`vueWaitFonts`) is left for the next slice **and named in the readout** (`waiting: its images are still arriving`). The settle ceiling still wins, so a node that never settles is still pictured. The page's font state is in the picture's signature now, so a fallback-font picture is dropped and re-made when the fonts arrive. |
+| 3 | "Rethink the capture: take simple screenshots of the nodes as the frontend shows them to the human" | A pixel screenshot of a DOM element is **not obtainable from page JavaScript**: no browser API draws an element into a canvas. The only route is a rasteriser (clone → inline computed styles → `<svg><foreignObject>` → `XMLSerializer` → data URL → `createImageBitmap` → `drawImage`), whose known failure modes are the cascade (computed-style copying with a `getDiffStyle`-style diff, as `modern-screenshot` does), cross-origin media (taint), webfonts, and — on this machine — a full tree rasterisation per capture, which is the frontend cost the stand-in pathway exists to remove. | The prototype was written against documented behaviour and **not shipped**: no browser can be obtained in this environment for a pixel A/B, so shipping it would be an unverified code path on the user's machine. What shipped is the honest form of the same sentence: the picture is read from the element the user is looking at, taken only once that element is finished, and the node's *state* is never frozen into it (a running, erroring or dragged node keeps its own element in this renderer). The rasteriser is recorded in `plan.md` as speculative, to be attempted only with a real page to compare against. |
+
+**The one thing this stretch could not bind.** The pane observer answers a report
+additions-first, whatever order the records arrived in — the semantically right
+answer to "what is true now", and the thing that keeps a removal from answering for
+a node whose new element is already in the same report. The harness delivers one
+record per DOM operation, so no test can distinguish it from answering in arrival
+order; the mutation battery's eighth edit survives for that reason and is recorded
+as such rather than claimed as bound. What *is* bound: the crossing between
+callbacks (a replacement as two reports — the orphan memory), a report that carries
+no added nodes (the sweep), the identity check, the hand-back and claims-other
+rules, the completeness gate, the font token, and the no-write steady state.
+
 ## The stand-in pictures: what a capture actually contains, and where the cache went wrong
 
 The user's report was specific: image loaders and mask editors show a stand-in
@@ -910,7 +933,11 @@ apply, not just in the docs.
   heavy graph can show. The tool measures both: the frame budget, the Stalls tab
   and `lowZoom.snapshots.vueBlanked` / `vueBoxes` / `vueMedia` / `vueContent` /
   `vueText` / `vueScale` / `vueScaleFrom` / `vueRestored` / `vueCleared` /
-  `vueUnreached` / `vueNoElement`, and — since v2.6.6 — `vuePaintSkipped` (nodes
+  `vueUnreached` / `vueNoElement`, and — since v2.7.0 — `vueRedressed` (marks
+  put back on an element the frontend replaced), `vueStaleEls` (a cached element
+  that turned out to belong to another node), `vuePaneWatches` (node containers
+  watched for replacements) and `vueWaitLayout` / `vueWaitMedia` / `vueWaitFonts`
+  (captures held for a node that had not finished), and — since v2.6.6 — `vuePaintSkipped` (nodes
   whose paint the frontend no longer owes), `vueChrome` / `vueChromeBoxes` (the
   node's structure drawn), `vueSettleMs` / `vueSettleArms` / `vueSettleHeld` (the
   settle window, and how many capture slices it held back), and — since v2.6.7 —
@@ -951,7 +978,15 @@ apply, not just in the docs.
   library (or an SVG `foreignObject` trick), which would mis-render real
   stylesheets and cross-origin images, and which on a GPU-less machine would
   rasterise the whole node tree per capture — the cost this pathway exists to
-  remove. What a stand-in *is* instead (since v2.6.3, structure included since
+  remove. The twelfth report asked for exactly that ("take simple screenshots of
+  the nodes as the frontend is showing them to the human"), and a rasteriser
+  prototype was worked out on paper against documented behaviour (clone, inline
+  the computed styles with a diff like `modern-screenshot`'s `getDiffStyle`, wrap
+  in `<svg><foreignObject>`, `encodeURIComponent` data URL, `createImageBitmap`,
+  `drawImage`). It is **not shipped**: no browser can be obtained in this
+  environment, and an unverifiable picture path is exactly the kind of change the
+  live page has already caught five times for this feature. It is the next thing
+  to try *with* a real page and a pixel comparison — see `plan.md`, Track K. What a stand-in *is* instead (since v2.6.3, structure included since
   v2.6.6) is the node re-drawn from the browser's own numbers: every rect and
   text metric the layout gives, every background colour the browser computed
   (a widget's own row included, since v2.6.6: the element the frontend mounts,

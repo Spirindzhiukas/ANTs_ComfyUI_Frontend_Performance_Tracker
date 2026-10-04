@@ -4,7 +4,7 @@ A running record for whoever picks this up next (including me). `CLAUDE.md` is t
 rules for changing the code; `plan.md` is where it is going. This file is the past:
 what was built, what was rejected, and what the evidence was.
 
-Last updated at **v2.6.9**, 228 tests green, PR #2 on
+Last updated at **v2.7.0**, 232 tests green, PR #2 on
 `Spirindzhiukas/ANTs_ComfyUI_Frontend_Performance_Tracker`.
 
 ---
@@ -13,8 +13,8 @@ Last updated at **v2.6.9**, 228 tests green, PR #2 on
 
 | | |
 | --- | --- |
-| Version | 2.6.9 (`web/tracker.js` `VERSION`) |
-| Tests | 228 (`node tests/run-tests.mjs`), plus `tests/test_init.py` |
+| Version | 2.7.0 (`web/tracker.js` `VERSION`) |
+| Tests | 232 (`node tests/run-tests.mjs`), plus `tests/test_init.py` |
 | Frontend | `web/tracker.js`, one ES module, no dependencies. The separate window is `web/window.html`, served at `/ants_optimizer/window`, not loaded as an extension. |
 | Backend | `__init__.py` — node `ANTs_Frontend_Optimizer` (old class key kept as an alias), nine best-effort routes (GPU, five thumbnail routes, the window page, `/ants_optimizer/ui`), and thumbnail read/write under ComfyUI's temp folder |
 | Panel | 10 tabs: Node Rendering Settings, Status, Timing, Nodes, Stalls, Governor, Load, Memory, GPU / VRAM, Testing |
@@ -36,6 +36,8 @@ something has to be drawn less or hit-tested less.
 ## 2. Version log
 
 The commit log is the full record; this is the "why", newest first.
+
+**v2.7.0 — the twelfth report: the flicker, the wrong moment, and what a "screenshot" can be.** The report had three parts and each was traced to a mechanism before anything was touched. *The flicker* ("some nodes flicker/fight") was three ownership bugs in one mark: the element the tool cached for a node was trusted until it left the page, but this frontend reuses elements and rewrites the `data-node-id` they carry, so the box could be painted for one node while another node's element was blanked or handed back; the mark was re-applied on the next *canvas draw* — a draw is neither guaranteed nor immediate — so an element the frontend had just put on the page was painted unmarked for a frame before the box took its place; and a replacement delivered as two reports (a removal in one task, the addition in the next) left the node forgotten. The fixes are one ledger: identity (`data-node-id` must still match, else `vueStaleEls` and a re-lookup), the page's own report (`lodVuePaneWatch`, a `childList` observer on the container the frontend renders nodes into, resolving the report's `addedNodes` through `lodVueNodeById` and re-marking **in the callback, before the paint** — `vueRedressed`), a short memory for a node that lost its element (`lodVueOrphan`, 500 ms, so the element arriving later is dressed on arrival), and two explicit hand-back rules (an element taken off this node is handed back; an element the frontend gave to *another* node keeps that node's mark — `lodVueClaimsOther`, ids compared as strings, because `"7" === 7` is false and the first cut of that check read backwards). *The wrong moment* was the settle window holding a node that was being written but not one that was still arriving: `lodVueShotWait` now holds a capture for a node with no laid-out box (`vueWaitLayout`), an `<img>` that has not arrived (`vueWaitMedia`) or content of its own while `document.fonts.status === "loading"` (`vueWaitFonts`), names the reason in the readout, and the page's font state joined the picture's signature — so a fallback-font picture is dropped and re-made when the webfont arrives. The ceiling still wins: a node that never settles is still photographed. *"Rethink it as simple screenshots"* was answered as a question about the browser: a pixel screenshot of a DOM element is not obtainable from page JavaScript, and the only route (clone → inline computed styles → `<svg><foreignObject>` → data URL → `createImageBitmap`) was prototyped against documented behaviour and **deliberately not shipped** — there is no browser in this environment to A/B it against, and a rasteriser on a GPU-less Electron pays a full tree rasterisation per capture, which is the cost this pathway exists to remove. What shipped is the honest form: the picture is read from the element the user is looking at, taken only once that element is finished, with the node's state never frozen into it. **Tests: 232** (four new), and the mutation battery's eight edits caught seven — the survivor (answering a report in arrival order rather than additions-first) is unobservable in a harness that delivers one record per DOM operation, and is recorded as such in `CHANGELOG.md` and `ANALYSIS.md` instead of being claimed as bound.
 
 **v2.6.9 — the two open items from the eleventh report traced to their sources, plus one fix they turned up.** The first was the sentence a user quotes back at you: "16 hidden element(s) of 75 boxed node(s)". `LOD.domHidden` is set by the owner sweep (`viewDress`), not by any DOM scan, so it counts *elements* the tool dressed, one per owner record — the class `ants-lod-box` on the DOM a node's widgets are built from, the attribute `data-ants-dom-hidden` on a Vue node's own element (an attribute because `LGraphNode.vue` rewrites `:class` wholesale). Verified with a probe at 10 % zoom (`domHidden` 1, classed elements in the document 1) and now pinned by a test that walks the page for both marks and holds the readout to the walk: "N element(s) hidden" is a claim about the user's page, so it has to be checkable on the user's page. The second was whether a box may honestly draw `node.progress`/`node.has_errors` in the renderer where the node *is* a DOM element — and the answer is that it never has to: `lodVueFlatNode` refuses the same nodes `lodSnapLive` refuses, so a running, erroring, dragged or video node keeps its own element and the frontend draws its own bar (`h-2 bg-primary-500`, centred on the header/body boundary), its own error ring and its own executing outline (`outline-node-stroke-executing`; the overlay at `-inset-0.75` otherwise). In the canvas renderer, where a box does stand for such a node, the marks come from fields the frontend itself mirrors onto the node (`nodeProgressCanvasSync.ts` sets `node.progress` from the execution store for every node in both renderers; `useNodeErrorFlagSync.ts` reconciles `has_errors`), read per frame and never out of a picture — `lodSnapLive` refuses both the photograph and the blit while either is set, so a bar of the instant of a capture cannot outlive its run. The two marks are one guarded function now (`lodSnapStateMarks`, each mark in its own `try`), because an exception in the middle of it used to fall through to the Vue pathway's "hand the element back" recovery: one refused `fillRect` cost the node its stand-in for the frame. The fix the tracing produced: the selection ring on a stored picture asked for the node's graph `size` while the box painter and the capture ask `lodVueBoxSize` — so a node the frontend renders taller than its graph size (an image preview reserve, a pack's own content) was ringed *inside* the node and the ring changed size the moment the picture replaced the live box. It asks the same function now, pinned by a test on a node rendered 420 units taller than its graph size. **Tests: 228** — the three new claims are asserted inside existing tests, and the mutation battery was extended by the ring's size (**eighteen anchored edits, all eighteen caught**).
 
@@ -283,6 +285,33 @@ and a `skipped N` counter.
 own ids so `clearInterval`/`cancelAnimationFrame` keep working. The table can
 report "was 50/s, now 12/s" without having changed anything until asked.
 
+**A node element is identified by `data-node-id` and nothing else.** The frontend
+reuses elements and rewrites the id they carry (a slot given to another node, a
+graph swapped under the same pane). A cached element is therefore trusted only
+while it still says it is this node's, and anything that hides or hands back an
+element checks first. The whole point is that a picture and the mark under it are
+the *same* decision about the *same* element; the moment they can disagree the
+user sees a node fight its own stand-in.
+
+**The page's own report is the authority on timing — not the next frame.** A mark
+is put back inside the `MutationObserver` callback that reports the new element (a
+microtask, before the paint), additions-first, in the same turn. "Re-apply on the
+next draw" is a frame in which the real node is on screen, and that frame is the
+flicker users report. A replacement split across tasks is covered by remembering
+the loss briefly rather than by a faster timer.
+
+**A picture is taken only of a node that is finished, and the readout says what it
+waited for.** Laid out, its media arrived, the page's fonts loaded — or the settle
+ceiling passed, because a picture of a node that is still arriving beats a box that
+never becomes one. Any new reason to wait goes in `lodVueShotWait`, gets a named
+counter, and joins the signature if it can invalidate a picture.
+
+**A "screenshot" of a DOM element is not a thing the browser will do.** The picture
+is a drawing read out of the element (`lodVueCapturePaint`), and that is not a
+compromise of convenience — it is the only route that costs nothing per frame on a
+GPU-less machine. A rasteriser is not forbidden, but it is *unverified* until it
+has been A/B'd against a real page, which this environment cannot do.
+
 **A picture is whatever the canvas draws — no more, no less.** The rule for
 whether a node can be photographed is not a list of things that look scary (a DOM
 widget, a custom widget, a function, a long string — all of which upstream refuses)
@@ -408,6 +437,13 @@ line. Unchecked paints nothing inside the ring; checked fills `#0D2A2A`; both ar
 - **Faking GPU numbers.** Page JavaScript cannot get them. The GPU tab shows the
   backend route's `nvidia-smi` output, ComfyUI's `/system_stats` VRAM fields, and
   says what is missing.
+- **A `<foreignObject>` rasteriser shipped without a browser to verify it in.**
+  It is the only way to get real pixels of a DOM element, but its failure modes
+  (the cascade re-created by hand, cross-origin taint, webfont embedding) and its
+  cost (a tree rasterisation per capture on a GPU-less machine) are exactly what
+  this pathway exists to avoid, and this environment cannot A/B a picture. The
+  prototype is written up in `ANALYSIS.md` and `plan.md` (Track K) as
+  speculative — try it with a real page and a pixel comparison, not here.
 - **An `auto` link style.** "A link's shape changing because the *node* setting
   crossed a threshold" is precisely the coupling users hated.
 

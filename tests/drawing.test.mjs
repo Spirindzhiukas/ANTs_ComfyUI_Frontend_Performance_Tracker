@@ -3620,6 +3620,168 @@ suite("drawing: the Nodes 2.0 (Vue nodes) frontend", () => {
     assertGreater(snapApi(h).captured, 1, "and a new one is made from the element that is there");
   });
 
+  test("an element the frontend replaces is marked again before it is painted, and the mark never lands on another node", async () => {
+    const h = await boot();
+    const { nodes, vue } = vueGraph(h, 2);
+    stripWidgets(nodes);
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true });
+    draw(h, 1);
+    const state = h.tracker.lowZoom.state;
+    for (const n of nodes) assert(vue.rootFor(n).hasAttribute("data-ants-vue-standin"), "each node element is blanked while its box stands in");
+    // The frontend re-renders one node's element. Nothing is drawn in between: the
+    // *page's own report* of the new child is what has to put the mark back. Without
+    // it the real node is painted for a frame and the box takes its place on the
+    // next — the "fighting" a user sees on some nodes.
+    const before = state.vueRedressed;
+    const fresh = vue.replaceRoot(nodes[0]);
+    assert(fresh.hasAttribute("data-ants-vue-standin"), "the element the frontend has just created is marked again in the same turn");
+    assertEqual(state.vueRedressed, before + 1, "and the re-mark is counted");
+    // The same thing when the report does not name the node it added: the nodes that
+    // are standing in are checked directly, which is the set this feature marks.
+    const pane = h.document.querySelector('[data-testid="transform-pane"]');
+    const oldEl = vue.rootFor(nodes[1]);
+    const replacement = h.document.createElement("div");
+    replacement.setAttribute("data-node-id", String(nodes[1].id));
+    replacement.className = "lg-node absolute";
+    replacement._rect = oldEl._rect;
+    h.withQuiet(() => {
+      oldEl.remove();
+      pane.appendChild(replacement);
+    });
+    assert(!replacement.hasAttribute("data-ants-vue-standin"), "an element that arrives with no report is unmarked");
+    h.fireMutation(pane); // the shape of a report with no added nodes
+    assert(replacement.hasAttribute("data-ants-vue-standin"), "the sweep finds it anyway");
+    assertEqual(state.vueRedressed, before + 2, "and that, too, is a re-mark");
+    // And a frame later the box is still what the user sees for that node: the mark
+    // and the box are the same decision.
+    const boxes = snapApi(h).vueBoxes;
+    draw(h, 1);
+    assertGreater(snapApi(h).vueBoxes, boxes, "the box is painted for the replaced element, not for one that is gone");
+  });
+
+  test("an element the frontend replaces is handed back before the new one is marked", async () => {
+    const h = await boot();
+    const { nodes, vue } = vueGraph(h, 2);
+    stripWidgets(nodes);
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true });
+    draw(h, 1);
+    const el = vue.rootFor(nodes[0]);
+    assert(el.hasAttribute("data-ants-vue-standin"), "the node's element is the stand-in's");
+    // The frontend unmounts it and mounts a new one. The old element is off the page,
+    // but it is not gone: the frontend reuses elements (a pane rebuild puts them
+    // back), and an element that comes back carrying the mark comes back invisible,
+    // with nothing left to lift it. It is handed back — and the element the node has
+    // now is marked, in the same turn, before anything is painted.
+    const fresh = vue.replaceRoot(nodes[0]);
+    assert(!el.hasAttribute("data-ants-vue-standin"), "the element taken off the page is handed back");
+    assert(fresh.hasAttribute("data-ants-vue-standin"), "and the node's new element takes the mark");
+  });
+
+  test("an element the frontend gives to another node keeps that node's mark", async () => {
+    const h = await boot();
+    const { nodes, vue } = vueGraph(h, 2);
+    stripWidgets(nodes);
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true });
+    draw(h, 1);
+    const state = h.tracker.lowZoom.state;
+    const el = vue.rootFor(nodes[0]);
+    assert(el.hasAttribute("data-ants-vue-standin"), "the first node's element is the stand-in's");
+    // The frontend hands the same element to another node — and this node's next
+    // element is not on the page yet. The element now says it is node 2's; taking the
+    // mark off it here would show *that* node through its own box for a frame, which
+    // is the same fight from the other side. It is left alone: it is node 2's element
+    // now, and node 2's own dress or lift decides about its mark.
+    el.setAttribute("data-node-id", String(nodes[1].id));
+    draw(h, 2);
+    assertGreater(state.vueStaleEls, 0, "the cached element is noticed as not this node's");
+    assert(el.hasAttribute("data-ants-vue-standin"), "and the mark on it is left for the node it now names");
+  });
+
+  test("a node is photographed when it is finished, not while it is still arriving", async () => {
+    const h = await boot();
+    const { nodes, vue } = vueGraph(h, 1);
+    stripWidgets(nodes);
+    const n = nodes[0];
+    // The node's own content: an image the browser has not fetched yet, and a
+    // canvas somebody else draws into (a canvas has no arrival flag — it is as
+    // ready as whoever draws into it says).
+    const img = h.document.createElement("img");
+    Object.assign(img, { naturalWidth: 0, naturalHeight: 0, complete: false, src: "big.png", currentSrc: "big.png" });
+    vue.addMedia(n, img, { x: 10, y: 40, w: 180, h: 120 });
+    const cv = h.document.createElement("canvas");
+    Object.assign(cv, { width: 180, height: 120 });
+    vue.addMedia(n, cv, { x: 10, y: 170, w: 180, h: 120 });
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true });
+    const api = () => snapApi(h);
+    const state = h.tracker.lowZoom.state;
+    const why = () => (api().why || []).map((e) => e.why).join(" | ");
+    draw(h, 2);
+    await h.flush();
+    h.fireMutation(vue.rootFor(n)); // the page reports a change to this node: the window opens now
+    await h.flush();
+    // 400 ms on, the node has stood still long enough for the lane to *pick* it —
+    // and its image still has not arrived. The picture waits; the wait is counted
+    // and named, and nothing is stored under this node's key.
+    h.advance(400);
+    await h.flush();
+    assertEqual(api().captured, 0, "a node whose own image has not arrived is not photographed");
+    assertGreater(state.vueWaitMedia, 0, "the wait is counted");
+    assertIncludes(why(), "arriving", "and named, with the reason a report can read");
+    assertEqual(h.canvases.length, 0, "nothing was stored for it either");
+    // The image arrives. The picture is then made — the ceiling past the last
+    // change does not have to be reached for a node that is finished, and a node
+    // that is never finished is still photographed when it is (a picture of a node
+    // that is arriving beats a box that never becomes one — the ceiling's job).
+    img.complete = true;
+    img.naturalWidth = 180;
+    img.naturalHeight = 120;
+    h.advance(500);
+    await h.flush();
+    draw(h, 1);
+    await idle(h, 300);
+    assertGreater(api().captured, 0, "once its content has arrived the node is pictured");
+    // The page's fonts. A picture drawn while the webfont is still loading is a
+    // picture in the fallback font: it would keep the wrong font for as long as it
+    // is served, so a node with content of its own waits for the page to be ready.
+    const fresh = await boot();
+    const g = vueGraph(fresh, 1);
+    stripWidgets(g.nodes);
+    const fcv = fresh.document.createElement("canvas");
+    Object.assign(fcv, { width: 180, height: 120 });
+    g.vue.addMedia(g.nodes[0], fcv, { x: 10, y: 40, w: 180, h: 120 });
+    fresh.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true });
+    const fapi = () => snapApi(fresh);
+    draw(fresh, 2);
+    await fresh.flush();
+    fresh.document.fonts.status = "loading"; // the page says its fonts are still arriving
+    fresh.fireMutation(g.vue.rootFor(g.nodes[0]));
+    await fresh.flush();
+    fresh.advance(400);
+    await fresh.flush();
+    assertEqual(fapi().captured, 0, "a node with content of its own waits for the page's fonts");
+    assertGreater(fresh.tracker.lowZoom.state.vueWaitFonts, 0, "and that wait is counted, too");
+    assertIncludes(String(fapi().why.map((e) => e.why).join(" | ")), "fonts", "and the wait that held it is named in the report");
+    // The ceiling: a page whose fonts never settle still gets its pictures (a box
+    // that never becomes one is the worse answer), and that picture is a picture in
+    // the fallback font — so the moment the fonts do arrive, the signature says the
+    // picture no longer matches the page and it is thrown away and made again.
+    fresh.advance(600); // past LOD_SNAP_SETTLE_MAX_MS from the change
+    await fresh.flush();
+    draw(fresh, 1);
+    await idle(fresh, 300);
+    assertGreater(fapi().captured, 0, "past the ceiling the node is pictured even in the fallback font");
+    const made = fapi().captured;
+    fresh.document.fonts.status = "loaded";
+    fresh.advance(200);
+    await fresh.flush();
+    draw(fresh, 1);
+    assertGreater(fapi().invalidated, 0, "and the picture is dropped the moment the page's fonts arrive");
+    await idle(fresh, 300);
+    draw(fresh, 1);
+    await idle(fresh, 300);
+    assertGreater(fapi().captured, made, "and a picture in the real font takes its place");
+  });
+
   test("a widget the frontend mounts inside the node is drawn where the browser put it", async () => {
     const h = await boot();
     const { nodes, vue } = vueGraph(h, 1);

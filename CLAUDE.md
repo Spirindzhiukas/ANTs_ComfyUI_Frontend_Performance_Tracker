@@ -82,6 +82,22 @@ bug that was reported by a user, and most have a regression test.
 12. **Measure before claiming.** A new optimisation needs a number from the A/B
     harness (scripted pan, or `lowZoom.measureLinks`), on a graph that is actually
     slow. "It should be faster" is not a result.
+13. **A node element is identified by `data-node-id`, and by nothing else.** This
+    frontend reuses elements and rewrites the id they carry, so a cached element
+    is trusted only while it still says it is this node's. Anything that hides or
+    hands back an element must check first — a box painted for one node while
+    another node's element was blanked is a node fighting its own stand-in.
+14. **The page's own report is the authority on timing, not the next frame.** The
+    mark on a node element is re-applied inside the `MutationObserver` callback
+    that reports the new element (a microtask, before the browser paints) and in
+    the same turn, additions first; a plain "re-apply on the next draw" is a frame
+    in which the real node is on screen, which is the flicker users report.
+15. **A picture is only taken of a node that is finished, and the readout says what
+    it waited for.** Laid out, its media arrived, the page's fonts loaded (or the
+    settle ceiling passed — a picture of a node still arriving beats a box that
+    never becomes one). A new reason to wait goes in `lodVueShotWait`, is counted
+    in a named counter, and is mixed into the signature if it can invalidate a
+    picture.
 
 ## Architecture map of `web/tracker.js`
 
@@ -169,6 +185,13 @@ Seams worth knowing:
   `h.tracker.totals`, `h.tracker._state`, `h.tracker._panel`.
 - `h.infos()/warnings()/errors()` — console capture. `errors()` must be empty in
   a passing test.
+- `h.fireMutation(target, added, removed)` — one `childList` report, with the
+  nodes that arrived and left (as a browser's record has them); the shim's own
+  `appendChild`/`insertBefore`/`removeChild`/`textContent` pass the node through,
+  so a fixture's DOM building *is* a report the tracker hears. `h.withQuiet(fn)`
+  around the fixture's own layout keeps that distinction intact.
+- `h.document.fonts` — `{status, ready, check, addEventListener,
+  removeEventListener}`; a test flips `status` to `"loading"` to hold a capture.
 - `h.enterVueNodes()` — switches the page to the Nodes 2.0 (Vue nodes) renderer
   for the rest of the test: the flag goes on `h.LiteGraph.vueNodesMode` (the same
   object the frontend writes), `drawNode()` early-returns, and each node gets a
@@ -429,6 +452,16 @@ Rules for tests:
 - **Patch the prototype, not the instance**, when the frontend may recreate the
   object — but note that per-instance hooks exist (see `maybeWrapInstanceHooks`
   and `scanRegisteredTypes`) and must keep working.
+- **The DOM shim delivers one `MutationRecord` per DOM operation.** A real
+  browser batches the records of one task into one callback, so an ordering rule
+  *inside* the callback (the pane watcher answers additions before the sweep) is
+  not observable in this harness — a mutation test against it will survive, and
+  that is the harness, not a missing guarantee. What is observable — and bound by
+  tests — is the crossing between callbacks (a replacement delivered as two
+  reports) and the sweep for a report that carries no added nodes.
+- **`data-node-id` is a string, `node.id` is a number.** `"7" === 7` is false;
+  compare with `String(...)` on both sides. The first cut of `lodVueClaimsOther`
+  read the comparison backwards and handed back a mark it should have kept.
 - **The pill's geometry is one unit = one pixel** (`ANTS_GLYPH_BOX = 22`, viewBox
   `0 0 22 22`, `box-sizing: border-box`, ring centre line `r = 10.25`). Change one
   of those numbers and you have to change the others; `tools/pill-preview.mjs`
