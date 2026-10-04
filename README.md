@@ -788,6 +788,11 @@ and a fake ComfyUI (`tests/harness.mjs`), with a clock you control. There is
 no npm, no bundler and no jsdom: the extension's only dependency is ComfyUI
 itself.
 
+`docs/` holds the evidence the stand-in pathway is built on: a structured reading
+of ComfyUI-NodeSnapshots (the extension this feature learned from, and the lever it
+uses that this tool does not), the Nodes 2.0 renderer contract as read from the
+frontend's own sources, and the measurement behind the v2.7.2 capture-rate fix.
+
 `CLAUDE.md` is the operating manual (golden rules, the end-to-end recipe for
 adding a setting, testing seams, release checklist); `ANALYSIS.md` is the
 works/fails audit with the fixed defects and the retired ideas;
