@@ -387,27 +387,38 @@ counts it), the picture carries the node's structure, and the capture waits for 
 node to settle; since v2.6.7 it is not dropped while it is out of date either, so
 the saving is not paid back as a box on screen (1020 of 1800 frames with a box in
 the A/B, 17 after; an average of 7.14 boxed nodes a frame against 0.45, and 23.8
-blits a frame against 20.4). What is still not measurable from here is the rasteriser's bill on
+blits a frame against 20.4). v2.6.8 closed the fidelity half of the same question:
+the frontend has no zoom-based level of detail (verified against `LGraphNode.vue`,
+`TransformPane.vue` and `drawNode`, and reported from the page by `lodVueLodProbe`),
+and what made a stand-in look unlike the node was the picture itself — Tailwind 4
+`oklch()`/`oklab()` colours a canvas silently ignores, text drawn as one Arial line,
+a muted node drawn at full strength, and the frontend's own widget rows never read
+(now read, with the control's value drawn as the control it is). What is still not measurable from here is the rasteriser's bill on
 the user's machine (Electron, GPU/hardware acceleration off) — DevTools' paint
 flashing is the direct way to see it, and the frame budget plus the Stalls tab are
 the tool's own instruments. Each report has been a state the harness could model only after the fact:
 a class Vue rewrote, a picture half that was off, a picture with no text in it, a
 plan fighting the setting once per frame, a picture taken before the node had
 finished rendering, a poll the page could have answered itself. The user's page
-remains the live test. The eight live reports so far (v2.5.6 "pictures with no
+remains the live test. The nine live reports so far (v2.5.6 "pictures with no
 content"; v2.6.0 "nothing in Nodes 2.0"; v2.6.2 "only text nodes have content";
 v2.6.3 "no pictures and no disk files at all"; v2.6.4 "captured box previews,
 cached boxes in the canvas workspace, and a canvas that flickers when the stand-in
 mode is not pictures"; v2.6.5 "photographed too early, and the stand-ins drop the
 frame rate"; v2.6.6 "the performance hit is the same, and the stand-ins still look
 half-rendered"; v2.6.7 "still not there yet: flat rectangles at 42 % and the
-performance hit unchanged") each found something the harness could not, and the harness has been
+performance hit unchanged"; v2.6.8 "we are still half-way there — and does the
+frontend have its own zoom-based LOD?") each found something the harness could not, and the harness has been
 strengthened by each one — the last pass added the two change observers (with
 `withQuiet` so a pan or a zoom is not mistaken for a box change), a Vue re-render
 that rewrites `className`, an `isConnected` that tells the truth, the element's
 real height, the frontend's transform pane (so the DOM zoom is exercised the way
-the page writes it) and a `getComputedStyle` that resolves transforms the way a
-browser reports them.
+the page writes it), a `getComputedStyle` that resolves transforms the way a
+browser reports them, a shim that *says* when a selector is one its own grammar
+cannot express (`document._qsaUnsupported` — the v2.6.8 pass found the reader had
+been asking for the widget grid's rows with a child-combinator selector the tests
+silently answered with nothing), and `ANTS_TRACKER` so the suite can be pointed at
+a copy of the tracker for the mutation battery.
 A stand-in picture in this renderer is drawn, not photographed. The frontend composites all nodes in one transformed container
 (O(1) pan/zoom by design — `useTransformState.ts`), so panning and zooming are not
 where the cost is; v2.6.5 measured the rest and **withdrew the "fewer node pixels"

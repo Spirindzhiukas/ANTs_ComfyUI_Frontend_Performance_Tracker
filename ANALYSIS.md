@@ -1,6 +1,6 @@
 # What works, what fails, and what was taken out
 
-An audit of the repository as of v2.6.7, done by reading the sources rather
+An audit of the repository as of v2.6.8, done by reading the sources rather
 than the docs, running the suites, and running the demo. Every claim below
 has a file and (where it matters) a line reference. Found defects were fixed
 in the same pass; retired ideas were removed rather than documented as if
@@ -9,8 +9,8 @@ they still existed.
 ## How this was checked
 
 ```bash
-node tests/run-tests.mjs        # 223 passing (172 before the stand-in passes; fifty-one added)
-node tests/run-tests.mjs "Nodes 2.0"        # the thirty-seven that cover that renderer
+node tests/run-tests.mjs        # 228 passing (172 before the stand-in passes; fifty-six added)
+node tests/run-tests.mjs "Nodes 2.0"        # the forty-five that cover that renderer
 node tests/run-tests.mjs "cache on disk"    # the six that cover the picture store
 node tests/run-tests.mjs "stand-in picture" # the five that cover what a picture holds
 python3 tests/test_init.py      # Ran 9 tests ... OK
@@ -642,6 +642,91 @@ hidden` skips the paint, while `display: none` would remove the layout the
 frontend's own resize and measure passes read. Making that trade would have to be
 measured against a `display: none` variant first, on the user's own page, which is
 the live test this project still does not have.
+
+**The eleventh report (v2.6.8): the frontend has no zoom-based level of detail,
+and the picture was losing colour, text, opacity and the rows.** The report's
+hypothesis was that the frontend draws nodes at a *tier* that depends on zoom — so
+that a stand-in would be a faithful picture of a node the frontend itself has
+simplified. It is not, and this is now settled from the sources rather than from
+behaviour: `LGraphNode.vue`'s root element binds its size, its position, a z-index
+and its opacity and nothing else; `TransformPane.vue` carries one transform for the
+entire graph, written straight to the DOM by `useTransformState.ts`; LiteGraph's
+`drawNode` early-returns in this renderer (it keeps slot metrics in sync and draws
+nothing); a zoom therefore re-composites — no element is re-laid out, no computed
+style changes with scale, no text metrics change, no colour is simplified. A
+browser has no "level of detail" to photograph, at any zoom, in this renderer.
+`lodVueLodProbe` (v2.6.8) reports that answer from the page itself — the element
+count under the node's element, the computed font size of its text, whether
+`content-visibility` is doing anything, and the transform scale the measurement was
+divided by — and the readout's picture clause names it, so the claim can be
+re-checked at any zoom on the user's own machine.
+
+What the report was actually seeing has four parts, all found and fixed:
+
+*Colour.* Tailwind 4 computes the themed surfaces as `oklch()`/`oklab()` strings
+(`--node-component-header-surface: var(--color-smoke-200)`,
+`--component-node-background: var(--color-charcoal-600)`). Assigning one to a canvas
+`2d` context's `fillStyle` is **silently ignored** — an invalid value leaves the
+previous fillStyle in place — so a node's surface was painted in the *previous
+node's* colour, and a run of nodes read as one wrong palette. Colours are now
+translated by hand (hex 3/4/6/8, `rgb()`/`rgba()` with either syntax, `hsl()`,
+`hwb()`, `oklab()`, `oklch()`, `srgb`/`srgb-linear`), cached per string, and what
+is deliberately not read (`lab()`, `lch()`, `color(display-p3 …)`) is counted and
+sampled in the readout (`vueColorMiss`, `vueColorSample`) instead of being left to
+the engine to ignore.
+
+*Text.* A paragraph is one element with many laid-out lines; the reader flattened
+it to a single string and drew one line clipped to the box, in Arial. The picture
+is now wrapped into the element's own box, drawn line by line in the element's own
+font (family, weight, style, line height, letter spacing, `-webkit-line-clamp`),
+with the browser's own newlines kept and the overflow marked the way the browser
+marks it. On the fidelity rig (two recreated nodes, one muted, run against v2.6.7
+and the new tree side by side): text lines 98 → 100, fonts
+`["11px Arial","12px Arial"]` → `["400 11px Inter, sans-serif","400 12px Arial"]`,
+and one clipped prompt line → two wrapped ones. A `TEXTAREA` is treated as a block
+— its first line at its own top, not one line centred in a tall field.
+
+*Opacity.* `LGraphNode.vue` puts the node's own opacity on the root (`nodeOpacity`,
+0.6 while ghosting, 0.5 muted). A canvas does not inherit it, so a muted node was
+photographed at full strength — and because the stand-in is what the user sees of
+the node, the dimming disappeared entirely. The composited opacity is read with the
+measurement, carried in the record, combined with the box's own alpha by `min`, and
+baked into the picture and the live box through `lodPaintNode`'s `alphaOverride`
+(setting `globalAlpha` around the painter does not work — the painter writes its
+own from `lodBoxAlpha`), and it is part of the signature, so a node muted later is
+re-photographed rather than kept.
+
+*The rows.* The frontend's own widget rows (`WidgetGrid.vue`:
+`data-testid="node-widgets"`, one child per widget, the control inside a
+`lg-node-widget` element) have no `widget.element`, which is the only thing the
+DOM-widget route looks for — so a real node's body was read as an empty flat panel
+with a title above it. Both routes are read now, in the same measurement pass, and
+the values inside the controls are read as what they are: an
+`<input>`/`<textarea>`/`<select>` value (with the element's own alignment), a reka
+slider's `aria-valuenow` with the track and thumb colours measured from its child
+boxes, a checkbox/switch tick, a colour input's swatch. A swatch carries its colour
+under its own field, because the element's computed `color` is the *text* colour
+and the style pass fills that field on every item — a bug the new test caught
+(a swatch drawn in the page's default text colour).
+
+Two failures were caught by the suite while making the above true, and both are
+worth recording. First, **the same value was drawn twice**: with two readers knowing
+about form controls, a widget element mounted inside the node's DOM was drawn by the
+DOM-widget route *and* by the node's own text pass, a unit apart, once in the page's
+styles and once as Arial on a `#222` bar the page never drew. The DOM-widget route
+now yields a *measured* text control to the text pass (images and canvases still
+come from it). Second, **the harness could not tell "no match" from "cannot
+express the selector"**: the reader asked for the widget grid's rows with a
+child-combinator selector, which is valid CSS a browser answers and which this
+shim's grammar silences to an empty list — the reader had been reading nothing in
+the test fixture and everything on the real page, which is the worst kind of test
+gap. The shim records such selectors now (`document._qsaUnsupported`), the grid is
+read through `els[0].children`, and a test asserts the list is empty for every
+selector the reader uses after proving the guard itself records a `>` selector.
+
+Test ledger: five added (wrapping and font, colour translation with chroma and hue,
+a dimmed node, a Vue-rendered widget's values including the controls, the selector
+guard), two rewritten, and the seventeen-mutation battery is **all caught**.
 
 Two things the Nodes 2.0 pass confirmed rather than changed: the Vue node's
 **root element is never hidden or inerted** (`via: "root"` records are exempt from

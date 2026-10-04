@@ -28,7 +28,7 @@ this is going. Read the golden rules before the code.
 ## Commands
 
 ```bash
-node tests/run-tests.mjs              # all 223 tests — must be green before any commit
+node tests/run-tests.mjs              # all 228 tests — must be green before any commit
 node tests/run-tests.mjs <substring>  # one suite/test, e.g. ... pill
 python3 tests/test_init.py            # the Python side (route parsing, node contract)
 node tests/demo.mjs                   # prints what the panel says against a synthetic graph
@@ -223,7 +223,36 @@ Seams worth knowing:
   and `lodVueTextLines`/`lodVueTextInk` for its **text** (v2.6.4: every leaf string
   with its laid-out box and computed font/colour, at most `LOD_VUE_TEXT_MAX` lines
   of `LOD_VUE_TEXT_CHARS` characters, each clipped to its own box — a picture of a
-  Vue node without its labels read as a box). `lodVueContentInk` is the one place
+  Vue node without its labels read as a box). **v2.6.8 made the text the page's
+  text**: a paragraph is wrapped into its own box and drawn line by line in the
+  element's own font (`lodVueTextStyle` carries family/weight/style/line
+  height/letter spacing/`-webkit-line-clamp`; `lodSnapWrapText` keeps the
+  browser's newlines and breaks a too-wide word anywhere), the rest marked with an
+  ellipsis, and a `TEXTAREA` is laid out as a **block** (`it.block`: its first
+  line at its own top — one line centred in a tall field is a prompt drawn in the
+  middle of its own box). **Every colour a stand-in draws goes through
+  `lodVueColor`** — the themed surfaces are Tailwind 4 `oklch()`/`oklab()`
+  strings and assigning one to `fillStyle` is *silently ignored* (the previous
+  colour stays, so a node wears the previous node's palette); hex/rgb/hsl/hwb/
+  oklab/oklch and `srgb`/`srgb-linear` are translated by hand, cached
+  (`LOD_VUE_COLOR_CACHE` 512), and what cannot be read (`lab()`, `color(...)`) is
+  counted and sampled (`vueColorMiss`, `vueColorSample`). **Form and ARIA
+  controls are drawn as themselves**: `lodVueFormItem`/`lodVueAriaItem` read an
+  `<input>`/`<textarea>`/`<select>` value (and the element's own alignment), a
+  checkbox/switch's checked state, a colour input's swatch — which lives under
+  `item.swatch`, *not* `item.color`, because the style pass fills `color` with
+  the element's text colour — and a reka slider's `aria-valuenow` with its track
+  and thumb colours measured off its child boxes (`kind: "swatch"|"check"|
+  "range"|"text"`, counted as `vueControlInk`). **One element is drawn once**: the
+  DOM-widget route (`lodSnapDomInk`, given `boxes`) skips a *measured* text
+  control, because the node's own text pass draws it in the page's styles —
+  before v2.6.8 the same value was drawn twice, a unit apart, and the suite
+  caught it; images and canvases still come from that route. The node's
+  composited opacity is read with the measurement (`lodVueOpacity`), carried in
+  the record, baked into the picture and the live box through `lodPaintNode`'s
+  `alphaOverride` (**`min` with the box alpha, never a multiply; never
+  `globalAlpha` around the painter — it sets its own from `lodBoxAlpha`**), and
+  mixed into the signature so a node muted later is re-photographed. `lodVueContentInk` is the one place
   the live box and the capture both draw from, so they cannot drift apart.
   `lodPaintNode` takes optional `content` / `detailOverride` / `sizeOverride` and
   clips content to the node's box **and its title bar** (a DOM node's title is
@@ -325,7 +354,17 @@ Seams worth knowing:
   `vue.growRoot()` for testing layout and `vue.addStructure(node, {title, inputs})`
   (v2.6.6) for the frontend's own node structure — surface, header, body panel and
   one row + dot per input, laid out in element-local units the way `LGraphNode.vue`
-  lays it out, so the reader and the ink are pinned against the real shape. v2.6.5 added the
+  lays it out, so the reader and the ink are pinned against the real shape. **The
+  shim records selectors its own grammar cannot express** (`document._qsaUnsupported`,
+  v2.6.8): an unexpressible selector returns `[]` — indistinguishable from a
+  selector that matches nothing — so a reader could ask the page for a part no test
+  would ever see. The reader's selectors must therefore stay inside the shim's
+  grammar (attribute / `.class` / `*` / tag), which is why the frontend's widget
+  grid is read through `els[0].children` rather than with a child-combinator
+  selector, and a test asserts the list is empty after a picture is taken (after
+  proving the guard records a `>` selector). `ANTS_TRACKER=<file>` runs the whole
+  suite against a copy of `web/tracker.js` — that is how the mutation battery asks
+  "would these tests notice?" without touching the tree. v2.6.5 added the
   two observers to the sandbox (on by default — a browser has them; a test can
   call `h.setDomObservers(false)` to exercise the timer fallback) with
   `withQuiet` so the fixture's own pan/zoom layout is not mistaken for a box

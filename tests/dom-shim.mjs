@@ -283,6 +283,13 @@ class Node {
         tests.push((n) => n.nodeType === 1 && want.includes(String(n.tagName).toUpperCase()));
         continue;
       }
+      // A selector this shim cannot express is *recorded*, not silently dropped: a
+      // selector that returns nothing on the harness and something on a real page is
+      // a behaviour difference no test would ever see, and a reader that keeps asking
+      // for one is reading a different page than the tests do.
+      if (this._doc && this._doc._qsaUnsupported && this._doc._qsaUnsupported.indexOf(sel) < 0) {
+        this._doc._qsaUnsupported.push(sel);
+      }
       return [];
     }
     return this.descendants().filter((n) => n.nodeType === 1 && tests.every((t) => t(n)));
@@ -343,6 +350,14 @@ export function computedStyle(el) {
     fontSize: style.fontSize || "12px",
     color: style.color || "rgb(220, 220, 230)",
     fontFamily: style.fontFamily || "Arial",
+    fontWeight: style.fontWeight || "400",
+    fontStyle: style.fontStyle || "normal",
+    lineHeight: style.lineHeight || "normal",
+    letterSpacing: style.letterSpacing || "0px",
+    // The one native level-of-detail switch, read by the tracker's probe. A shim
+    // cannot implement `content-visibility`, so it reports what was *set* — which is
+    // exactly what the probe is asking (is this property in the CSSOM at all).
+    contentVisibility: style.contentVisibility || "visible",
     // The box colours a browser actually resolves for an element, which is what a
     // stand-in reads to draw a node's own structure (the coloured surface, the
     // header bar, the body panel, a slot's dot). A test sets them on the fixture;
@@ -425,6 +440,7 @@ export function createDocument(options = {}) {
   // budget, not per frame": a pan must not re-walk the DOM.
   const baseQsa = Node.prototype.querySelectorAll;
   doc._qsaCalls = 0;
+  doc._qsaUnsupported = []; // selectors the shim's grammar could not express
   doc.querySelectorAll = function (selector) {
     doc._qsaCalls++;
     return baseQsa.call(this, selector);

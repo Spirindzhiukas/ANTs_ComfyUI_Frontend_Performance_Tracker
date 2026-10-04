@@ -3262,7 +3262,7 @@ suite("drawing: the Nodes 2.0 (Vue nodes) frontend", () => {
     label.style.fontSize = "14px";
     label.style.color = "rgb(255, 0, 0)";
     root.appendChild(label);
-    label._rect = { left: root._rect.left + 12 * 0.1, top: root._rect.top + (30 + 44) * 0.1, width: 60 * 0.1, height: 16 * 0.1 };
+    label._rect = { left: root._rect.left + 12 * 0.1, top: root._rect.top + (30 + 44) * 0.1, width: 140 * 0.1, height: 16 * 0.1 };
     // …and the node's title, which the frontend renders in the element's own title
     // bar — above the body, where the canvas draws a node's title. A picture that
     // clipped to the body alone would cut the node's name off it.
@@ -3282,13 +3282,14 @@ suite("drawing: the Nodes 2.0 (Vue nodes) frontend", () => {
     assertEqual(line("steps 20")[1], "steps 20", "with the string the DOM holds");
     // …where the browser laid it out: node-local, with the title bar taken off the
     // top — the space the canvas draws a node's body in. (The label sits 74 px from
-    // the element's top, which is 44 px into the body, and a single line is drawn
-    // on the middle of its own box.) A picture that painted the element's client
-    // position instead would put every label one title bar too low.
+    // the element's top, which is 44 px into the body; a single line is drawn from
+    // the top of its own line box, which is where the glyphs start.) A picture that
+    // painted the element's client position instead would put every label one title
+    // bar too low.
     const body = line("steps 20");
-    assertEqual(`${Math.round(body[2])},${Math.round(body[3])}`, "14,52", "at the position the browser gave it, in the node's own units");
+    assertEqual(`${Math.round(body[2])},${Math.round(body[3])}`, "14,44", "at the position the browser gave it, in the node's own units");
     const bar = line("KSampler");
-    assertEqual(`${Math.round(bar[2])},${Math.round(bar[3])}`, "28,-15", "and the title where its own box is, one title bar up");
+    assertEqual(`${Math.round(bar[2])},${Math.round(bar[3])}`, "28,-22", "and the title where its own box is, one title bar up");
     assertGreater(snapApi(h).vueText, 0, "and the readout counts the lines it could read");
     assert(h.canvas.ctx.ops.some((o) => o[0] === "clip"), "clipped to the box the text belongs in");
     // …and the clip covers the title bar as well as the body: a clip on the body
@@ -3610,13 +3611,20 @@ suite("drawing: the Nodes 2.0 (Vue nodes) frontend", () => {
     h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true });
     draw(h, 2);
     await idle(h);
-    const paintedAt = (y) =>
-      h.canvases.filter((c) =>
-        c._ctx && c._ctx.ops.some((o) => o[0] === "fillText" && String(o[1]).includes("cat") && Math.round(o[3]) === y)
-      );
-    assertEqual(paintedAt(55).length, 1, "the widget's text is in the picture, where the browser put the element (y 52)");
-    const op = paintedAt(55)[0]._ctx.ops.find((o) => String(o[1]).includes("cat"));
-    assertEqual(Math.round(op[2]), 15, "at the x the element was laid out at (12), plus the paint's own inset");
+    // One element, one drawing. The text pass reads this control and paints it in the
+    // page's own font and colours, so the DOM-widget route must not paint it as well:
+    // the same value twice, a unit apart, is not a picture of a node.
+    const cats = () =>
+      h.canvases.flatMap((c) => (c._ctx ? c._ctx.ops.filter((o) => o[0] === "fillText" && String(o[1]).includes("cat")).map((o) => Object.assign({ canvas: c }, o)) : []));
+    assertEqual(cats().length, 1, "the widget's value is in the picture exactly once");
+    const op = cats()[0];
+    assertEqual(Math.round(op[2]), 14, "at the x the element was laid out at (12), plus the field's own inset (2)");
+    // The element is 40 units tall and the textarea's own text starts at its top:
+    // element top 52 + the field's own inset 2 (plus the half-leading, which is zero
+    // here because the page's line height and the font's content box agree). A field's
+    // line is *not* centred in a box this tall — that is what drew a prompt in the
+    // middle of its own field.
+    assertEqual(Math.round(op[3]), 54, "and at the top of the field, not centred in it");
     // The layout moves (the frontend re-arranges, a label above grows). The picture
     // follows: the measured box is part of what a picture *is*.
     ta._rect = { left: root._rect.left + 12 * 0.1, top: root._rect.top + (30 + 90) * 0.1, width: 100 * 0.1, height: 40 * 0.1 };
@@ -3625,7 +3633,302 @@ suite("drawing: the Nodes 2.0 (Vue nodes) frontend", () => {
     draw(h, 3);
     await idle(h);
     assertGreater(snapApi(h).invalidated, 0, "the picture taken at the old position was dropped");
-    assertGreater(paintedAt(93).length, 0, "and the new one puts the text where the element is now");
+    // Per *picture*, not per scene: the stale one is still in the harness's canvas
+    // list — what must never happen is one picture carrying the value twice.
+    const perCanvas = (y) =>
+      h.canvases.map((c) =>
+        c._ctx ? c._ctx.ops.filter((o) => o[0] === "fillText" && String(o[1]).includes("cat") && Math.round(o[3]) === y).length : 0
+      );
+    assertEqual(Math.max(...perCanvas(92)), 1, "the new picture has the value exactly once, not once per route");
+    assertEqual(perCanvas(92).reduce((a, b) => a + b, 0), 1, "put where the element is now (top 90, plus the same inset)");
+  });
+
+  test("every selector the reader asks the page for is one the page can actually answer", async () => {
+    const h = await boot();
+    const { nodes, vue } = vueGraph(h, 1);
+    const n = nodes[0];
+    stripWidgets(nodes);
+    // The shape of a node in this renderer, as the reader reads it: a header, a body,
+    // a widget grid with a row in it, a slot dot. Each of those is asked for by
+    // selector. A selector a browser cannot parse throws; a selector *this* harness
+    // cannot express returns nothing — the same empty answer as a node with no such
+    // part, so a picture could lose a part and no test would ever say so. The harness
+    // records every selector it had to guess at, so this can be asserted instead.
+    const root = vue.rootFor(n);
+    const S = 0.1;
+    const part = (tag, testid, y, cls) => {
+      const el = h.document.createElement(tag);
+      if (testid) el.setAttribute("data-testid", testid);
+      if (cls) el.className = cls;
+      el._rect = { left: root._rect.left, top: root._rect.top + (30 + y) * S, width: 200 * S, height: 20 * S };
+      root.appendChild(el);
+      return el;
+    };
+    part("div", "node-inner-wrapper", 0);
+    part("div", "node-header-" + n.id, 0);
+    part("div", "node-body-" + n.id, 20);
+    const grid = part("div", "node-widgets", 24);
+    for (let i = 0; i < 2; i++) {
+      const row = h.document.createElement("div");
+      row.className = "lg-node-widget";
+      row._rect = { left: root._rect.left + 2 * S, top: root._rect.top + (30 + 26 + i * 18) * S, width: 190 * S, height: 16 * S };
+      grid.appendChild(row);
+    }
+    part("span", null, 60, "slot-dot");
+    // The guard itself, first: a selector this harness cannot express has to leave a
+    // mark, or the assertion below could never fail and a reader could ask the page
+    // for something no test ever sees.
+    const probe = h.document.createElement("div");
+    root.appendChild(probe);
+    probe.querySelectorAll('[data-testid="node-widgets"] > *');
+    assertEqual(h.document._qsaUnsupported.length, 1, "a selector the harness cannot express is recorded, not silently empty");
+    h.document._qsaUnsupported.length = 0;
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true });
+    draw(h, 2);
+    await idle(h);
+    assertEqual(
+      h.document._qsaUnsupported.length,
+      0,
+      "no selector the reader used had to be guessed at: " + h.document._qsaUnsupported.join(" | ")
+    );
+  });
+
+  test("a Vue-rendered widget's value is in the picture, in the control it lives in", async () => {
+    const h = await boot();
+    const { nodes, vue } = vueGraph(h, 1);
+    const n = nodes[0];
+    stripWidgets(nodes);
+    const root = vue.rootFor(n);
+    const S = 0.1;
+    // The shape `WidgetGrid.vue` really renders: a grid (`data-testid=node-widgets`)
+    // with one row per widget, the control in a `lg-node-widget` element. A
+    // Vue-rendered widget is a reka component — a number field is an `<input>`, a
+    // slider is a div with `role="slider"` and `aria-valuenow` — so its *value* is not
+    // text: it is `value`/`aria-*`, and a reader that skipped form controls left the
+    // row drawn as an empty background.
+    const grid = h.document.createElement("div");
+    grid.setAttribute("data-testid", "node-widgets");
+    root.appendChild(grid);
+    const mkRow = (y, label, control) => {
+      const row = h.document.createElement("div");
+      const lab = h.document.createElement("span");
+      lab.textContent = label;
+      row.appendChild(lab);
+      row.appendChild(control);
+      grid.appendChild(row);
+      row._rect = { left: root._rect.left + 4 * S, top: root._rect.top + (30 + y) * S, width: 190 * S, height: 18 * S };
+      lab._rect = { left: root._rect.left + 6 * S, top: root._rect.top + (30 + y + 4) * S, width: 50 * S, height: 10 * S };
+      // The row the frontend lays the widget out in: a grid child with its own
+      // surface and no class of its own. Reading only the control's own element would
+      // miss it, and on a real page that is the panel a node's body is made of.
+      row.style.backgroundColor = "rgb(17, 19, 24)";
+      return row;
+    };
+    const field = h.document.createElement("input");
+    field.value = "24";
+    field.style.backgroundColor = "rgb(24, 28, 36)";
+    field.style.color = "rgb(230, 235, 240)";
+    const holder = h.document.createElement("div");
+    holder.className = "lg-node-widget";
+    holder.style.backgroundColor = "rgb(24, 28, 36)";
+    holder.appendChild(field);
+    const row1 = mkRow(10, "steps", holder);
+    holder._rect = { left: root._rect.left + 70 * S, top: root._rect.top + (30 + 10) * S, width: 110 * S, height: 18 * S };
+    field._rect = { left: root._rect.left + 72 * S, top: root._rect.top + (30 + 13) * S, width: 100 * S, height: 12 * S };
+    const slider = h.document.createElement("div");
+    slider.setAttribute("role", "slider");
+    slider.setAttribute("aria-valuenow", "0.75");
+    slider.setAttribute("aria-valuemin", "0");
+    slider.setAttribute("aria-valuemax", "1");
+    slider.style.color = "rgb(120, 140, 170)";
+    const row2 = mkRow(34, "denoise", slider);
+    // The other two shapes the frontend's own widgets take: a checkbox (a tick, not a
+    // value string) and a colour input (a swatch of the colour chosen).
+    const tick = h.document.createElement("input");
+    tick.type = "checkbox";
+    tick.checked = true;
+    tick.style.color = "rgb(90, 200, 120)";
+    const row3 = mkRow(56, "enabled", tick);
+    const swatchInput = h.document.createElement("input");
+    swatchInput.type = "color";
+    swatchInput.value = "#ff0000";
+    const row4 = mkRow(78, "tint", swatchInput);
+    void row1;
+    void row2;
+    void row3;
+    void row4;
+    slider._rect = { left: root._rect.left + 70 * S, top: root._rect.top + (30 + 34) * S, width: 110 * S, height: 18 * S };
+    tick._rect = { left: root._rect.left + 70 * S, top: root._rect.top + (30 + 58) * S, width: 10 * S, height: 10 * S };
+    swatchInput._rect = { left: root._rect.left + 70 * S, top: root._rect.top + (30 + 80) * S, width: 24 * S, height: 12 * S };
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true });
+    draw(h, 2);
+    await idle(h);
+    const pic = h.canvases.filter((c) => c._ctx && c._ctx.ops.some((o) => o[0] === "fillText"))[0];
+    assert(pic, "the node was pictured");
+    const texts = pic._ctx.ops.filter((o) => o[0] === "fillText").map((o) => String(o[1]));
+    assert(texts.includes("steps"), "the row's label is there");
+    assert(texts.includes("24"), "and the field's value, which is not the element's text");
+    // The control's own surface, measured from the element the frontend mounts.
+    const fills = pic._ctx.paintLog.filter((p) => /fill/.test(p.op)).map((p) => p.fill);
+    assert(fills.includes("rgba(24, 28, 36, 1)"), "the field's own background is drawn");
+    assert(fills.includes("rgba(17, 19, 24, 1)"), "and the widget row's own surface, read from the grid the frontend renders");
+    // The slider shows its position, not a number: a track with a knob three quarters
+    // along it.
+    const sliderFills = pic._ctx.paintLog.filter((p) => /fill/.test(p.op) && p.fill === "rgba(120, 140, 170, 1)");
+    assert(sliderFills.length > 0, "the slider's track is drawn in the colour the browser computed");
+    const knob = pic._ctx.ops.find((o) => o[0] === "arc");
+    assert(knob, "with a knob for the value");
+    assertGreater(pic._ctx.ops.filter((o) => o[0] === "arc").length, 0, "drawn as a round knob");
+    // The knob is where the *value* is: the slider's box runs from x 70 to x 180 in
+    // node units and the value is 0.75, so the knob sits in the last quarter. A knob
+    // pinned at the left edge would be a slider that shows the wrong number.
+    const knobX = Number(knob[1]);
+    assertGreater(knobX, 136, "the knob sits three quarters along the track, not at its start");
+    assertLess(knobX, 170, "and not past the end of it");
+    // A checked box is a tick, drawn on the surface; a colour input is a swatch of
+    // the colour itself.
+    assert(
+      pic._ctx.ops.some((o) => o[0] === "stroke"),
+      "a checked box is drawn with its tick"
+    );
+    assert(
+      pic._ctx.paintLog.some((p) => /fill/.test(p.op) && p.fill === "rgba(255, 0, 0, 1)"),
+      "a colour input is drawn in the colour it holds"
+    );
+    assertGreater(snapApi(h).vueControlInk || 0, 3, "and the readout counts the controls it drew");
+  });
+
+  test("a long label is wrapped into its own box, in the page's own font", async () => {
+    const h = await boot();
+    const { nodes, vue } = vueGraph(h, 1);
+    const n = nodes[0];
+    stripWidgets(nodes);
+    const root = vue.rootFor(n);
+    const S = 0.1;
+    // A prompt block: one element, one long string, laid out by the browser over
+    // several lines. The read used to flatten it into a single line and draw that
+    // line clipped to the box — one row of text in the middle of an empty block,
+    // cut at the right edge. That is the "text gets cut off" a user sees.
+    const para = h.document.createElement("div");
+    para.textContent = "a long prompt line that has to wrap inside its own box";
+    para.style.fontSize = "12px";
+    para.style.fontFamily = "Inter, sans-serif";
+    para.style.lineHeight = "18px";
+    para.style.color = "rgb(200, 210, 220)";
+    root.appendChild(para);
+    para._rect = { left: root._rect.left + 10 * S, top: root._rect.top + (30 + 20) * S, width: 100 * S, height: 40 * S };
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true });
+    draw(h, 2);
+    await idle(h);
+    const pic = h.canvases.filter((c) => c._ctx && c._ctx.ops.some((o) => o[0] === "fillText"))[0];
+    assert(pic, "the text reached the picture");
+    const lines = pic._ctx.ops.filter((o) => o[0] === "fillText");
+    // 40 units of box at an 18px line height: two lines fit, and two are drawn.
+    assertEqual(lines.length, 2, "as many lines as the box has room for");
+    for (const l of lines) {
+      assertGreater(l[1].length, 1, "each drawn line carries text");
+      assertLess(String(l[1]).length, 20, "and no line is the whole unwrapped string");
+    }
+    assertIncludes(String(lines[1][1]), "\u2026", "the last visible line is marked as the cut one");
+    // The font is the page's: same family, same size. A picture drawn in LiteGraph's
+    // font is a picture of a node nobody has.
+    assertIncludes(String(lines[0][4]), "Inter", "drawn in the element's own font family");
+    assertIncludes(String(lines[0][4]), "12px", "at the size the browser computed");
+    assertEqual(String(lines[0][5]), "rgba(200, 210, 220, 1)", "in the colour the browser computed");
+    // Where the line boxes are: the element sits 20 units into the node's body, its
+    // two lines are centred in the 40-unit box (2 units of slack) and the first one
+    // leads in by half the leftover line height (1.5) — y 24, the next one 18 down.
+    assertEqual(`${Math.round(lines[0][2])},${Math.round(lines[0][3])}`, "12,24", "the first line at its own box");
+    assertEqual(Math.round(lines[1][3] - lines[0][3]), 18, "and the next one a line height down");
+  });
+
+  test("a colour the canvas cannot parse is translated, not dropped", async () => {
+    const h = await boot();
+    const { nodes, vue } = vueGraph(h, 1);
+    const n = nodes[0];
+    stripWidgets(nodes);
+    vue.addStructure(n, { title: "Scheduler", inputs: ["model"], header: "oklch(0.7 0.15 150)" });
+    const root = vue.rootFor(n);
+    const S = 0.1;
+    const wrap = root.querySelectorAll('[data-testid="node-inner-wrapper"]')[0];
+    const body = root.querySelectorAll(`[data-testid="node-body-${n.id}"]`)[0];
+    const dot = root.querySelectorAll(".slot-dot")[0];
+    // What Tailwind 4 computes for a themed surface: an oklch/oklab string, which is
+    // not a syntax a canvas parses. Assigning one is silently ignored — the previous
+    // fillStyle stays — which is how one node's colour becomes another's.
+    wrap.style.backgroundColor = "oklch(1 0 0)"; // white
+    dot.style.backgroundColor = "oklab(0.6 0.1 -0.05)"; // a colour with real chroma
+    body.style.backgroundColor = "lab(50% 40 -30)"; // a space this tool does not read
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true });
+    // The live box first, before any picture exists: it draws the node's own
+    // structure live, so the translated colour has to be right there too.
+    h.canvas.ctx.paintLog.length = 0;
+    draw(h, 1);
+    const liveFills = h.canvas.ctx.paintLog.filter((p) => p.op === "fill" || p.op === "fillRect").map((p) => p.fill);
+    assert(liveFills.includes("rgba(255, 255, 255, 1)"), "the live box paints the translated colour");
+    draw(h, 1);
+    await idle(h);
+    const pic = h.canvases.filter((c) => c._ctx && c._ctx.paintLog.some((p) => p.op === "fill" || p.op === "fillRect"))[0];
+    assert(pic, "the node's structure was painted");
+    const fills = pic._ctx.paintLog.filter((p) => p.op === "fill" || p.op === "fillRect").map((p) => p.fill);
+    assert(fills.includes("rgba(255, 255, 255, 1)"), "the oklch surface is painted as the rgb the browser meant");
+    // A grey round-trips trivially, so the conversion is pinned on colours that carry
+    // chroma and a hue: reading them as grey, or dropping the chroma, has to fail here.
+    assert(fills.includes("rgba(76, 184, 106, 1)"), "an oklch colour with chroma and a hue is converted, not read as grey");
+    assert(fills.includes("rgba(168, 102, 156, 1)"), "and so is an oklab one");
+    assert(!fills.some((f) => String(f).includes("lab(")), "no raw unparsable string is ever handed to the canvas");
+    assertGreater(snapApi(h).vueColorMiss || 0, 0, "and the colour it could not read is counted");
+    assert(
+      (snapApi(h).vueColorSample || []).some((x) => String(x).includes("lab(")),
+      "with a sample, so the readout can say which syntax was missed"
+    );
+    // …and the picture draws it the same way. (With the pictures *off* the node is
+    // the box ladder the user chose, no content — that is the documented promise, not
+    // a colour question.)
+  });
+
+  test("a node the frontend dims is pictured dimmed", async () => {
+    const h = await boot();
+    const { nodes, vue } = vueGraph(h, 2);
+    const [a, b] = nodes;
+    stripWidgets(nodes);
+    const rootA = vue.rootFor(a);
+    const S = 0.1;
+    // `LGraphNode.vue` composites the whole node with `opacity: nodeOpacity` — the
+    // `Comfy.Node.Opacity` setting, times 0.6 while the node is dragged and 0.5 while
+    // it is muted or bypassed. The picture *replaces* the element, so a picture that
+    // ignores it does not just look wrong: the dimming never happens at all.
+    rootA.style.opacity = "0.5";
+    const span = h.document.createElement("span");
+    span.textContent = "steps 20";
+    rootA.appendChild(span);
+    span._rect = { left: rootA._rect.left + 12 * S, top: rootA._rect.top + (30 + 44) * S, width: 140 * S, height: 16 * S };
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true });
+    draw(h, 2);
+    await idle(h);
+    const dim = (c) => c._ctx.paintLog.filter((p) => p.alpha < 0.99);
+    const pics = h.canvases.filter((c) => c._ctx && c._ctx.ops.some((o) => o[0] === "fillText"));
+    const dimmed = pics.filter((c) => dim(c).length > 0);
+    assertEqual(dimmed.length, 1, "exactly one picture was drawn at a reduced alpha");
+    assertClose(dimmed[0]._ctx.paintLog.find((p) => p.alpha < 0.99).alpha, 0.5, 0.01, "the node's own opacity");
+    assertEqual(snapApi(h).pictured, 2, "and both nodes are pictured");
+    // And the opacity is part of what the picture is: changing it remakes it.
+    const before = snapApi(h).captured;
+    rootA.style.opacity = "1";
+    // A node's opacity is not a change the page reports (the tool watches children
+    // and boxes, deliberately not attributes — the frontend rewrites class and style
+    // on hover, on selection and on every pane gesture), so it reaches the picture on
+    // the insurance read. That read is the documented lag, and this is it.
+    h.advance(6000);
+    await h.flush();
+    draw(h, 2);
+    await idle(h);
+    assertGreater(snapApi(h).captured - before, 0, "the picture is remade when the node stops being dimmed");
+    const fresh = h.canvases.filter(
+      (c) => c._ctx && c._ctx.ops.some((o) => o[0] === "fillText" && String(o[1]) === "steps 20" && c._ctx.paintLog.some((p) => p.alpha === 1))
+    );
+    assert(fresh.length > 0, "and the new picture is fully opaque");
+    assertEqual(dim(fresh[fresh.length - 1]).length, 0, "nothing in it is drawn dimmed");
   });
 
   test("the readout describes pictures in this renderer when snapshots are on", async () => {

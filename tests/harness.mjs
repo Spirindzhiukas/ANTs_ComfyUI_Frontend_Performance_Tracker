@@ -13,7 +13,10 @@ import { fileURLToPath } from "node:url";
 import { computedStyle, createDocument, createStorage, fireMutation, fireResize, observerClasses, withQuiet } from "./dom-shim.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const TRACKER_PATH = path.join(HERE, "..", "web", "tracker.js");
+// The tracker under test. `ANTS_TRACKER` points the same suite at a copy of the
+// file — which is how the mutation battery asks "would these tests notice if this
+// line were wrong?" without touching the tree under test.
+const TRACKER_PATH = process.env.ANTS_TRACKER || path.join(HERE, "..", "web", "tracker.js");
 export const FRAME_MS = 1000 / 60;
 
 export function createHarness(options = {}) {
@@ -170,6 +173,10 @@ export function createHarness(options = {}) {
       this.ops = [];
       this.ink = ink !== false; // opaque pixels unless a test asks for a blank draw
       this.globalAlpha = 1;
+      // Every drawing call with the paint state it ran under: a picture's colours,
+      // its transparency and its fonts are things a test has to be able to see, and
+      // the ops list itself stays the shape every older assertion expects.
+      this.paintLog = [];
       this.shadowColor = "";
       this.fillStyle = "";
       this.strokeStyle = "";
@@ -221,12 +228,20 @@ export function createHarness(options = {}) {
     "clearRect",
     // The DOM-widget composite paints a text widget's value; the ops list is how
     // a test sees that it reached the picture.
-    "fillText",
   ]) {
     FakeCanvasRenderingContext2D.prototype[name] = function (...args) {
       this.ops.push([name, ...args]);
+      if (this.paintLog) this.paintLog.push({ op: name, fill: this.fillStyle, alpha: this.globalAlpha, font: this.font });
     };
   }
+  // `fillText` records the font and the paint colour that were current when it ran:
+  // a picture's text is only the node's text if it was drawn in the node's own font
+  // and colour, and both are things a test has to be able to see. They land in slots
+  // 5 and 6, after the string and its position — every older assertion reads 0..3.
+  FakeCanvasRenderingContext2D.prototype.fillText = function (text, x, y, ...rest) {
+    this.ops.push(["fillText", text, x, y, ...rest, this.font || "", this.fillStyle || ""]);
+    if (this.paintLog) this.paintLog.push({ op: "fillText", text, fill: this.fillStyle, alpha: this.globalAlpha, font: this.font });
+  };
   const makeStubCtx = () => new FakeCanvasRenderingContext2D(opts.ink !== "none");
 
   // createImageBitmap with the resize options, recording what was asked for.

@@ -6,7 +6,7 @@ for: *which extension's JavaScript is actually costing me frames while I pan
 this graph, and what is eating main-thread time that no draw hook owns?* —
 without opening DevTools and without restarting ComfyUI to bisect.
 
-Version **2.6.7**. Everything runs from page load: no node has to be placed,
+Version **2.6.8**. Everything runs from page load: no node has to be placed,
 nothing executes, and the tool never changes your graph or your workflows.
 
 - **Measure** — per-extension and per-node-type frame cost, canvas draw
@@ -218,13 +218,22 @@ call, never latched:
   existing seam fires with the context already in node-local space, and the box
   lands exactly where a picture lands in the canvas renderer.
   While the stand-in setting is **picture of the node**, each box also carries
-  what the node is showing, drawn live, from the two places a node's content
-  reaches the page. **Widget-borne content** (a prompt's `<textarea>`, anything a
-  pack added through `addDOMWidget`) is drawn in the box the browser actually
-  laid it out in when the frontend has mounted the element inside the node's own
-  element (`WidgetDOM.vue` does; that is the route a text widget's value reaches
-  the screen in this renderer) and otherwise at the row geometry the frontend
-  positions it by. **Everything the node renders itself** — the frontend's
+  what the node is showing, drawn live, from the places a node's content
+  reaches the page. **The frontend's own widget rows** (`WidgetGrid.vue` renders
+  a `data-testid="node-widgets"` grid, one child per widget, the control inside a
+  `lg-node-widget` element) are read as rows, and the value inside each control is
+  read from the control itself: an `<input>`/`<textarea>`/`<select>` value, a reka
+  slider's `aria-valuenow` with its track and thumb colours measured off its own
+  children, a checkbox's tick, a colour input's swatch of the colour it holds —
+  drawn where the browser laid the element out, in its own font, size and colour,
+  with its own alignment. **A widget a pack mounted through `addDOMWidget`** (the
+  route `WidgetDOM.vue` takes) is drawn from its element too, in the box the
+  browser laid it out in when the frontend has mounted the element inside the
+  node's own element, and otherwise at the row geometry the frontend positions it
+  by. So that nothing is drawn twice, a *measured* text control is drawn by the
+  node's own text pass and no longer by the DOM-widget composite, while images
+  and canvases still come from that composite, because no text pass can draw
+  those; a textarea lays its text out from its own top, the way the element does. **Everything the node renders itself** — the frontend's
   `ImagePreview.vue` puts the node's pictures in `<img>` elements inside the
   node's DOM, and a custom node may render a `<canvas>` for a viewport or a curve
   editor — is found by walking the node's element and drawn at the position the
@@ -234,10 +243,22 @@ call, never latched:
   reported by every observer. **Everything the node renders as text** — its title, its
   widget labels and the values the frontend draws itself — is read out of the
   DOM, string by string, with the box the browser laid each one out in and the
-  styles it computed for it, and re-painted there. Page JavaScript cannot
-  *screenshot* rendered text, but it can read every string, its position and its
-  font, which is what a stand-in needs; a field's *value* is drawn from the value
-  the field holds, as before. The content is clipped to the node's box **and its
+  styles it computed for it, and re-painted there: wrapped into that box, line by
+  line, in the element's own font (family, weight, style, line height, letter
+  spacing, `-webkit-line-clamp`), with the text that does not fit marked the way
+  the browser marks it. Page JavaScript cannot *screenshot* rendered text, but it
+  can read every string, its position and its font, which is what a stand-in
+  needs; a field's *value* is drawn from the value the field holds, as before.
+  Two things about colour and transparency are worth stating because both were
+  wrong in v2.6.7 and both are visible from across the room. The frontend's
+  themed colours are Tailwind 4 `oklch()`/`oklab()` strings, and assigning one to
+  a canvas `fillStyle` is **silently ignored** — the previous fillStyle stays, so
+  a node's surface came out in the previous node's colour — so every colour a
+  stand-in draws is translated to `rgba()` first, and what cannot be translated is
+  counted and sampled in the readout rather than left to the engine. And the
+  node's composited opacity (a muted or dragged node) is read with the rest of the
+  measurement and baked into the picture, since in this renderer the picture *is*
+  what the user sees of the node. The content is clipped to the node's box **and its
   title bar**, so the node's own name is in the picture rather than cut off above
   it. **The node's own structure** is read the same way and drawn the same way:
   the element's box (the coloured surface), the header bar that carries the title,
@@ -284,6 +305,22 @@ call, never latched:
   about the DOM can be read at all (which the readout says, because a capture
   sets that number to 1 while the DOM keeps the frontend's transform) — so
   content lands where it belongs even in a capture taken mid-zoom.
+
+**There is no level of detail to reproduce, and that is verified rather than
+assumed.** A recurring question about this pathway was whether the frontend draws
+nodes at a simpler *tier* when they are small — which would make a stand-in a
+faithful picture of a simplified node. It does not, and the answer comes from the
+frontend's own sources: the node's root element binds its size, position, z-index
+and opacity and nothing else, the transform pane carries a single transform for the
+whole graph, and LiteGraph's `drawNode` draws nothing at all in this renderer — so a
+zoom is compositor work, and no element is re-laid out, no computed style changes
+with scale and no text is simplified at any zoom. The tool reports that answer from
+the user's own page in the readout's picture clause (`lodVueLodProbe`: the element
+count under the node's element, the computed font size of its text, whether
+`content-visibility` is doing anything, and the transform scale the measurement was
+divided by), so the claim can be re-checked at any zoom without reading this file.
+What made stand-ins look simpler than the node was the picture, not a level of
+detail: colour, text, opacity and the widget rows — all four fixed in v2.6.8, above.
 
 **In this renderer the mark is the mechanism, and v2.6.6 is where it became one.**
 A stand-in has to make the frontend stop *painting* the node — that is the whole
@@ -670,7 +707,7 @@ short version:
 ## Development
 
 ```bash
-node tests/run-tests.mjs              # all tests — 223 passing, zero dependencies
+node tests/run-tests.mjs              # all tests — 228 passing, zero dependencies
 node tests/run-tests.mjs <substring>  # one suite or test
 python3 tests/test_init.py            # the Python side (routes, node contract)
 node tests/demo.mjs                   # prints what every tab says, against a synthetic graph

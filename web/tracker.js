@@ -27,7 +27,7 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.6.7";
+const VERSION = "2.6.8";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
 // The class key ComfyUI stores in a workflow. The old key is still recognised so
 // a graph saved before the rename does not lose this node.
@@ -914,6 +914,7 @@ const LOD = {
   snapPartial: 0, // pictures of nodes that have DOM widgets (the canvas part is not all of them)
   snapDomInk: 0, // DOM widget contents drawn into pictures (images, canvases, text)
   vueWidgetInk: 0, // widget rows whose own box and colour a picture carries (gauge)
+  vueControlInk: 0, // form controls drawn as themselves: a slider's track and knob, a checkbox's tick, a colour swatch (gauge)
   snapDomText: 0, // of those, text widgets re-painted from their value
   snapDomSkipped: 0, // widget contents that could not be drawn (HTML, or an image not loaded yet)
   snapFit: 0, // captures made coarser than your ratio so they fit the size cap
@@ -1710,7 +1711,7 @@ function lodBoxAlpha(node) {
 // to the node's origin, which is why this paints at 0,0. What it may paint is the
 // box-detail ladder above: the fill and the selection ring always, the title bar
 // and the state marks only when the user has asked for them.
-function lodPaintNode(node, canvas, ctx, content, detailOverride, sizeOverride) {
+function lodPaintNode(node, canvas, ctx, content, detailOverride, sizeOverride, alphaOverride) {
   const size = sizeOverride || lodVueBoxSize(node, canvas) || (node && (node.renderingSize || node.size)) || [0, 0];
   const w = Math.abs(Number(size[0])) || 0;
   const h = Math.abs(Number(size[1])) || 0;
@@ -1724,7 +1725,16 @@ function lodPaintNode(node, canvas, ctx, content, detailOverride, sizeOverride) 
   const detail = !S.enabled ? LOD_BOX_DETAIL_DEFAULT : detailOverride || LOD.boxDetail;
   // Dimming belongs to `state`. Below it every box looks like every other box,
   // which is what v2.1.16 painted and what an off-by-default tool must keep.
-  const alpha = detail === LOD_BOX_DETAIL[2] ? lodBoxAlpha(node) : 1;
+  // `alphaOverride` is the *page's* composited opacity, which the canvas pathway
+  // cannot see: in this renderer `LGraphNode.vue` puts the node's own opacity on the
+  // element's style (the node-opacity setting, times 0.6 while it is dragged and 0.5
+  // while it is muted or bypassed) and the browser composites the whole subtree with
+  // it. `lodBoxAlpha` is the canvas renderer's answer to the same question (the
+  // ghost/mute/bypass modes), so the two are combined by taking the lower — never
+  // multiplied, which would dim a muted node twice.
+  const own = detail === LOD_BOX_DETAIL[2] ? lodBoxAlpha(node) : 1;
+  const wanted = Number(alphaOverride);
+  const alpha = Number.isFinite(wanted) ? Math.max(0.05, Math.min(own, wanted)) : own;
   const drawable = w > 0 && h > 0;
   ctx.shadowColor = "transparent";
   ctx.globalAlpha = alpha;
@@ -3697,7 +3707,11 @@ function patchCanvasDraw() {
               // With the setting off, the box ladder the user chose is drawn
               // exactly as documented, no content.
               const picture = !!LOD.snapOn;
-              lodPaintNode(node, this, ctx, picture ? () => lodVueBoxContent(node, this, ctx) : null, picture ? LOD_BOX_DETAIL[2] : null);
+              // The page's own composited opacity, from the cached measurement (a
+              // read, never a per-frame measurement): the live box and the picture it
+              // becomes have to be the same node.
+              const meta = LOD.vueMedia ? LOD.vueMedia.get(node) : null;
+              lodPaintNode(node, this, ctx, picture ? () => lodVueBoxContent(node, this, ctx) : null, picture ? LOD_BOX_DETAIL[2] : null, null, meta ? meta.opacity : undefined);
               LOD.vueBoxes++;
               LOD.nodes++;
               LOD.ms += dtv;
@@ -4139,6 +4153,69 @@ function lodVueBlank(node, on) {
 // the callback throws the node's measurement away, and the next draw re-measures it
 // through the same per-frame ration — so a graph where nothing changes costs no
 // layout read at all, however many nodes are in it.
+// The tenth report asked whether the frontend already has a level of detail —
+// whether it renders a node *because* the canvas is at 42 %, so that a capture reads
+// a reduced node and a picture can never look like the real thing.
+//
+// It does not, and this is checked from two sides. Upstream: the renderer's own
+// components carry no zoom in any of their shapes — `LGraphNode.vue` positions the
+// node (`translate(...)`), sets its size, its opacity and its `data-node-id`; the
+// pane holds *one* transform (`useTransformState.ts`), and zooming a DOM tree is a
+// compositor operation: the layout, the text metrics and the computed colours of a
+// node do not change with it. `LiteGraph.drawNode` early-returns in this renderer,
+// so LiteGraph's own `low_quality`/`show_info` tiers never run either. So a
+// stand-in's reads are always at full detail — which is exactly why a picture whose
+// text was cut off could not have been "captured at 42 %".
+//
+// And the engine side, measured rather than assumed: `content-visibility: auto` is
+// the one native DOM level-of-detail switch (it lets an engine *skip* the layout,
+// paint and style of off-screen content inside a scroll container). If the frontend
+// had an LOD of its own it would be built from this, so the probe below answers
+// whether the engine this page runs in even honours it. Reported in the readout, so
+// the answer travels with the snapshot.
+function lodVueLodProbe() {
+  if (LOD.vueLodProbe !== null && LOD.vueLodProbe !== undefined) return LOD.vueLodProbe;
+  let ok = false;
+  let why = "";
+  try {
+    const doc = typeof document !== "undefined" ? document : null;
+    if (!doc || typeof doc.createElement !== "function" || typeof getComputedStyle !== "function") {
+      why = "no document";
+    } else {
+      const el = doc.createElement("div");
+      el.style.contentVisibility = "auto";
+      el.style.containIntrinsicSize = "1px 1px";
+      el.style.width = "1px";
+      el.style.height = "1px";
+      el.style.overflow = "hidden";
+      if (!el.style.contentVisibility) {
+        why = "not in CSSOM";
+      } else {
+        const holder = doc.createElement("div");
+        holder.style.position = "absolute";
+        holder.style.left = "-9999px";
+        holder.style.top = "0";
+        holder.style.width = "1px";
+        holder.style.height = "1px";
+        holder.appendChild(el);
+        (doc.body || doc.documentElement || doc).appendChild(holder);
+        const cs = getComputedStyle(el);
+        ok = !!cs && String(cs.contentVisibility || "") === "auto";
+        if (!ok) why = String((cs && cs.contentVisibility) || "unset");
+        try {
+          if (holder.parentNode && typeof holder.parentNode.removeChild === "function") holder.parentNode.removeChild(holder);
+        } catch (e) {
+          /* leaving one hidden pixel behind is not worth a fault */
+        }
+      }
+    }
+  } catch (e) {
+    why = "probe threw";
+  }
+  LOD.vueLodProbe = { ok, why };
+  return LOD.vueLodProbe;
+}
+
 function lodVueWatchOn() {
   const hasRO = typeof ResizeObserver === "function";
   const hasMO = typeof MutationObserver === "function";
@@ -4495,6 +4572,12 @@ function lodVueMediaBudget() {
 function lodVueTextStyle(el, boxH) {
   let size = 0;
   let color = "";
+  let family = "";
+  let weight = "";
+  let style = "";
+  let lineH = 0;
+  let spacing = 0;
+  let clampLines = 0;
   try {
     if (typeof getComputedStyle === "function") {
       const cs = getComputedStyle(el);
@@ -4502,6 +4585,27 @@ function lodVueTextStyle(el, boxH) {
       if (Number.isFinite(fs) && fs > 0 && fs < 64) size = fs;
       const c = cs && cs.color;
       if (c && typeof c === "string" && c !== "rgba(0, 0, 0, 0)") color = c;
+      // The page's own font, not LiteGraph's. A picture drawn in Arial is a picture
+      // of a node nobody has: the frontend renders its text in its own stack, and at
+      // the zooms stand-ins live at, the letterforms are most of what carries.
+      const fam = cs && cs.fontFamily;
+      if (fam && typeof fam === "string") family = fam;
+      const w = cs && Number(cs.fontWeight);
+      if (Number.isFinite(w) && w > 0) weight = String(Math.round(w));
+      const st = cs && cs.fontStyle;
+      if (st && st !== "normal") style = String(st);
+      // Chromium resolves a numeric line-height to px and leaves `normal` alone.
+      const lh = parseFloat(cs && cs.lineHeight);
+      if (Number.isFinite(lh) && lh > 0 && lh < 128) lineH = lh;
+      const ls = parseFloat(cs && cs.letterSpacing);
+      if (Number.isFinite(ls)) spacing = Math.max(-2, Math.min(8, ls));
+      // `line-clamp: 3` (Tailwind's line-clamp-3) really does stop the browser after
+      // three lines; a picture that draws ten because the string is long is a picture
+      // the browser never painted.
+      if (cs && typeof cs.getPropertyValue === "function") {
+        const lc = parseInt(String(cs.getPropertyValue("-webkit-line-clamp") || ""), 10);
+        if (Number.isFinite(lc) && lc > 0 && lc < 64) clampLines = lc;
+      }
     }
   } catch (e) {
     /* the fallbacks below are the answer, not a guess about the theme */
@@ -4509,7 +4613,194 @@ function lodVueTextStyle(el, boxH) {
   if (!(size > 0)) size = Math.max(8, Math.min(16, Number(boxH) || 12));
   const LG = typeof LiteGraph !== "undefined" && LiteGraph ? LiteGraph : null;
   if (!color) color = (LG && LG.WIDGET_TEXT_COLOR) || "#DDD";
-  return { size, color };
+  if (!family) family = (LG && LG.NODE_FONT) || "Arial";
+  if (!(lineH > 0)) lineH = size * 1.25;
+  return { size, color, family, weight, style, lineH, spacing, clampLines };
+}
+
+// One item from a form control, in the same shape the ink already draws: the
+// control's box, its computed text style, and what the control is *showing*.
+// Everything here is read from the element, never guessed: a number field's value,
+// a select's chosen option, a checkbox's checked state, a colour input's colour, a
+// range input's position. (The frontend's Vue widgets are reka components — a
+// `Slider` is a div with `role="slider"` and a thumb, a `NumberField` is an
+// `<input>` — so both shapes have to be read for a picture to show the values the
+// user sees.)
+function lodVueBoxOf(el, rr, domScale, title) {
+  let r = null;
+  try {
+    r = typeof el.getBoundingClientRect === "function" ? el.getBoundingClientRect() : null;
+  } catch (e) {
+    r = null;
+  }
+  if (!r) return null;
+  const w = Number(r.width) / domScale;
+  const h = Number(r.height) / domScale;
+  if (!(w > 1) || !(h > 1)) return null;
+  const x = (Number(r.left) - Number(rr.left)) / domScale;
+  const y = (Number(r.top) - Number(rr.top)) / domScale - title;
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+  return { x, y, w, h };
+}
+
+function lodVueNumAttr(el, name, fallback) {
+  try {
+    const raw = el && typeof el.getAttribute === "function" ? el.getAttribute(name) : null;
+    const n = parseFloat(String(raw == null ? "" : raw));
+    return Number.isFinite(n) ? n : fallback;
+  } catch (e) {
+    return fallback;
+  }
+}
+
+function lodVueFormItem(el, tag) {
+  let type = "";
+  try {
+    type = String((el && el.type) || el.getAttribute("type") || "").toLowerCase();
+  } catch (e) {
+    type = "";
+  }
+  if (type === "password") return null; // never read, let alone draw, a password
+  if (type === "checkbox" || type === "radio") {
+    let checked = false;
+    try {
+      checked = !!el.checked;
+      if (!checked) {
+        const aria = el.getAttribute("aria-checked");
+        checked = aria === "true";
+      }
+    } catch (e) {
+      checked = false;
+    }
+    return { kind: "check", checked };
+  }
+  if (type === "color") {
+    let color = "";
+    try {
+      color = String(el.value || "");
+    } catch (e) {
+      color = "";
+    }
+    // Carried under its own name: this is the colour the *control* holds, and the
+    // element's own computed `color` is a different thing (it is the text colour, and
+    // the text style pass fills that field on every item). One field for both is how a
+    // swatch came out in the page's default text colour instead of the colour chosen.
+    return { kind: "swatch", swatch: color };
+  }
+  if (type === "range") {
+    let value = 0;
+    let min = 0;
+    let max = 100;
+    try {
+      value = Number(el.value);
+      min = Number(el.min || 0);
+      max = Number(el.max || 100);
+    } catch (e) {
+      value = 0;
+    }
+    return { kind: "range", value, min, max };
+  }
+  let raw = "";
+  try {
+    if (tag === "SELECT") {
+      const opts = el.selectedOptions;
+      const chosen = opts && opts.length ? opts[0] : null;
+      raw = chosen ? String(chosen.textContent || chosen.label || chosen.value || "") : String(el.value || "");
+    } else {
+      raw = String(el.value == null ? "" : el.value);
+    }
+  } catch (e) {
+    raw = "";
+  }
+  raw = raw.replace(/[^\S\n]+/g, " ").trim();
+  if (!raw) return null;
+  // A textarea is a block of text, not a one-line field: its first line sits at its
+  // own top and the rest flows down, which is what the element shows. A one-line
+  // input centres its single line in the row, and a row is what a picture of a
+  // taller `block` box got wrong — a prompt drawn in the middle of its own box.
+  return { kind: "text", text: raw, align: lodVueTextAlign(el), block: tag === "TEXTAREA" };
+}
+
+// The same item, from the ARIA shape a reka component renders: a slider is a div
+// with `role="slider"` and `aria-valuenow`, a checkbox or a switch carries
+// `aria-checked`, a combobox carries its chosen value in a readonly input or a span.
+function lodVueAriaItem(el) {
+  let role = "";
+  try {
+    role = String((el && typeof el.getAttribute === "function" && el.getAttribute("role")) || "").toLowerCase();
+  } catch (e) {
+    role = "";
+  }
+  if (!role) return null;
+  if (role === "slider") {
+    // The parts a slider is made of are its own children in this renderer (a track
+    // and a thumb), each with a box and a computed colour, so they are read rather
+    // than invented: the widest child with a paintable surface is the track, a small
+    // one after it is the thumb.
+    const item = {
+      kind: "range",
+      value: lodVueNumAttr(el, "aria-valuenow", 0),
+      min: lodVueNumAttr(el, "aria-valuemin", 0),
+      max: lodVueNumAttr(el, "aria-valuemax", 100),
+      track: "",
+      thumb: "",
+      thumbW: 0,
+    };
+    try {
+      const kids = el.children || [];
+      for (let i = 0; i < kids.length && i < 4; i++) {
+        const kid = kids[i];
+        if (!kid || !kid.tagName) continue;
+        const st = lodVueChromeStyle(kid);
+        const box = kid.getBoundingClientRect && kid.getBoundingClientRect();
+        const w = box ? Number(box.width) : 0;
+        const h = box ? Number(box.height) : 0;
+        if (st.fill && !item.track && w > 0) item.track = st.fill;
+        else if ((st.fill || st.border) && !item.thumb && w > 0) {
+          item.thumb = st.fill || st.border;
+          item.thumbW = Math.max(2, Math.min(w, h || w));
+        }
+      }
+    } catch (e) {
+      /* a slider without readable parts is drawn from the fallbacks */
+    }
+    return item;
+  }
+  if (role === "checkbox" || role === "switch" || role === "radio") {
+    let checked = false;
+    try {
+      checked = String(el.getAttribute("aria-checked") || "") === "true";
+    } catch (e) {
+      checked = false;
+    }
+    return { kind: "check", checked };
+  }
+  return null;
+}
+
+// The text style every item shares, copied onto it (so the ink reads one shape).
+function lodVueTextStyleInto(item, style) {
+  item.size = style.size;
+  item.color = style.color;
+  item.family = style.family;
+  item.weight = style.weight;
+  item.style = style.style;
+  item.lineH = style.lineH;
+  item.spacing = style.spacing;
+  item.clampLines = style.clampLines;
+}
+
+function lodVueTextAlign(el) {
+  try {
+    if (typeof getComputedStyle === "function") {
+      const cs = getComputedStyle(el);
+      const ta = cs && String(cs.textAlign || "");
+      if (ta === "right" || ta === "center") return ta;
+    }
+  } catch (e) {
+    /* left is what a browser does with an unset alignment */
+  }
+  return "left";
 }
 
 // The text the frontend renders inside a node: widget labels, the values it draws
@@ -4529,9 +4820,39 @@ function lodVueTextLines(root, rr, domScale, title) {
       if (out.length >= LOD_VUE_TEXT_MAX) break;
       const tag = String((el && el.tagName) || "").toUpperCase();
       if (tag === "IMG" || tag === "CANVAS") continue; // drawn as pictures
-      // A field's *value* is not its text: the widget pass owns those, and the
-      // default content of a textarea would be yesterday's value.
-      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") continue;
+      const box = lodVueBoxOf(el, rr, domScale, title);
+      if (!box) continue; // hidden, collapsed or not laid out yet
+      const style = lodVueTextStyle(el, box.h);
+      // A form control's *value* is not its text: `textContent` of an input is its
+      // default value, which is why these were skipped outright — and in this
+      // renderer a widget's value *is* a form control (a number field's input, a
+      // select's chosen option, a slider's thumb), so skipping them left a node's
+      // rows drawn as empty backgrounds. What the user reads there is `value`,
+      // `aria-*` and the checked/range state, all of which are readable.
+      const form = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
+      if (form) {
+        const item = lodVueFormItem(el, tag);
+        if (!item) continue;
+        item.x = box.x;
+        item.y = box.y;
+        item.w = box.w;
+        item.h = box.h;
+        lodVueTextStyleInto(item, style);
+        out.push(item);
+        continue;
+      }
+      // Reka components (the frontend's own sliders, checkboxes, switches) are divs
+      // with ARIA roles rather than form controls.
+      const aria = lodVueAriaItem(el);
+      if (aria) {
+        aria.x = box.x;
+        aria.y = box.y;
+        aria.w = box.w;
+        aria.h = box.h;
+        lodVueTextStyleInto(aria, style);
+        out.push(aria);
+        continue;
+      }
       if (el.children && el.children.length) continue; // a leaf is where the text is
       let raw = "";
       try {
@@ -4539,23 +4860,20 @@ function lodVueTextLines(root, rr, domScale, title) {
       } catch (e) {
         raw = "";
       }
-      raw = raw.replace(/\s+/g, " ").trim();
+      // Horizontal runs collapse, newlines do not: a caption or a prompt block the
+      // browser wrapped itself keeps its own breaks, and flattening them turns a
+      // paragraph into one line of text the node never showed.
+      raw = raw.replace(/[^\S\n]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
       if (!raw) continue;
       if (raw.length > LOD_VUE_TEXT_CHARS) raw = raw.slice(0, LOD_VUE_TEXT_CHARS);
-      let r = null;
-      try {
-        r = typeof el.getBoundingClientRect === "function" ? el.getBoundingClientRect() : null;
-      } catch (e) {
-        r = null;
-      }
-      const w = Number(r && r.width) / domScale;
-      const h = Number(r && r.height) / domScale;
-      if (!(w > 1) || !(h > 1)) continue; // hidden, collapsed or not laid out yet
-      const x = (Number(r.left) - Number(rr.left)) / domScale;
-      const y = (Number(r.top) - Number(rr.top)) / domScale - title;
-      if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
-      const style = lodVueTextStyle(el, h);
-      out.push({ text: raw, x, y, w, h, size: style.size, color: style.color });
+      const align = lodVueTextAlign(el);
+      // Everything the ink needs to draw the string the way the browser did: the
+      // size, the colour, the family, the weight, the line height and the clamp the
+      // element asked for. (A picture that draws Arial at 12px where the page drew
+      // Inter at 11px is a picture of a node nobody has.)
+      const item = { kind: "text", text: raw, align, x: box.x, y: box.y, w: box.w, h: box.h };
+      lodVueTextStyleInto(item, style);
+      out.push(item);
     }
   } catch (e) {
     /* text that cannot be read leaves the box as it was */
@@ -4570,7 +4888,7 @@ function lodVueTextLines(root, rr, domScale, title) {
 function lodVueChromeInk(ctx, chrome, out, key) {
   if (!chrome || !chrome.length || !ctx || typeof ctx.fillRect !== "function") return out;
   const into = key || "chrome"; // which gauge the caller wants counted
-  const order = { frame: 0, panel: 1, widget: 2, header: 3, dot: 4 };
+  const order = { frame: 0, panel: 1, widget: 2, ring: 3, header: 4, dot: 5 };
   const list = chrome.slice().sort((a, b) => (order[a.kind] || 9) - (order[b.kind] || 9));
   for (const c of list) {
     if (!(c.w > 0) || !(c.h > 0)) continue;
@@ -4611,7 +4929,8 @@ function lodVueChromeInk(ctx, chrome, out, key) {
       } else {
         ctx.rect(c.x, c.y, c.w, c.h);
       }
-      if (c.fill) {
+      const strokeOnly = c.kind === "ring"; // an outline element has no fill of its own
+      if (c.fill && !strokeOnly) {
         ctx.fillStyle = c.fill;
         ctx.fill();
         out[into] = (out[into] || 0) + 1;
@@ -4635,21 +4954,140 @@ function lodVueChromeInk(ctx, chrome, out, key) {
 function lodVueTextInk(ctx, lines, out) {
   if (!ctx || !lines || !lines.length) return 0;
   const LG = typeof LiteGraph !== "undefined" && LiteGraph ? LiteGraph : null;
-  const family = (LG && LG.NODE_FONT) || "Arial";
   let drew = 0;
   for (const it of lines) {
     try {
+      // The three control shapes a Vue node shows values in that are not text: a
+      // colour input (a swatch), a checkbox/switch (a tick), a slider (a track with
+      // a knob where the value is). Drawing them as their own shapes is what makes a
+      // picture of a node with widgets look like the node instead of like a list.
+      if (it.kind === "swatch") {
+        const c = lodVueColor(it.swatch || it.color);
+        if (c) {
+          ctx.fillStyle = c;
+          const r = Math.max(0, Math.min(Number(it.h) / 2 || 0, 4));
+          if (r > 0 && typeof ctx.roundRect === "function" && typeof ctx.beginPath === "function") {
+            ctx.beginPath();
+            ctx.roundRect(it.x, it.y, it.w, it.h, r);
+            ctx.fill();
+          } else if (typeof ctx.fillRect === "function") {
+            ctx.fillRect(it.x, it.y, it.w, it.h);
+          }
+          if (out) {
+            out.ink = (out.ink || 0) + 1;
+            out.control = (out.control || 0) + 1;
+          }
+          drew++;
+        }
+        continue;
+      }
+      if (it.kind === "check") {
+        const s = Math.max(4, Math.min(Number(it.w) || 8, Number(it.h) || 8));
+        const x = it.x + (Number(it.w) - s) / 2;
+        const y = it.y + (Number(it.h) - s) / 2;
+        if (it.checked) {
+          ctx.fillStyle = lodVueColor(it.color) || "#ddd";
+          if (typeof ctx.fillRect === "function") ctx.fillRect(x, y, s, s);
+          // the tick, in the surface's own colour so it reads on the fill
+          ctx.strokeStyle = "rgba(0, 0, 0, 0.75)";
+          ctx.lineWidth = Math.max(1, s / 6);
+          if (typeof ctx.beginPath === "function" && typeof ctx.moveTo === "function") {
+            ctx.beginPath();
+            ctx.moveTo(x + s * 0.22, y + s * 0.55);
+            ctx.lineTo(x + s * 0.42, y + s * 0.75);
+            ctx.lineTo(x + s * 0.78, y + s * 0.28);
+            if (typeof ctx.stroke === "function") ctx.stroke();
+          }
+        } else if (typeof ctx.strokeRect === "function") {
+          ctx.strokeStyle = lodVueColor(it.color) || "#888";
+          ctx.lineWidth = 1;
+          ctx.strokeRect(x + 0.5, y + 0.5, Math.max(1, s - 1), Math.max(1, s - 1));
+        }
+        if (out) {
+          out.ink = (out.ink || 0) + 1;
+          out.control = (out.control || 0) + 1;
+        }
+        drew++;
+        continue;
+      }
+      if (it.kind === "range") {
+        const min = Number.isFinite(Number(it.min)) ? Number(it.min) : 0;
+        const max = Number.isFinite(Number(it.max)) ? Number(it.max) : 100;
+        const value = Number.isFinite(Number(it.value)) ? Number(it.value) : min;
+        const t = max > min ? Math.max(0, Math.min(1, (value - min) / (max - min))) : 0;
+        const trackY = it.y + it.h / 2;
+        const trackH = Math.max(1, Math.min(4, it.h / 4));
+        ctx.fillStyle = (it.track ? lodVueColor(it.track) : "") || lodVueColor(it.color) || "rgba(255, 255, 255, 0.35)";
+        if (typeof ctx.fillRect === "function") ctx.fillRect(it.x, trackY - trackH / 2, it.w, trackH);
+        // The knob sits where the value is, the way a slider shows it.
+        const knob = it.thumbW > 0 ? Math.min(it.h, it.thumbW) : Math.min(it.h, Math.max(6, it.h * 0.7));
+        const kx = it.x + t * Math.max(0, it.w - knob);
+        ctx.fillStyle = (it.thumb ? lodVueColor(it.thumb) : "") || "rgba(255, 255, 255, 0.85)";
+        if (typeof ctx.beginPath === "function" && typeof ctx.arc === "function") {
+          ctx.beginPath();
+          ctx.arc(kx + knob / 2, trackY, Math.max(1, knob / 2), 0, Math.PI * 2);
+          if (typeof ctx.fill === "function") ctx.fill();
+        } else if (typeof ctx.fillRect === "function") {
+          ctx.fillRect(kx, trackY - knob / 2, knob, knob);
+        }
+        if (out) {
+          out.ink = (out.ink || 0) + 1;
+          out.control = (out.control || 0) + 1;
+        }
+        drew++;
+        continue;
+      }
+      const size = Math.max(6, Math.min(48, Number(it.size) || 12));
+      const family = it.family || (LG && LG.NODE_FONT) || "Arial";
+      const lineH = Number(it.lineH) > 0 ? Number(it.lineH) : size * 1.25;
       if (typeof ctx.save === "function") ctx.save();
       if (typeof ctx.beginPath === "function" && typeof ctx.rect === "function" && typeof ctx.clip === "function") {
         ctx.beginPath();
         ctx.rect(it.x, it.y, it.w, it.h);
         ctx.clip();
       }
-      ctx.fillStyle = it.color;
-      ctx.font = `${Math.max(6, Math.min(48, Number(it.size) || 12))}px ${family}`;
-      ctx.textAlign = "left";
-      if ("textBaseline" in ctx) ctx.textBaseline = "middle";
-      if (typeof ctx.fillText === "function") ctx.fillText(it.text, it.x + 2, it.y + it.h / 2);
+      ctx.fillStyle = lodVueColor(it.color) || it.color;
+      // The page's font, at the page's weight and style, with the spacing it asked
+      // for — a picture of a node whose text is Arial is not a picture of the node.
+      const font = [it.style || "", it.weight || "", `${size}px`, family].join(" ").replace(/\s+/g, " ").trim();
+      ctx.font = font;
+      if ("letterSpacing" in ctx) {
+        try {
+          ctx.letterSpacing = `${Number(it.spacing) || 0}px`;
+        } catch (e) {
+          /* an engine without letterSpacing draws the same text, a hair differently */
+        }
+      }
+      ctx.textAlign = it.align === "right" ? "right" : it.align === "center" ? "center" : "left";
+      if ("textBaseline" in ctx) ctx.textBaseline = "top";
+      // One `fillText` per *leaf* is what a browser does not do: a paragraph is one
+      // element with many laid-out lines, and drawing it as one line clipped to the
+      // box is exactly the "text gets cut off" a user sees — one line of a prompt,
+      // cut at the right edge, in the middle of an empty block. The string is wrapped
+      // to the box it was laid out in, in the font it was laid out with, and as many
+      // lines are drawn as the box has room for; the rest is marked the way the
+      // wrapper marks it.
+      const pad = 2;
+      const room = Math.max(1, Math.min(64, Number(it.clampLines) || Math.floor((it.h - pad) / lineH) || 1));
+      const wrapped = lodSnapWrapText(it.text, Math.max(4, it.w - pad * 2), room + 1, size, ctx);
+      if (wrapped.length > room) {
+        const last = wrapped[room - 1];
+        wrapped[room - 1] = last && last.length > 1 ? `${last.slice(0, last.length - 1)}\u2026` : "\u2026";
+      }
+      const drawn = wrapped.length > room ? wrapped.slice(0, room) : wrapped;
+      // Where the browser puts the first line: its line box starts at the top of
+      // the measured box and leads into the glyphs by half the leftover between the
+      // line height and the font's own content height. A single line in a taller row
+      // is centred inside it, which is what the row looks like.
+      const contentH = size * 1.25;
+      const half = Math.max(0, (lineH - contentH) / 2);
+      const top = it.block
+        ? it.y + pad + half // a block element's own top, the way the browser starts it
+        : it.y + Math.max(0, (it.h - drawn.length * lineH) / 2) + half;
+      const tx = it.align === "right" ? it.x + it.w - pad : it.align === "center" ? it.x + it.w / 2 : it.x + pad;
+      if (typeof ctx.fillText === "function") {
+        for (let i = 0; i < drawn.length; i++) ctx.fillText(drawn[i], tx, top + i * lineH);
+      }
       if (typeof ctx.restore === "function") ctx.restore();
       if (out) {
         out.ink = (out.ink || 0) + 1;
@@ -4743,6 +5181,21 @@ function lodVueChromeBoxes(node, root, rr, domScale, title) {
     ['[data-testid="node-inner-wrapper"]', "frame", 1],
     [`[data-testid="node-body-${id}"]`, "panel", 1],
     [`[data-testid="node-header-${id}"]`, "header", 1],
+    // The widget rows the frontend renders itself (`WidgetGrid.vue`: a grid with
+    // `data-testid="node-widgets"`, one row per widget, the control in a
+    // `lg-node-widget` element). This is the route that exists on a real page: the
+    // `widget.element` route below is the *DOM-widget* route (`WidgetDOM.vue`) and a
+    // Vue-rendered widget — a reka slider, a number field, a combo — has no such
+    // element, so before this the row surfaces of a real node were never read, which
+    // is what a node's body looking like an empty flat panel was.
+    ['[data-testid="node-widgets"]', "widgets", 96],
+    [".lg-node-widget", "widget", 96],
+    // The selection outline is deliberately *not* read here: it is drawn on top of
+    // the picture at blit time (`lodSnapSelectionRing`), for both pathways, so
+    // reading it into the capture would draw it twice and make a click cost a
+    // recapture. (The *executing* outline is its own element and is a known gap: a
+    // node that starts running keeps the picture it had until something else about
+    // it changes.)
     [".slot-dot", "dot", 96],
   ];
   for (const [sel, kind, cap] of spec) {
@@ -4751,6 +5204,13 @@ function lodVueChromeBoxes(node, root, rr, domScale, title) {
       els = root.querySelectorAll(sel) || [];
     } catch (e) {
       els = null;
+    }
+    // The grid the frontend renders its widgets in: its rows are its children, read
+    // through `children` rather than a child-combinator selector — a selector the
+    // page has to parse is a selector that can silently match nothing, and a row that
+    // is never read is a widget that never appears in the picture.
+    if (sel === '[data-testid="node-widgets"]' && els && els.length && els[0] && els[0].children) {
+      els = els[0].children;
     }
     if (!els || !els.length) continue;
     const n = Math.min(els.length, cap);
@@ -4784,16 +5244,40 @@ function lodVueChromeBoxes(node, root, rr, domScale, title) {
 // element that computes to transparent paints nothing, and inventing a colour for
 // it would paint a box the frontend does not (the header bar, for instance, is
 // usually just the wrapper's own surface showing through).
+// How opaque the frontend is compositing this node right now. `LGraphNode.vue` puts
+// the node's opacity on the element's own `style` (`opacity: nodeOpacity`, from the
+// `Comfy.Node.Opacity` setting, times 0.6 while the node is being dragged and 0.5
+// while it is muted or bypassed), and the whole subtree is composited with it. A
+// picture that ignores it draws a muted node at full strength, a dragged-away node
+// as if it were still in place, and — because the picture *replaces* the element —
+// no dimming happens at all where the user expects to see it.
+function lodVueOpacity(el) {
+  let op = 1;
+  try {
+    const inline = el && el.style ? parseFloat(el.style.opacity) : NaN;
+    if (Number.isFinite(inline)) op = inline;
+    else if (typeof getComputedStyle === "function") {
+      const cs = getComputedStyle(el);
+      const c = cs ? parseFloat(cs.opacity) : NaN;
+      if (Number.isFinite(c)) op = c;
+    }
+  } catch (e) {
+    /* unreadable: fully opaque is what a node is unless the page says otherwise */
+  }
+  if (!Number.isFinite(op)) op = 1;
+  return Math.max(0, Math.min(1, op));
+}
+
 function lodVueChromeStyle(el) {
   const out = { fill: "", border: "", borderW: 0, radius: 0 };
   try {
     const cs = typeof getComputedStyle === "function" ? getComputedStyle(el) : null;
     if (cs) {
-      out.fill = lodVuePaintable(cs.backgroundColor) ? String(cs.backgroundColor) : "";
+      out.fill = lodVuePaint(cs.backgroundColor);
       const bw = parseFloat(cs.borderTopWidth || "0") || 0;
       if (bw > 0 && lodVuePaintable(cs.borderTopColor)) {
         out.borderW = bw;
-        out.border = String(cs.borderTopColor);
+        out.border = lodVuePaint(cs.borderTopColor);
       }
       const rad = parseFloat(cs.borderTopLeftRadius || "0") || 0;
       out.radius = Number.isFinite(rad) ? Math.max(0, Math.min(24, rad)) : 0;
@@ -4802,6 +5286,209 @@ function lodVueChromeStyle(el) {
     /* unreadable style: no chrome for this element, which is never a failure */
   }
   return out;
+}
+
+// ---------------------------------------------------------------- colour ---
+// A computed colour string is what the *browser* said; whether the canvas can
+// paint it is a different question. `rgb()`, `rgba()` and hex always could. But
+// this frontend is built on Tailwind 4 (`tailwindcss` 4.3 in its package.json),
+// whose opacity modifiers compile to `color-mix()` — so a class like
+// `bg-primary-500/10` (which `LGraphNode.vue` applies while a node is dragged
+// over) computes to an `oklab(...)` or `color(srgb ...)` string, and any pack
+// whose CSS uses `oklch()` computes to that too. Assigning a string the canvas
+// cannot parse is *not* an error: the assignment is silently ignored and the
+// previous fillStyle stays — which is how one node's colour becomes another
+// node's colour in a picture, and what a user sees as "the colours are
+// different". So every string is parsed here, by hand, into `rgba(...)`:
+// exactly the colour the browser computed, in the one syntax every canvas has
+// always understood. Unparsable strings are counted and sampled (`vueColorMiss`
+// / `vueColorSample`) and paint nothing, rather than painting the wrong colour.
+const LOD_VUE_COLOR_CACHE = 512;
+
+function lodVueColorCount(raw) {
+  if (!raw) return;
+  LOD.vueColorMiss = (LOD.vueColorMiss || 0) + 1;
+  if (!LOD.vueColorSample) LOD.vueColorSample = [];
+  const t = String(raw).slice(0, 60);
+  if (LOD.vueColorSample.indexOf(t) < 0 && LOD.vueColorSample.length < 4) LOD.vueColorSample.push(t);
+}
+
+function lodVueClamp01(x) {
+  return x < 0 ? 0 : x > 1 ? 1 : x;
+}
+
+// linear-light sRGB (0..1) -> 8-bit channels, with the transfer function the
+// browser uses. Values outside the gamut are clamped, which is what a canvas
+// without a wide-gamut backing store does with them anyway.
+function lodVueLinearToByte(v) {
+  const s = v <= 0.0031308 ? 12.92 * v : 1.055 * Math.pow(Math.max(0, v), 1 / 2.4) - 0.055;
+  return Math.round(lodVueClamp01(s) * 255);
+}
+
+function lodVueOklabToRgb(L, a, b) {
+  const l_ = L + 0.3963377774 * a + 0.2158037573 * b;
+  const m_ = L - 0.1055613458 * a - 0.0638541728 * b;
+  const s_ = L - 0.0894841775 * a - 1.291485548 * b;
+  const l = l_ * l_ * l_;
+  const m = m_ * m_ * m_;
+  const s = s_ * s_ * s_;
+  return [
+    lodVueLinearToByte(4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s),
+    lodVueLinearToByte(-1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s),
+    lodVueLinearToByte(-0.0041960863 * l - 0.7034186147 * m + 1.707614701 * s),
+  ];
+}
+
+function lodVueHslToRgb(h, s, l) {
+  const hue = ((h % 360) + 360) % 360;
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const x = c * (1 - Math.abs(((hue / 60) % 2) - 1));
+  const m = l - c / 2;
+  const seg = Math.floor(hue / 60) % 6;
+  const rgb = [
+    [c, x, 0],
+    [x, c, 0],
+    [0, c, x],
+    [0, x, c],
+    [x, 0, c],
+    [c, 0, x],
+  ][seg];
+  return [Math.round((rgb[0] + m) * 255), Math.round((rgb[1] + m) * 255), Math.round((rgb[2] + m) * 255)];
+}
+
+// `none` is a real value in CSS Color 4 and means "no contribution".
+function lodVueNum(tok, scale) {
+  const t = String(tok == null ? "" : tok).trim();
+  if (!t || t === "none") return 0;
+  const n = parseFloat(t);
+  if (!Number.isFinite(n)) return NaN;
+  if (/%$/.test(t)) return (n / 100) * (scale === undefined ? 1 : scale);
+  return n;
+}
+
+function lodVueAlpha(tok) {
+  if (tok == null || tok === "") return 1;
+  const n = lodVueNum(tok, 1);
+  return Number.isFinite(n) ? lodVueClamp01(n) : 1;
+}
+
+// One string in, `rgba(r, g, b, a)` out — or "" when this tool cannot read it.
+function lodVueColor(raw) {
+  const src = String(raw == null ? "" : raw).trim();
+  const low = src.toLowerCase();
+  if (!src || low === "none" || low === "initial" || low === "inherit" || low === "inherit") return "";
+  if (low === "transparent") return "rgba(0, 0, 0, 0)";
+  if (!LOD.vueColorCache) LOD.vueColorCache = new Map();
+  const hit = LOD.vueColorCache.get(low);
+  if (hit !== undefined) return hit;
+  let out = "";
+  try {
+    out = lodVueColorParse(low);
+  } catch (e) {
+    out = "";
+  }
+  if (!out) lodVueColorCount(src);
+  if (LOD.vueColorCache.size > LOD_VUE_COLOR_CACHE) LOD.vueColorCache.clear();
+  LOD.vueColorCache.set(low, out);
+  return out;
+}
+
+function lodVueColorParse(low) {
+  const hex = /^#([0-9a-f]{3,8})$/.exec(low);
+  if (hex) {
+    const h = hex[1];
+    const to = (t) => parseInt(t, 16);
+    if (h.length === 3 || h.length === 4) {
+      return `rgba(${to(h[0] + h[0])}, ${to(h[1] + h[1])}, ${to(h[2] + h[2])}, ${h.length === 4 ? (to(h[3] + h[3]) / 255).toFixed(3) : 1})`;
+    }
+    if (h.length === 6 || h.length === 8) {
+      return `rgba(${to(h.slice(0, 2))}, ${to(h.slice(2, 4))}, ${to(h.slice(4, 6))}, ${h.length === 8 ? (to(h.slice(6, 8)) / 255).toFixed(3) : 1})`;
+    }
+    return "";
+  }
+  const fn = /^([a-z-]+)\(([^)]*)\)$/.exec(low);
+  if (!fn) return "";
+  const name = fn[1];
+  const parts = fn[2].split("/");
+  const body = parts[0].trim();
+  const alpha = lodVueAlpha(parts.length > 1 ? parts[1] : null);
+  const toks = body.replace(/,/g, " ").split(/\s+/).filter((t) => t.length);
+  const rgbOut = (r, g, b, a) => {
+    const al = Number.isFinite(a) ? String(Number(lodVueClamp01(a).toFixed(3))) : "1";
+    return `rgba(${Math.round(lodVueClamp01(r / 255) * 255)}, ${Math.round(lodVueClamp01(g / 255) * 255)}, ${Math.round(lodVueClamp01(b / 255) * 255)}, ${al})`;
+  };
+  const chan = (t) => {
+    const t0 = String(t == null ? "" : t).trim();
+    if (!t0 || t0 === "none") return 0;
+    return /%$/.test(t0) ? (parseFloat(t0) / 100) * 255 : parseFloat(t0);
+  };
+  if (name === "rgb" || name === "rgba") {
+    if (toks.length < 3) return "";
+    return rgbOut(chan(toks[0]), chan(toks[1]), chan(toks[2]), alpha);
+  }
+  if (name === "hsl" || name === "hsla") {
+    if (toks.length < 3) return "";
+    const h = lodVueNum(toks[0], 360);
+    const s = lodVueNum(toks[1], 1);
+    const l = lodVueNum(toks[2], 1);
+    if (![h, s, l].every(Number.isFinite)) return "";
+    const [r, g, b] = lodVueHslToRgb(h, lodVueClamp01(s), lodVueClamp01(l));
+    return rgbOut(r, g, b, alpha);
+  }
+  if (name === "hwb") {
+    if (toks.length < 3) return "";
+    const h = lodVueNum(toks[0], 360);
+    const w = lodVueClamp01(lodVueNum(toks[1], 1));
+    const bl = lodVueClamp01(lodVueNum(toks[2], 1));
+    const [r0, g0, b0] = lodVueHslToRgb(h, 1, 0.5);
+    const mix = (c) => {
+      const v = (c / 255) * (1 - w - bl) + w;
+      return lodVueClamp01(v) * 255;
+    };
+    return rgbOut(mix(r0), mix(g0), mix(b0), alpha);
+  }
+  if (name === "oklab" || name === "oklch") {
+    if (toks.length < 3) return "";
+    const L = lodVueNum(toks[0], 1);
+    if (!Number.isFinite(L)) return "";
+    let a, b;
+    if (name === "oklch") {
+      const C = lodVueNum(toks[1], 0.4);
+      const H = lodVueNum(toks[2], 360);
+      const rad = (H * Math.PI) / 180;
+      a = C * Math.cos(rad);
+      b = C * Math.sin(rad);
+    } else {
+      a = lodVueNum(toks[1], 0.4);
+      b = lodVueNum(toks[2], 0.4);
+    }
+    if (![a, b].every(Number.isFinite)) return "";
+    const [r, g, bl2] = lodVueOklabToRgb(L, a, b);
+    return rgbOut(r, g, bl2, alpha);
+  }
+  if (name === "color") {
+    // `color(srgb-linear …)` and `color(srgb …)`; the wide-gamut spaces are left
+    // to the canvas (or counted as unread) rather than approximated badly.
+    const space = String(toks[0] || "").toLowerCase();
+    if ((space === "srgb" || space === "srgb-linear") && toks.length >= 4 && typeof fn[2] !== "undefined") {
+      const vals = [toks[1], toks[2], toks[3]].map((t) => {
+        const n = lodVueNum(t, 1);
+        return Number.isFinite(n) ? n : NaN;
+      });
+      if (vals.some((n) => !Number.isFinite(n))) return "";
+      const bytes = vals.map((v) => (space === "srgb-linear" ? lodVueLinearToByte(v) : Math.round(lodVueClamp01(v) * 255)));
+      return rgbOut(bytes[0], bytes[1], bytes[2], alpha);
+    }
+    return "";
+  }
+  return "";
+}
+
+// A colour a surface can be painted in: the normalised string, or "" for
+// transparent / unreadable. (The raw string is never handed to the canvas: a
+// string it cannot parse is silently ignored and the previous colour leaks.)
+function lodVuePaint(color) {
+  return lodVueColor(color);
 }
 
 // A colour worth painting: not transparent, not an unset value.
@@ -4918,7 +5605,7 @@ function lodVueRootMetrics(node, canvas, force) {
   // the same pass: a picture without them is a sketch of the node, not the node.
   const chrome = rr ? lodVueChromeBoxes(node, root, rr, domScale, title) : [];
   LOD.vueChromeNow = chrome.length; // what the last measurement read, kept until the next one
-  const rec = { root, key, scale: domScale, at: now, items, boxH, texts, wboxes, chrome };
+  const rec = { root, key, scale: domScale, at: now, items, boxH, texts, wboxes, chrome, opacity: lodVueOpacity(root) };
   cache.set(node, rec);
   return rec;
 }
@@ -4968,6 +5655,13 @@ function lodVueCapturePaint(node, canvas, ctx, geom) {
     // says a moment later), and the ink is read from the same fresh measurement.
     const metrics = lodVueRootMetrics(node, canvas, true);
     const size = geom ? [geom.bodyW, geom.bodyH] : metrics && metrics.boxH > 0 ? [(node && (node.renderingSize || node.size) || [0, 0])[0], metrics.boxH] : null;
+    // The node's composited opacity, read with the measurement this capture is built
+    // from (never per frame), goes into the picture through the painter: a muted node
+    // stays muted, a node being dragged becomes the faint ghost the frontend makes it,
+    // and the effect survives on the canvas because the picture is what is drawn
+    // there. (The picture replaces the element, so a picture that ignored this would
+    // not just look wrong — the dimming would never happen at all.)
+    const op = metrics && Number.isFinite(Number(metrics.opacity)) ? Number(metrics.opacity) : NaN;
     lodPaintNode(
       node,
       canvas,
@@ -4977,7 +5671,8 @@ function lodVueCapturePaint(node, canvas, ctx, geom) {
       // cache this reads, so it is one pass, not two.
       () => lodVueContentInk(node, canvas, ctx, out),
       LOD_BOX_DETAIL[2],
-      size
+      size,
+      op
     );
   } catch (e) {
     /* the box is painted first; content that cannot be drawn is skipped */
@@ -5026,7 +5721,11 @@ function lodVueContentInk(node, canvas, ctx, into) {
     lodVueChromeInk(ctx, metrics.wboxes, out, "widget");
     LOD.vueWidgetInk += (out.widget || 0) - beforeW; // how much of the node's widget row is in the picture
   }
-  if (metrics) lodVueTextInk(ctx, metrics.texts, out);
+  if (metrics) {
+    const beforeC = out.control || 0;
+    lodVueTextInk(ctx, metrics.texts, out);
+    LOD.vueControlInk += (out.control || 0) - beforeC; // values drawn as their own control (a slider, a tick, a swatch)
+  }
   lodSnapDomInk(node, ctx, canvas, out, metrics ? metrics.wboxes : null);
   const boxes = metrics ? metrics.items : null;
   if (boxes) {
@@ -5351,6 +6050,10 @@ function lodSnapSignature(node, canvas) {
     // That is the "captured too early, never fully" a user sees.
     const metrics = lodVueRootMetrics(node, canvas, false);
     num(metrics && metrics.boxH ? metrics.boxH : 0);
+    // The composited opacity is part of the picture now (it is baked into the
+    // capture), so it invalidates it: mute, bypass and the drag ghost each change
+    // what the picture has to look like.
+    num(metrics && metrics.opacity !== undefined ? metrics.opacity : 1);
     const items = metrics ? metrics.items : null;
     num(items ? items.length : 0);
     // The structure is part of the picture: a frame that arrives, a header that
@@ -5988,10 +6691,31 @@ function lodSnapWrapText(raw, maxW, maxLines, size, cctx) {
     }
     let line = "";
     for (let i = 0; i < words.length && out.length < maxLines; i++) {
-      const next = line ? `${line} ${words[i]}` : words[i];
+      let word = words[i];
+      // A single word wider than the box — a path, a URL, a token — is what the
+      // browser breaks with `overflow-wrap: anywhere`, and it is also what a picture
+      // clips at the right edge when the reproduction cannot. Chop it by measure.
+      if (lodSnapMeasureText(cctx, word, size) > maxW) {
+        if (line) {
+          out.push(line);
+          line = "";
+        }
+        let chunk = "";
+        for (const ch of word) {
+          if (chunk && lodSnapMeasureText(cctx, chunk + ch, size) > maxW) {
+            out.push(chunk);
+            chunk = ch;
+            if (out.length >= maxLines) break;
+          } else {
+            chunk += ch;
+          }
+        }
+        word = chunk;
+      }
+      const next = line ? `${line} ${word}` : word;
       if (line && lodSnapMeasureText(cctx, next, size) > maxW) {
         out.push(line);
-        line = words[i];
+        line = word;
       } else {
         line = next;
       }
@@ -6080,6 +6804,19 @@ function lodSnapDomInk(node, cctx, canvas, into, boxes) {
   // (the Vue-nodes pathway, where the browser lays the widgets out inside the
   // node's element). Absent, the canvas rows are used, which is right in the
   // renderer where LiteGraph authors them.
+  //
+  // A measured box is also how this route knows the element sits inside the node's
+  // own DOM — which is where the node's text pass reads it, in the page's own font,
+  // colours and column. Drawing a control here as well would put the same value on
+  // the picture twice: once as the page drew it and once as Arial on a `#222` bar
+  // the page never drew. Images and canvases still come from here, because no text
+  // pass can draw those.
+  const measured = boxes && boxes.length
+    ? (el) => {
+        for (const b of boxes) if (b && b.el === el) return true;
+        return false;
+      }
+    : null;
   for (let i = 0; i < widgets.length && i < LOD_SNAP_DOM_MAX; i++) {
     const w = widgets[i];
     if (!w) continue;
@@ -6121,6 +6858,7 @@ function lodSnapDomInk(node, cctx, canvas, into, boxes) {
         out.ink++;
         if (out.els && out.els.indexOf(el) < 0) out.els.push(el);
       } else if (kind === "text") {
+        if (measured && measured(el)) continue; // read and drawn by the node's own text pass
         if (lodSnapTextInk(el, cctx, box)) {
           out.ink++;
           out.text++;
@@ -13671,7 +14409,7 @@ function buildTelemetryReport() {
               lodVueNodesMode()
                 ? (LOD.snapOn
                     ? `node stand-ins are pictures: below ${Math.round(LOD.flatBelow * 100)}% zoom each node's own element stops painting and the canvas blits the picture taken of it ` +
-                      `(the bitmap half of the engine is active — a picture of the node's box, its text and its widgets, remade when the node changes)`
+                      `(the bitmap half of the engine is active — a picture of the node's box, its text and its widgets, remade when the node changes; the frontend itself has no level of detail — a zoom is one compositor transform, so every read is at full detail, and node LOD here is ${(() => { const p = lodVueLodProbe(); return p.ok ? "available to the page (content-visibility is honoured) but unused by the frontend" : `unavailable (content-visibility: ${p.why})`; })()})`
                     : `node stand-ins are boxes: below ${Math.round(LOD.flatBelow * 100)}% zoom each node's own element stops painting and the canvas draws its box ` +
                       `(no picture is taken while the snapshots setting is off — the bitmap half of the engine is idle; the widget and focus settings below still act)`)
                 : `every node a rectangle below ${Math.round(LOD.flatBelow * 100)}% zoom${LOD.legacyPx ? `, carried over from "nodes under ${LOD.legacyPx}px"` : ""}`
@@ -14046,9 +14784,16 @@ function installDebugApi() {
             // picture without it is the sketch a user described as "semi".
             vueChrome: LOD.vueChrome,
             vueChromeBoxes: LOD.vueChromeNow,
+            // Colour strings the canvas could not be handed raw: how many, and the
+            // first few - so a page whose theme uses a syntax this tool does not
+            // read is *visible* in the readout instead of quietly painting another
+            // element's colour.
+            vueColorMiss: LOD.vueColorMiss || 0,
+            vueColorSample: LOD.vueColorSample ? LOD.vueColorSample.slice() : [],
             staleHeld: LOD.snapStaleHeld,
             cooldown: LOD.snapCooldown,
             vueWidgetInk: LOD.vueWidgetInk,
+            vueControlInk: LOD.vueControlInk,
             // What the stand-in does to the frontend's own painting: how many nodes
             // have their DOM subtree taken out of the paint phase while their
             // picture stands in (visibility, which the engine honours, rather than
@@ -14443,15 +15188,26 @@ app.registerExtension({
 //  * What a Vue-nodes stand-in cannot be is a *screenshot*: no browser API
 //    draws a DOM element into a canvas (not drawImage, not createImageBitmap,
 //    not captureStream). The picture is therefore *drawn* — the box, its title
-//    bar and state marks, the widget text the frontend mounts as DOM, and the
-//    node's own `<img>`/`<canvas>` elements at the rows the layout gave them —
-//    into the same capture surface the canvas renderer uses, with the same
-//    capture resolution, mip chain, RAM budget and disk files. The parts that
-//    are neither an image, a canvas nor plain text (a pack's own HTML) stay
-//    blank in the picture and are counted. A picture made in one renderer is
-//    not reused in the other: switching renderers releases what was held and
-//    makes the pictures again, because the box, the padding and the content
-//    route all differ.
+//    bar and state marks, the node's own structure and widget rows in the
+//    colours the browser computed, the text wrapped into the box the browser
+//    laid it out in and drawn in the element's own font, the values of its form
+//    and ARIA controls drawn as the controls they are, the node's composited
+//    opacity, and the node's own `<img>`/`<canvas>` elements at the rows the
+//    layout gave them — into the same capture surface the canvas renderer uses,
+//    with the same capture resolution, mip chain, RAM budget and disk files.
+//    Every colour goes through `lodVueColor` first: this frontend's themed
+//    surfaces are Tailwind 4 `oklch()`/`oklab()` strings, which a canvas
+//    `fillStyle` ignores *silently* (the previous colour stays, so a node wears
+//    the previous node's palette). The parts that are neither an image, a canvas
+//    nor plain text (a pack's own HTML) stay blank in the picture and are
+//    counted. A picture made in one renderer is not reused in the other:
+//    switching renderers releases what was held and makes the pictures again,
+//    because the box, the padding and the content route all differ. There is no
+//    zoom-dependent level of detail to reproduce, either: this frontend binds a
+//    node's size, position, z-index and opacity and nothing else, transforms the
+//    whole graph with one pane, and draws no node with LiteGraph in this mode —
+//    a zoom is compositor work, so the DOM the reader measures is the same DOM at
+//    every zoom (`lodVueLodProbe` reports that from the page).
 //  * The box a Vue-nodes stand-in covers is measured from the element, not
 //    taken from `node.size`: `LGraphNode.vue` renders an image node
 //    IMAGE_PREVIEW_HEIGHT_RESERVE = 220 + 8 + 4 px taller than its graph size,

@@ -4,7 +4,7 @@ A running record for whoever picks this up next (including me). `CLAUDE.md` is t
 rules for changing the code; `plan.md` is where it is going. This file is the past:
 what was built, what was rejected, and what the evidence was.
 
-Last updated at **v2.6.7**, 223 tests green, PR #2 on
+Last updated at **v2.6.8**, 228 tests green, PR #2 on
 `Spirindzhiukas/ANTs_ComfyUI_Frontend_Performance_Tracker`.
 
 ---
@@ -13,8 +13,8 @@ Last updated at **v2.6.7**, 223 tests green, PR #2 on
 
 | | |
 | --- | --- |
-| Version | 2.6.7 (`web/tracker.js` `VERSION`) |
-| Tests | 223 (`node tests/run-tests.mjs`), plus `tests/test_init.py` |
+| Version | 2.6.8 (`web/tracker.js` `VERSION`) |
+| Tests | 228 (`node tests/run-tests.mjs`), plus `tests/test_init.py` |
 | Frontend | `web/tracker.js`, one ES module, no dependencies. The separate window is `web/window.html`, served at `/ants_optimizer/window`, not loaded as an extension. |
 | Backend | `__init__.py` — node `ANTs_Frontend_Optimizer` (old class key kept as an alias), nine best-effort routes (GPU, five thumbnail routes, the window page, `/ants_optimizer/ui`), and thumbnail read/write under ComfyUI's temp folder |
 | Panel | 10 tabs: Node Rendering Settings, Status, Timing, Nodes, Stalls, Governor, Load, Memory, GPU / VRAM, Testing |
@@ -36,6 +36,8 @@ something has to be drawn less or hit-tested less.
 ## 2. Version log
 
 The commit log is the full record; this is the "why", newest first.
+
+**v2.6.8 — the eleventh report: "we are still half-way there", and the last open question (a zoom-based level of detail in the frontend) answered with a *no*.** The question was worth answering properly, because if the frontend drew nodes at a zoom-dependent tier, every stand-in would be faithfully reproducing a node that had already been simplified. It does not: `LGraphNode.vue`'s root binds size, position, z-index and opacity and nothing else, `TransformPane.vue` carries one transform for the whole graph, `LiteGraph.drawNode` early-returns in this renderer, and a zoom is therefore compositor work — no re-layout, no computed style that changes with scale, no text simplification at any zoom. `lodVueLodProbe` (element count, computed font size, `content-visibility`, the transform scale) reports that from the page and the readout names it, so the answer can be re-checked on the user's own machine instead of believed. What the report was actually seeing was the *picture* losing four things, all fixed in this release: (1) **colour** — the themed surfaces are Tailwind 4 `oklch()`/`oklab()` strings, and assigning one to `fillStyle` is silently ignored, so a node wore the previous node's colour; every colour is translated to `rgba()` by a hand-written parser now, with misses counted and sampled; (2) **text** — a paragraph was flattened to one line and drawn in Arial, cut at the box, and is now wrapped into its own box, line by line, in the element's own font (family/weight/style/line height/letter spacing/line clamp), with a textarea laid out as a block from its own top; (3) **opacity** — the node's composited opacity (`nodeOpacity`, muted/dragged) was not read at all, so a muted node was photographed at full strength; it is read with the measurement and baked into the picture and the live box through the painter's `alphaOverride` (combined by `min`, never by wrapping the painter in `globalAlpha`); (4) **the rows** — the frontend's own widget rows (`WidgetGrid.vue`'s `data-testid="node-widgets"` grid, controls inside `lg-node-widget`) have no `widget.element`, so only the DOM-widget route existed and a real node's body was read as an empty flat panel; both routes are read now, and the values inside the controls are drawn as the controls they are (a reka slider's track and knob at `aria-valuenow` in the colours measured off its children, a tick, a swatch of the colour the input holds, an aligned field value). Two failures the suite caught on the way are the kind that only a suite can catch: the same widget value was being drawn **twice** (the DOM-widget route and the new text pass both knew about form controls — the DOM-widget route now yields a *measured* text control to the text pass, images and canvases still come from it), and the reader had been asking for the widget grid's rows with a child-combinator selector which is valid CSS the browser answers and which the test harness's grammar silenced to an empty list — the reader was reading nothing in the tests and everything on the real page. The harness now records selectors it cannot express (`document._qsaUnsupported`, asserted empty by a test after proving the guard records a `>` selector) and `ANTS_TRACKER` points the whole suite at a copy of the tracker, which is how the seventeen-mutation battery runs (**all seventeen caught**, including the parser not parsing, chroma dropped from an oklch, the duplicate drawing back, and the selector guard switched off). Fidelity rig against v2.6.7 (two recreated nodes, one muted): text lines 98 → 100, fonts `["11px Arial","12px Arial"]` → `["400 11px Inter, sans-serif","400 12px Arial"]`, alphas `[1]` → `[0.5, 1]`, and every colour that reaches the canvas now parseable `rgba(...)`.
 
 **v2.6.7 — the tenth report: "still not there yet", with the numbers.** The snapshot (75 nodes at 42 % zoom; fps 83 but p99 19.6 ms and a 249 ms worst frame; 498 stalls over 5.9 minutes, 32.1 s blocking, 11.3 s of it forced layout inside the frontend's own `renderFrame`; stand-ins at 42 % reduced to flat boxes; "16 DOM element(s) of boxed nodes hidden"; and a readout that said "(no picture is taken in this renderer)" beside "34386 served / 493 captured") was read against two probes built from the same code, and three of the four causes were in the tool's own lane.
 
