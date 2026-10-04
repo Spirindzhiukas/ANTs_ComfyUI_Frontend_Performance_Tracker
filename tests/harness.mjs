@@ -10,7 +10,7 @@ import fs from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
 import { fileURLToPath } from "node:url";
-import { createDocument, createStorage } from "./dom-shim.mjs";
+import { computedStyle, createDocument, createStorage } from "./dom-shim.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const TRACKER_PATH = path.join(HERE, "..", "web", "tracker.js");
@@ -567,6 +567,10 @@ export function createHarness(options = {}) {
   sandbox.window.LiteGraph = LiteGraphShim;
   sandbox.CanvasRenderingContext2D = FakeCanvasRenderingContext2D;
   sandbox.window.CanvasRenderingContext2D = FakeCanvasRenderingContext2D;
+  // The page's own computed style: the tracker reads two things from it (whether a
+  // marked element is really off, and the font/colour of text it re-paints).
+  sandbox.getComputedStyle = (el) => computedStyle(el);
+  sandbox.window.getComputedStyle = (el) => computedStyle(el);
   sandbox.createImageBitmap = createImageBitmapStub;
   sandbox.window.createImageBitmap = createImageBitmapStub;
   vm.createContext(sandbox);
@@ -667,6 +671,14 @@ export function createHarness(options = {}) {
     const container = document.createElement("div");
     container.className = "vue-nodes";
     document.body.appendChild(container);
+    // The frontend's own structure (TransformPane.vue): one element carrying the
+    // camera transform, every node inside it, and the nodes positioned by their own
+    // `translate`. Its computed matrix is how the tool measures the zoom the DOM is
+    // really laid out at — the one number a capture cannot take from the canvas,
+    // which a capture rewrites to 1.
+    const pane = document.createElement("div");
+    pane.setAttribute("data-testid", "transform-pane");
+    container.appendChild(pane);
     const roots = new Map(); // node id (string) -> element
     const wrappers = new Map(); // widget element -> its .dom-widget wrapper
     const nodes = () => (canvas.nodes && canvas.nodes.length ? canvas.nodes : app.graph._nodes) || [];
@@ -677,7 +689,7 @@ export function createHarness(options = {}) {
       root.className = "lg-node absolute";
       root.setAttribute("data-node-id", String(n.id));
       root.style.transform = `translate(${n.pos[0]}px, ${n.pos[1] - 30}px)`;
-      container.appendChild(root);
+      pane.appendChild(root);
       roots.set(String(n.id), root);
     }
     // What the node renders *itself* — the shape ImagePreview.vue has: a
@@ -700,6 +712,10 @@ export function createHarness(options = {}) {
       const scale = Number(canvas.ds.scale) || 1;
       const ox = Number(canvas.ds.offset[0]) || 0;
       const oy = Number(canvas.ds.offset[1]) || 0;
+      // The camera transform lives on the pane: `scale3d(z,z,z)
+      // translate3d(x,y,0)`, exactly the string useTransformState.ts writes, so the
+      // tool's measurement of the DOM zoom is exercised the way the page does it.
+      pane.style.transform = `scale3d(${scale}, ${scale}, ${scale}) translate3d(${ox * scale}px, ${oy * scale}px, 0)`;
       let originX = 0;
       let originY = 0;
       try {
@@ -773,10 +789,16 @@ export function createHarness(options = {}) {
       exit: () => {
         LiteGraphShim.vueNodesMode = false;
         // GraphCanvas.vue renders the whole pane with `v-if`: switching the
-        // renderer off unmounts every node element instead of hiding it. A tool
-        // mark left on a detached element is a node that comes back invisible if
-        // the frontend reuses it, so the elements really do leave the page here.
+        // renderer off *unmounts* every node element — the elements leave the page,
+        // they are not merely hidden. That is the state the tool has to clean up
+        // after: a mark left on a detached element is a node that comes back
+        // invisible if the frontend puts the same element back, and a capture made
+        // from a detached element is a picture of nothing. (The shim's
+        // `isConnected` answers "in the document", so this is a real detachment.)
+        for (const [, root] of roots) root.remove();
         if (container.parentNode) container.parentNode.removeChild(container);
+        container.remove();
+        for (const m of media) m.el.remove();
       },
     };
   }

@@ -6,7 +6,7 @@ for: *which extension's JavaScript is actually costing me frames while I pan
 this graph, and what is eating main-thread time that no draw hook owns?* —
 without opening DevTools and without restarting ComfyUI to bisect.
 
-Version **2.6.3**. Everything runs from page load: no node has to be placed,
+Version **2.6.4**. Everything runs from page load: no node has to be placed,
 nothing executes, and the tool never changes your graph or your workflows.
 
 - **Measure** — per-extension and per-node-type frame cost, canvas draw
@@ -130,7 +130,7 @@ drawing**, and "off" is a real restoration, not a memory of one.
 | Setting | Choices | Default | What it does |
 | --- | --- | --- | --- |
 | Replace node previews with bitmap stand-ins at zoom levels | off — draw every node · below 5 · 10 · 15 · 20 · 25 · 30 · 40 · 50 % | **below 50 %** | Below this zoom a node is a flat box instead of a live draw. The decision is the zoom, never a node's pixel size. In the Nodes 2.0 (Vue-nodes) renderer the same setting blanks the node's own element and the canvas paints the same box in its place — see the section further down. Hover, selection and a drag keep the picture; a selected node gets a ring; a link drag, a running progress bar and an error still draw live. |
-| Stand-in | plain fill · title bar colour · title + error ring + progress + muted · picture of the node | **picture of the node** | What the box is made of. *plain* is a fill, *title* adds each node's own title bar, *state* adds error rings, progress bars and muted dimming, *picture* stores a bitmap of the node and blits it instead. A picture needs a canvas that draws nodes: in the Nodes 2.0 (Vue-nodes) renderer this choice falls back to the box with the *state* marks, and the readout says why. |
+| Stand-in | plain fill · title bar colour · title + error ring + progress + muted · picture of the node | **picture of the node** | What the box is made of. *plain* is a fill, *title* adds each node's own title bar, *state* adds error rings, progress bars and muted dimming, *picture* stores a bitmap of the node and blits it instead. In the Nodes 2.0 (Vue-nodes) renderer *picture* works too, drawn rather than photographed — see the section further down. Changing this choice never hands an element back and forth: the nodes that were boxes stay boxes, and the ones that were pictures stay pictures, so the canvas does not flicker. |
 | Keep these node types live | comma-separated node types | empty | Types never served from a picture, however far you zoom out. They keep the painted fill or draw live, and the readout counts them as "kept live on purpose", not as failures. |
 | Stand-in capture resolution | 0.25× · 0.5× · 1× · 2× · 3× | **1×** | Pixels per graph unit in the picture. Below 1× the picture is a quarter (0.25×) or a half (0.5×) of the node's size — that is what makes it cheap to hold a thousand of them, and it is drawn at that size, not at 1× with a smaller name. Half and quarter copies are still made for the screen. Zoomed in past the ratio a picture is softer than live drawing, which is why a node being worked at is never served from one. Changing this value re-captures and re-keys the disk files (see below). |
 | Stand-in memory (RAM) budget | 256 · 512 · 1024 · 2048 · 4096 · 8192 MiB | **4096 MiB** | How much RAM the pictures may hold. A full budget refuses a new capture rather than evicting a picture that is on screen (that is what flicker looks like). On Execute or Run-to-node, at 85 % system RAM the off-screen pictures leave memory; at 95 % all of them do. Disk files stay and are loaded back after the run. |
@@ -220,9 +220,15 @@ call, never latched:
   node's DOM, and a custom node may render a `<canvas>` for a viewport or a curve
   editor — is found by walking the node's element and drawn at the position the
   browser laid it out in, which is readable while the node is blanked because
-  `opacity: 0` keeps every box. Text is re-painted from the value the field holds
-  (page JavaScript cannot screenshot rendered text); a pack's own HTML stays blank
-  and is counted. Nothing is drawn twice, and the layout is read on a change
+  `opacity: 0` keeps every box. **Everything the node renders as text** — its title, its
+  widget labels and the values the frontend draws itself — is read out of the
+  DOM, string by string, with the box the browser laid each one out in and the
+  styles it computed for it, and re-painted there. Page JavaScript cannot
+  *screenshot* rendered text, but it can read every string, its position and its
+  font, which is what a stand-in needs; a field's *value* is drawn from the value
+  the field holds, as before. The content is clipped to the node's box **and its
+  title bar**, so the node's own name is in the picture rather than cut off above
+  it. A pack's own drawn HTML is still blank and counted. Nothing is drawn twice, and the layout is read on a change
   (the node's own size, the elements and their sources) rather than per frame:
   panning and zooming cost no read at all, because every number stored is
   node-local, and the periodic refresh is rationed to a few node layouts per
@@ -233,10 +239,13 @@ call, never latched:
   (220 + 8 + 4 px) taller than its graph size and puts the picture in that
   reserve, so a box built from `node.size` would clip off exactly the picture
   being looked for. The element's own rect is measured, divided by the zoom the
-  *element* is laid out at — measured from its own width, never read from
-  `canvas.ds.scale`, which a capture sets to 1 while the DOM keeps its
-  transform — so content lands where it belongs even in a capture taken
-  mid-zoom.
+  *element* is laid out at — read from the frontend's own transform pane
+  (`[data-testid=transform-pane]`, one computed matrix for the whole graph, and
+  the first answer), then from the element that carries the node's declared
+  width, then from the node's root, and only from `canvas.ds.scale` if nothing
+  about the DOM can be read at all (which the readout says, because a capture
+  sets that number to 1 while the DOM keeps the frontend's transform) — so
+  content lands where it belongs even in a capture taken mid-zoom.
 
 Nothing is hidden: the element is still there — slots, widgets, resize handles,
 the context menu — so clicking, dragging, selecting and link-dragging behave
@@ -248,7 +257,11 @@ zoom leaves the setting, the setting or the tool is switched off, or the
 renderer changes — the per-frame plan compares one boolean in the steady state,
 so a stale mark cannot be left behind, and an element the frontend unmounted
 mid-flight (it renders the whole pane with `v-if`) has the mark taken off it
-too, so a reused element does not come back invisible.
+too, so a reused element does not come back invisible. That plan asks the *same*
+predicate the draw loop does, in one function: a mode that is not a picture is
+not a reason to stop standing in, so nothing is handed back and forth while the
+setting rests — which is what a per-frame fight between the two would look like,
+nodes flickering between a box and the frontend's own rendering.
 
 **Pictures work here as well, and so do the disk files.** Below the threshold
 the idle lane builds a stand-in *picture* for each boxed node — not a
@@ -258,19 +271,27 @@ frontend mounts as DOM, and the node's own `<img>`/`<canvas>` elements at the
 rows the layout gave them) drawn into the same offscreen capture surface the
 canvas renderer uses. Everything downstream is therefore identical: the capture
 resolution ladder (0.25× → 3×), the half and quarter mip copies blitted on
-screen, the RAM budget, the disk cache and its `…r<ratio>t<theme>` key, and the
-files in `temp/ANTs_Frontend_Optimizer_THUMBNAILS/`. A picture made in one
-renderer is not reused in the other: switching renderers releases what was held
-and makes the pictures again. What stays impossible is a pack widget that is
+screen, the RAM budget, the disk cache and its key, and the files in
+`temp/ANTs_Frontend_Optimizer_THUMBNAILS/`. **The key names the pathway** —
+`…r<ratio>t<theme><pc|pv>`, canvas or Vue — because the two pictures are not
+interchangeable: one is a photograph of LiteGraph's own drawing, the other is
+this tool's drawing of the node's DOM. A picture made in one renderer is never
+reused in the other, in RAM or from disk: switching renderers releases what was
+held and makes the pictures again, and a file written before that token existed
+is re-made rather than served. **A node whose element is not on the page is
+never photographed** — the picture *is* that element, so what the tool could
+draw then is a bare box, and a bare box stored under the node's key would be
+served to every later frame as if it were the node. It is drawn as a box
+instead, and counted (`vueNoElement`). What stays impossible is a pack widget that is
 neither an image, a canvas nor plain text (its own HTML): it is blank in the
 picture and counted, exactly as in the canvas renderer.
 
 | Setting | In the Vue-nodes frontend |
 | --- | --- |
 | Replace node previews with bitmap stand-ins at zoom levels | **Works, as boxes.** Below the setting each node's element stops painting and the canvas draws its box; above it, every element is handed back. |
-| Stand-in (plain / title / title + state) | **Works** — the same box ladder, same marks, same colours, and no content drawn (that is what "plain" means here too). |
+| Stand-in (plain / title / title + state) | **Works** — the same box ladder, same marks, same colours, and no content drawn (that is what "plain" means here too). Choosing one of these instead of *picture* changes nothing else: the elements stay handed over and the boxes keep standing, frame after frame. |
 | Stand-in: *picture of the node* | **Works, drawn rather than photographed.** No browser API can draw a DOM element into a canvas, so a screenshot of a Vue node is impossible; the picture is instead *drawn* — the box at the picture level (title bar, error ring, progress, dimming) with the node's own content: the images and canvases the node renders (the frontend's preview `<img>` elements among them) at their real laid-out position, text fields re-painted, a pack's HTML blank and counted. Until the idle lane has that picture, the box carries the same content live. |
-| Capture resolution, RAM budget, disk cache | **Work.** The picture is made on the same idle lane, at the same resolution ladder, with the same mip chain, RAM budget and disk files (`temp/ANTs_Frontend_Optimizer_THUMBNAILS/`, keyed by signature + ratio + theme). Switching renderer releases the pictures the other renderer made and builds them again, because the box, the padding and the content route all differ. |
+| Capture resolution, RAM budget, disk cache | **Work.** The picture is made on the same idle lane, at the same resolution ladder, with the same mip chain, RAM budget and disk files (`temp/ANTs_Frontend_Optimizer_THUMBNAILS/`, keyed by signature + ratio + theme + pathway). Switching renderer releases the pictures the other renderer made and builds them again, because the box, the padding and the content route all differ. |
 | Keep these node types live | **Works** — a listed type is never blanked and stays in full detail at any zoom. |
 | Link shape, link thinning, Measure link thinning | **Work.** Links are still drawn by the canvas, so the 1 px/no-outline thinning and the straight-line style reach the ink exactly as in canvas mode. |
 | Idle redraw cap | **Works** — it caps the canvas redraws, nodes or not. |
@@ -553,7 +574,7 @@ short version:
 ## Development
 
 ```bash
-node tests/run-tests.mjs              # all tests — 204 passing, zero dependencies
+node tests/run-tests.mjs              # all tests — 209 passing, zero dependencies
 node tests/run-tests.mjs <substring>  # one suite or test
 python3 tests/test_init.py            # the Python side (routes, node contract)
 node tests/demo.mjs                   # prints what every tab says, against a synthetic graph

@@ -1,6 +1,6 @@
 # What works, what fails, and what was taken out
 
-An audit of the repository as of v2.6.3, done by reading the sources rather
+An audit of the repository as of v2.6.4, done by reading the sources rather
 than the docs, running the suites, and running the demo. Every claim below
 has a file and (where it matters) a line reference. Found defects were fixed
 in the same pass; retired ideas were removed rather than documented as if
@@ -9,9 +9,9 @@ they still existed.
 ## How this was checked
 
 ```bash
-node tests/run-tests.mjs        # 204 passing (172 before the stand-in passes; thirty-two added)
-node tests/run-tests.mjs "Nodes 2.0"        # the nineteen that cover that renderer
-node tests/run-tests.mjs "cache on disk"    # the five that cover the picture store
+node tests/run-tests.mjs        # 209 passing (172 before the stand-in passes; thirty-seven added)
+node tests/run-tests.mjs "Nodes 2.0"        # the twenty-six that cover that renderer
+node tests/run-tests.mjs "cache on disk"    # the six that cover the picture store
 node tests/run-tests.mjs "stand-in picture" # the five that cover what a picture holds
 python3 tests/test_init.py      # Ran 9 tests ... OK
 node tests/demo.mjs             # exit 0, prints every tab
@@ -280,14 +280,107 @@ frontend unmounted mid-flight (the whole pane is `v-if`) has its mark taken off
 too — the element the tool last dressed is remembered for exactly that — so an
 element Vue puts back later cannot come back invisible.
 
+**The seventh report: pictures that were boxes, and a canvas that flickered
+(v2.6.4).** Both defects named in it were reproduced or located in the sources
+before anything was changed.
+
+*In the Vue renderer the pictures now existed but "were captured box previews",
+and in the canvas workspace there were "cached boxes only, no proper
+stand-ins", which the tracker reported as in use.* Four causes, all fixed:
+
+1. **The picture had no text in it.** A box, a title bar and (at best) an image
+   is most of what a user calls a box. In this renderer the node's text *is* DOM
+   text and cannot be photographed — but every string, its laid-out box and the
+   styles the browser computed for it are readable while the node is blanked
+   (`opacity: 0` keeps the layout). `lodVueTextLines` reads them in the same
+   single measurement the media pass already made, capped at
+   `LOD_VUE_TEXT_MAX` = 16 lines of `LOD_VUE_TEXT_CHARS` = 80 characters, and
+   `lodVueTextInk` re-paints each one clipped to its own box. The node's title
+   is one of those lines — above the body, where the canvas draws a node's
+   title — so the content clip in `lodPaintNode` now covers the title bar as
+   well as the body; a clip on the body alone cut the node's name off its own
+   picture. The live box and the capture call one function
+   (`lodVueContentInk`) so the picture cannot drift from the box.
+2. **The zoom a measurement is divided by was read from the wrong place.** The
+   v2.6.3 rule was "the element's own width over the node's width in graph
+   units" — but the node's *root* element carries only `min-width`
+   (`g_LGraphNode.vue` gives only `min-width`; the declared width lives on
+   `[data-testid=node-inner-wrapper]`), so the root's width is whatever its
+   content needs rather than the width the frontend declared — and every number
+   derived from a measurement taken at the wrong zoom (the box height, the media
+   rows, the text) lands away from where it belongs. `lodVueDomScale` now asks in the order most likely to be
+   right: the transform pane's own computed matrix (`scale3d(z,z,z)`, m11 — one
+   number for the whole graph, written by `useTransformState.ts`), then the
+   element that carries the node's declared width, then the root, and only then
+   `canvas.ds.scale` — which a capture rewrites to 1 while the DOM keeps the
+   frontend's transform. The readout names which one answered
+   (`vueScale`/`vueScaleFrom`).
+3. **A capture with no element was a bare box, stored as the node's picture.**
+   The picture *is* the element; with it off the page (the frontend mounts only
+   what it renders, and re-renders replace elements) the capture could only
+   draw the box — and a box stored under the node's key is served to every
+   later frame as if it were the node. `lodSnapCaptureNode` now refuses
+   (`vueNoElement`), and the node keeps its live box until an element exists.
+4. **The disk key could not tell the two renderers apart.** The key was
+   `<signature>r<ratio>t<theme>`; the *signature* differed between pathways
+   (that is what the cache is keyed on in RAM) but a file written from a drawn
+   Vue picture could satisfy a canvas-renderer request and vice versa. The
+   pathway is now part of both — the signature mixes it, and the file name ends
+   `<pc|pv>` — so a picture is never served across renderers, and a file from
+   before the token is re-made instead of trusted. This is the mechanism behind
+   "cached boxes only" in the canvas workspace: the Vue-made box picture was
+   being served there.
+
+*Switching the stand-in mode to anything other than "picture of the node" made
+every node flicker between box and full preview across the canvas.* The frame
+plan and the draw loop asked two different questions: the plan wanted a
+*picture* (`LOD.snapOn`), the draw loop only needed the zoom
+(`lodFlatOn`). With any other mode the plan decided, every frame, that nothing
+stood in — handing every blanked element back at the top of the frame — and the
+draw loop blanked them again to paint the box, so any frame the frontend
+rendered in between showed the node in full. One predicate
+(`lodVuePathOn`) is now asked by both, and it deliberately does not mention the
+picture setting: a box *is* a stand-in. The plan is idempotent, so in the steady
+state it does nothing; the elements are handed back only when the pathway
+genuinely stops (the tool or the flatten zoom goes, the renderer changes, the
+node stops being flat). `/tmp` reproduction of the old behaviour, for the
+record: `cleared="setting"` and `vueRestored` +3 on *every* frame with the mode
+off — over a thousand redundant hand-backs a minute on a graph of three hundred
+nodes. The reading of the same counters in the fixed build is
+`cleared=""`, `vueRestored` unchanged, elements blanked, boxes drawn once per
+node per frame. (No new tests here beyond the ones below — this was already
+covered by the existing capture change tests.)
+
+Five tests added, one of them twice over (the refusal has two halves):
+
+* the node's own text — title and widget label — is painted in the live box and
+  in the stored picture, at the node-local position the browser laid it out in,
+  with the clip reaching into the title bar;
+* a node whose element is off the page gets a box and no picture, both when the
+  element never appeared and when it left between the blank and the idle lane;
+* a stand-in mode that is not a picture leaves the stand-ins standing (no
+  hand-back, no clear, no growth, the same boxes every frame) and switching back
+  to pictures captures again;
+* the zoom a picture is measured in follows the frontend's own transform pane
+  and the same node-local geometry comes out at 10 % and at 40 % zoom;
+* a picture drawn in one renderer is never served to the other, in either
+  direction.
+
+Mutation checks bind them: the plan requiring the picture setting → the
+mode test fails; the text route skipped → the text test fails; the zoom back to
+`canvas.ds.scale` → three tests fail (including the media-row ones); the
+pathway token dropped from the key → three fail; the no-element refusal removed
+→ the refusal test fails; the title-bar clip narrowed to the body → the text
+test fails; the text keeping the title-bar offset → the text test fails.
+
 **What is not verified.** The mechanism is verified against the frontend's
-sources and the harness (twenty-two tests now cover that renderer); it had not
+sources and the harness (twenty-six tests now cover that renderer); it had not
 been run against a live Vue-nodes page by this project when the fourth report
-arrived, and that report is exactly why the two defects above were invisible from
-here — the harness put a class on an element nothing rewrote, and it reported
-pictures "off" in that renderer as a *decision* rather than a bug. It has still
-not been run against a live page by this project: the user's page is the live
-test, and the size of the saving on a real heavy graph is not measured here — the
+arrived, and that report is exactly why the defects above were invisible from
+here — the harness put a class on an element nothing rewrote, it reported
+pictures "off" in that renderer as a *decision* rather than a bug, and it had no
+text in a node's element for a picture to omit. It has still not been run against
+a live page by this project: the user's page is the live test, and the size of the saving on a real heavy graph is not measured here — the
 tool's own frame budget and Stalls tab can measure it on the page. One honest nuance: while a node is blanked, its
 accessibility-tree entry is that of a blank element (`opacity: 0` keeps the
 elements rather than removing them).
@@ -410,22 +503,29 @@ apply, not just in the docs.
   other than the Node harness was executed in this pass.
 - **The Vue-nodes stand-in has not been run against a live page *by this
   project*.** It is verified against the frontend's sources and the harness
-  (twenty-two tests), and its failure modes are contained by construction (a box
+  (twenty-six tests), and its failure modes are contained by construction (a box
   only ever follows a real blanking, and every blanked element is handed back on
   the frame the setting stops applying) — but the user's page is the live test, and
-  it has already caught two defects this harness could not: a class that Vue
-  rewrote, and the picture half switched off as if it were a decision. The size of
-  the saving and the feel of a blanked-but-interactive node are things only a real
+  it has already caught four defects this harness could not: a class that Vue
+  rewrote, the picture half switched off as if it were a decision, a picture with
+  no text in it and a zoom measured off the wrong element, and — the seventh
+  report — a plan that fought the stand-in setting once per frame. The size of the
+  saving and the feel of a blanked-but-interactive node are things only a real
   heavy graph can show. The tool measures both: the frame budget, the Stalls tab
   and `lowZoom.snapshots.vueBlanked` / `vueBoxes` / `vueMedia` / `vueContent` /
-  `vueRestored` / `vueUnreached`.
-- **The Vue box's media positions come from layout**, read when the node's own
-  size changes and otherwise at most every 400 ms, with those refreshes rationed
-  per frame. A child that resizes with no signal at all (a font loading, a CSS
+  `vueText` / `vueScale` / `vueScaleFrom` / `vueRestored` / `vueCleared` /
+  `vueUnreached` / `vueNoElement`.
+- **The Vue box's media positions and its height come from layout**, read when the
+  node's own size changes and otherwise at most every 400 ms, with those refreshes
+  rationed per frame. Node-local numbers do not change with the camera (a pan is
+  not a change, and a zoom is caught by the ration), so a pan reads nothing at
+  all. A child that resizes with no signal at all (a font loading, a CSS
   animation) can therefore be drawn where it was for a while, and on a graph with
   hundreds of boxed nodes the ration spreads the refresh over a second or so. The
   alternative — reading layout every frame for every blanked node — is the cost
-  this whole feature exists to avoid. A capture always reads fresh.
+  this whole feature exists to avoid. A capture always reads fresh, and because
+  the box a capture draws is sized from that same read, a picture can never
+  disagree with the box it replaces.
 - **A pack whose preview is a canvas *widget* with no DOM** (unlike the frontend's
   own preview, which renders `<img>` elements inside the node) still has nothing on
   the page for a Vue box or a Vue picture to carry: `surfaces: { vueNode: 'never' }`

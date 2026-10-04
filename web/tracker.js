@@ -27,7 +27,7 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.6.3";
+const VERSION = "2.6.4";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
 // The class key ComfyUI stores in a workflow. The old key is still recognised so
 // a graph saved before the rename does not lose this node.
@@ -996,6 +996,10 @@ const LOD = {
   domOwners: null, // Map<element, record>: every node DOM element we may hide
   vueFlat: null, // Set of nodes whose Vue element this tool has blanked
   vueUnreached: 0, // nodes whose element could not be found to blank
+  vueNoElement: 0, // captures refused because the node's element was not on the page
+  vueScaleNow: 0, // the DOM zoom measured for the last node measurement
+  vueScaleFrom: "", // how it was measured: pane | inner | root | canvas
+  vueTextNow: 0, // text lines the boxes/captures read out of the node's own DOM
   vueElSeq: null, // WeakMap<element, serial>: what the signature uses to see a replaced element
   vueElNext: 0,
   vuePathway: "", // which pathway the held pictures were made for
@@ -1174,6 +1178,12 @@ const LOD_VUE_MEDIA_MS = 400;
 // worse than late. Captures read unconditionally — one layout per picture is
 // part of making the picture.
 const LOD_VUE_MEDIA_BUDGET = 6;
+// How much of a node's own rendered text one measurement may carry, and how long a
+// single string may be. A node's DOM text is its widget labels and values as the
+// frontend draws them; the cap keeps a node with a hundred spans (or one with a
+// 40 kB string in it) from turning the read into a walk of the whole subtree.
+const LOD_VUE_TEXT_MAX = 16;
+const LOD_VUE_TEXT_CHARS = 80;
 const LOD_INERT_CLASS = "ants-lod-inert"; // elements switched off while their node is inert
 // Below this zoom nobody can read a node, let alone use one, so its UI is
 // switched off rather than paid for on every pointer event.
@@ -1646,25 +1656,27 @@ function lodPaintNode(node, canvas, ctx, content, detailOverride, sizeOverride) 
   ctx.globalAlpha = alpha;
   ctx.fillStyle = fill;
   ctx.fillRect(0, 0, w, h);
+  // The title bar, where LiteGraph draws it: above the body, not inside it — and
+  // clamped so a short node does not become nothing but title.
+  const titleH = Math.min(LOD_BOX_TITLE_H, h * LOD_BOX_TITLE_MAX);
   if (drawable && detail !== LOD_BOX_DETAIL_DEFAULT) {
     if (alpha < 1) LOD.boxMuted++;
-    // The title bar, where LiteGraph draws it: above the body, not inside it —
-    // and clamped so a short node does not become nothing but title.
-    const titleH = Math.min(LOD_BOX_TITLE_H, h * LOD_BOX_TITLE_MAX);
     ctx.fillStyle = node.renderingColor || node.color || fill;
     ctx.fillRect(0, -titleH, w, titleH);
     LOD.boxTitles++;
   }
   // The node's own content, where the caller has some it can honestly draw. It
   // goes on the body, under the marks: an error ring or a progress bar is about
-  // the node, not part of its picture. Clipped to the node's own box, because
-  // that is how the node shows its content — nothing spills out of a node.
+  // the node, not part of its picture. Clipped to the node's own box — body *and*
+  // title bar, because in the Vue-nodes pathway the node's title is DOM text like
+  // any other and a clip on the body alone would cut it off the picture — so
+  // nothing spills out of a node either way.
   if (drawable && content) {
     try {
       if (typeof ctx.save === "function") ctx.save();
       if (typeof ctx.beginPath === "function" && typeof ctx.rect === "function" && typeof ctx.clip === "function") {
         ctx.beginPath();
-        ctx.rect(0, 0, w, h);
+        ctx.rect(0, -titleH, w, h + titleH);
         ctx.clip();
       }
       content();
@@ -3901,9 +3913,20 @@ function lodSnapLive(node, canvas) {
 // The saving is different too: not cheaper canvas drawing, but fewer node pixels
 // for the browser to paint, which is exactly where a zoomed-out heavy graph spends
 // its frame.
+// Is the Vue stand-in pathway doing anything this frame? **One answer, asked in
+// one place.** The draw loop asks it of every node it draws; the frame plan asks
+// it once for the whole set of blanked elements. The two disagreeing is not a
+// subtle bug on a live page — it is nodes flickering: the last time they did
+// (v2.6.0–v2.6.3, the plan demanded the *picture* setting while the draw loop only
+// needed the zoom) a non-picture stand-in mode handed every element back at the top
+// of every frame, the draw loop blanked them again and painted the boxes, and any
+// frame where the frontend rendered between the two showed the node in full.
+function lodVuePathOn(canvas) {
+  return !!(lodVueNodesMode() && lodFlatOn(canvas));
+}
+
 function lodVueFlatNode(node, canvas) {
-  if (!lodVueNodesMode()) return false;
-  if (!lodFlatOn(canvas)) return false;
+  if (!lodVuePathOn(canvas)) return false;
   if (!node) return false;
   if (node.flags && node.flags.collapsed) return false; // already a small box
   if (lodOwnNode(node)) return false; // the panel has to stay reachable
@@ -4020,6 +4043,77 @@ function lodVueElSeq(el) {
 // a distance in graph units. The read happens only when the node's own layout key
 // changes (zoom, position, size, the elements and their sources), so the steady
 // state costs nothing: a key comparison per drawn box, no layout read.
+// The zoom the frontend's DOM is *actually* laid out at. Measured, never assumed,
+// and measured in the order that is most likely to be right:
+//
+//   1. the transform pane's own computed matrix. The frontend writes
+//      `scale3d(z,z,z) translate3d(x,y,0)` on `[data-testid=transform-pane]`, so
+//      m11 of that matrix *is* the zoom. Exact, and independent of anything about
+//      the node — which is why it is the first answer;
+//   2. the element that carries the node's declared width,
+//      `[data-testid=node-inner-wrapper]` (`w-(--node-width)`), over the node's
+//      width in graph units. The node's *root* only has `min-width`, so its own
+//      width is whatever its content needs — a node whose content is wider or
+//      narrower than the graph size would make the root the wrong ruler;
+//   3. the root element over the node's graph width — the weakest answer, and the
+//      one this used to take for granted;
+//   4. `canvas.ds.scale` — and a capture *rewrites* that to 1 so the picture is
+//      zoom-free while the DOM keeps the transform the frontend gave it, so this
+//      is only used when nothing about the DOM could be measured at all.
+//
+// Getting this wrong is not cosmetic: every number a Vue box draws is a client-pixel
+// rect divided by this zoom. Divide a node's content by the wrong zoom and it is
+// drawn at the wrong size, somewhere outside the box, which is why a picture could
+// come out as a bare box.
+function lodVueMatrixScale(style) {
+  const t = style && style.transform;
+  if (!t || t === "none") return 0;
+  const m3 = /matrix3d\(([^)]+)\)/.exec(String(t));
+  const m2 = /matrix\(([^)]+)\)/.exec(String(t));
+  const m = m3 || m2;
+  if (!m) return 0;
+  const parts = m[1].split(",").map((v) => Number(String(v).trim()));
+  const sx = Math.abs(parts[0]);
+  return Number.isFinite(sx) && sx > 0 ? sx : 0;
+}
+
+function lodVuePaneScale() {
+  if (typeof document === "undefined" || typeof document.querySelector !== "function") return 0;
+  if (typeof getComputedStyle !== "function") return 0;
+  try {
+    const pane = document.querySelector('[data-testid="transform-pane"]');
+    if (!pane) return 0;
+    return lodVueMatrixScale(getComputedStyle(pane));
+  } catch (e) {
+    return 0;
+  }
+}
+
+function lodVueSaneScale(v) {
+  const n = Number(v);
+  return Number.isFinite(n) && n >= 0.01 && n <= 8 ? n : 0;
+}
+
+function lodVueDomScale(node, canvas, root, rect, wUnits) {
+  const canvasScale = lodVueSaneScale(Number(canvas && canvas.ds && canvas.ds.scale)) || 1;
+  const fromPane = lodVueSaneScale(lodVuePaneScale());
+  if (fromPane) return { scale: fromPane, from: "pane" };
+  const wpx = Number(rect && rect.width) || 0;
+  if (root && wUnits > 1 && typeof root.querySelector === "function") {
+    try {
+      const inner = root.querySelector('[data-testid="node-inner-wrapper"]');
+      const iw = Number(inner && inner.getBoundingClientRect && inner.getBoundingClientRect().width) || 0;
+      const ratio = lodVueSaneScale(iw / wUnits);
+      if (ratio) return { scale: ratio, from: "inner" };
+    } catch (e) {
+      /* no inner wrapper to measure: the root is the next best ruler */
+    }
+  }
+  const ratio = lodVueSaneScale(wpx / wUnits);
+  if (ratio) return { scale: ratio, from: "root" };
+  return { scale: canvasScale, from: "canvas" };
+}
+
 // One ration per frame, shared by every node asking for a backstop re-read.
 function lodVueMediaBudget() {
   const left = LOD.vueMediaLeft;
@@ -4027,6 +4121,120 @@ function lodVueMediaBudget() {
   if (left <= 0) return false;
   LOD.vueMediaLeft = left - 1;
   return true;
+}
+
+// The styles the browser computed for one text element, or honest fallbacks when
+// this page (or the test harness) cannot answer. The size is in CSS pixels, which
+// is also the node-local size: a font rendered at zoom z is z times as tall, and a
+// node-local unit is 1/z of a client pixel, so the two z's cancel.
+function lodVueTextStyle(el, boxH) {
+  let size = 0;
+  let color = "";
+  try {
+    if (typeof getComputedStyle === "function") {
+      const cs = getComputedStyle(el);
+      const fs = parseFloat(cs && cs.fontSize);
+      if (Number.isFinite(fs) && fs > 0 && fs < 64) size = fs;
+      const c = cs && cs.color;
+      if (c && typeof c === "string" && c !== "rgba(0, 0, 0, 0)") color = c;
+    }
+  } catch (e) {
+    /* the fallbacks below are the answer, not a guess about the theme */
+  }
+  if (!(size > 0)) size = Math.max(8, Math.min(16, Number(boxH) || 12));
+  const LG = typeof LiteGraph !== "undefined" && LiteGraph ? LiteGraph : null;
+  if (!color) color = (LG && LG.WIDGET_TEXT_COLOR) || "#DDD";
+  return { size, color };
+}
+
+// The text the frontend renders inside a node: widget labels, the values it draws
+// itself, the title, badges. In this renderer that text is DOM text, and no browser
+// API screenshots it — but every string, its laid-out box and the styles the
+// browser computed for it *are* readable, and painting them with the canvas is what
+// makes a Vue stand-in look like the node instead of like a coloured rectangle.
+//
+// Read in the same pass as the node's media, from the same single measurement:
+// node-local units, so the draw itself is a handful of fillText calls and costs
+// nothing per frame.
+function lodVueTextLines(root, rr, domScale, title) {
+  const out = [];
+  try {
+    const els = root.querySelectorAll("*") || [];
+    for (const el of els) {
+      if (out.length >= LOD_VUE_TEXT_MAX) break;
+      const tag = String((el && el.tagName) || "").toUpperCase();
+      if (tag === "IMG" || tag === "CANVAS") continue; // drawn as pictures
+      // A field's *value* is not its text: the widget pass owns those, and the
+      // default content of a textarea would be yesterday's value.
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") continue;
+      if (el.children && el.children.length) continue; // a leaf is where the text is
+      let raw = "";
+      try {
+        raw = String(el.textContent == null ? "" : el.textContent);
+      } catch (e) {
+        raw = "";
+      }
+      raw = raw.replace(/\s+/g, " ").trim();
+      if (!raw) continue;
+      if (raw.length > LOD_VUE_TEXT_CHARS) raw = raw.slice(0, LOD_VUE_TEXT_CHARS);
+      let r = null;
+      try {
+        r = typeof el.getBoundingClientRect === "function" ? el.getBoundingClientRect() : null;
+      } catch (e) {
+        r = null;
+      }
+      const w = Number(r && r.width) / domScale;
+      const h = Number(r && r.height) / domScale;
+      if (!(w > 1) || !(h > 1)) continue; // hidden, collapsed or not laid out yet
+      const x = (Number(r.left) - Number(rr.left)) / domScale;
+      const y = (Number(r.top) - Number(rr.top)) / domScale - title;
+      if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+      const style = lodVueTextStyle(el, h);
+      out.push({ text: raw, x, y, w, h, size: style.size, color: style.color });
+    }
+  } catch (e) {
+    /* text that cannot be read leaves the box as it was */
+  }
+  return out;
+}
+
+// Paint those lines. Each is clipped to the element's own box — a browser clips a
+// long label to its element too — and drawn on the middle of that box, which is
+// where a single line of text sits in it.
+function lodVueTextInk(ctx, lines, out) {
+  if (!ctx || !lines || !lines.length) return 0;
+  const LG = typeof LiteGraph !== "undefined" && LiteGraph ? LiteGraph : null;
+  const family = (LG && LG.NODE_FONT) || "Arial";
+  let drew = 0;
+  for (const it of lines) {
+    try {
+      if (typeof ctx.save === "function") ctx.save();
+      if (typeof ctx.beginPath === "function" && typeof ctx.rect === "function" && typeof ctx.clip === "function") {
+        ctx.beginPath();
+        ctx.rect(it.x, it.y, it.w, it.h);
+        ctx.clip();
+      }
+      ctx.fillStyle = it.color;
+      ctx.font = `${Math.max(6, Math.min(48, Number(it.size) || 12))}px ${family}`;
+      ctx.textAlign = "left";
+      if ("textBaseline" in ctx) ctx.textBaseline = "middle";
+      if (typeof ctx.fillText === "function") ctx.fillText(it.text, it.x + 2, it.y + it.h / 2);
+      if (typeof ctx.restore === "function") ctx.restore();
+      if (out) {
+        out.ink = (out.ink || 0) + 1;
+        out.text = (out.text || 0) + 1;
+      }
+      drew++;
+    } catch (e) {
+      try {
+        if (typeof ctx.restore === "function") ctx.restore();
+      } catch (e2) {
+        /* nothing left to restore */
+      }
+      if (out) out.skipped = (out.skipped || 0) + 1;
+    }
+  }
+  return drew;
 }
 
 function lodVueRootMetrics(node, canvas, force) {
@@ -4068,17 +4276,15 @@ function lodVueRootMetrics(node, canvas, force) {
   } catch (e) {
     rr = null;
   }
-  // The zoom the *element* is actually laid out at, measured rather than assumed:
-  // the element's own width over the node's width in graph units. `canvas.ds.scale`
-  // is not that number during a capture — a capture sets the canvas scale to 1 so
-  // the picture is zoom-free, while the DOM keeps whatever transform the frontend
-  // gave it — and dividing a client-pixel rect by the wrong zoom puts the picture
-  // somewhere else entirely (an image measured at 10% zoom and divided by 1 drew a
-  // tenth of its size, off the top edge of the box).
-  let domScale = scale;
-  const wpx = Number(rr && rr.width) || 0;
-  if (wpx > 1 && wUnits > 1) domScale = wpx / wUnits;
-  if (!(domScale > 0) || !Number.isFinite(domScale)) domScale = scale;
+  // The zoom the *element* is actually laid out at — see lodVueDomScale. Nothing
+  // here reads `canvas.ds.scale` unless the DOM itself could not be measured: a
+  // capture sets that to 1 while the DOM keeps the transform the frontend gave it,
+  // and dividing a client-pixel rect by the wrong zoom puts the content at the
+  // wrong size, outside the box it belongs in.
+  const measured = lodVueDomScale(node, canvas, root, rr, wUnits);
+  const domScale = measured.scale;
+  LOD.vueScaleNow = domScale;
+  LOD.vueScaleFrom = measured.from;
   const items = [];
   let boxH = 0;
   if (rr) {
@@ -4111,7 +4317,8 @@ function lodVueRootMetrics(node, canvas, force) {
       items.push({ el, x, y, w, h });
     }
   }
-  const rec = { root, key, scale: domScale, at: now, items, boxH };
+  const texts = rr ? lodVueTextLines(root, rr, domScale, title) : [];
+  const rec = { root, key, scale: domScale, at: now, items, boxH, texts };
   cache.set(node, rec);
   return rec;
 }
@@ -4162,30 +4369,10 @@ function lodVueCapturePaint(node, canvas, ctx) {
       node,
       canvas,
       ctx,
-      () => {
-        lodSnapDomInk(node, ctx, canvas, out);
-        const boxes = metrics ? metrics.items : null;
-        if (boxes) {
-          for (const it of boxes) {
-            const el = it.el;
-            if (out.els.indexOf(el) >= 0) continue;
-            const wpx = Number(el.naturalWidth || el.width) || 0;
-            const hpx = Number(el.naturalHeight || el.height) || 0;
-            if (!(wpx > 0) || !(hpx > 0)) {
-              out.skipped++;
-              continue;
-            }
-            try {
-              ctx.drawImage(el, it.x, it.y, it.w, it.h);
-              out.ink++;
-              out.media = (out.media || 0) + 1;
-              if (out.els.indexOf(el) < 0) out.els.push(el);
-            } catch (e) {
-              out.skipped++;
-            }
-          }
-        }
-      },
+      // The same ink the live box paints, through the same function — the picture
+      // is what the box would have drawn, frozen. The measurement above filled the
+      // cache this reads, so it is one pass, not two.
+      () => lodVueContentInk(node, canvas, ctx, out),
       LOD_BOX_DETAIL[2],
       size
     );
@@ -4204,14 +4391,31 @@ function lodVueCapturePaint(node, canvas, ctx) {
 // API draws a DOM element into a canvas, so the parts that are neither an image,
 // a canvas nor a plain string stay blank and are counted.
 function lodVueBoxContent(node, canvas, ctx) {
-  const out = { ink: 0, text: 0, skipped: 0, els: [] };
-  // 1. The widgets that carry their own element (a prompt's textarea and anything
-  //    a pack added), at the row geometry the frontend positions them by.
+  const out = lodVueContentInk(node, canvas, ctx);
+  if (out.ink) LOD.vueContentNow += out.ink;
+  if (out.media) LOD.vueMediaNow += out.media;
+  if (out.text) LOD.vueTextNow += out.text;
+  return out.ink;
+}
+
+// Everything a Vue node's content is made of, in one place, so the live box and the
+// picture drawn for it can never drift apart. Three routes, in the order a browser
+// would paint them:
+//
+//   1. the text the frontend renders inside the node — labels and values it draws
+//      itself, the title, badges — re-painted from the strings the DOM holds, at
+//      the positions the browser laid them out in;
+//   2. the widgets that carry their own element (a prompt's textarea and anything a
+//      pack added), at the row geometry the frontend positions them by;
+//   3. the node's own rendered pictures and canvases, at the position the browser
+//      laid them out in. What an earlier route already drew is skipped, so nothing
+//      is drawn twice.
+function lodVueContentInk(node, canvas, ctx, into) {
+  const out = into || { ink: 0, text: 0, skipped: 0, els: [] };
+  const metrics = lodVueRootMetrics(node, canvas);
+  if (metrics) lodVueTextInk(ctx, metrics.texts, out);
   lodSnapDomInk(node, ctx, canvas, out);
-  // 2. The node's own rendered pictures and canvases, at the position the browser
-  //    laid them out in. What the widget route already blitted is skipped, so an
-  //    image is never drawn twice.
-  const boxes = lodVueMediaBoxes(node, canvas);
+  const boxes = metrics ? metrics.items : null;
   if (boxes) {
     for (const it of boxes) {
       const el = it.el;
@@ -4231,9 +4435,7 @@ function lodVueBoxContent(node, canvas, ctx) {
       }
     }
   }
-  if (out.ink) LOD.vueContentNow += out.ink;
-  if (out.media) LOD.vueMediaNow += out.media;
-  return out.ink;
+  return out;
 }
 
 // Hand every blanked element back. Called when the zoom leaves the setting, when
@@ -4259,8 +4461,10 @@ function lodVueUnblankAll(reason) {
 function lodVueFramePlan(canvas) {
   LOD.vueContentNow = 0; // gauges of the last frame, not running totals
   LOD.vueMediaNow = 0;
+  LOD.vueTextNow = 0;
   LOD.vueMediaLeft = LOD_VUE_MEDIA_BUDGET; // this frame's layout-read ration
-  const flat = !!(S.enabled && LOD.snapOn && LOD.flatBelow > 0 && lodVueNodesMode() && lodFlatOn(canvas));
+  // The same predicate the draw loop uses, not a second opinion about it.
+  const flat = lodVuePathOn(canvas);
   const prev = LOD.vueFlatOn;
   LOD.vueFlatOn = flat;
   const set = LOD.vueFlat;
@@ -4621,6 +4825,13 @@ function lodSnapSignature(node, canvas) {
   //   * the camera: position, pan and zoom. A node does not change because you
   //     looked at it from somewhere else, and a pan is exactly when these
   //     pictures are worth having.
+  // The renderer is part of the signature, not an accident of it: in the canvas
+  // renderer a picture is LiteGraph's own drawing, in the Vue renderer it is this
+  // tool's drawing of the node's DOM, and the two are different pictures in every
+  // way that matters (box, padding, content route). Mixing the pathway in means a
+  // picture made in one can never be trusted in the other, whatever order the user
+  // switches renderers in.
+  str(lodVueNodesMode() ? "pathway-vue" : "pathway-canvas");
   void canvas;
   return (h >>> 0).toString(36);
 }
@@ -5395,6 +5606,18 @@ function lodSnapCaptureNode(node, canvas) {
     return false;
   }
   if (lodSnapLive(node, canvas)) return false; // nothing to capture: it is being drawn live
+  if (lodVueNodesMode() && !lodVueRootEl(node)) {
+    // In this renderer a picture *is* the node's DOM: the box, its text and the
+    // elements it renders. With the element off the page (the frontend mounts only
+    // what it renders, and a node can be between renderers) the capture would be a
+    // bare box — and a bare box stored under this node's key is served to every
+    // later frame as if it were a picture of the node, which is exactly the
+    // "cached boxes" a user should never see. Refused, counted, and left
+    // un-pictured so a later slice can do it properly once the element is back.
+    LOD.vueNoElement++;
+    lodSnapNoteWhy(node, "element not on the page");
+    return false;
+  }
   const geom = lodSnapGeometry(node, canvas);
   if (!geom) return false;
   const want = Number(LOD.snapRatio) || LOD_SNAP_RATIO_DEFAULT;
@@ -5826,14 +6049,28 @@ function lodSnapThemeToken() {
 function lodSnapDiskSig(node, canvas, ratio) {
   const base = lodSnapSignature(node, canvas);
   if (!base) return "";
-  return `${base}r${lodSnapRatioToken(ratio)}t${lodSnapThemeToken()}`;
+  // …plus the pathway, spelled out at the end of the key. The signature already
+  // mixes it, but a key is read by humans and by the server's own bookkeeping, and
+  // the failure this prevents is worth naming: a *drawn* Vue picture and a
+  // *photographed* canvas picture are different pictures, and a file written by one
+  // must never be served to the other. A file whose key predates this token is read
+  // as a miss (lodSnapDiskRatio answers the default ratio, and the ask includes the
+  // token) and is re-made, exactly like the pre-2.5.6 files with no ratio in them.
+  return `${base}r${lodSnapRatioToken(ratio)}t${lodSnapThemeToken()}${lodSnapPathwayToken()}`;
+}
+
+// Which pathway a file was written in: "pc" for the canvas renderer, "pv" for the
+// Vue-nodes renderer. One character, because it rides in a file name.
+function lodSnapPathwayToken() {
+  return lodVueNodesMode() ? "pv" : "pc";
 }
 
 // The ratio a stored file was drawn at, read back out of its own key. A file
-// whose key has no ratio token (written before this existed) reads as the default
-// and is re-made on the next capture rather than trusted.
+// whose key has no ratio token (written before this existed) — or no pathway token
+// (written before v2.6.4) — reads as the default and is re-made on the next
+// capture rather than trusted.
 function lodSnapDiskRatio(sig) {
-  const m = /r([0-9]+(?:\.[0-9]+)?)t[0-9a-z]+$/.exec(String(sig || ""));
+  const m = /r([0-9]+(?:\.[0-9]+)?)t[0-9a-z]+(?:p[vc])?$/.exec(String(sig || ""));
   const r = m ? Number(m[1]) : 0;
   return LOD_SNAP_RATIOS.indexOf(r) >= 0 ? r : LOD_SNAP_RATIO_DEFAULT;
 }
@@ -10103,8 +10340,13 @@ function buildTweaksTab(container) {
                 `spends its frame. ` +
                 (lodSnapBitmaps() && LOD.snaps && LOD.snaps.size
                   ? `Pictures are made here too (${LOD.snaps.size} held): the tool draws the box and the node's own content into the capture surface, so the ` +
-                    `capture resolution, the mip chain and the disk cache all apply. What no browser API can do is photograph the element itself, so a pack's ` +
-                    `widget that is neither an image, a canvas nor plain text is left blank in the picture and counted`
+                    `capture resolution, the mip chain and the disk cache all apply. The content is what could be read out of the node's own DOM — the text the ` +
+                    `frontend renders (${LOD.vueTextNow} lines on the last frame), the images and canvases it renders, and the widgets that carry an element; a ` +
+                    `pack's widget that is none of those is left blank in the picture and counted` +
+                    (LOD.vueScaleFrom === "canvas"
+                      ? `. The DOM zoom could not be measured on this page (no transform pane and no readable node element), so it is being taken from the ` +
+                        `canvas scale — if the boxes look wrong, that is why`
+                      : "")
                   : `Pictures, the capture resolution and the disk cache work here too — the tool draws the box and the node's own content into the capture ` +
                     `surface, since no browser API photographs the element itself; switch the stand-ins on to make them`)
               : "")
@@ -12937,6 +13179,15 @@ function installDebugApi() {
             vueContent: LOD.vueContentNow,
             vueMedia: LOD.vueMediaNow,
             vueUnreached: LOD.vueUnreached,
+            // What a Vue stand-in could actually read out of the node: the text
+            // lines drawn on the last frame, the zoom the DOM measurement was taken
+            // at and how it was taken (pane matrix, the element that carries the
+            // node's declared width, the node's root, or — the weakest answer, used
+            // only when nothing about the DOM could be read — the canvas scale).
+            vueText: LOD.vueTextNow,
+            vueScale: Math.round((Number(LOD.vueScaleNow) || 0) * 1000) / 1000,
+            vueScaleFrom: LOD.vueScaleFrom || "",
+            vueNoElement: LOD.vueNoElement,
             vueBoxes: LOD.vueBoxes,
             vueRestored: LOD.vueRestored,
             vueCleared: LOD.vueCleared,

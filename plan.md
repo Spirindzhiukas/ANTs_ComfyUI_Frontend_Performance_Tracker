@@ -304,6 +304,19 @@ Vue rewrites the element's `class` and `style` on every re-render, and the
 capture/ratio/budget/disk half is **not** idle in this renderer — a picture is
 *drawn* into the capture surface (`lodVueCapturePaint`), so the ratio ladder, the
 mips, the RAM budget and the disk files behave exactly as in the canvas renderer.
+**v2.6.4 closed the two defects the seventh report named.** A picture now carries
+the node's own text (read out of the DOM — every string, its box and its computed
+styles — and re-painted, title included, with the content clip reaching into the
+title bar), the zoom it is measured in comes off the frontend's own transform pane
+first and `canvas.ds.scale` only as a last resort, a capture whose element is not
+on the page is refused rather than stored as a bare box, and the pathway is part
+of the picture's signature *and* of its file name (`…<pc|pv>`) so neither
+renderer can ever be served the other's picture. The flicker was the frame plan
+and the draw loop asking two different questions: the plan wanted the picture
+setting, the draw loop only the zoom, so with any other stand-in mode the plan
+handed the whole set of elements back every frame while the draw loop blanked
+them again. One predicate (`lodVuePathOn`) is asked by both now, and a box counts
+as standing in.
 
 What the boxes carry (v2.6.1, completed in v2.6.2, made to work in v2.6.3): the
 node's own content, drawn live from the two routes it takes to the page —
@@ -327,12 +340,19 @@ the live frame context for every blanked node, which is exactly the per-frame
 cost this pathway exists to remove.
 
 Open, and deliberately not guessed at: **how much this saves on a real heavy
-Vue-nodes graph — and whether the v2.6.3 fixes are enough on the user's own page.**
-The four live reports so far (v2.5.6 pictures with no content; v2.6.0 "nothing in
+Vue-nodes graph — and whether the v2.6.3/v2.6.4 fixes are enough on the user's own
+page.** Each report has been a state the harness could model only after the fact:
+a class Vue rewrote, a picture half that was off, a picture with no text in it, a
+plan fighting the setting once per frame. The user's page remains the live test.
+The five live reports so far (v2.5.6 "pictures with no content"; v2.6.0 "nothing in
 Nodes 2.0"; v2.6.2 "only text nodes have content"; v2.6.3 "no pictures and no disk
-files at all") each found something the harness could not, and the harness has been
-strengthened by each one — the last pass added a Vue re-render that rewrites
-`className`, an `isConnected` that tells the truth, and the element's real height.
+files at all"; v2.6.4 "captured box previews, cached boxes in the canvas workspace,
+and a canvas that flickers when the stand-in mode is not pictures") each found
+something the harness could not, and the harness has been strengthened by each one
+— the last pass added a Vue re-render that rewrites `className`, an `isConnected`
+that tells the truth, the element's real height, the frontend's transform pane (so
+the DOM zoom is exercised the way the page writes it) and a `getComputedStyle`
+that resolves transforms the way a browser reports them.
 A stand-in picture in this renderer is drawn, not photographed. The frontend composites all nodes in one transformed container
 (O(1) pan/zoom by design — `useTransformState.ts`), so the saving is node pixels,
 not transform work, and only a live page can price it. The tool's own frame

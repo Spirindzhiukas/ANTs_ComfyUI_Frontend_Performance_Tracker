@@ -28,7 +28,7 @@ this is going. Read the golden rules before the code.
 ## Commands
 
 ```bash
-node tests/run-tests.mjs              # all 204 tests — must be green before any commit
+node tests/run-tests.mjs              # all 209 tests — must be green before any commit
 node tests/run-tests.mjs <substring>  # one suite/test, e.g. ... pill
 python3 tests/test_init.py            # the Python side (route parsing, node contract)
 node tests/demo.mjs                   # prints what the panel says against a synthetic graph
@@ -197,27 +197,51 @@ Seams worth knowing:
 - `lodVueBoxContent` gives a Vue box the node's own content when the stand-in is
   *picture of the node*, from the two routes content takes to the page:
   `lodSnapDomInk` for widget-borne elements (textarea values re-painted, img and
-  canvas blitted) and `lodVueRootMetrics` for what the node renders itself
+  canvas blitted), `lodVueRootMetrics` for what the node renders itself
   (`img`/`canvas` children of the node's element, drawn at their laid-out
-  position — `(childRect - rootRect)/zoom` in graph units, minus the title bar).
+  position — `(childRect - rootRect)/zoom` in graph units, minus the title bar)
+  and `lodVueTextLines`/`lodVueTextInk` for its **text** (v2.6.4: every leaf string
+  with its laid-out box and computed font/colour, at most `LOD_VUE_TEXT_MAX` lines
+  of `LOD_VUE_TEXT_CHARS` characters, each clipped to its own box — a picture of a
+  Vue node without its labels read as a box). `lodVueContentInk` is the one place
+  the live box and the capture both draw from, so they cannot drift apart.
   `lodPaintNode` takes optional `content` / `detailOverride` / `sizeOverride` and
-  clips content to the node's box; the canvas renderer passes none of them. Gauges:
-  `lowZoom.snapshots.vueContent` / `.vueMedia`.
+  clips content to the node's box **and its title bar** (a DOM node's title is
+  content like any other, and a clip on the body alone cut it off the picture);
+  the canvas renderer passes none of them. Gauges: `lowZoom.snapshots.vueContent`
+  / `.vueMedia` / `.vueText`.
   Three things here are load-bearing, learned the hard way in v2.6.3:
   (1) **the box is `lodVueBoxSize`** — the element's measured box, not `node.size`
   (`LGraphNode.vue` renders image nodes `IMAGE_PREVIEW_HEIGHT_RESERVE` = 232 px
   taller than their graph size and puts the picture in the overhang);
-  (2) **the zoom is measured from the element's own width**, never read from
-  `canvas.ds.scale` — a capture sets that to 1 while the DOM keeps its transform,
-  and dividing client pixels by the wrong zoom puts the content outside its box;
+  (2) **the zoom is measured, in one order** (`lodVueDomScale`): the transform
+  pane's own computed matrix first (one matrix for the whole graph, written by
+  `useTransformState.ts` — m11 is the zoom), then `[data-testid=node-inner-wrapper]`
+  (the element that carries the node's declared width — the root has only
+  `min-width`, so its own width is whatever its content needs), then the root, and
+  `canvas.ds.scale` only when nothing about the DOM can be read. That last one is
+  why this matters: a capture sets it to 1 while the DOM keeps its transform, and
+  dividing client pixels by the wrong zoom puts the content outside its box. The
+  readout names the answer: `lowZoom.snapshots.vueScale` / `.vueScaleFrom`;
   (3) **the cache key is the node's own size only** — every stored number is
   node-local, so a pan or a zoom must cost *no* layout read (a key that included
   them meant one forced layout per boxed node per frame while the user dragged),
   and the 400 ms backstop refresh is rationed by `LOD_VUE_MEDIA_BUDGET` per frame.
-  Elements the widget route drew are skipped, so nothing is drawn twice. If you
-  touch this, keep it that way: a photograph of a DOM element is impossible (no
-  browser API), and the harness shim supports `el._rect`, `h.rectReads` and
-  `vue.growRoot()` for testing layout.
+  Elements the widget route drew are skipped, so nothing is drawn twice.
+  **The plan and the draw loop ask one predicate** (`lodVuePathOn`): if the plan
+  ever asks a *narrower* question than the draw loop — as it did while it required
+  `LOD.snapOn` — it hands every blanked element back at the top of every frame
+  while the draw loop blanks it again, and the user sees the whole canvas flicker
+  (v2.6.4). A box is a stand-in; the picture setting decides what the box is made
+  of, not whether anything stands in. **A capture with no element on the page is
+  refused** (`vueNoElement`), because a bare box stored under the node's key is
+  served to every later frame as if it were the node. **The pathway is part of a
+  picture**: it is mixed into the signature and appended to the disk key
+  (`lodSnapPathwayToken`, `…<pc|pv>`), so neither renderer is ever served the
+  other's picture — RAM or file. If you touch this, keep it that way: a photograph
+  of a DOM element is impossible (no browser API), and the harness shim supports
+  `el._rect`, `h.rectReads`, `getComputedStyle` (display/pointer-events/transform
+  matrix/font/colour) and `vue.growRoot()` for testing layout.
 
 Rules for tests:
 

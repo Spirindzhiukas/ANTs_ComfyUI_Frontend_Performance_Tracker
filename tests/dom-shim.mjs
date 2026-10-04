@@ -228,6 +228,12 @@ class Node {
         tests.push((n) => n._cls && n._cls.has(cls[1]));
         continue;
       }
+      // The universal selector: how a walk of a node's own subtree starts when the
+      // walker cannot use `children` (a widget element is not always an element).
+      if (part === "*") {
+        tests.push(() => true);
+        continue;
+      }
       // Tag names, one or a comma-separated list: what the tracker asks for when
       // it looks inside a widget's element (`img,canvas`, `video`) — the shapes
       // the real DOM offers and the wrapper cases the docs describe.
@@ -257,6 +263,47 @@ class Node {
     }
     return out;
   }
+}
+
+// What the page's own computed style would say, as far as anything here reads it:
+// whether a marked element is really off (the two rules this tool's stylesheet
+// writes: a boxed element is `display: none`, an inert one does not answer
+// pointers), and the font/colour of a text element. Anything a test set inline
+// wins, exactly as it does in a browser.
+// `getComputedStyle().transform` in a browser is the *resolved* matrix, not the
+// string that was written, and everything that reads it depends on that: the
+// frontend writes `scale3d(z,z,z) translate3d(x,y,0)` and the tool reads m11 as the
+// zoom. Resolving the handful of forms the frontend actually writes keeps the shim
+// honest about the one number being measured.
+function resolveTransform(t) {
+  const src = String(t || "").trim();
+  if (!src || src === "none") return "none";
+  if (/^matrix3?\(/.test(src)) return src; // already resolved
+  const s3 = /scale3?d?\(\s*([-0-9.]+)/.exec(src);
+  const s1 = /scale\(\s*([-0-9.]+)/.exec(src);
+  const m1 = s3 ? Number(s3[1]) : s1 ? Number(s1[1]) : 0;
+  const s = Number.isFinite(m1) && m1 ? m1 : 0;
+  if (!s) return "matrix(1, 0, 0, 1, 0, 0)";
+  const tr3 = /translate3d\(\s*([-0-9.]+)px,\s*([-0-9.]+)px/.exec(src);
+  const tr2 = /translate\(\s*([-0-9.]+)px(?:,\s*([-0-9.]+)px)?/.exec(src);
+  const tx = Number((tr3 ? tr3[1] : tr2 ? tr2[1] : 0)) || 0;
+  const ty = Number((tr3 ? tr3[2] : tr2 && tr2[2] ? tr2[2] : 0)) || 0;
+  return `matrix3d(${s}, 0, 0, 0, 0, ${s}, 0, 0, 0, 0, ${s}, 0, ${tx}, ${ty}, 0, 1)`;
+}
+
+export function computedStyle(el) {
+  const cls = el && el._cls ? el._cls : new Set();
+  const style = (el && el.style) || {};
+  return {
+    display: style.display || (cls.has("ants-lod-box") ? "none" : "block"),
+    visibility: style.visibility || "visible",
+    opacity: style.opacity || "1",
+    pointerEvents: style.pointerEvents || (cls.has("ants-lod-inert") ? "none" : "auto"),
+    transform: resolveTransform(style.transform),
+    fontSize: style.fontSize || "12px",
+    color: style.color || "rgb(220, 220, 230)",
+    fontFamily: style.fontFamily || "Arial",
+  };
 }
 
 export function createDocument(options = {}) {
