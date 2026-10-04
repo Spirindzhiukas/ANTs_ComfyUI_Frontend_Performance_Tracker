@@ -6,7 +6,7 @@ for: *which extension's JavaScript is actually costing me frames while I pan
 this graph, and what is eating main-thread time that no draw hook owns?* —
 without opening DevTools and without restarting ComfyUI to bisect.
 
-Version **2.6.6**. Everything runs from page load: no node has to be placed,
+Version **2.6.7**. Everything runs from page load: no node has to be placed,
 nothing executes, and the tool never changes your graph or your workflows.
 
 - **Measure** — per-extension and per-node-type frame cost, canvas draw
@@ -329,13 +329,27 @@ the idle lane builds a stand-in *picture* for each boxed node — not a
 screenshot of the element, which no browser API can make, but the same drawing
 the live box makes (the box, its title bar and state marks, the node's structure
 read out of the DOM — surface, header, body panel, slot dots — every widget's own
-row, drawn with the box, border and radius the browser gave it, the widget text the
+row, drawn with the box, border and radius the browser gave it — and the reader
+is sized for a real node rather than a fixture: 256 text lines, 400 characters per
+string, 96 widget elements, 128 structural boxes and 96 slot dots, the widget text the
 frontend mounts as DOM, and the node's own `<img>`/`<canvas>` elements at the
 rows the layout gave them) drawn into the same offscreen capture surface the
 canvas renderer uses. **A node is only photographed once it has stood still**: a
 settle window (300 ms) opens when a node is first drawn as a stand-in and re-opens
 on every change the page reports or the signature notices, so a burst of rendering
-costs one picture at the end of it instead of one picture per step. That is the
+costs one picture at the end of it instead of one picture per step. The window
+is a grace period and not a veto: a node that keeps changing past
+`LOD_SNAP_SETTLE_MAX_MS` (900 ms, measured from the first change of the burst) is
+photographed anyway. **And a change no longer takes the picture away**: what is on
+screen is a complete picture of the moment before, so it stays there while its
+replacement is made — a node whose value changed used to fall back to a plain box
+until the new picture arrived, and a node whose value changes often was never
+anything but a box (measured: 1020 of 1800 frames on a 24-node graph at the zoom
+this feature is for, against 17 now). A node still out of date after 2 s (it is
+changing faster than the lane can photograph it) gets its box back for 2 s and
+keeps being asked; a capture that turns out slower than 60 ms buys a doubling
+cooldown (10 s, 20 s, 40 s …, capped at 120 s) rather than blocking that node for
+the session — the readout counts the cooldowns and says when the next try is. That is the
 answer to a node being photographed while the frontend was still filling it in —
 the frontend mounts a node and then writes its parts over the following frames,
 and an image is decoded when it is decoded, so "capture immediately" is a picture
@@ -656,7 +670,7 @@ short version:
 ## Development
 
 ```bash
-node tests/run-tests.mjs              # all tests — 220 passing, zero dependencies
+node tests/run-tests.mjs              # all tests — 222 passing, zero dependencies
 node tests/run-tests.mjs <substring>  # one suite or test
 python3 tests/test_init.py            # the Python side (routes, node contract)
 node tests/demo.mjs                   # prints what every tab says, against a synthetic graph

@@ -1,6 +1,6 @@
 # What works, what fails, and what was taken out
 
-An audit of the repository as of v2.6.6, done by reading the sources rather
+An audit of the repository as of v2.6.7, done by reading the sources rather
 than the docs, running the suites, and running the demo. Every claim below
 has a file and (where it matters) a line reference. Found defects were fixed
 in the same pass; retired ideas were removed rather than documented as if
@@ -9,7 +9,7 @@ they still existed.
 ## How this was checked
 
 ```bash
-node tests/run-tests.mjs        # 220 passing (172 before the stand-in passes; forty-eight added)
+node tests/run-tests.mjs        # 222 passing (172 before the stand-in passes; fifty added)
 node tests/run-tests.mjs "Nodes 2.0"        # the thirty-seven that cover that renderer
 node tests/run-tests.mjs "cache on disk"    # the six that cover the picture store
 node tests/run-tests.mjs "stand-in picture" # the five that cover what a picture holds
@@ -583,6 +583,65 @@ opened, the structure reader reduced to the frame, the widget row's surface not
 read, the widget rows not drawn, the slot-dot pointer exception removed — and
 **all ten are caught**.
 
+**The tenth report (v2.6.7): the picture was being taken away from the node, and
+the reader was sized for a fixture.** The page snapshot — 75 nodes at 42 % zoom,
+fps 83 with p99 19.6 ms and a 249 ms worst frame, 498 stalls totalling 32.1 s of
+blocking of which 11.3 s is forced layout inside the frontend's own `renderFrame`,
+stand-ins at 42 % reduced to flat boxes, and a readout that said "(no picture is
+taken in this renderer)" beside "34386 served, 493 captured" — was read against two
+harness probes that reproduced the mechanism exactly.
+
+*The picture was dropped on every change.* The intent of dropping the bitmap on a
+signature mismatch was "never show a stale picture"; the effect was that a node
+whose value changes often enough is never anything but a box, because the bitmap is
+thrown away the moment it is out of date — and the v2.6.6 settle window holds the
+replacement back on top of that. One node, two strings rewritten every 400 ms, a
+frame per step: `pictured` alternated 1/0 for the whole run. The picture of the
+moment before is *complete*; it now stays up while the replacement is made
+(`LOD_SNAP_STALE_KEEP_MS`, 2000 ms), the box comes back only past that (for
+`LOD_SNAP_CHURN_HOLD_MS`, 2000 ms), and the node is still asked again rather than
+written off. Through the whole engine (24 nodes at the user's zoom, 30 s of frames,
+each node's values changing every 2 s): v2.6.6 painted a box in **1020 of 1800
+frames**, v2.6.7 in **17**.
+
+*The settle window could be slid shut forever.* It was re-armed by every change, so
+a node rewritten more often than 300 ms was never photographed — and with the rule
+above, such a node showed a box for as long as it kept changing. `lodVueChanged`
+now carries the first change of the burst as well as the last, and
+`LOD_SNAP_SETTLE_MAX_MS` (900 ms) lets the capture through: a grace period, not a
+veto.
+
+*One slow capture was a life sentence.* `dt > LOD_SNAP_SLOW_MS` (60 ms) called
+`lodSnapBlockNode` — "it stays live for the session". On a CPU-only machine with a
+30-row node that is a plain box forever, which is the shape the report shows. It is
+a doubling cooldown now (10 s → 20 s → 40 s …, capped at 120 s), the node is always
+retried, and the readout counts the cooldowns and says when the next try is.
+
+*The reader was the size of the fixture.* `LOD_VUE_TEXT_MAX` 16,
+`LOD_VUE_TEXT_CHARS` 80, `LOD_SNAP_DOM_MAX` 12, `LOD_VUE_CHROME_MAX` 32 and the
+slot-dot sub-cap 24 describe a 12-row node, not a node people work in: a 30-row
+node came out of the capture with its first sixteen labels and nothing else, which
+is the "flat rectangles with values missing" the user reported. The caps are
+256 / 400 / 96 / 128 / 96 now (probe: `fillText 60` where v2.6.6 drew 16, all 90 row
+boxes drawn), the widget and text pass runs when a picture is made rather than on
+every frame (DOM queries over the A/B window: 50562 → 14454; widget rows drawn
+40824 → 4716), and a value that fits is no longer ellipsised by the row's own line
+budget. Two readout statements were false and are fixed: the Vue paragraph's "(no
+picture is taken in this renderer)" beside a serving count (a v2.6.0/v2.6.1
+leftover — with snapshots on it now describes what happens, off it keeps the old
+sentence), and the DOM-hiding count now names the boxed nodes it belongs to. Two
+tests added, four rewritten from "the changed node is dropped" to the behaviour the
+report asked for, and the sixteen-mutation battery is all caught.
+
+**What this pass does not claim.** The tool's own per-frame DOM work is zero
+(measured, steady state and churn), and the forced layout left in the report is the
+*frontend's* own `renderFrame` re-measuring 75 live node subtrees — 11.3 s of
+32.1 s. Our stand-ins keep those subtrees in layout deliberately: `visibility:
+hidden` skips the paint, while `display: none` would remove the layout the
+frontend's own resize and measure passes read. Making that trade would have to be
+measured against a `display: none` variant first, on the user's own page, which is
+the live test this project still does not have.
+
 Two things the Nodes 2.0 pass confirmed rather than changed: the Vue node's
 **root element is never hidden or inerted** (`via: "root"` records are exempt from
 the stand-in classes, and only widget wrappers are marked), and the canvas
@@ -701,7 +760,7 @@ apply, not just in the docs.
   other than the Node harness was executed in this pass.
 - **The Vue-nodes stand-in has not been run against a live page *by this
   project*.** It is verified against the frontend's sources and the harness
-  (thirty-seven tests), and its failure modes are contained by construction (a box
+  (thirty-nine tests), and its failure modes are contained by construction (a box
   only ever follows a real blanking, and every blanked element is handed back on
   the frame the setting stops applying) — but the user's page is the live test, and
   it has already caught four defects this harness could not: a class that Vue
@@ -715,7 +774,9 @@ apply, not just in the docs.
   `vueUnreached` / `vueNoElement`, and — since v2.6.6 — `vuePaintSkipped` (nodes
   whose paint the frontend no longer owes), `vueChrome` / `vueChromeBoxes` (the
   node's structure drawn), `vueSettleMs` / `vueSettleArms` / `vueSettleHeld` (the
-  settle window, and how many capture slices it held back).
+  settle window, and how many capture slices it held back), and — since v2.6.7 —
+  `staleHeld` (pictures kept on screen while their replacement was photographed)
+  and `cooldown` (slow-capture cooldowns entered).
 - **The Vue box's media positions and its height come from layout**, read when the
   node's own size changes and otherwise at most every 400 ms, with those refreshes
   rationed per frame. Node-local numbers do not change with the camera (a pan is

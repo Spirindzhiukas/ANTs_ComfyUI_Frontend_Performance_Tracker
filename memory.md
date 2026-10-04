@@ -4,7 +4,7 @@ A running record for whoever picks this up next (including me). `CLAUDE.md` is t
 rules for changing the code; `plan.md` is where it is going. This file is the past:
 what was built, what was rejected, and what the evidence was.
 
-Last updated at **v2.6.6**, 220 tests green, PR #2 on
+Last updated at **v2.6.7**, 222 tests green, PR #2 on
 `Spirindzhiukas/ANTs_ComfyUI_Frontend_Performance_Tracker`.
 
 ---
@@ -13,8 +13,8 @@ Last updated at **v2.6.6**, 220 tests green, PR #2 on
 
 | | |
 | --- | --- |
-| Version | 2.6.6 (`web/tracker.js` `VERSION`) |
-| Tests | 220 (`node tests/run-tests.mjs`), plus `tests/test_init.py` |
+| Version | 2.6.7 (`web/tracker.js` `VERSION`) |
+| Tests | 222 (`node tests/run-tests.mjs`), plus `tests/test_init.py` |
 | Frontend | `web/tracker.js`, one ES module, no dependencies. The separate window is `web/window.html`, served at `/ants_optimizer/window`, not loaded as an extension. |
 | Backend | `__init__.py` — node `ANTs_Frontend_Optimizer` (old class key kept as an alias), nine best-effort routes (GPU, five thumbnail routes, the window page, `/ants_optimizer/ui`), and thumbnail read/write under ComfyUI's temp folder |
 | Panel | 10 tabs: Node Rendering Settings, Status, Timing, Nodes, Stalls, Governor, Load, Memory, GPU / VRAM, Testing |
@@ -36,6 +36,18 @@ something has to be drawn less or hit-tested less.
 ## 2. Version log
 
 The commit log is the full record; this is the "why", newest first.
+
+**v2.6.7 — the tenth report: "still not there yet", with the numbers.** The snapshot (75 nodes at 42 % zoom; fps 83 but p99 19.6 ms and a 249 ms worst frame; 498 stalls over 5.9 minutes, 32.1 s blocking, 11.3 s of it forced layout inside the frontend's own `renderFrame`; stand-ins at 42 % reduced to flat boxes; "16 DOM element(s) of boxed nodes hidden"; and a readout that said "(no picture is taken in this renderer)" beside "34386 served / 493 captured") was read against two probes built from the same code, and three of the four causes were in the tool's own lane.
+
+*The picture was taken away on every change.* Dropping the bitmap on a signature mismatch meant a node whose value changes often is never anything but a box — with the v2.6.6 settle window holding the replacement back on top of that. Probe: two strings rewritten every 400 ms, a frame per step → `pictured 1, 0, 1, 0 …`. The complete picture of the moment before now stays up while the replacement is made (`LOD_SNAP_STALE_KEEP_MS` 2000, `staleHeld` in the readout), the box comes back only past that (for `LOD_SNAP_CHURN_HOLD_MS` 2000) and the node keeps being asked. A/B over the whole engine (24 nodes, the user's zoom, 30 s of virtual frames, each node's values changing every 2 s, v2.6.6 and v2.6.7 in the same rig): frames with a plain box on screen **1020 → 17** of 1800; DOM queries **50562 → 14454**; widget rows drawn **40824 → 4716** (the chrome and widget pass had been running on every frame instead of on every capture).
+
+*The settle window could be slid shut forever, and one slow capture was a life sentence.* v2.6.6 re-armed the window on every change, so a node rewritten more often than 300 ms was never photographed at all; `lodVueChanged` now keeps the first change of a burst as well (`{at, first}`) and `LOD_SNAP_SETTLE_MAX_MS` (900 ms) lets the capture through — a grace period, not a veto. And a capture slower than 60 ms used to call `lodSnapBlockNode` ("stays live for the session"), which on a CPU-only machine with a big node is a plain box forever; it is a doubling cooldown now (10 s → 20 s → 40 s …, capped at 120 s), gated in both the enqueue and the capture, with the reason in the readout kept current instead of frozen at the first note.
+
+*The reader was the size of the fixture.* 16 text lines / 80 chars / 12 DOM widgets / 32 chrome boxes / 24 dots describe a 12-row node: a 30-row node came back with its first sixteen labels and nothing else, which is "flat rectangles with values missing". 256 / 400 / 96 / 128 / 96 now (a 30-row probe draws `fillText 60` and all 90 row boxes, where v2.6.6 drew 16), the widget and text pass runs on a capture rather than on every frame, and a value that fits is no longer ellipsised by the row's own line budget ("a cat" came back "a ca…"). Two readout statements were false and are fixed: the Vue paragraph's "(no picture is taken in this renderer)" beside a serving count (a v2.6.0/v2.6.1 leftover — with snapshots on it now says what happens, with them off it keeps the old sentence) and the DOM-hiding count, which now names the boxed nodes it belongs to.
+
+*Two tests added, four rewritten (222 green), sixteen-mutation battery: all sixteen caught.* New: a 30-row node's own labels all reach the picture (the old cap was 16), and a node whose value is rewritten every 200 ms is photographed anyway and never loses its picture. Rewritten from "the changed node is dropped" to the behaviour the report asked for: a change keeps the picture until the new one lands, a font of churn keeps the picture and the box never comes back, the flicker counter does not count a change as a switch back to the box, and a slow capture buys a cooldown rather than a session block. Newly bound by mutations: a held picture dropped on every change, the settle ceiling removed, the cooldown guards removed, the reader back to sixteen lines, and the row trimmed instead of the text. The A/B rig that produced the box-frame and DOM-work numbers compares two tracker revisions in one process and is session-local (`/tmp/ab.mjs`), not part of the repo.
+
+*What is not claimed, again.* The tool's own per-frame DOM work is zero (steady state and churn), and the forced layout left in the report is the frontend's own `renderFrame` re-measuring 75 live subtrees. Our stand-ins keep those subtrees in layout on purpose (`visibility: hidden` skips the paint; `display: none` would remove the layout the frontend's own resize and measure passes read), so a `display: none` variant would have to be measured against a real page before it is called a fix.
 
 **v2.6.6 — the ninth report: the performance hit was the same, the pictures were still "semi", and both had one cause each.** The user ran the tool in Electron (the new ComfyUI Desktop v2 style, several portable environments) with **GPU/hardware acceleration disabled**, and reported that v2.6.5's three per-frame fixes changed nothing they could feel, that the stand-ins still looked "captured/rendered in the same semi 'not fully there' way", and asked for (a) a settle/grace period before a node is photographed, (b) an answer to whether the capture tick rides the frontend's own tick and whether the frontend redraws nodes in a tiered/staggered way, and (c) — if that is the cause — a capture process of our own, "basically screenshot the node the way user sees it".
 

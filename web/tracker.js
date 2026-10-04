@@ -27,7 +27,7 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.6.6";
+const VERSION = "2.6.7";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
 // The class key ComfyUI stores in a workflow. The old key is still recognised so
 // a graph saved before the rename does not lose this node.
@@ -903,7 +903,9 @@ const LOD = {
   snapMisses: 0, // flat draws with no usable bitmap (painted as a box instead)
   snapCaptured: 0,
   snapMs: 0, // time spent inside captures — this tool's cost, kept out of the frame lanes
-  snapSlow: 0, // nodes blocked because their own capture was too slow
+  snapSlow: 0, // captures that were slower than the budget (each buys a cooldown)
+  snapCooldown: 0, // slow-capture cooldowns entered (each doubles the next wait)
+  snapStaleHeld: 0, // pictures kept on screen while their replacement was photographed
   snapFailed: 0, // captures that threw
   snapLarge: 0, // nodes left as boxes: too big for a capture at any ratio
   snapEvicted: 0,
@@ -920,7 +922,7 @@ const LOD = {
   snapBlank: 0, // nodes whose own draw leaves the canvas empty: nothing to photograph
   snapDrops: null, // WeakMap<node, drops since it was last drawn from a picture>
   snapWhy: null, // [{type, title, why}] — the names behind those counters
-  snapWhySeen: null, // WeakSet<node>, so one node is named once
+  snapWhySeen: null, // WeakMap<node, its entry>, so one node is named once and its reason stays current
   snapPruned: 0, // records dropped because their node left the graph
   snapClears: 0, // whole-cache clears (theme change, off, threshold gone, renderer switched)
   snapFull: 0, // captures skipped: the budget was full of bitmaps still in use
@@ -1123,7 +1125,7 @@ const LOD_SNAP_PAD = 24; // graph units of margin around the node, so hooks that
 // draw outside the body (selection rings, glow) are not cut off
 const LOD_SNAP_TITLE_H = 30; // graph units above the body: LiteGraph's title bar
 const LOD_SNAP_MAX_DIM = 2048; // px; a capture is fitted down to this, or the node stays a box
-const LOD_SNAP_SLOW_MS = 60; // a slower capture blocks that node for the session
+const LOD_SNAP_SLOW_MS = 60; // slower than this: stop, cool down, and try again later
 const LOD_SNAP_SIG_MS = 100; // a signature is re-checked at most this often
 const LOD_SNAP_IDLE_MS = 400; // input within this many ms stops the capture lane
 const LOD_SNAP_GAP_MS = 32; // between capture slices, once the page is idle
@@ -1139,7 +1141,6 @@ const LOD_SNAP_TYPES_MAX = 64; // never-snapshot type list cap (a policy, not a 
 // re-photograph it (a poller writing widget values, for instance). Three strikes
 // and it keeps its box for the session — and the readout names it, which is the
 // one thing a box cannot say for itself.
-const LOD_SNAP_CHURN_MAX = 3;
 // How many nodes the readout may name as "not pictured, and why".
 const LOD_SNAP_WHY_MAX = 6;
 // Images a node draws into itself are part of its picture; the walk is capped
@@ -1193,8 +1194,15 @@ const LOD_VUE_MEDIA_BUDGET = 6;
 // single string may be. A node's DOM text is its widget labels and values as the
 // frontend draws them; the cap keeps a node with a hundred spans (or one with a
 // 40 kB string in it) from turning the read into a walk of the whole subtree.
-const LOD_VUE_TEXT_MAX = 16;
-const LOD_VUE_TEXT_CHARS = 80;
+// How much of a node a reconstruction will read and draw. These were caps chosen
+// for the *cost* of a read — 16 strings and 12 widget rows per node — and on a
+// real node they are what made a picture look like a sketch: the node the user
+// photographed has ~30 widget rows with a label and a value each, so two thirds of
+// it was never read at all. A measure happens once per capture (never per frame)
+// and the read is batched, so the caps are now set where a real node ends rather
+// than where the first card felt cheap.
+const LOD_VUE_TEXT_MAX = 256; // strings read from a node's DOM, per measurement
+const LOD_VUE_TEXT_CHARS = 400; // per string (a label is short; a caption is not)
 // How long a "no video in this node" answer stands before it is re-probed. The
 // guarantee it protects (a video is never photographed) is enforced freshly at
 // capture time; this window is only about a *held* picture of a node that has just
@@ -1230,6 +1238,26 @@ const LOD_VUE_MEDIA_MS_WATCHED = 5000;
 // waits: in the canvas renderer the node's drawing is synchronous with the frame
 // the capture is taken on.
 const LOD_SNAP_SETTLE_MS = 300;
+// The window is a floor on lateness, never a gate that can be held shut: a node
+// whose subtree is rewritten more often than the window (a running node's value,
+// an extension that rewrites titles) would otherwise never be photographed at
+// all. The ceiling is measured from the first change of a burst.
+const LOD_SNAP_SETTLE_MAX_MS = 900;
+// How long a picture that no longer matches the node may stay on screen while
+// the replacement is photographed. A complete picture of a moment ago is not a
+// lie the way an empty box is: on a node with one changing value the old rule —
+// drop the picture the moment the node changes — made the stand-in flip between
+// its picture and a plain box on every change.
+const LOD_SNAP_STALE_KEEP_MS = 2000;
+// A capture slower than this buys a cooldown, not a life sentence. One slow
+// capture used to block the node for the session, which on a big node (and a
+// CPU-only machine) means a plain box forever.
+const LOD_SNAP_SLOW_COOLDOWN_MS = 10000;
+const LOD_SNAP_SLOW_MAX_MS = 120000;
+// A node whose pictures keep arriving already out of date is photographed less
+// often, never never: the hold is what replaces the old "three drops and it is
+// blocked for the session".
+const LOD_SNAP_CHURN_HOLD_MS = 2000;
 const LOD_INERT_CLASS = "ants-lod-inert"; // elements switched off while their node is inert
 // Below this zoom nobody can read a node, let alone use one, so its UI is
 // switched off rather than paid for on every pointer event.
@@ -4318,7 +4346,11 @@ function lodVueChanged(node) {
   if (!node || !lodVueNodesMode()) return 0;
   if (!LOD.vueSettle) LOD.vueSettle = new WeakMap();
   const t = nowMs();
-  LOD.vueSettle.set(node, t);
+  const prev = LOD.vueSettle.get(node);
+  // The stamp carries the *first* change of a burst as well as the last: `at` is
+  // the floor (the node has to stand still for the window), `first` is the
+  // ceiling (a node that never stands still still gets photographed).
+  LOD.vueSettle.set(node, prev ? { at: t, first: prev.first || t } : { at: t, first: t });
   LOD.vueSettleArms++;
   return t;
 }
@@ -4327,10 +4359,19 @@ function lodVueChanged(node) {
 // node's drawing is synchronous with the frame the capture is taken on.
 function lodVueSettleLeft(node, t) {
   if (!lodVueNodesMode()) return 0;
-  const set = LOD.vueSettle ? LOD.vueSettle.get(node) : 0;
-  if (!set) return 0;
-  const left = LOD_SNAP_SETTLE_MS - ((t || nowMs()) - set);
-  return left > 0 ? left : 0;
+  const stamp = LOD.vueSettle ? LOD.vueSettle.get(node) : 0;
+  if (!stamp) return 0;
+  const now = t || nowMs();
+  const at = typeof stamp === "number" ? stamp : Number(stamp.at) || 0;
+  const first = typeof stamp === "number" ? stamp : Number(stamp.first) || at;
+  const left = LOD_SNAP_SETTLE_MS - (now - at);
+  if (left <= 0) return 0;
+  // The ceiling: past this, a node that keeps changing is photographed anyway.
+  // Without it a node whose subtree is rewritten more often than the window is
+  // never photographed at all — and, with the old drop-on-change rule, showed a
+  // plain box for as long as it kept changing.
+  if (now - first >= LOD_SNAP_SETTLE_MAX_MS) return 0;
+  return left;
 }
 
 // A stable number per element, for the signature. A replaced <img> is a different
@@ -4691,7 +4732,7 @@ function lodVueWidgetBoxes(node, root, rr, domScale, title) {
 // body surface, `[data-testid^=node-header-]` the title bar, and a slot's dot is
 // `.slot-dot`. Anything absent is skipped — a node without a header (a reroute) has
 // no header box, and that is not an error.
-const LOD_VUE_CHROME_MAX = 32;
+const LOD_VUE_CHROME_MAX = 128; // a real node has two dots per row it carries
 
 function lodVueChromeBoxes(node, root, rr, domScale, title) {
   const out = [];
@@ -4702,7 +4743,7 @@ function lodVueChromeBoxes(node, root, rr, domScale, title) {
     ['[data-testid="node-inner-wrapper"]', "frame", 1],
     [`[data-testid="node-body-${id}"]`, "panel", 1],
     [`[data-testid="node-header-${id}"]`, "header", 1],
-    [".slot-dot", "dot", 24],
+    [".slot-dot", "dot", 96],
   ];
   for (const [sel, kind, cap] of spec) {
     let els = null;
@@ -5179,16 +5220,25 @@ function lodSnapBlockNode(node, rec, why) {
 // the user cannot act on and one they can.
 function lodSnapNoteWhy(node, why) {
   try {
-    if (!LOD.snapWhySeen) LOD.snapWhySeen = new WeakSet();
+    if (!LOD.snapWhySeen) LOD.snapWhySeen = new WeakMap();
     if (!LOD.snapWhy) LOD.snapWhy = [];
-    if (LOD.snapWhySeen.has(node)) return;
-    LOD.snapWhySeen.add(node);
+    const text = String(why);
+    const seen = LOD.snapWhySeen.get(node);
+    if (seen) {
+      // The node is named once, but its reason has to stay current: a cooldown that
+      // doubled would otherwise leave the readout promising a try that already
+      // happened ("another try in 10s" after the retry is scheduled for 20s).
+      seen.why = text;
+      return;
+    }
     if (LOD.snapWhy.length >= LOD_SNAP_WHY_MAX) return;
-    LOD.snapWhy.push({
+    const entry = {
       type: String(node.type || node.comfyClass || "?"),
       title: String(node.title || ""),
-      why: String(why),
-    });
+      why: text,
+    };
+    LOD.snapWhySeen.set(node, entry);
+    LOD.snapWhy.push(entry);
   } catch (e) {
     /* naming a node is never worth a fault */
   }
@@ -5867,7 +5917,7 @@ function lodSnapInk(el, geom, ratio) {
 // lodSnapLive.
 const LOD_SNAP_WIDGET_MARGIN = 10; // BaseDOMWidgetImpl.DEFAULT_MARGIN
 const LOD_SNAP_WIDGET_H = 50; // the frontend's `computedHeight ?? 50`
-const LOD_SNAP_DOM_MAX = 12; // widget elements looked at per node, per capture
+const LOD_SNAP_DOM_MAX = 96; // widget elements looked at per node, per capture
 const LOD_SNAP_TEXT_CHARS = 2000; // characters of a text widget that are painted
 const LOD_SNAP_TEXT_LINES = 12; // and lines; past that it is clipped like the row is
 
@@ -5989,8 +6039,20 @@ function lodSnapTextInk(el, cctx, box) {
     cctx.font = font;
     cctx.textAlign = "left";
     if ("textBaseline" in cctx) cctx.textBaseline = "top";
-    const lines = lodSnapWrapText(raw.slice(0, LOD_SNAP_TEXT_CHARS), Math.max(4, box.w - 6), LOD_SNAP_TEXT_LINES, size, cctx);
     const lineH = size * 1.25;
+    // As many lines as the row actually has room for (a tall text node shows a
+    // prompt, not a caption), never more than the clip can hold. The *wrap* is
+    // still asked for the full budget — handing the wrapper a smaller line budget
+    // makes it mark the text as truncated after one line, which is where a
+    // value that plainly fit came back as "a ca…". The visible rows are what is
+    // trimmed, and the trim is marked the way the wrapper marks its own.
+    const room = Math.max(1, Math.min(64, Math.floor((Number(box.h) - 6) / lineH) || 1));
+    const wrapped = lodSnapWrapText(raw.slice(0, LOD_SNAP_TEXT_CHARS), Math.max(4, box.w - 6), LOD_SNAP_TEXT_LINES, size, cctx);
+    if (wrapped.length > room) {
+      const last = wrapped[room - 1];
+      wrapped[room - 1] = last && last.length > 1 ? `${last.slice(0, last.length - 1)}\u2026` : "\u2026";
+    }
+    const lines = wrapped.length > room ? wrapped.slice(0, room) : wrapped;
     for (let i = 0; i < lines.length; i++) {
       if (typeof cctx.fillText === "function") cctx.fillText(lines[i], box.x + 3, box.y + 3 + i * lineH);
     }
@@ -6264,7 +6326,17 @@ function lodSnapCaptureNode(node, canvas) {
   lodSnapEnsure();
   let rec = LOD.snaps.get(node);
   if (rec && rec.diskPending) return false; // a disk load is in flight; don't photograph twice
-  if (rec && (rec.canvas || rec.blocked || rec.failed)) return false;
+  if (rec && (rec.blocked || rec.failed)) return false;
+  // A *held* picture is not a reason to refuse its own replacement — that is what
+  // the lane was asked for. A picture that still matches the node is, because
+  // there is nothing to re-photograph. (This line used to refuse every node with a
+  // canvas, so the re-capture a change asked for was silently dropped.)
+  if (rec && rec.canvas && !rec.staleAt) return false;
+  // A node waiting out a slow-capture cooldown is not photographed, however it got
+  // asked: the ask comes again by itself when the wait is over (a paint finds it
+  // un-pictured), and this is the line that keeps the lane from hammering a node
+  // whose own draw is too expensive to run.
+  if (rec && rec.cooldownUntil && nowMs() < rec.cooldownUntil) return false;
   if (lodSnapHasVideoProbe(node)) {
     // A video is never photographed: a still frame presented as the node is the
     // one thing the user asked to be excluded, and this check is the fresh one —
@@ -6368,13 +6440,25 @@ function lodSnapCaptureNode(node, canvas) {
   }
   if (dt > LOD_SNAP_SLOW_MS) {
     LOD.snapMs += dt;
-    // One slow capture is enough evidence: this node's own draw path is too
-    // expensive to run a second time, so it stays live for the session. Upstream
-    // makes the same call at 32ms; the tooltip and memory.md say why this is 60.
+    // A slow capture buys a cooldown, not a life sentence. This used to block the
+    // node for the session — "one slow capture is enough evidence" — and on a big
+    // node on a CPU-only machine that is a plain box forever, which is exactly
+    // what a user with two 30-row nodes was looking at. The wait doubles per slow
+    // attempt and is capped: the node is always tried again.
     LOD.snapSlow++;
+    LOD.snapCooldown++;
     lodSnapDiscard(made);
-    lodSnapBlockNode(node, rec, `slow capture (${Math.round(dt)}ms)`);
-    lodSnapNoteWhy(node, `too slow to photograph (${Math.round(dt)}ms)`);
+    const tries = (Number(rec && rec.slowTries) || 0) + 1;
+    const wait = Math.min(LOD_SNAP_SLOW_MAX_MS, LOD_SNAP_SLOW_COOLDOWN_MS * Math.pow(2, tries - 1));
+    if (!rec) {
+      // A node whose very first capture is slow has no record yet. The cooldown has
+      // to live somewhere or the next paint asks again immediately.
+      rec = { sig: "", checkedAt: 0, bytes: 0, canvas: null };
+      LOD.snaps.set(node, rec);
+    }
+    rec.slowTries = tries;
+    rec.cooldownUntil = nowMs() + wait;
+    lodSnapNoteWhy(node, `too slow to photograph (${Math.round(dt)}ms) — another try in ${Math.round(wait / 1000)}s`);
     return false;
   }
   // The probe is this tool's own cost like the draw is, so it lands in the same
@@ -6444,6 +6528,9 @@ function lodSnapCaptureNode(node, canvas) {
   rec.ratio = made.ratio;
   rec.blocked = false;
   rec.failed = false;
+  rec.staleAt = 0; // the picture that is up is the node again
+  rec.slowTries = 0; // and the capture was inside its budget this time
+  rec.cooldownUntil = 0;
   LOD.snaps.set(node, rec);
   LOD.snapBytes += rec.bytes;
   LOD.snapCaptured++;
@@ -6502,17 +6589,6 @@ function lodSnapRefreshMips(rec) {
 // the rest of the session. The counter lives on the node, not on the record, so it
 // survives the record being dropped (it is reset by a successful reuse, which is
 // what "the lane is keeping up" looks like).
-function lodSnapNoteDrop(node) {
-  if (!LOD.snapDrops) LOD.snapDrops = new WeakMap();
-  const n = (Number(LOD.snapDrops.get(node)) || 0) + 1;
-  LOD.snapDrops.set(node, n);
-  return n;
-}
-
-function lodSnapNoteReuse(node) {
-  if (LOD.snapDrops && LOD.snapDrops.get(node)) LOD.snapDrops.set(node, 0);
-}
-
 function lodSnapSchedule(delay) {
   if (LOD.snapTimer != null) return;
   try {
@@ -7013,7 +7089,7 @@ function lodThumbDiskAsk(node, canvas) {
   return true;
 }
 
-function lodSnapEnqueue(node, canvas) {
+function lodSnapEnqueue(node, canvas, restale) {
   if (!lodSnapBitmaps(canvas)) return;
   lodSnapEnsure();
   // A node the Vue lane has never seen starts its window now — the frame it was
@@ -7023,7 +7099,13 @@ function lodSnapEnqueue(node, canvas) {
   if (lodVueNodesMode() && !(LOD.vueSettle && LOD.vueSettle.has(node))) lodVueChanged(node);
   const rec = LOD.snaps.get(node);
   if (rec && rec.diskPending) return;
-  if (rec && (rec.canvas || rec.blocked || rec.failed)) return;
+  // A node whose picture is being replaced is asked for *with* its canvas in
+  // hand: that is the re-capture a change triggers now, instead of dropping the
+  // picture and drawing a box until a new one arrives.
+  if (rec && (rec.blocked || rec.failed)) return;
+  if (rec && rec.canvas && !restale) return;
+  if (rec && rec.canvas && rec.restaleHoldUntil && nowMs() < rec.restaleHoldUntil) return;
+  if (rec && rec.cooldownUntil && nowMs() < rec.cooldownUntil) return;
   if (!rec || !rec.canvas) {
     if (lodThumbDiskAsk(node, canvas)) return;
   }
@@ -7084,21 +7166,34 @@ function lodSnapPaint(node, canvas, ctx) {
       return false;
     }
     if (sig !== rec.sig) {
+      // The node changed — but what is held is a *complete* picture of the moment
+      // before, and the old rule (drop it here, let the box ladder stand in) is
+      // what made a node with one changing value flip between its picture and a
+      // plain box on every change. Measured on the harness: a value rewritten
+      // every 400 ms gave `pictured 1, 0, 1, 0 …` for as long as it changed.
+      // So the picture stays up while the replacement is photographed, and it is
+      // only given back if it stays out of date past LOD_SNAP_STALE_KEEP_MS —
+      // which means the node is changing faster than the lane can photograph it,
+      // and then it is photographed *less often* rather than never.
       lodVueChanged(node); // the node just changed: let it finish before the next try
-      lodSnapDrop(node, "changed");
+      if (!rec.staleAt) rec.staleAt = t;
       LOD.snapInvalid++;
-      LOD.snapMisses++;
-      if (lodSnapNoteDrop(node) >= LOD_SNAP_CHURN_MAX) {
-        // Three pictures in a row were out of date before anyone saw them: this
-        // node's drawing is being rewritten faster than the lane can photograph
-        // it, so it keeps its box and the readout names it.
-        lodSnapBlockNode(node, null, "changed before it was drawn, every time");
-        LOD.snapChurn++;
-        lodSnapNoteWhy(node, `kept changing (${LOD_SNAP_CHURN_MAX} pictures dropped)`);
+      const stale = t - rec.staleAt;
+      if (stale <= LOD_SNAP_STALE_KEEP_MS) {
+        LOD.snapStaleHeld++;
+        lodSnapEnqueue(node, canvas, true); // and ask for a fresh one
+        // falls through: the held picture is blitted below
       } else {
-        lodSnapEnqueue(node, canvas); // and ask for a fresh one
+        // Changing faster than it can be photographed: give the box back for a
+        // moment and stop asking so often (never "blocked for the session").
+        LOD.snapMisses++;
+        LOD.snapChurn++;
+        rec.restaleHoldUntil = t + LOD_SNAP_CHURN_HOLD_MS;
+        lodSnapNoteWhy(node, "changing faster than it can be photographed");
+        return false;
       }
-      return false;
+    } else if (rec.staleAt) {
+      rec.staleAt = 0; // it matches again: nothing stale to show
     }
   }
   // The canvas's own shadow flag is compared, cheaply, on every reuse. If another
@@ -7122,7 +7217,6 @@ function lodSnapPaint(node, canvas, ctx) {
   LOD.snaps.delete(node);
   LOD.snaps.set(node, rec);
   LOD.snapDrawn++;
-  lodSnapNoteReuse(node); // it made it to the screen: the lane is keeping up
   return true;
 }
 
@@ -13575,8 +13669,11 @@ function buildTelemetryReport() {
         lodOn()
           ? `on (${
               lodVueNodesMode()
-                ? `node stand-ins are boxes: below ${Math.round(LOD.flatBelow * 100)}% zoom each node's own element stops painting and the canvas draws its box ` +
-                  `(no picture is taken in this renderer — the bitmap half of the engine is idle; the widget and focus settings below still act)`
+                ? (LOD.snapOn
+                    ? `node stand-ins are pictures: below ${Math.round(LOD.flatBelow * 100)}% zoom each node's own element stops painting and the canvas blits the picture taken of it ` +
+                      `(the bitmap half of the engine is active — a picture of the node's box, its text and its widgets, remade when the node changes)`
+                    : `node stand-ins are boxes: below ${Math.round(LOD.flatBelow * 100)}% zoom each node's own element stops painting and the canvas draws its box ` +
+                      `(no picture is taken while the snapshots setting is off — the bitmap half of the engine is idle; the widget and focus settings below still act)`)
                 : `every node a rectangle below ${Math.round(LOD.flatBelow * 100)}% zoom${LOD.legacyPx ? `, carried over from "nodes under ${LOD.legacyPx}px"` : ""}`
             }, links ${lodLinksStraight() ? "straight (link setting)" : "as drawn"}, idle redraw cap ${LOD.idleCapMs ? LOD.idleCapMs + "ms" : "off"}, box detail ${LOD.boxDetail}, ` +
             `snapshots ${LOD.snapOn ? `on (${LOD.snapDrawn} served, ${LOD.snapCaptured} captured, ${fmtBytes(LOD.snapBytes)} of ${LOD.snapMb} MiB)` : "off"}) ` +
@@ -13593,7 +13690,7 @@ function buildTelemetryReport() {
                   : ""
               : "") +
             (LOD.domHidden
-              ? `, ${LOD.domHidden} DOM element(s) of boxed nodes hidden` +
+              ? `, ${LOD.domHidden} DOM element(s) of ${LOD.domNodes} boxed node(s) hidden` +
                 (LOD.domStilled ? ` (${LOD.domStilled} out of the per-frame widget layout pass)` : "")
               : "") +
             (() => {
@@ -13949,6 +14046,8 @@ function installDebugApi() {
             // picture without it is the sketch a user described as "semi".
             vueChrome: LOD.vueChrome,
             vueChromeBoxes: LOD.vueChromeNow,
+            staleHeld: LOD.snapStaleHeld,
+            cooldown: LOD.snapCooldown,
             vueWidgetInk: LOD.vueWidgetInk,
             // What the stand-in does to the frontend's own painting: how many nodes
             // have their DOM subtree taken out of the paint phase while their

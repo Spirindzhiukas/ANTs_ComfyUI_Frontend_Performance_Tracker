@@ -384,20 +384,23 @@ Vue-nodes graph — and whether the v2.6.3–v2.6.6 fixes are enough on the user
 page.** Since v2.6.6 the saving has a mechanism as well as a count: the frontend's
 own painting of the stand-in nodes is skipped (`visibility`, and `vuePaintSkipped`
 counts it), the picture carries the node's structure, and the capture waits for the
-node to settle. What is still not measurable from here is the rasteriser's bill on
+node to settle; since v2.6.7 it is not dropped while it is out of date either, so
+the saving is not paid back as a box on screen (1020 of 1800 frames with a box in
+the A/B, 17 after). What is still not measurable from here is the rasteriser's bill on
 the user's machine (Electron, GPU/hardware acceleration off) — DevTools' paint
 flashing is the direct way to see it, and the frame budget plus the Stalls tab are
 the tool's own instruments. Each report has been a state the harness could model only after the fact:
 a class Vue rewrote, a picture half that was off, a picture with no text in it, a
 plan fighting the setting once per frame, a picture taken before the node had
 finished rendering, a poll the page could have answered itself. The user's page
-remains the live test. The seven live reports so far (v2.5.6 "pictures with no
+remains the live test. The eight live reports so far (v2.5.6 "pictures with no
 content"; v2.6.0 "nothing in Nodes 2.0"; v2.6.2 "only text nodes have content";
 v2.6.3 "no pictures and no disk files at all"; v2.6.4 "captured box previews,
 cached boxes in the canvas workspace, and a canvas that flickers when the stand-in
 mode is not pictures"; v2.6.5 "photographed too early, and the stand-ins drop the
 frame rate"; v2.6.6 "the performance hit is the same, and the stand-ins still look
-half-rendered") each found something the harness could not, and the harness has been
+half-rendered"; v2.6.7 "still not there yet: flat rectangles at 42 % and the
+performance hit unchanged") each found something the harness could not, and the harness has been
 strengthened by each one — the last pass added the two change observers (with
 `withQuiet` so a pan or a zoom is not mistaken for a box change), a Vue re-render
 that rewrites `className`, an `isConnected` that tells the truth, the element's

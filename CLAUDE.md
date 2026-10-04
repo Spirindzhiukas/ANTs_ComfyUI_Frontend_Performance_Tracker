@@ -28,7 +28,7 @@ this is going. Read the golden rules before the code.
 ## Commands
 
 ```bash
-node tests/run-tests.mjs              # all 220 tests — must be green before any commit
+node tests/run-tests.mjs              # all 222 tests — must be green before any commit
 node tests/run-tests.mjs <substring>  # one suite/test, e.g. ... pill
 python3 tests/test_init.py            # the Python side (route parsing, node contract)
 node tests/demo.mjs                   # prints what the panel says against a synthetic graph
@@ -269,7 +269,11 @@ Seams worth knowing:
   (slots sync, layout, widgets, media decoding), so "capture immediately" is a
   picture of a half-built node. Canvas pathway: no window (its drawing is
   synchronous with the frame). Gauges: `vueSettleMs` / `.vueSettleArms` /
-  `.vueSettleHeld`.
+  `.vueSettleHeld`. **The window has a ceiling** (v2.6.7): `lodVueChanged` keeps
+  the *first* change of a burst as well as the last (`{ at, first }`), and
+  `LOD_SNAP_SETTLE_MAX_MS` (900 ms) lets the capture through anyway — a node whose
+  subtree is rewritten more often than the window would otherwise never be
+  photographed, and a grace period must not become a veto.
   (5) **a capture takes one measurement.** `lodVueRootMetrics(node, canvas, true)`
   → `lodSnapGeometry(node, canvas, dom.boxH)` → surface, box and ink from the same
   number, and the signature mixes that height, the text lines and the measured
@@ -279,6 +283,30 @@ Seams worth knowing:
   mounted it inside the node's own element (`WidgetDOM.vue`), and at the canvas
   row only when there is no such element.
   Elements the widget route drew are skipped, so nothing is drawn twice.
+  (6) **a change keeps the picture** (v2.6.7, and this is the one that made
+  "flat rectangles"): the paint path used to `lodSnapDrop` on a signature
+  mismatch, so a node whose value changes often was never anything but a box —
+  measured: `pictured 1, 0, 1, 0 …` for a value rewritten every 400 ms, and 1020
+  of 1800 frames with a box in the 24-node A/B. The complete picture of the
+  moment before now stays on screen while its replacement is captured
+  (`rec.staleAt`, `LOD_SNAP_STALE_KEEP_MS` 2000, `staleHeld` in the readout); past
+  that the node gets its box back for `LOD_SNAP_CHURN_HOLD_MS` (2000) and is
+  asked again — never `lodSnapBlockNode`d, never a session verdict. A slow
+  capture is the same shape: `LOD_SNAP_SLOW_MS` (60 ms) starts a doubling
+  cooldown (`LOD_SNAP_SLOW_COOLDOWN_MS` 10000 x 2^n, capped at
+  `LOD_SNAP_SLOW_MAX_MS` 120000) instead of a permanent block, with the gate in
+  both `lodSnapEnqueue` and `lodSnapCaptureNode` (defence in depth: either one
+  alone keeps the node out). If you touch either, keep the *outcome* true: a node
+  that is merely changing or slow must never end up a plain box for the session,
+  and a picture must never be replaced by a box while a fresh one is in flight.
+  The reader caps are sized for a real node too (v2.6.7): `LOD_VUE_TEXT_MAX` 256,
+  `LOD_VUE_TEXT_CHARS` 400, `LOD_SNAP_DOM_MAX` 96, `LOD_VUE_CHROME_MAX` 128, the
+  slot-dot sub-cap 96 — a 30-row node's 60 text leaves and 90 row boxes all reach
+  the picture (`fillText 60`; the v2.6.6 fixture-sized caps drew 16). A row's
+  value that fits is never ellipsised: the wrapper gets the full line budget
+  (`LOD_SNAP_TEXT_LINES`) and only the *drawn* lines are trimmed to what the box
+  holds — handing it the row's own count makes it mark `out.length >= maxLines`
+  and "a cat" comes back "a ca…".
   **The plan and the draw loop ask one predicate** (`lodVuePathOn`): if the plan
   ever asks a *narrower* question than the draw loop — as it did while it required
   `LOD.snapOn` — it hands every blanked element back at the top of every frame

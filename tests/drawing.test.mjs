@@ -1656,7 +1656,7 @@ suite("drawing: a flat box can say what it stands for, and only when asked", () 
 //   4. the nodes that must stay live stay live — broken, running, dragged.
 //      Hover and selection keep the picture. A DOM widget or a
 //      function-valued property is still captured: the picture is the canvas part;
-//   5. a capture that was slow blocks that node for the session;
+//   5. a capture that was slow buys a doubling cooldown — never a session block;
 //   6. a capture's cost is this tool's, not the pack's: hooks run, attribution
 //      stands aside, and the time lands in the snapshot's own counter;
 //   7. off (or the flatten setting at zero) releases every bitmap and paints
@@ -2028,7 +2028,7 @@ suite("drawing: node snapshots — a box that is a picture of the node", () => {
     assertGreater(snapApi(h).queue + (snapApi(h).held || 0), 0, "and something is loading or queued, not left blank");
   });
 
-  test("a node that changes is dropped, not shown stale", async () => {
+  test("a node that changes keeps its picture until the new one lands", async () => {
     const h = await boot();
     const nodes = snapGraph(h, 1);
     nodes[0].widgets = [{ type: "number", name: "steps", value: 20 }];
@@ -2043,32 +2043,48 @@ suite("drawing: node snapshots — a box that is a picture of the node", () => {
     h.advance(SNAP_SIG_WINDOW_MS); // past the window in which the old signature would still be trusted
     h.canvas.ctx.ops.length = 0;
     draw(h, 1);
-    assertEqual(blits(h).length, 0, "the changed node is not served from the old picture");
-    assertEqual(snapApi(h).invalidated, 1, "the bitmap was dropped as stale");
-    assertEqual(snapApi(h).queue, 1, "and a fresh capture was asked for");
+    // What is held is a *complete* picture of the moment before. Dropping it here
+    // and letting the box ladder stand in put a plain rectangle on screen for as
+    // long as the node kept changing — the flash every changing node showed.
+    assertEqual(blits(h).length, 1, "the changed node is still served from its picture");
+    assertEqual(boxes(h).length, 0, "and no plain box is painted over it");
+    assertEqual(snapApi(h).invalidated, 1, "the picture is known to be out of date");
+    assertGreater(snapApi(h).staleHeld, 0, "the readout counts the hold");
+    assertEqual(snapApi(h).queue, 1, "and a fresh capture was asked for, with the canvas in hand");
     await idle(h);
     assertEqual(snapApi(h).captured, 2, "which happened");
   });
 
-  test("a capture that was slow blocks that node for the session", async () => {
+  test("a slow capture buys a cooldown, not a life sentence", async () => {
     const h = await boot();
     const nodes = snapGraph(h, 3);
-    // One node whose own drawing is expensive: past the slow-capture cutoff it must
-    // never be captured again, while its neighbours still are.
+    // One node whose own drawing is expensive. Past the slow-capture cutoff it used
+    // to be blocked for the whole session — on a CPU-only machine with big nodes
+    // that is a plain box forever. Now the wait doubles per slow attempt, and the
+    // node is always tried again.
     nodes[1].onDrawBackground = () => h.busy(70);
     h.tracker.lowZoom.set({ flatBelow: 0.2, snapshots: true });
     draw(h, 1);
     await idle(h);
     const api = snapApi(h);
     assertEqual(api.captured, 2, "the two cheap nodes were captured");
-    assertEqual(api.slow, 1, "the expensive one was measured and blocked");
+    assertEqual(api.slow, 1, "the expensive one was measured");
     assertEqual(h.canvases.filter((c) => c.width === 0).length, 1, "the bitmap it drew was released again");
     assertEqual(api.bytes > 0, true, "and only the two cheap nodes are held");
-    await idle(h);
-    assertEqual(snapApi(h).captured, 2, "it is never retried");
     h.canvas.ctx.ops.length = 0;
     draw(h, 1);
-    assertEqual(boxes(h).length, 1, "that node keeps its box forever");
+    assertEqual(boxes(h).length, 1, "while it waits, that node is the plain box it would have been");
+    await idle(h);
+    assertEqual(snapApi(h).captured, 2, "and it is not re-photographed inside the cooldown");
+    // Past the cooldown it is tried again; the second slow capture doubles the wait
+    // rather than taking the node away for good.
+    h.advance(10500);
+    draw(h, 1);
+    await idle(h);
+    assertEqual(snapApi(h).slow, 2, "past the cooldown it is measured again");
+    assertEqual(snapApi(h).captured, 2, "and the retry costs nobody a picture");
+    assertEqual(snapApi(h).cooldown > 0, true, "the readout shows a node waiting out a cooldown");
+    assert(snapApi(h).why.some((w) => /another try in 20s/.test(String(w.why))), "and says when the next try is");
   });
 
   test("a capture's time is this tool's, not the pack's", async () => {
@@ -2223,31 +2239,35 @@ suite("drawing: node snapshots — a box that is a picture of the node", () => {
     assertEqual(boxes(h).length, 2, "the boxes stay, which is the honest stand-in");
   });
 
-  test("a font of churn keeps a node a box instead of a capture per slice", async () => {
+  test("a font of churn keeps the picture, and the box never comes back", async () => {
     const h = await boot();
     const nodes = snapGraph(h, 1);
     h.tracker.lowZoom.set({ flatBelow: 0.2, snapshots: true });
     draw(h, 1);
     await idle(h);
     assertEqual(snapApi(h).captured, 1, "captured once");
-    // Something rewrites a value the node draws, faster than the idle lane can
-    // keep up: the change lands after each capture and before each reuse, which is
-    // the shape a polling extension has.
+    h.canvas.ctx.ops.length = 0;
+    draw(h, 1);
+    assertEqual(snapApi(h).flips, 1, "one switch into the picture");
+    // Something rewrites a value the node draws, faster than the settle window the
+    // lane waits out: the change lands after each capture and before each reuse,
+    // which is the shape a polling extension has.
     for (let i = 0; i < 4; i++) {
-      h.advance(200); // past the signature re-check window: the lane may capture here
+      h.advance(200); // inside the settle window the change just re-armed
       nodes[0].widgets = [{ name: "polled", value: `v${i}`, type: "string" }];
       h.canvas.ctx.ops.length = 0;
       draw(h, 1); // ...and the value changed again before this draw
     }
     const api = snapApi(h);
-    assertGreater(api.invalidated, 0, "pictures were dropped for changing");
-    assertEqual(api.churn, 1, "and the node is left as a box after three of them");
-    const before = api.captured;
-    h.advance(2000);
-    draw(h, 2);
-    await idle(h, 2000);
-    assertEqual(snapApi(h).captured, before, "the lane stops spending captures on it");
-    assertEqual(boxes(h).length > 0, true, "and the box is what the user sees");
+    assertGreater(api.invalidated, 0, "the changes were seen");
+    assertEqual(blits(h).length, 1, "and the node still shows its picture");
+    assertEqual(boxes(h).length, 0, "never a box for it");
+    assertEqual(api.flips, 1, "so nothing flickered between the two");
+    await idle(h);
+    assertGreater(snapApi(h).captured, 1, "the picture is refreshed once the value stops moving");
+    h.canvas.ctx.ops.length = 0;
+    draw(h, 1);
+    assertEqual(boxes(h).length, 0, "and the box is still not what the user sees");
   });
 
   test("when the budget cannot hold your ratio, a coarse picture beats none", async () => {
@@ -2418,7 +2438,7 @@ suite("drawing: node snapshots — a box that is a picture of the node", () => {
     assertEqual(snapApi(h).captured, 2, "still two captures, not four");
   });
 
-  test("the flicker counter measures a node switching between picture and box", async () => {
+  test("the flicker counter does not count a change as a switch back to the box", async () => {
     const h = await boot();
     const nodes = snapGraph(h, 1);
     nodes[0].widgets = [{ type: "number", name: "steps", value: 20 }];
@@ -2430,12 +2450,13 @@ suite("drawing: node snapshots — a box that is a picture of the node", () => {
     assertEqual(blits(h).length, 1, "served from a picture");
     assertEqual(snapApi(h).flips, 1, "the first paint of a picture counts as one switch (box → picture)");
 
-    nodes[0].widgets[0].value = 30; // the node changes: picture goes, box comes back
+    nodes[0].widgets[0].value = 30; // the node changes: the picture stays, its replacement is queued
     h.advance(SNAP_SIG_WINDOW_MS);
     h.canvas.ctx.ops.length = 0;
     draw(h, 1);
-    assertEqual(blits(h).length, 0, "the box is painted");
-    assertEqual(snapApi(h).flips, 2, "and that switch is counted — this is the number that would have been huge before");
+    assertEqual(blits(h).length, 1, "the picture is still painted");
+    assertEqual(boxes(h).length, 0, "and no box");
+    assertEqual(snapApi(h).flips, 1, "so no switch is counted — this is the number that used to climb for every change");
   });
 
   test("off releases everything and paints exactly what it painted before", async () => {
@@ -3605,6 +3626,89 @@ suite("drawing: the Nodes 2.0 (Vue nodes) frontend", () => {
     await idle(h);
     assertGreater(snapApi(h).invalidated, 0, "the picture taken at the old position was dropped");
     assertGreater(paintedAt(93).length, 0, "and the new one puts the text where the element is now");
+  });
+
+  test("a tall node's own labels are read past the first sixteen", async () => {
+    const h = await boot();
+    const { nodes, vue } = vueGraph(h, 1);
+    const n = nodes[0];
+    stripWidgets(nodes);
+    vue.addStructure(n, { title: "ANT's Advanced Scheduler Advanced", inputs: ["model"] });
+    // Thirty rows of label + value: the shape of the node a user works in. The
+    // reader used to stop at 16 text leaves and 32 chrome boxes, which is how a
+    // node with real content came back as "flat rectangles with values missing".
+    const S = 0.1;
+    let leaves = 0;
+    for (let i = 0; i < 30; i++) {
+      const row = h.document.createElement("div");
+      row.className = "widget-row";
+      row.style.backgroundColor = "rgb(31, 37, 47)";
+      const label = h.document.createElement("span");
+      label.textContent = "label" + i;
+      const value = h.document.createElement("span");
+      value.textContent = String(i * 1.5);
+      row.appendChild(label);
+      row.appendChild(value);
+      vue.addMedia(n, row, { x: 8, y: 60 + i * 26, w: 184, h: 22 });
+      n.widgets.push({ name: "w" + i, element: row, node: n });
+      const rr = vue.rootFor(n)._rect;
+      label._rect = { left: rr.left + 6 * S, top: rr.top + (60 + i * 26 + 4) * S, width: 90 * S, height: 14 * S };
+      value._rect = { left: rr.left + 100 * S, top: rr.top + (60 + i * 26 + 4) * S, width: 80 * S, height: 14 * S };
+      leaves += 2;
+    }
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true });
+    draw(h, 2);
+    await idle(h);
+    const api = snapApi(h);
+    assertEqual(api.pictured, 1, "the node is a picture, not a box");
+    assertEqual(api.vueText, leaves, "every text leaf the browser laid out is read");
+    assertGreater(api.vueWidgetInk, 60, "every widget row is drawn");
+    const pic = h.canvases.filter((c) => c._ctx && c._ctx.ops.some((o) => o[0] === "roundRect"))[0];
+    assert(pic, "there is a picture");
+    const drawn = pic._ctx.ops.filter((o) => o[0] === "fillText").length;
+    assertEqual(drawn, leaves, "and every one of them is in the picture (the old cap was 16)");
+  });
+
+  test("a node that never stands still is photographed anyway, and never loses its picture", async () => {
+    const h = await boot();
+    const { nodes, vue } = vueGraph(h, 1);
+    const n = nodes[0];
+    stripWidgets(nodes);
+    vue.addStructure(n, { title: "Scheduler", inputs: ["model"] });
+    const S = 0.1;
+    const rows = [];
+    for (let i = 0; i < 3; i++) {
+      const row = h.document.createElement("div");
+      row.className = "widget-row";
+      const value = h.document.createElement("span");
+      value.textContent = "value " + i;
+      row.appendChild(value);
+      vue.addMedia(n, row, { x: 8, y: 60 + i * 26, w: 184, h: 22 });
+      n.widgets.push({ name: "w" + i, element: row, node: n });
+      const rr = vue.rootFor(n)._rect;
+      value._rect = { left: rr.left + 14 * S, top: rr.top + (60 + i * 26 + 4) * S, width: 80 * S, height: 14 * S };
+      rows.push(value);
+    }
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true });
+    draw(h, 2);
+    await idle(h);
+    assertEqual(snapApi(h).pictured, 1, "pictured once");
+    const before = snapApi(h).captured;
+    const boxesBefore = snapApi(h).vueBoxes; // painting the node as a box, ever
+    // A value rewritten every 200ms: shorter than the settle window, over and over.
+    // The window is a grace period, not a veto — and the picture of the moment
+    // before stays up while the replacement is made.
+    for (let k = 1; k <= 8; k++) {
+      rows[0].textContent = "value " + k;
+      h.advance(200);
+      h.canvas.ctx.ops.length = 0;
+      draw(h, 1);
+      assertEqual(snapApi(h).pictured, 1, "still the picture, never a box, at round " + k);
+      assertEqual(snapApi(h).vueBoxes, boxesBefore, "and no box flash ever");
+    }
+    assertGreater(snapApi(h).captured - before, 0, "it was photographed despite never standing still");
+    assertEqual(snapApi(h).churn, 0, "and the churn counter never fired: it is not a lost cause");
+    assertEqual(snapApi(h).slow, 0, "nor was it judged too slow");
   });
 
   test("the steady state costs the page no DOM work at all", async () => {
