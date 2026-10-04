@@ -99,7 +99,8 @@
     border-bottom: 1px solid var(--line);
   }
   .row .name { color: var(--text); }
-  select, .row button { width: 100%; max-width: 420px; }
+  select, input[type="text"], .row button { width: 100%; max-width: 420px; }
+  input[type="text"] { background: #202024; color: #eee; border: 1px solid #4a4a55; border-radius: 4px; padding: 5px 8px; font: inherit; }
   .note { margin: 8px 0 0; color: var(--muted); min-height: 1.2em; }
   table { width: 100%; border-collapse: collapse; margin-top: 8px; }
   th, td {
@@ -279,6 +280,13 @@
       else postSettings({ snapshots: false, boxDetail: stand.value });
     });
     row(host, "Stand-in", stand, "What replaces the node. A picture is a bitmap of the node itself. Until one is ready, the painted fill stands in.");
+    var keep = el("input", { type: "text", id: "keep" });
+    controls.keep = keep;
+    keep.addEventListener("change", function () {
+      var list = String(keep.value || "").split(",").map(function (t) { return t.trim(); }).filter(Boolean);
+      postSettings({ snapExclude: list });
+    });
+    row(host, "Keep these node types live", keep, "Comma-separated node types that are never served from a picture: they keep their painted fill, or draw live, however far you zoom out. A type on this list is counted apart from a failure \u2014 the readout's \u201ckept live on purpose\u201d is this setting doing its job.");
     var ratio = select("ratio");
     ratio.addEventListener("change", function () { postSettings({ snapRatio: Number(ratio.value) || 1 }); });
     row(host, "Stand-in capture resolution", ratio,
@@ -415,6 +423,7 @@
     if (!s || editing()) return;
     fill(controls.flat, optionsOf(controls.flat), s.flatBelow);
     fill(controls.stand, optionsOf(controls.stand), s.snapshots ? "picture" : (s.boxDetail || "plain"));
+    if (controls.keep && document.activeElement !== controls.keep) controls.keep.value = (s.snapExclude || []).join(", ");
     fill(controls.ratio, optionsOf(controls.ratio), s.snapRatio);
     fill(controls.budget, optionsOf(controls.budget), s.snapMb);
     fill(controls.disk, optionsOf(controls.disk), s.diskOn ? "on" : "off");

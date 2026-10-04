@@ -720,4 +720,38 @@ suite("panel: the Governor tab", () => {
     h.tracker.link.apply({ ok: true, rev: 2, origin: "window", command: "measure-links", commandRev: 1 });
     assert(h.tracker.lowZoom.state.ab && h.tracker.lowZoom.state.ab.text, "a window command starts the link measurement");
   });
+
+  test("the window and the page agree on which settings exist", async () => {
+    const dir = path.dirname(fileURLToPath(import.meta.url));
+    const html = fs.readFileSync(path.join(dir, "..", "web", "window.html"), "utf8");
+    const h = await boot();
+    const published = Object.keys(h.tracker.link.settings());
+
+    // Direction one: nothing the window posts may be a setting the page has
+    // never heard of. A typo here is a control that silently does nothing.
+    const posted = [...html.matchAll(/postSettings\(\{\s*([A-Za-z0-9_]+)/g)].map((m) => m[1]);
+    assertGreater(posted.length, 10, "the window posts a full settings page");
+    for (const key of new Set(posted)) {
+      assert(
+        published.indexOf(key) >= 0,
+        `the window posts "${key}", which the page never publishes — the control would do nothing`
+      );
+    }
+
+    // Direction two: nothing the page publishes may be invisible in the window.
+    for (const key of published) {
+      if (key === "enabled" || key === "paused") continue; // header buttons, not fields
+      assert(
+        html.indexOf(`s.${key}`) >= 0,
+        `the page publishes "${key}" but the window never shows it`
+      );
+    }
+
+    // The keep-live list is a control on both surfaces, not an API-only setting.
+    // (The window builds its fields in script, so the id is an object key there.)
+    assert(
+      html.indexOf('id="keep"') >= 0 || html.indexOf('id: "keep"') >= 0,
+      "the window has the keep-live text field"
+    );
+  });
 });

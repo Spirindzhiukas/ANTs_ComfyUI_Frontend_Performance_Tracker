@@ -10,7 +10,7 @@ import fs from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
 import { fileURLToPath } from "node:url";
-import { createDocument, createStorage } from "./dom-shim.mjs";
+import { computedStyle, createDocument, createStorage, fireMutation, fireResize, observerClasses, withQuiet } from "./dom-shim.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const TRACKER_PATH = path.join(HERE, "..", "web", "tracker.js");
@@ -184,6 +184,13 @@ export function createHarness(options = {}) {
       if (src && src._ctx && src._ctx.__antsImage) rec.imageReady = true;
       this.ops.push(rec);
     }
+    // The same approximation lodSnapMeasureText falls back to, parsed from the
+    // current font, so wrapping is deterministic in both branches.
+    measureText(text) {
+      const m = /(\d+(?:\.\d+)?)px/.exec(this.font || "");
+      const size = m ? Number(m[1]) : 14;
+      return { width: String(text).length * size * 0.55 };
+    }
     getImageData(x, y, w, h) {
       // What the snapshot engine's ink probe reads. Opaque by default, so the
       // probe's happy path runs in every test that captures anything; a test can
@@ -212,6 +219,9 @@ export function createHarness(options = {}) {
     "translate",
     "scale",
     "clearRect",
+    // The DOM-widget composite paints a text widget's value; the ops list is how
+    // a test sees that it reached the picture.
+    "fillText",
   ]) {
     FakeCanvasRenderingContext2D.prototype[name] = function (...args) {
       this.ops.push([name, ...args]);
@@ -220,11 +230,17 @@ export function createHarness(options = {}) {
   const makeStubCtx = () => new FakeCanvasRenderingContext2D(opts.ink !== "none");
 
   // createImageBitmap with the resize options, recording what was asked for.
+  // A blob that came out of this document's own canvas carries the canvas it came
+  // from, so the disk round trip (canvas -> toBlob -> PUT -> GET -> blob ->
+  // createImageBitmap -> canvas) can be exercised end to end in a test: the
+  // pixels are not re-encoded here, but the dimensions — which is what the
+  // capture ratio, the mip chain and the budget are all decided from — are real.
   const imageBitmaps = [];
   function createImageBitmapStub(img, opts) {
     const optsObj = opts || {};
-    const w = Number(optsObj.resizeWidth) || Number(img && (img.naturalWidth || img.width)) || 0;
-    const h = Number(optsObj.resizeHeight) || Number(img && (img.naturalHeight || img.height)) || 0;
+    const from = img && img.__antsCanvasNode;
+    const w = Number(optsObj.resizeWidth) || Number(from && from.width) || Number(img && (img.naturalWidth || img.width)) || 0;
+    const h = Number(optsObj.resizeHeight) || Number(from && from.height) || Number(img && (img.naturalHeight || img.height)) || 0;
     imageBitmaps.push({ src: img, width: w, height: h, quality: optsObj.resizeQuality || null });
     return Promise.resolve({ width: w, height: h, close() {}, __antsThumbOf: img });
   }
@@ -270,7 +286,23 @@ export function createHarness(options = {}) {
       wrapper.className = "dom-widget size-full";
       wrapper.appendChild(element);
       layer.appendChild(wrapper);
-      const widget = { name, type, element, options: options || {}, node: this, wrapper };
+      // The row this widget occupies, in node units: `DomWidgets.vue` positions
+      // the wrapper at `node.pos + margin` and sizes it from these two fields
+      // (`widget.width ?? node.width`, `widget.computedHeight ?? 50`), so a test
+      // that cares where the content lands sets them the way a real widget does.
+      const opts = options || {};
+      const widget = {
+        name,
+        type,
+        element,
+        options: opts,
+        node: this,
+        wrapper,
+        y: Number(opts.y) || 0,
+        computedHeight: opts.computedHeight != null ? Number(opts.computedHeight) : 50,
+        margin: opts.margin != null ? Number(opts.margin) : 10,
+        width: opts.width != null ? Number(opts.width) : undefined,
+      };
       this.widgets.push(widget);
       this._domWidgets = this._domWidgets || [];
       this._domWidgets.push(widget);
@@ -418,6 +450,11 @@ export function createHarness(options = {}) {
     }
     drawNode(node, ctx) {
       this.nodeDraws++;
+      // Nodes 2.0: `LGraphCanvas.drawNode()` returns early when
+      // `LiteGraph.vueNodesMode` is set — the node is a DOM element and the
+      // canvas draws none of it. The call still happens (the canvas walks its
+      // node list), so a wrapper around it still runs; what stops is the work.
+      if (LiteGraphShim.vueNodesMode) return;
       this.nodeLowQuality.push(this._isLowQuality);
       busy(this.costs.chrome);
       // LiteGraph draws into the context it was handed. A capture hands its own
@@ -447,16 +484,42 @@ export function createHarness(options = {}) {
   const LiteGraphShim = { registered_node_types: {}, LGraphCanvas: FakeLGraphCanvas };
 
   // ---------------------------------------------------------- fetch stub ---
+  // Routes are keyed by path (`/ants_optimizer/thumbs/3`), which is what most
+  // tests want, or by the whole URL when a test is about the query — the disk
+  // cache keys its files by what is in that query, so those tests read the calls
+  // out of `fetchUrls` and can serve a blob for one exact key. A route value that
+  // is a function is called with `{ url, method, body }` and its return value is
+  // used as the response, so a test can play the thumb store's part completely.
   const fetchRoutes = new Map();
   let fetchCalls = 0;
-  const fetchShim = async (url) => {
+  const fetchUrls = []; // every call, in order: { url, method, body }
+  const fetchShim = async (url, init) => {
     fetchCalls++;
-    const key = String(url).split("?")[0];
-    if (fetchRoutes.has(key)) {
-      const body = fetchRoutes.get(key);
-      return { ok: true, status: 200, json: async () => body };
+    const full = String(url);
+    const key = full.split("?")[0];
+    const req = { url: full, method: (init && init.method) || "GET", body: init && init.body };
+    fetchUrls.push(req);
+    let route = fetchRoutes.has(full) ? fetchRoutes.get(full) : fetchRoutes.has(key) ? fetchRoutes.get(key) : undefined;
+    if (route === undefined) {
+      // A key ending in `*` is a prefix route: one handler for a family of URLs
+      // (the thumb store is one route per node id, and a test does not want to
+      // register one per id).
+      for (const [k, v] of fetchRoutes) {
+        if (k.endsWith("*") && key.startsWith(k.slice(0, -1))) {
+          route = v;
+          break;
+        }
+      }
     }
-    return { ok: false, status: 404, json: async () => ({}) };
+    if (typeof route === "function") {
+      const res = route(req);
+      if (res !== undefined) return res;
+    } else if (route && route.__blob) {
+      return { ok: true, status: 200, json: async () => ({}), blob: async () => route.__blob };
+    } else if (route !== undefined) {
+      return { ok: true, status: 200, json: async () => route };
+    }
+    return { ok: false, status: 404, json: async () => ({}), blob: async () => null };
   };
 
   // ------------------------------------------------------------- sandbox ---
@@ -504,8 +567,28 @@ export function createHarness(options = {}) {
   sandbox.window.LiteGraph = LiteGraphShim;
   sandbox.CanvasRenderingContext2D = FakeCanvasRenderingContext2D;
   sandbox.window.CanvasRenderingContext2D = FakeCanvasRenderingContext2D;
+  // The page's own computed style: the tracker reads two things from it (whether a
+  // marked element is really off, and the font/colour of text it re-paints).
+  sandbox.getComputedStyle = (el) => computedStyle(el);
+  sandbox.window.getComputedStyle = (el) => computedStyle(el);
   sandbox.createImageBitmap = createImageBitmapStub;
   sandbox.window.createImageBitmap = createImageBitmapStub;
+  // The two observers a real page has, so the tracker can watch the node elements
+  // instead of re-measuring them on a timer. On by default (a browser always has
+  // them); a test that wants the fallback path switches them off.
+  const observerShims = observerClasses();
+  const setDomObservers = (on) => {
+    for (const k of ["ResizeObserver", "MutationObserver"]) {
+      if (on) {
+        sandbox[k] = observerShims[k];
+        sandbox.window[k] = observerShims[k];
+      } else {
+        delete sandbox[k];
+        delete sandbox.window[k];
+      }
+    }
+  };
+  setDomObservers(true);
   vm.createContext(sandbox);
 
   // Opt-in: make the fake timer functions behave like Chrome's, which throws
@@ -578,6 +661,270 @@ export function createHarness(options = {}) {
     return new FakeLGraphNode(opts);
   }
 
+  // ------------------------------------------------- Nodes 2.0 (Vue) mode ---
+  // The renderer this tool has to survive without painting anything: every node
+  // is a DOM element and the canvas draws none of it. Built to the frontend's own
+  // shapes, with the source of each one, so this cannot drift from the real page:
+  //
+  //   * `LiteGraph.vueNodesMode` is set from the `Comfy.VueNodes.Enabled` setting
+  //     (useVueFeatureFlags.ts) and `LiteGraph` is put on `window`
+  //     (useGlobalLitegraph.ts).
+  //   * Each node is `<div class="lg-node absolute" data-node-id="N" tabindex="0">`
+  //     positioned by `transform: translate(x, y)` — no left/top
+  //     (LGraphNode.vue).
+  //   * DOM widgets live in the `[data-testid="dom-widgets"]` layer, one
+  //     `.dom-widget` per widget, `position: fixed` with `left`/`top` in client
+  //     pixels plus `transform: scale(<zoom>)` (DomWidgets.vue +
+  //     useAbsolutePosition({ useTransform: true })).
+  //   * The conversion is the frontend's own: client = (graph + offset) * scale
+  //     + canvas rect (useCanvasPositionConversion.ts), which is what the
+  //     tracker's ownership arithmetic has to invert.
+  //
+  // `place()` re-positions the wrappers the way the frontend does on every drawn
+  // frame, so a test can pan and zoom and then ask what the tracker made of it.
+  function enterVueNodes() {
+    LiteGraphShim.vueNodesMode = true;
+    const container = document.createElement("div");
+    container.className = "vue-nodes";
+    document.body.appendChild(container);
+    // The frontend's own structure (TransformPane.vue): one element carrying the
+    // camera transform, every node inside it, and the nodes positioned by their own
+    // `translate`. Its computed matrix is how the tool measures the zoom the DOM is
+    // really laid out at — the one number a capture cannot take from the canvas,
+    // which a capture rewrites to 1.
+    const pane = document.createElement("div");
+    pane.setAttribute("data-testid", "transform-pane");
+    container.appendChild(pane);
+    const roots = new Map(); // node id (string) -> element
+    const wrappers = new Map(); // widget element -> its .dom-widget wrapper
+    const nodes = () => (canvas.nodes && canvas.nodes.length ? canvas.nodes : app.graph._nodes) || [];
+    let nextId = 1;
+    for (const n of nodes()) {
+      if (n.id === undefined || n.id === null || n.id === "") n.id = nextId++;
+      const root = document.createElement("div");
+      root.className = "lg-node absolute";
+      root.setAttribute("data-node-id", String(n.id));
+      root.style.transform = `translate(${n.pos[0]}px, ${n.pos[1] - 30}px)`;
+      pane.appendChild(root);
+      roots.set(String(n.id), root);
+    }
+    // What the node renders *itself* — the shape ImagePreview.vue has: a
+    // container inside the node's own DOM holding the node's images, laid out by
+    // the browser, not mounted through a widget. `box` is in node-local units
+    // (the same space the canvas draws a node in), which is what the client rect
+    // is derived from below.
+    const growth = new Map(); // node id -> extra node-local height the frontend adds
+    const media = []; // { el, node, box }
+    // The structure `LGraphNode.vue` renders inside the node element: the coloured
+    // surface, the header bar, the body panel and a row per slot with its
+    // connection dot. `box` is *element*-local (y = 0 is the top of the node
+    // element, one title bar above the node's own origin), which is the space the
+    // browser lays these out in and the space the tool's reader inverts.
+    const structure = []; // { el, node, box }
+    const addMedia = (node, el, box) => {
+      const root = roots.get(String(node.id));
+      if (root) root.appendChild(el);
+      else container.appendChild(el);
+      media.push({ el, node, box: { x: Number(box.x) || 0, y: Number(box.y) || 0, w: Number(box.w) || 0, h: Number(box.h) || 0 } });
+      place();
+      return el;
+    };
+
+    const place = () => withQuiet(() => {
+      const scale = Number(canvas.ds.scale) || 1;
+      const ox = Number(canvas.ds.offset[0]) || 0;
+      const oy = Number(canvas.ds.offset[1]) || 0;
+      // The camera transform lives on the pane: `scale3d(z,z,z)
+      // translate3d(x,y,0)`, exactly the string useTransformState.ts writes, so the
+      // tool's measurement of the DOM zoom is exercised the way the page does it.
+      pane.style.transform = `scale3d(${scale}, ${scale}, ${scale}) translate3d(${ox * scale}px, ${oy * scale}px, 0)`;
+      let originX = 0;
+      let originY = 0;
+      try {
+        const r = canvas.canvas && typeof canvas.canvas.getBoundingClientRect === "function" ? canvas.canvas.getBoundingClientRect() : null;
+        originX = r ? Number(r.left) || 0 : 0;
+        originY = r ? Number(r.top) || 0 : 0;
+      } catch (e) {
+        /* the shim's rect is always 0,0 */
+      }
+      // The frontend's own conversion: client = (graph + offset) * scale + rect.
+      // A node element is placed one title bar above the node's origin, which is
+      // exactly what LGraphNode.vue's transform does.
+      for (const n of nodes()) {
+        const root = roots.get(String(n.id));
+        if (root) {
+          root._rect = {
+            left: (n.pos[0] + ox) * scale + originX,
+            top: (n.pos[1] - 30 + oy) * scale + originY,
+            width: (Math.abs(Number(n.size && n.size[0])) || 0) * scale,
+            // The element LGraphNode.vue renders is the title bar *and* the body:
+            // its height is what the tool measures the real rendered box from.
+            // `growRoot` adds the frontend's own reserve below that (image nodes
+            // are rendered IMAGE_PREVIEW_HEIGHT_RESERVE = 232 px taller than their
+            // graph size).
+            height: ((Math.abs(Number(n.size && n.size[1])) || 0) + 30 + (growth.get(String(n.id)) || 0)) * scale,
+          };
+        }
+      }
+      for (const m of media) {
+        const n = m.node;
+        const root = roots.get(String(n.id));
+        if (!root || !root._rect) continue;
+        m.el._rect = {
+          left: (n.pos[0] + m.box.x + ox) * scale + originX,
+          top: (n.pos[1] + m.box.y + oy) * scale + originY,
+          width: m.box.w * scale,
+          height: m.box.h * scale,
+        };
+      }
+      for (const s of structure) {
+        const n = s.node;
+        const root = roots.get(String(n.id));
+        if (!root || !root._rect) continue;
+        s.el._rect = {
+          left: (n.pos[0] + s.box.x + ox) * scale + originX,
+          top: (n.pos[1] - 30 + s.box.y + oy) * scale + originY,
+          width: s.box.w * scale,
+          height: s.box.h * scale,
+        };
+      }
+      for (const n of nodes()) {
+        for (const w of n._domWidgets || []) {
+          if (!w.wrapper) continue;
+          const margin = Number(w.margin) || 10; // BaseDOMWidgetImpl.DEFAULT_MARGIN
+          const gx = Number(n.pos[0]) + margin;
+          const gy = Number(n.pos[1]) + margin + (Number(w.y) || 0);
+          w.wrapper.style.position = "fixed";
+          w.wrapper.style.left = `${(gx + ox) * scale + originX}px`;
+          w.wrapper.style.top = `${(gy + oy) * scale + originY}px`;
+          w.wrapper.style.transform = `scale(${scale})`;
+          wrappers.set(w.element, w.wrapper);
+        }
+      }
+    });
+    place();
+    return {
+      container,
+      roots,
+      wrappers,
+      place,
+      rootFor: (n) => roots.get(String(n.id)) || null,
+      // The frontend's own node structure, so a test can hold the tool to drawing
+      // it: everything inside the node element that is not text, not an image and
+      // not a widget — the surface, the header, the body panel, the slot dots.
+      // Returns the pieces so a test can move one and see the picture follow.
+      addStructure: (n, opts = {}) => {
+        const root = roots.get(String(n.id));
+        if (!root) return null;
+        const w = Math.abs(Number(opts.w || (n.size && n.size[0]))) || 200;
+        const h = (Math.abs(Number(n.size && n.size[1])) || 100) + 30 + (growth.get(String(n.id)) || 0);
+        const inputs = opts.inputs || ["image", "model"];
+        const keep = [];
+        const put = (el, box) => {
+          el._localBox = box;
+          structure.push({ el, node: n, box });
+          keep.push(el);
+          return el;
+        };
+        const surface = put(document.createElement("div"), { x: 0, y: 0, w, h });
+        surface.setAttribute("data-testid", "node-inner-wrapper");
+        surface.style.backgroundColor = opts.surface || "rgb(40, 40, 48)";
+        surface.style.borderTopWidth = "1px";
+        surface.style.borderTopColor = "rgb(18, 18, 22)";
+        surface.style.borderTopLeftRadius = "6px";
+        root.appendChild(surface);
+        const header = put(document.createElement("div"), { x: 0, y: 0, w, h: 30 });
+        header.setAttribute("data-testid", `node-header-${n.id}`);
+        header.style.backgroundColor = opts.header || "rgb(64, 84, 116)";
+        header.appendChild(document.createTextNode(String(opts.title || n.title || n.type || "Node")));
+        surface.appendChild(header);
+        const body = put(document.createElement("div"), { x: 0, y: 30, w, h: Math.max(0, h - 30) });
+        body.setAttribute("data-testid", `node-body-${n.id}`);
+        body.style.backgroundColor = opts.body || "rgb(30, 30, 36)";
+        surface.appendChild(body);
+        const dots = [];
+        inputs.forEach((name, i) => {
+          const row = put(document.createElement("div"), { x: 0, y: 34 + i * 20, w, h: 20 });
+          row.className = "lg-slot lg-slot--input";
+          body.appendChild(row);
+          const dot = put(document.createElement("div"), { x: 0, y: 34 + i * 20, w: 12, h: 20 });
+          dot.className = "slot-dot";
+          dot.style.backgroundColor = "rgb(150, 160, 180)";
+          row.appendChild(dot);
+          const label = put(document.createElement("div"), { x: 12, y: 34 + i * 20, w: w - 12, h: 20 });
+          label.appendChild(document.createTextNode(String(name)));
+          row.appendChild(label);
+          dots.push(dot);
+        });
+        // One more slot later on, the way a promoted widget or a new input turns
+        // up: a dot and nothing else, so a test can move the node's *structure*
+        // without moving its text or its size.
+        const addDot = (row = 3) => {
+          const dot = put(document.createElement("div"), { x: 0, y: 34 + Number(row) * 20, w: 12, h: 20 });
+          dot.className = "slot-dot";
+          dot.style.backgroundColor = "rgb(150, 160, 180)";
+          body.appendChild(dot);
+          dots.push(dot);
+          place();
+          fireMutation(root); // the page reports the new child inside the node
+          return dot;
+        };
+        place();
+        // The frontend reported it: a new subtree inside the node is a change, and
+        // the observer the tool put on the node's subtree is what says so.
+        fireMutation(root);
+        return { root, surface, header, body, dots, addDot, keep };
+      },
+      addMedia,
+      media,
+      // The frontend lays an image node out taller than its graph size. The tool
+      // has to cover the element, so the harness can say so.
+      // What the frontend does when it re-creates a node's element: the old one
+      // leaves the page and a new one takes its place carrying the same node id (a
+      // re-render, or a remount after the pane was torn down and rebuilt). The
+      // node's own content moves with it, and the new element is not blanked yet.
+      replaceRoot: (n) => {
+        const old = roots.get(String(n.id));
+        const root = document.createElement("div");
+        root.className = "lg-node absolute";
+        root.setAttribute("data-node-id", String(n.id));
+        root.style.transform = `translate(${n.pos[0]}px, ${n.pos[1] - 30}px)`;
+        for (const m of media) if (m.node === n && old && m.el.parentNode === old) root.appendChild(m.el);
+        for (const s of structure) if (s.node === n && old && s.el.parentNode === old) root.appendChild(s.el);
+        if (old) old.remove();
+        pane.appendChild(root);
+        roots.set(String(n.id), root);
+        place();
+        return root;
+      },
+      growRoot: (n, px) => {
+        growth.set(String(n.id), Number(px) || 0);
+        place();
+        // The element's own box changed (the frontend reserved more room inside the
+        // node), which is what a ResizeObserver reports — and what the tool needs to
+        // hear, since no frame would otherwise ask for the new height.
+        const root = roots.get(String(n.id));
+        if (root) fireResize(root);
+      },
+      // What the frontend does with a widget while its node is off screen
+      // (DomWidgets.vue's `isNodeVisible`) — a test can hand it back.
+      exit: () => {
+        LiteGraphShim.vueNodesMode = false;
+        // GraphCanvas.vue renders the whole pane with `v-if`: switching the
+        // renderer off *unmounts* every node element — the elements leave the page,
+        // they are not merely hidden. That is the state the tool has to clean up
+        // after: a mark left on a detached element is a node that comes back
+        // invisible if the frontend puts the same element back, and a capture made
+        // from a detached element is a picture of nothing. (The shim's
+        // `isConnected` answers "in the document", so this is a real detachment.)
+        for (const [, root] of roots) root.remove();
+        if (container.parentNode) container.parentNode.removeChild(container);
+        container.remove();
+        for (const m of media) m.el.remove();
+      },
+    };
+  }
+
   function addResource(url, { startTime = 0, duration = 10, transferSize = 1000, encodedBodySize = 1000 } = {}) {
     resourceEntries.push({ name: url, startTime, duration, transferSize, encodedBodySize, decodedBodySize: encodedBodySize });
   }
@@ -618,6 +965,7 @@ export function createHarness(options = {}) {
     sandbox,
     tracker,
     observers,
+    setDomObservers,
     emitPerformance,
     performanceShim,
     resourceEntries,
@@ -628,10 +976,20 @@ export function createHarness(options = {}) {
     infos: () => consoleCalls.filter(([lvl]) => lvl === "info").map(([, msg]) => msg),
     fetchRoutes,
     fetchCalls: () => fetchCalls,
+    fetchUrls: () => fetchUrls.slice(),
     registerExtension,
     registerNodeType,
     makeNode,
     node,
+    enterVueNodes,
+    get rectReads() {
+      return document._rectReads || 0;
+    },
+    // The per-document operations a browser would charge for (see dom-shim.mjs):
+    // a benchmark diffs these to price a frame.
+    get ops() {
+      return document._counts;
+    },
     addResource,
     panel,
     textOf,

@@ -12,19 +12,23 @@ this is going. Read the golden rules before the code.
 
 | Path | What it is |
 | --- | --- |
-| `web/tracker.js` | The whole frontend: instrumentation, the scheduler layer, the low-zoom/viewport rules, the panel. ~9.5k lines, one ES module, `import { app } from "/scripts/app.js"`. |
-| `__init__.py` | The node class (does nothing, never executes) and one optional read-only route `GET /ants_tracker/gpu`. |
+| `web/tracker.js` | The whole frontend: instrumentation, the scheduler layer, the low-zoom/viewport rules, the panel. ~12k lines, one ES module, `import { app } from "/scripts/app.js"`. |
+| `web/window.html` | The separate window at `/ants_optimizer/window`: its own page (no canvas script), talking to the ComfyUI page through `/ants_optimizer/ui`. |
+| `__init__.py` | The node class (does nothing, never executes) and nine best-effort routes: `GET /ants_tracker/gpu`, the five `/ants_optimizer/thumbs/*` routes, `/ants_optimizer/window` and `/ants_optimizer/ui`. |
 | `tests/` | Zero-dependency test suite + a synthetic-browser harness + a demo. No npm, no jsdom, no browser. |
 | `tools/pill-preview.mjs` | Renders the pill into `preview/` straight from the real CSS and glyph builders. |
 | `tools/box-preview.mjs` | Renders the flat boxes at each `boxDetail` level into `preview/` by recording the real paint ops (`lodPaintNode`) and replaying them as SVG. |
 | `preview/` | Generated. Never hand-edit; regenerate. |
-| `README.md` | User-facing docs. Every release adds a "What changed in vX.Y.Z" section **at the top of the changelog**. |
+| `README.md` | User-facing docs: install, use, every setting with its ladder and default, the tabs, the limits, credits. |
+| `CHANGELOG.md` | Version history. Every release adds a "What changed in vX.Y.Z" section **at the top**. |
+| `ANALYSIS.md` | What works, what failed and was fixed, and which ideas were retired; keep it honest and dated. |
+| `LICENSE` / `THIRD_PARTY_NOTICES.md` | This project's MIT licence, and the upstream notices carried with the ported ideas (the NodeSnapshots notice verbatim; no other code is copied). |
 | `REVIEW.md` | The v1 defect review with line references and the v2 fix for each. Read it before touching attribution or muting. |
 
 ## Commands
 
 ```bash
-node tests/run-tests.mjs              # all tests — must be green before any commit
+node tests/run-tests.mjs              # all 223 tests — must be green before any commit
 node tests/run-tests.mjs <substring>  # one suite/test, e.g. ... pill
 python3 tests/test_init.py            # the Python side (route parsing, node contract)
 node tests/demo.mjs                   # prints what the panel says against a synthetic graph
@@ -90,8 +94,7 @@ Read in this order to understand the file:
 | `--- 1. wrap extension registration` | The interceptor for `app.registerExtension` that wraps every other extension's `nodeCreated`/hook installs. |
 | `--- 2. catch hooks never routed through beforeRegisterNodeDef` | Pre-existing prototypes and per-instance hooks. |
 | `--- 3. canvas-level patches` | `draw` frame total, per-node-type cost, the three draw stages. |
-| `--- low-zoom drawing` | `LOD`, every predicate (`lodOn`, `lodFlatOn`, …), the DOM registry/sweep, preview ladder, link ink. |
-| `--- previews` | The thumbnail ladder (`LOD.thumbs`, a WeakMap per source; `createImageBitmap` with a canvas fallback). |
+| `--- low-zoom drawing` | `LOD`, every predicate (`lodOn`, `lodFlatOn`, …), the DOM registry/sweep, link ink, and the retired-ladder tombstone (`LOD.thumbZoom = 0` — do not restore it). |
 | `--- node snapshots` | The bitmap engine: signature, the keep-live set and every reason a node stays a box (with its name in the readout), size fitting and the ink probe, the capture into an offscreen canvas, the idle-lane pump, the budget (coarse-before-refused), and the reuse path called from the `drawNode` wrapper. Reads `LOD_SNAP_*` and the block comment above them first. |
 | `--- DOM boxes` | `view*`: the widget gate, the node-DOM registry, the event gate, fovea. |
 | `--- the event gate` | `LOD.blockSet` and the document-capture listener. |
@@ -138,7 +141,8 @@ predicate, not inline in a hot path.
    `set`) so tests and scripts do not reach into internals.
 8. **Tests**: one that the default changes nothing, one that switching it on
    changes exactly its own subject, one that switching it off restores.
-9. **README**: the changelog section, and `memory.md` if it involved a decision.
+9. **Docs**: a `CHANGELOG.md` entry, the README if a user-facing setting or
+   number changed, and `memory.md` if it involved a decision.
 
 ## Testing
 
@@ -165,6 +169,168 @@ Seams worth knowing:
   `h.tracker.totals`, `h.tracker._state`, `h.tracker._panel`.
 - `h.infos()/warnings()/errors()` — console capture. `errors()` must be empty in
   a passing test.
+- `h.enterVueNodes()` — switches the page to the Nodes 2.0 (Vue nodes) renderer
+  for the rest of the test: the flag goes on `h.LiteGraph.vueNodesMode` (the same
+  object the frontend writes), `drawNode()` early-returns, and each node gets a
+  `.lg-node[data-node-id]` root plus the `.dom-widget` wrappers of any widget that
+  was added with `addDOMWidget`, positioned in client pixels like
+  `DomWidgets.vue` does it. Returns `{container, roots, wrappers, place(),
+  rootFor(node), exit()}`; `exit()` puts the canvas renderer back on the same
+  page. The fixture's shapes come from the upstream files listed in
+  `ANALYSIS.md` — change it there first if it ever drifts.
+- In that renderer the stand-in is the **blanking pathway**: below the threshold
+  the node's own root element gets `LOD_VUE_ATTR` (`data-ants-vue-standin`, an
+  `!important` `opacity: 0` rule) and `lodPaintNode` paints the same box the canvas
+  renderer paints; `lodVueFramePlan` hands every element back when the setting,
+  the zoom, the tool or the renderer changes, and a box is only painted after a
+  *successful* marking (`lodVueBlank`). **The mark is `visibility`, not
+  `opacity`** (v2.6.6, and this is the whole point of the pathway): the attribute
+  carries `[data-ants-vue-standin] { opacity: 0 !important }` *and*
+  `[data-ants-vue-standin] > * { visibility: hidden !important }`. An engine skips
+  a hidden subtree in the paint phase, which is the only saving available in a
+  renderer whose node drawing is the browser's own DOM painting; an opacity-0
+  subtree is still painted (that is what v2.6.0–v2.6.5 shipped, and why the
+  stand-ins could cost performance here). The element's own box stays visible and
+  therefore hit-testable — selecting and dragging a node are bound on the root — so
+  the *children* are hidden, never the root, and the layout is untouched: rects,
+  text metrics and both observers still answer, which is where every number the
+  box and the picture are made of comes from. Trade, stated in README/`LIMITS`:
+  a widget inside a stand-in no longer takes its own clicks at that zoom, and the
+  node's accessibility entry is that of a hidden subtree. **Never a class**: `LGraphNode.vue` binds
+  `:class` on that element and Vue rewrites it on every re-render, so a class is
+  dropped and the node comes back visible behind its box — that was the v2.6.3 bug,
+  and the harness was blind to it until `exit()` started detaching the pane and the
+  shim started reporting `isConnected` truthfully. The fovea's hide/inert marks on
+  a node's own element are attributes too (`LOD_DOM_ATTR`, `LOD_DOM_INERT_ATTR`);
+  only widget wrappers, which Vue does not own, still use classes. The readout/API
+  name it: `lowZoom.snapshots.pathway` / `.bitmaps` / `.vuePaintSkipped` /
+  `.vueBlanked` / `.vueBoxes` /
+  `.vueRestored` / `.vueUnreached`. A test in that mode asserts the attribute, the
+  box ink, the re-render survival and the hand-back; the harness shim supports tag
+  selectors and `querySelector` for the nested-`<video>` and wrapper-`<img>` cases.
+- `lodVueBoxContent` gives a Vue box the node's own content when the stand-in is
+  *picture of the node*, from the two routes content takes to the page:
+  `lodSnapDomInk` for widget-borne elements (textarea values re-painted, img and
+  canvas blitted), `lodVueRootMetrics` for what the node renders itself
+  (`img`/`canvas` children of the node's element, drawn at their laid-out
+  position — `(childRect - rootRect)/zoom` in graph units, minus the title bar)
+  `lodVueChromeBoxes`/`lodVueChromeInk` for its **structure** (v2.6.6: the
+  element's own box, the header bar (`node-header-<id>`), the body panel
+  (`node-body-<id>`) and every `.slot-dot`, each from its own rect and the
+  background colour the browser computed, drawn biggest-first and rounded; a node
+  with no header has none — a picture of the text and media alone had no surface
+  under it, which is the "semi, not fully there" the user reported),
+  and `lodVueTextLines`/`lodVueTextInk` for its **text** (v2.6.4: every leaf string
+  with its laid-out box and computed font/colour, at most `LOD_VUE_TEXT_MAX` lines
+  of `LOD_VUE_TEXT_CHARS` characters, each clipped to its own box — a picture of a
+  Vue node without its labels read as a box). `lodVueContentInk` is the one place
+  the live box and the capture both draw from, so they cannot drift apart.
+  `lodPaintNode` takes optional `content` / `detailOverride` / `sizeOverride` and
+  clips content to the node's box **and its title bar** (a DOM node's title is
+  content like any other, and a clip on the body alone cut it off the picture);
+  the canvas renderer passes none of them. Gauges: `lowZoom.snapshots.vueContent`
+  / `.vueMedia` / `.vueText` / `.vueChrome` / `.vueChromeBoxes`.
+  Three things here are load-bearing, learned the hard way in v2.6.3:
+  (1) **the box is `lodVueBoxSize`** — the element's measured box, not `node.size`
+  (`LGraphNode.vue` renders image nodes `IMAGE_PREVIEW_HEIGHT_RESERVE` = 232 px
+  taller than their graph size and puts the picture in the overhang);
+  (2) **the zoom is measured, in one order** (`lodVueDomScale`): the transform
+  pane's own computed matrix first (one matrix for the whole graph, written by
+  `useTransformState.ts` — m11 is the zoom), then `[data-testid=node-inner-wrapper]`
+  (the element that carries the node's declared width — the root has only
+  `min-width`, so its own width is whatever its content needs), then the root, and
+  `canvas.ds.scale` only when nothing about the DOM can be read. That last one is
+  why this matters: a capture sets it to 1 while the DOM keeps its transform, and
+  dividing client pixels by the wrong zoom puts the content outside its box. The
+  readout names the answer: `lowZoom.snapshots.vueScale` / `.vueScaleFrom`;
+  (3) **the cache key is the node's own size only** — every stored number is
+  node-local, so a pan or a zoom must cost *no* layout read (a key that included
+  them meant one forced layout per boxed node per frame while the user dragged),
+  and the refresh is rationed by `LOD_VUE_MEDIA_BUDGET` per frame. **The refresh
+  is not a poll** (v2.6.5): `lodVueWatch` puts a `ResizeObserver` on the node's
+  element and the elements inside it and a `MutationObserver` over its children
+  and text, and a report deletes that node's measurement
+  (`lodVueStaleNode`), so the next frame re-takes it; attributes are deliberately
+  not observed (Vue rewrites `style`/`class` on hover, selection and every pane
+  gesture), a watched node keeps a 5 s insurance read
+  (`LOD_VUE_MEDIA_MS_WATCHED`), and a page without the observers keeps the 400/
+  800 ms beat. Keep it that way: a `setAttribute` with the value the element
+  already has is not free (Blink/WebKit run the attribute-changed path), the
+  video verdict must stay cached (`LOD.snapVideo`; 30 s watched / 100 ms
+  unwatched, and a capture probes fresh), and the steady state must cost the page
+  nothing — three tests assert exactly zero writes, reads, queries and probes per
+  frame at any node count.
+  (4) **a capture waits for the node to stand still** (v2.6.6): `LOD_SNAP_SETTLE_MS`
+  (300 ms) is a window opened when a node is first drawn as a stand-in and
+  re-opened by every reported change or signature mismatch (`lodVueChanged`), and
+  `lodVueSettleLeft` is the gate in the capture lane — `lodSnapTake` skips a node
+  inside its window and the slice is scheduled for the moment it opens (never
+  polled). The frontend mounts a node and fills it over the following passes
+  (slots sync, layout, widgets, media decoding), so "capture immediately" is a
+  picture of a half-built node. Canvas pathway: no window (its drawing is
+  synchronous with the frame). Gauges: `vueSettleMs` / `.vueSettleArms` /
+  `.vueSettleHeld`. **The window has a ceiling** (v2.6.7): `lodVueChanged` keeps
+  the *first* change of a burst as well as the last (`{ at, first }`), and
+  `LOD_SNAP_SETTLE_MAX_MS` (900 ms) lets the capture through anyway — a node whose
+  subtree is rewritten more often than the window would otherwise never be
+  photographed, and a grace period must not become a veto.
+  (5) **a capture takes one measurement.** `lodVueRootMetrics(node, canvas, true)`
+  → `lodSnapGeometry(node, canvas, dom.boxH)` → surface, box and ink from the same
+  number, and the signature mixes that height, the text lines and the measured
+  widget boxes (`lodVueWidgetBoxes`), so a picture is dropped and re-made when the
+  node finishes rendering instead of being kept from the first look. Widget
+  content is drawn where the browser laid the element out when the frontend has
+  mounted it inside the node's own element (`WidgetDOM.vue`), and at the canvas
+  row only when there is no such element.
+  Elements the widget route drew are skipped, so nothing is drawn twice.
+  (6) **a change keeps the picture** (v2.6.7, and this is the one that made
+  "flat rectangles"): the paint path used to `lodSnapDrop` on a signature
+  mismatch, so a node whose value changes often was never anything but a box —
+  measured: `pictured 1, 0, 1, 0 …` for a value rewritten every 400 ms, and 1020
+  of 1800 frames with a box in the 24-node A/B. The complete picture of the
+  moment before now stays on screen while its replacement is captured
+  (`rec.staleAt`, `LOD_SNAP_STALE_KEEP_MS` 2000, `staleHeld` in the readout); past
+  that the node gets its box back for `LOD_SNAP_CHURN_HOLD_MS` (2000) and is
+  asked again — never `lodSnapBlockNode`d, never a session verdict. A slow
+  capture is the same shape: `LOD_SNAP_SLOW_MS` (60 ms) starts a doubling
+  cooldown (`LOD_SNAP_SLOW_COOLDOWN_MS` 10000 x 2^n, capped at
+  `LOD_SNAP_SLOW_MAX_MS` 120000) instead of a permanent block, with the gate in
+  both `lodSnapEnqueue` and `lodSnapCaptureNode` (defence in depth: either one
+  alone keeps the node out). If you touch either, keep the *outcome* true: a node
+  that is merely changing or slow must never end up a plain box for the session,
+  and a picture must never be replaced by a box while a fresh one is in flight.
+  The reader caps are sized for a real node too (v2.6.7): `LOD_VUE_TEXT_MAX` 256,
+  `LOD_VUE_TEXT_CHARS` 400, `LOD_SNAP_DOM_MAX` 96, `LOD_VUE_CHROME_MAX` 128, the
+  slot-dot sub-cap 96 — a 30-row node's 60 text leaves and 90 row boxes all reach
+  the picture (`fillText 60`; the v2.6.6 fixture-sized caps drew 16). A row's
+  value that fits is never ellipsised: the wrapper gets the full line budget
+  (`LOD_SNAP_TEXT_LINES`) and only the *drawn* lines are trimmed to what the box
+  holds — handing it the row's own count makes it mark `out.length >= maxLines`
+  and "a cat" comes back "a ca…".
+  **The plan and the draw loop ask one predicate** (`lodVuePathOn`): if the plan
+  ever asks a *narrower* question than the draw loop — as it did while it required
+  `LOD.snapOn` — it hands every blanked element back at the top of every frame
+  while the draw loop blanks it again, and the user sees the whole canvas flicker
+  (v2.6.4). A box is a stand-in; the picture setting decides what the box is made
+  of, not whether anything stands in. **A capture with no element on the page is
+  refused** (`vueNoElement`), because a bare box stored under the node's key is
+  served to every later frame as if it were the node. **The pathway is part of a
+  picture**: it is mixed into the signature and appended to the disk key
+  (`lodSnapPathwayToken`, `…<pc|pv>`), so neither renderer is ever served the
+  other's picture — RAM or file. If you touch this, keep it that way: a photograph
+  of a DOM element is impossible (no browser API), and the harness shim supports
+  `el._rect`, `h.rectReads`, `getComputedStyle` (display/pointer-events/transform
+  matrix/font/colour — and, since v2.6.6, the box colours a stand-in reads:
+  `backgroundColor`, `borderTopWidth`, `borderTopColor`, `borderTopLeftRadius`),
+  `vue.growRoot()` for testing layout and `vue.addStructure(node, {title, inputs})`
+  (v2.6.6) for the frontend's own node structure — surface, header, body panel and
+  one row + dot per input, laid out in element-local units the way `LGraphNode.vue`
+  lays it out, so the reader and the ink are pinned against the real shape. v2.6.5 added the
+  two observers to the sandbox (on by default — a browser has them; a test can
+  call `h.setDomObservers(false)` to exercise the timer fallback) with
+  `withQuiet` so the fixture's own pan/zoom layout is not mistaken for a box
+  change, `fireResize` for the changes a test makes by hand, and `h.ops` carries
+  `attrWriteBy` so a test can hold the tool to "the mark is written once".
 
 Rules for tests:
 
@@ -213,9 +379,9 @@ Rules for tests:
 2. `cp web/tracker.js /tmp/x.mjs && node --check /tmp/x.mjs`.
 3. Bump `VERSION` in `web/tracker.js` (the panel, the report and the snapshot all
    read it from there).
-4. README: a new `## What changed in vX.Y.Z` section directly above the previous
-   one, written as "the problem, then what changed, then what it cost", plus the
-   test count in the Development block.
+4. `CHANGELOG.md`: a new `## What changed in vX.Y.Z` section directly above the
+   previous one, written as "the problem, then what changed, then what it cost";
+   keep the test count in the README's Development block current.
 5. `memory.md`: append to the version log; add any decision worth not re-litigating.
 6. `node tools/pill-preview.mjs > preview/pill.html` if any pill CSS, glyph or
    control changed.
