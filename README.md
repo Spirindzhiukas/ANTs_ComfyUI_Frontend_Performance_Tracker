@@ -26,19 +26,17 @@ This README describes the current code. Version history moved to
 
 ## Install
 
-Drop the whole folder into `ComfyUI/custom_nodes/` so that it sits at:
+`ComfyUI/custom_nodes/` 
+and there open cmd window 
+git clone https://github.com/Spirindzhiukas/ANTs_ComfyUI_Frontend_Performance_Tracker
+so that it sits at:
 
 ```
-ComfyUI/custom_nodes/0000_ANTs_nasty_bastards_tracker/
+ComfyUI/custom_nodes/ANTs_ComfyUI_Frontend_Performance_Tracker/
     __init__.py
     web/tracker.js
     web/window.html
 ```
-
-The `0000_` prefix is deliberate: web directories load in alphabetical
-order, and this file must load **before** other custom nodes' scripts so it
-can wrap their `registerExtension` calls and see their draw hooks. If you
-rename it, keep something that still sorts first.
 
 Restart ComfyUI. There is no build step, no bundler, and nothing to
 `pip install`; the extension ships by being copied.
