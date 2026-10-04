@@ -4,7 +4,7 @@ A running record for whoever picks this up next (including me). `CLAUDE.md` is t
 rules for changing the code; `plan.md` is where it is going. This file is the past:
 what was built, what was rejected, and what the evidence was.
 
-Last updated at **v2.7.0**, 232 tests green, PR #2 on
+Last updated at **v2.7.1**, 236 tests green, PR #2 on
 `Spirindzhiukas/ANTs_ComfyUI_Frontend_Performance_Tracker`.
 
 ---
@@ -13,8 +13,8 @@ Last updated at **v2.7.0**, 232 tests green, PR #2 on
 
 | | |
 | --- | --- |
-| Version | 2.7.0 (`web/tracker.js` `VERSION`) |
-| Tests | 232 (`node tests/run-tests.mjs`), plus `tests/test_init.py` |
+| Version | 2.7.1 (`web/tracker.js` `VERSION`) |
+| Tests | 236 (`node tests/run-tests.mjs`), plus `tests/test_init.py` |
 | Frontend | `web/tracker.js`, one ES module, no dependencies. The separate window is `web/window.html`, served at `/ants_optimizer/window`, not loaded as an extension. |
 | Backend | `__init__.py` — node `ANTs_Frontend_Optimizer` (old class key kept as an alias), nine best-effort routes (GPU, five thumbnail routes, the window page, `/ants_optimizer/ui`), and thumbnail read/write under ComfyUI's temp folder |
 | Panel | 10 tabs: Node Rendering Settings, Status, Timing, Nodes, Stalls, Governor, Load, Memory, GPU / VRAM, Testing |
@@ -36,6 +36,8 @@ something has to be drawn less or hit-tested less.
 ## 2. Version log
 
 The commit log is the full record; this is the "why", newest first.
+
+**v2.7.1 — the parts of a node that are not elements: its icons, its badge pills and its footer band.** The thirteenth pass left "a stand-in must look like the node the user sees" as a standing criterion; this pass closed the two holes still left in the reader, both found by following the frontend's own DOM rather than by a report. (1) **Icons.** This frontend paints an icon as an SVG *mask* on an element — the iconify Tailwind plugin compiles `icon-[comfy--comfy-c]` to `mask-image: url("data:image/svg+xml,…")` with `background-color: currentColor` and `mask-size: 100% 100%` (`packages/design-system/src/css/iconifyDynamicPlugin.ts`; the vocabulary is generated with `@source inline("icon-[comfy--{…}]")` in `style.css`) — so there is no `<svg>`, no `<img>` and nothing in the markup that names the glyph, and a reader that stops at `textContent` leaves a hole exactly where the node's badges, control icons and footer tabs are (a reader that drew the element's box instead would paint a solid blob of the icon's colour). The reader takes the mask, its size, the background image and its size from the computed style it already read for the text, parses the SVG once per data URL (`lodVueIconParse`, Map cache keyed by the URL) and re-draws its shapes as a `Path2D` in the element's own box, scaled out of the icon's own `viewBox` (`lodVueIconInk`): a mask is painted in the colour it clips out of (the element's own background — `currentColor` at the plugin's rule, resolved by the browser), and a background-image icon keeps its own colours with `currentColor` meaning the element's text colour. Shapes with a primitive (path, circle, ellipse, rect, line, polyline, polygon, one level of `g`) are drawn; everything else — a raster mask, a mask that is *tiled* rather than stretched over the box, a `d` that is not path data, a context without `Path2D`, or one without `save`/`restore` (a transform that cannot be put back would move everything drawn after it) — is **counted and left as a hole** (`vueIconSkip`), because a solid box where the page shows a glyph is worse than a gap. (2) **The badge pills and the footer band** have no stable class (they are generated Tailwind utilities) and only one test id each (the Comfy badge, each footer tab), so they are read **by relationship**: the anchor's own box, the anchor's siblings inside the badge row (capped at 8), the tab button and its parent — two new structural kinds, drawn after the panel and under the content. (3) A key bug found while writing the invalidation test: the icon's key was the data URL's head and tail, and **every icon in a set shares both**, so the check-mark `<path>` and the `<circle>` dot hashed *equal* and a picture showing one was kept when the page showed the other; the key is the parsed geometry now (`lodVueIconKey`: the viewBox and every shape's path data, fill, stroke, width and fill-rule). **Tests: 236** (four new: the glyph's path data, box, scale and colour plus the panel's own sentence; the picture remade with the new glyph after a change and not carrying the old one; unreadable icons as holes and counts, never blobs; the pills and the footer band as surfaces at the page's own rects). **Mutation battery: nine anchored edits, nine caught** (icons not read, the mask painted in the text colour, a tiled mask accepted, the geometry key back to the URL's ends, the glyph out of the signature, circles and rects not shapes, the badge pills not read, the footer band not read, a drawn glyph not counted as content). Recorded rather than engineered around: an icon whose CSS the page injects *after* a picture was taken is not noticed until the node next changes, because a watched node is re-measured on the page's own reports and not on a timer (5 s beat — what keeps the steady state free of DOM work); a fresh measurement always reads the icons as they are then, and on the built frontend the vocabulary is in the stylesheet before the first element is measured.
 
 **v2.7.0 — the twelfth report: the flicker, the wrong moment, and what a "screenshot" can be.** The report had three parts and each was traced to a mechanism before anything was touched. *The flicker* ("some nodes flicker/fight") was three ownership bugs in one mark: the element the tool cached for a node was trusted until it left the page, but this frontend reuses elements and rewrites the `data-node-id` they carry, so the box could be painted for one node while another node's element was blanked or handed back; the mark was re-applied on the next *canvas draw* — a draw is neither guaranteed nor immediate — so an element the frontend had just put on the page was painted unmarked for a frame before the box took its place; and a replacement delivered as two reports (a removal in one task, the addition in the next) left the node forgotten. The fixes are one ledger: identity (`data-node-id` must still match, else `vueStaleEls` and a re-lookup), the page's own report (`lodVuePaneWatch`, a `childList` observer on the container the frontend renders nodes into, resolving the report's `addedNodes` through `lodVueNodeById` and re-marking **in the callback, before the paint** — `vueRedressed`), a short memory for a node that lost its element (`lodVueOrphan`, 500 ms, so the element arriving later is dressed on arrival), and two explicit hand-back rules (an element taken off this node is handed back; an element the frontend gave to *another* node keeps that node's mark — `lodVueClaimsOther`, ids compared as strings, because `"7" === 7` is false and the first cut of that check read backwards). *The wrong moment* was the settle window holding a node that was being written but not one that was still arriving: `lodVueShotWait` now holds a capture for a node with no laid-out box (`vueWaitLayout`), an `<img>` that has not arrived (`vueWaitMedia`) or content of its own while `document.fonts.status === "loading"` (`vueWaitFonts`), names the reason in the readout, and the page's font state joined the picture's signature — so a fallback-font picture is dropped and re-made when the webfont arrives. The ceiling still wins: a node that never settles is still photographed. *"Rethink it as simple screenshots"* was answered as a question about the browser: a pixel screenshot of a DOM element is not obtainable from page JavaScript, and the only route (clone → inline computed styles → `<svg><foreignObject>` → data URL → `createImageBitmap`) was prototyped against documented behaviour and **deliberately not shipped** — there is no browser in this environment to A/B it against, and a rasteriser on a GPU-less Electron pays a full tree rasterisation per capture, which is the cost this pathway exists to remove. What shipped is the honest form: the picture is read from the element the user is looking at, taken only once that element is finished, with the node's state never frozen into it. **Tests: 232** (four new), and the mutation battery's eight edits caught seven — the survivor (answering a report in arrival order rather than additions-first) is unobservable in a harness that delivers one record per DOM operation, and is recorded as such in `CHANGELOG.md` and `ANALYSIS.md` instead of being claimed as bound.
 
@@ -412,6 +414,25 @@ so the switch's 1.5px border is drawn inside the box and its centre line sits at
 line. Unchecked paints nothing inside the ring; checked fills `#0D2A2A`; both are
 `#AE7719` in every state, hover only moves the background.
 
+**An icon is a data URL, not an element: read the computed style, draw the geometry.**
+There is no element to find, no `<svg>` to walk, and nothing in the markup that names
+the glyph; the mask is in `getComputedStyle(el).maskImage` (or its `-webkit-` alias)
+and the geometry is inside the data URL. Equally decided: an icon that cannot be read
+is a **hole and a counter**, never the element's box — the box is a solid block of the
+icon's colour, which is the one thing worse than a gap. And an icon's identity, for
+the picture's signature, is its geometry, never its URL: every icon in a set shares
+its SVG header and its closing bytes.
+
+**Structure is read by the page's own test ids and by DOM relationship, never by a
+generated class name.** The badge pills, the footer band and the widget rows are
+reached through the anchors the frontend itself marks (`data-testid="comfy-badge"`,
+`subgraph-enter-button`, `advanced-inputs-button`, `node-widgets`, `node-body-<id>`)
+and through `parentNode`/`children`. A Tailwind utility name is generated per build:
+a frontend rebuild renames it, the reader silently matches nothing, no test fails and
+every picture quietly loses a surface. (A `>` child-combinator selector is the same
+class of mistake for the same reason — the harness's grammar silenced one and the
+reader was reading nothing *in the tests* while reading everything on the real page.)
+
 ## 4. Rejected approaches (do not retry)
 
 - **`pointer-events: none` on node DOM as the way to stop widgets.** It cannot
@@ -446,6 +467,15 @@ line. Unchecked paints nothing inside the ring; checked fills `#0D2A2A`; both ar
   speculative — try it with a real page and a pixel comparison, not here.
 - **An `auto` link style.** "A link's shape changing because the *node* setting
   crossed a threshold" is precisely the coupling users hated.
+
+- **Selectors built from Tailwind utility class names for *structure***
+  (`.bg-component-node-widget-background` and friends, to read the badge pills or the
+  footer band). They are generated per build and a rebuild renames them under this
+  reader without a single test noticing. Test ids plus parent/sibling relationships
+  are stable; see the decision in §3 and rule 17 in `CLAUDE.md`.
+- **Drawing the element's box where an icon cannot be read.** It looks plausible and
+  it is a solid rectangle of the icon's colour over the node — worse than the hole it
+  replaces. Unreadable candidates are counted (`vueIconSkip`) and left out.
 
 ## 5. The pill, and what went wrong twice (worth reading before touching UI)
 
@@ -513,6 +543,15 @@ The user's machine and reports, all of which drove priorities:
   approve the rendered picture, but a real-page check is still owed.
 - **No per-node-type policy exists yet** — mutes and drawing settings are per
   extension or global. See `plan.md`.
+
+- **An icon whose CSS the page injects after a picture was taken** is not noticed
+  until the node next changes. A watched node is re-measured on the page's own
+  reports rather than on a timer (`LOD_VUE_MEDIA_MS_WATCHED` is 5 s, and that is what
+  keeps the steady state free of DOM work), so a stylesheet that arrives between two
+  reports gives an existing element its glyph without the signature changing. A fresh
+  measurement always reads it and the next change re-photographs the node; closing
+  the window with a per-frame query would cost a DOM read per frame in exactly the
+  pathway that exists to remove one.
 
 ## 8. How this code got written (process notes)
 

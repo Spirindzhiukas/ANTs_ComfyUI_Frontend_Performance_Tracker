@@ -98,6 +98,20 @@ bug that was reported by a user, and most have a regression test.
     never becomes one). A new reason to wait goes in `lodVueShotWait`, is counted
     in a named counter, and is mixed into the signature if it can invalidate a
     picture.
+16. **The picture carries what the element carries, including the parts that are not
+    elements.** This frontend draws an icon as an SVG `mask-image` data URL in a
+    computed style, its badges and footer tabs as elements whose *relatives* are the
+    visible surfaces, and its state as the frontend's own live drawing. Read the
+    first two, never freeze the third. Anything the reader cannot read — a raster
+    mask, a tiled mask, a `d` that is not path data — is **counted and left as a
+    hole**, never filled with the element's box: a solid box where the page shows a
+    glyph is worse than a gap.
+17. **Read structure by the page's own test ids and by DOM relationship, never by a
+    generated class name.** Tailwind utilities (`bg-component-node-widget-background`)
+    are renamed by a frontend rebuild under this reader without a single test
+    noticing, and every picture quietly loses a surface. An anchor the frontend puts
+    a test id on (the Comfy badge, a footer tab) plus its parent/siblings is stable;
+    a class selector is a silent hole waiting for a rebuild.
 
 ## Architecture map of `web/tracker.js`
 
@@ -181,6 +195,15 @@ Seams worth knowing:
   real capture/bubble event propagation with `stopPropagation`, `getBoundingClientRect`.
   It has `createElementNS` (the pill's SVG needs it) but **no `innerHTML`
   parsing** — assert classes, `aria-checked` and titles, not glyph contents.
+- `getComputedStyle` in the shim answers what the readers read: the box/colour
+  fields, the font fields, the *image* fields an icon lives in (`maskImage`,
+  `maskSize`, `backgroundImage`, `backgroundSize`) and the dashed spellings through
+  `getPropertyValue` (Chromium fills in `maskImage`, WebKit only
+  `-webkit-mask-image`; the tracker asks for either). A test sets them on the
+  fixture, exactly as `style.maskImage = "url(…)"` would.
+- The sandbox has `Path2D` (a shim that keeps the `d` it was built from, so a test
+  can say *what* was drawn and not only that something was). Icons reach the canvas
+  that way; `ctx.fill(path, rule)` is the op to look for.
 - `h.tracker` — the debug API; `h.tracker.lowZoom`, `h.tracker.governor`,
   `h.tracker.totals`, `h.tracker._state`, `h.tracker._panel`.
 - `h.infos()/warnings()/errors()` — console capture. `errors()` must be empty in
@@ -459,6 +482,17 @@ Rules for tests:
   that is the harness, not a missing guarantee. What is observable — and bound by
   tests — is the crossing between callbacks (a replacement delivered as two
   reports) and the sweep for a report that carries no added nodes.
+- **An icon's key is its geometry, not its URL.** Every icon in a set shares its
+  SVG header and its closing bytes, and the signature's cheap long-string hash looks
+  at a long string's two ends — so a URL-end key reads two different glyphs as one
+  and keeps a picture of the wrong one (a check-mark and a dot hashed equal, in the
+  test written for exactly this). `lodVueIconKey` hashes the parsed geometry.
+- **A watched node is re-measured on the page's reports, not on a timer**
+  (`LOD_VUE_MEDIA_MS_WATCHED` is 5 s, which is what keeps the steady state free of
+  DOM work). A change the observers do not report — the page injecting a stylesheet
+  that gives an existing element its icon — is therefore not in the signature until
+  the node changes. A fresh measurement always reads it; do not "fix" this with a
+  per-frame query.
 - **`data-node-id` is a string, `node.id` is a number.** `"7" === 7` is false;
   compare with `String(...)` on both sides. The first cut of `lodVueClaimsOther`
   read the comparison backwards and handed back a mark it should have kept.

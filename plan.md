@@ -661,6 +661,30 @@ in `CHANGELOG.md`; the one edit that survives (the ordering inside one callback)
 recorded there as unobservable in a harness that delivers one record per DOM
 operation.
 
+**K11. What a picture still cannot carry — the honest remainder (S, ongoing).**
+v2.7.1 closed the two structural holes the thirteenth pass left (the node's icons —
+an SVG mask in a computed style, not an element — and the badge pills/footer band,
+read from the page's own anchors by relationship). What is left, in the order it is
+worth doing, each only with evidence from the user's own page:
+
+- **A page-injected icon stylesheet is not noticed until the node changes** (the
+  watched beat is 5 s by design). Recorded in `ANALYSIS.md` and `memory.md` §7. A
+  fix would have to be *free* in the steady state — a per-frame query is not.
+- **The collapsed-node bar** (a collapsed node in this renderer is a header strip with
+  its own dots and progress line) is not read as its own shape; the reader draws the
+  header and the dots, and the bar only exists while a collapsed node is executing —
+  which is a node that keeps its own element, so nothing is lost today. Revisit only
+  if a report shows a collapsed stand-in that looks wrong.
+- **A pack's canvas-drawn widget content** is still invisible in this renderer (the
+  widget has no element to walk), and a pack's own HTML stays blank and counted. That
+  is a limit of the page, not of the reader.
+- **The state marks** (progress, error ring, executing outline) are the frontend's own
+  live drawing — a running, erroring or dragged node keeps its own element, so a
+  picture never has to carry them. The one case left is a node that *starts* running
+  while its picture stands in: `lodVueFlatNode` hands the element back on the next
+  draw, and the readout counts it (`vueRestored` / the stand-in counters). If a user
+  reports seeing a stale picture during a run, the answer is in the counters first.
+
 **K10. A real pixel screenshot — speculative, needs a machine with a browser
 (S–M).** The twelfth report asked for the capture to be "simple screenshots of the
 nodes as the frontend is showing them to the human". A DOM element cannot be drawn

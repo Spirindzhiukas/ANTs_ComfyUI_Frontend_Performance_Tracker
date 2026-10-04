@@ -244,6 +244,22 @@ export function createHarness(options = {}) {
   };
   const makeStubCtx = () => new FakeCanvasRenderingContext2D(opts.ink !== "none");
 
+  // `Path2D` is the one route icon geometry has to the canvas: the frontend's
+  // iconify plugin compiles an icon to a masked element, so a stand-in that wants
+  // the glyph builds its path from the SVG the page's own CSS carries and hands it
+  // to `fill`/`stroke`. The shim keeps the path data so a test can say *what* was
+  // drawn, not merely that something was; a browser's `Path2D` ignores path data it
+  // cannot parse (an empty path, no throw), which is what this does too.
+  class Path2DShim {
+    constructor(d) {
+      this.d = d == null ? "" : String(d);
+      this._ops = [this.d];
+    }
+    addPath(p) {
+      if (p && p.d) this._ops.push(p.d);
+    }
+  }
+
   // createImageBitmap with the resize options, recording what was asked for.
   // A blob that came out of this document's own canvas carries the canvas it came
   // from, so the disk round trip (canvas -> toBlob -> PUT -> GET -> blob ->
@@ -586,6 +602,8 @@ export function createHarness(options = {}) {
   // marked element is really off, and the font/colour of text it re-paints).
   sandbox.getComputedStyle = (el) => computedStyle(el);
   sandbox.window.getComputedStyle = (el) => computedStyle(el);
+  sandbox.Path2D = Path2DShim;
+  sandbox.window.Path2D = Path2DShim;
   sandbox.createImageBitmap = createImageBitmapStub;
   sandbox.window.createImageBitmap = createImageBitmapStub;
   // The two observers a real page has, so the tracker can watch the node elements

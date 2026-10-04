@@ -367,7 +367,32 @@ export function computedStyle(el) {
     borderTopWidth: style.borderTopWidth || "0px",
     borderTopColor: style.borderTopColor || "rgba(0, 0, 0, 0)",
     borderTopLeftRadius: style.borderTopLeftRadius || "0px",
+    // The image properties a node's icons live in. The frontend's iconify plugin
+    // compiles `icon-[comfy--info]` to `mask-image: url("data:image/svg+xml,…")`,
+    // so a reader that cannot see this property sees no icon at all — and a page
+    // that draws its glyphs this way is a page whose pictures need it. A test sets
+    // them on the fixture, exactly as `style.maskImage = "url(...)"` would.
+    maskImage: style.maskImage || "",
+    maskSize: style.maskSize || "",
+    backgroundImage: style.backgroundImage || "",
+    backgroundSize: style.backgroundSize || "",
   };
+  // A browser answers the dashed spellings too, and one of them is the only
+  // spelling that exists for a while (`-webkit-mask-image`), so the shim serves
+  // both from one table instead of leaving the reader with a route that only works
+  // on one engine.
+  const dashed = (name) => {
+    const key = String(name || "").replace(/^-[a-z]+-/, "");
+    const camel = key.replace(/-([a-z])/g, (m, c) => c.toUpperCase());
+    if (camel === "webkitLineClamp" || camel === "lineClamp") return style.webkitLineClamp || style.lineClamp || "";
+    if (camel === "webkitMaskImage") return out.maskImage;
+    if (camel === "webkitMaskSize") return out.maskSize;
+    return Object.prototype.hasOwnProperty.call(out, camel) ? out[camel] : "";
+  };
+  out.getPropertyValue = dashed;
+  Object.defineProperty(out, "webkitMaskImage", { value: out.maskImage, enumerable: false });
+  Object.defineProperty(out, "webkitMaskSize", { value: out.maskSize, enumerable: false });
+  return out;
 }
 
 export function createDocument(options = {}) {

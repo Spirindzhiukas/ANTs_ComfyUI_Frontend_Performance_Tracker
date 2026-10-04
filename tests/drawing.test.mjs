@@ -4566,6 +4566,211 @@ suite("drawing: the Nodes 2.0 (Vue nodes) frontend", () => {
     assertGreater(snapApi(h).captured, 1, "a fresh picture is taken once the node has stood still again");
   });
 
+  // The frontend paints every icon as an SVG *mask* on an element: its iconify
+  // Tailwind plugin compiles `icon-[comfy--comfy-c]` to
+  // `mask-image: url("data:image/svg+xml,…")` with `background-color: currentColor`
+  // and `mask-size: 100% 100%`. There is no `<svg>` and no `<img>` in the DOM and
+  // nothing in the markup names the glyph, so a reader that stops at `textContent`
+  // leaves a hole exactly where a node shows its badges, its control icons and its
+  // footer tabs — and a reader that draws the element's box instead of its glyph
+  // paints a solid blob of the icon's colour over the node.
+  const ICON_CHECK =
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24"><path fill="black" d="M9 16.2 4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4z"/></svg>';
+  const ICON_DOT = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24"><circle fill="black" cx="12" cy="12" r="9"/></svg>';
+  // What the plugin's CSS carries: the SVG with its quotes swapped for apostrophes
+  // and its spaces left as spaces. A browser normalises it either way and so does
+  // the reader.
+  const iconMask = (svg) => 'url("data:image/svg+xml,' + encodeURIComponent(svg).replace(/%20/g, " ") + '")';
+  const addIcon = (h, root, S, box, url) => {
+    const el = h.document.createElement("i");
+    if (url) el.style.maskImage = url;
+    el.style.maskSize = "100% 100%";
+    el.style.backgroundColor = "rgb(200, 210, 220)";
+    root.appendChild(el);
+    el._rect = { left: root._rect.left + box[0] * S, top: root._rect.top + box[1] * S, width: box[2] * S, height: box[3] * S };
+    return el;
+  };
+  // `NodeBadges.vue` as the page renders it: a row, the core/extension group pills
+  // and the Comfy badge — the row is the only one of the three the frontend puts a
+  // test id on, so the pills are read from the anchor's own element and its
+  // siblings.
+  const addBadgeRow = (h, root, S, y0) => {
+    const row = h.document.createElement("div");
+    row.className = "flex h-5 w-full gap-2 px-2";
+    root.appendChild(row);
+    row._rect = { left: root._rect.left + 8 * S, top: root._rect.top + y0 * S, width: 184 * S, height: 20 * S };
+    const group = h.document.createElement("div");
+    group.className = "flex h-6 items-center justify-center overflow-clip rounded-full";
+    group.style.backgroundColor = "rgb(38, 42, 52)";
+    row.appendChild(group);
+    group._rect = { left: root._rect.left + 8 * S, top: root._rect.top + (y0 - 2) * S, width: 40 * S, height: 24 * S };
+    const badge = h.document.createElement("div");
+    badge.setAttribute("data-testid", "comfy-badge");
+    badge.style.backgroundColor = "rgb(38, 42, 52)";
+    row.appendChild(badge);
+    badge._rect = { left: root._rect.left + 52 * S, top: root._rect.top + (y0 - 2) * S, width: 24 * S, height: 24 * S };
+    return { row, group, badge };
+  };
+  const pathFills = (h, test) => h.canvases.filter((c) => c._ctx && c._ctx.ops.some(test));
+
+  test("a node's own icons are drawn into the picture, from the mask the page paints them with", async () => {
+    const h = await boot();
+    const { nodes, vue } = vueGraph(h, 1);
+    const n = nodes[0];
+    stripWidgets(nodes);
+    const root = vue.rootFor(n);
+    const S = 0.1;
+    const { badge } = addBadgeRow(h, root, S, 96);
+    // The Comfy badge's glyph: an element with no text, no children and nothing on
+    // it but the mask. 12 units of icon inside a 24-unit badge, out of a 24-unit
+    // viewBox — the numbers the drawing has to reproduce.
+    addIcon(h, badge, S, [6, 6, 12, 12], iconMask(ICON_CHECK));
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true, diskOn: false });
+    draw(h, 2);
+    await idle(h);
+    const api = snapApi(h);
+    assertEqual(api.captured, 1, "the node was pictured");
+    assertEqual(api.vueIconSkip, 0, "nothing about this node's icons was unreadable");
+    assertGreater(api.vueIcons, 0, "and the glyph is counted as drawn");
+    assertGreater(api.vueContent, 0, "it is content the frame drew, like text or a picture");
+    const pics = pathFills(h, (o) => o[0] === "fill" && o[1] && o[1].d);
+    assertEqual(pics.length, 1, "the picture carries the icon as its own geometry, not as a box");
+    const pic = pics[0];
+    const at = pic._ctx.ops.findIndex((o) => o[0] === "fill" && o[1] && o[1].d);
+    const fill = pic._ctx.ops[at];
+    assertIncludes(String(fill[1].d), "M9 16.2", "the path data is the one inside the mask's SVG");
+    const before = pic._ctx.ops.slice(Math.max(0, at - 3), at);
+    assertEqual(`${before[0][0]}:${Math.round(before[0][1])},${Math.round(before[0][2])}`, "translate:58,70", "drawn at the element's own box inside the node");
+    assertEqual(`${before[1][0]}:${Number(before[1][1]).toFixed(2)}`, "scale:0.50", "scaled from the icon's 24-unit viewBox into its 12-unit box");
+    assertEqual(pic._ctx.paintLog[at].fill, "rgba(200, 210, 220, 1)", "in the colour the mask clips out of the element's background");
+    // The panel says it in the same terms, and the number it shows is the one the
+    // reader counted — a claim about the user's page has to be readable on it.
+    await openTweaksTab(h);
+    assertIncludes(panelText(h), "icon(s) drawn so far", "the panel names the icons it drew");
+    assertIncludes(panelText(h), `${api.vueIcons} icon(s)`, "and shows the same count the readout holds");
+  });
+
+  test("a picture carries the icon the page shows, and is remade with it when the page changes it", async () => {
+    const h = await boot();
+    const { nodes, vue } = vueGraph(h, 1);
+    const n = nodes[0];
+    stripWidgets(nodes);
+    const root = vue.rootFor(n);
+    const S = 0.1;
+    const { badge } = addBadgeRow(h, root, S, 96);
+    const glyph = addIcon(h, badge, S, [6, 6, 12, 12], iconMask(ICON_CHECK));
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true, diskOn: false });
+    draw(h, 2);
+    await idle(h);
+    assertEqual(snapApi(h).captured, 1, "the node is pictured");
+    assertEqual(
+      pathFills(h, (o) => o[0] === "fill" && o[1] && o[1].d && String(o[1].d).includes("M9 16.2")).length,
+      1,
+      "with the badge's own glyph in it"
+    );
+    // The page re-renders the icon — another glyph on the same element — and reports
+    // it, which is what makes the picture stale. The replacement is measured from the
+    // element as it is *now*, so the icon the user is looking at is the icon in the
+    // picture; one that kept the old glyph would be a picture of the node from before
+    // the change.
+    glyph.style.maskImage = iconMask(ICON_DOT);
+    h.fireMutation(root, glyph);
+    draw(h, 1);
+    h.advance(150); // past the signature's own window
+    await h.flush();
+    draw(h, 1);
+    h.advance(600); // the settle window the change re-opened
+    await h.flush();
+    const after = snapApi(h);
+    assertGreater(after.invalidated, 0, "the picture with the old glyph is dropped");
+    assertGreater(after.captured, 1, "the change is photographed again");
+    assertGreater(after.vueIcons, 0, "with an icon in it");
+    const pics = pathFills(h, (o) => o[0] === "fill" && o[1] && o[1].d);
+    const newest = pics[pics.length - 1];
+    const drawn = newest._ctx.ops.filter((o) => o[0] === "fill" && o[1] && o[1].d).map((o) => String(o[1].d));
+    assert(drawn.some((d) => /a9,9/.test(d)), "carrying the glyph the page now shows");
+    assert(!drawn.some((d) => d.includes("M9 16.2")), "and not the one it showed before");
+  });
+
+  test("an icon the reader cannot read is a hole and a count, never a blob", async () => {
+    const h = await boot();
+    const { nodes, vue } = vueGraph(h, 1);
+    const n = nodes[0];
+    stripWidgets(nodes);
+    const root = vue.rootFor(n);
+    const S = 0.1;
+    // Three shapes the reader must refuse: a raster mask (no SVG inside the data
+    // URL), the same SVG stretched onto a box the page never painted it in
+    // (`mask-size: 50% 50%` tiles it), and an SVG whose only "shape" is text and a
+    // `d` that is not path data.
+    const png = h.document.createElement("i");
+    png.style.maskImage = 'url("data:image/png;base64,iVBORw0KGgo=")';
+    png.style.maskSize = "100% 100%";
+    const tiled = addIcon(h, root, S, [10, 60, 12, 12], iconMask(ICON_CHECK));
+    tiled.style.maskSize = "50% 50%";
+    const junk = addIcon(
+      h,
+      root,
+      S,
+      [30, 60, 12, 12],
+      iconMask('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><text x="2" y="12">hi</text><path fill="black" d="javascript:alert(1)"/></svg>')
+    );
+    for (const [el, x] of [[png, 50], [tiled, 10], [junk, 30]]) {
+      root.appendChild(el);
+      el.style.backgroundColor = "rgb(10, 200, 30)";
+      el._rect = { left: root._rect.left + x * S, top: root._rect.top + 60 * S, width: 12 * S, height: 12 * S };
+    }
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true, diskOn: false });
+    draw(h, 2);
+    await idle(h);
+    const api = snapApi(h);
+    assertEqual(api.captured, 1, "the node is still pictured");
+    assertEqual(api.vueIcons, 0, "no glyph is invented for any of them");
+    assertGreater(api.vueIconSkip, 1, "and each one that was read as a candidate is counted as unreadable");
+    assertEqual(pathFills(h, (o) => o[0] === "fill" && o[1] && o[1].d).length, 0, "none of them reaches the picture as geometry");
+    // The colour the mask *would* have shown is on the element; painting it as a box
+    // is the blob a stand-in must never be.
+    assertEqual(pathFills(h, (p) => p.fill === "rgba(10, 200, 30, 1)").length, 0, "and none of them is painted as a solid box of its own colour");
+  });
+
+  test("the badge pills and the footer tabs are surfaces in the picture, read from the page's own anchors", async () => {
+    const h = await boot();
+    const { nodes, vue } = vueGraph(h, 1);
+    const n = nodes[0];
+    stripWidgets(nodes);
+    const root = vue.rootFor(n);
+    const S = 0.1;
+    addBadgeRow(h, root, S, 96);
+    // The footer of `NodeFooter.vue`: a wrapper the component paints with the node's
+    // own header colour, and a single tab button in it — the button is the anchor,
+    // the band it sits on is its parent.
+    const foot = h.document.createElement("div");
+    foot.style.backgroundColor = "rgb(28, 32, 40)";
+    root.appendChild(foot);
+    foot._rect = { left: root._rect.left + 4 * S, top: root._rect.top + 130 * S, width: 192 * S, height: 26 * S };
+    const tab = h.document.createElement("button");
+    tab.setAttribute("data-testid", "subgraph-enter-button");
+    tab.style.backgroundColor = "rgb(28, 32, 40)";
+    foot.appendChild(tab);
+    tab._rect = { left: root._rect.left + 4 * S, top: root._rect.top + 130 * S, width: 96 * S, height: 26 * S };
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true, diskOn: false });
+    draw(h, 2);
+    await idle(h);
+    const pic = h.canvases.filter((c) => c._ctx && c._ctx.ops.some((o) => o[0] === "fill" || o[0] === "fillRect"))[0];
+    assert(pic, "the node was pictured");
+    const rects = pic._ctx.ops.filter((o) => (o[0] === "roundRect" || o[0] === "rect") && Number(o[3]) > 0);
+    const has = (x, y, w, hh) => rects.some((o) => Math.round(o[1]) === x && Math.round(o[2]) === y && Math.round(o[3]) === w && Math.round(o[4]) === hh);
+    // The badge row sits at y 66 in node units (the element starts one title bar
+    // above the node's own origin), the group pill 40x24 at x 8, the Comfy badge
+    // 24x24 at x 52.
+    assert(has(8, 64, 40, 24), "the badge group's pill is drawn at the element's own box");
+    assert(has(52, 64, 24, 24), "and so is the Comfy badge's");
+    assert(has(4, 100, 192, 26), "the footer band is drawn where the footer put it");
+    const fills = pic._ctx.paintLog.map((p) => p.fill);
+    assert(fills.indexOf("rgba(38, 42, 52, 1)") >= 0, "the pills in the colour the browser computed for them");
+    assert(fills.indexOf("rgba(28, 32, 40, 1)") >= 0, "and the footer in its own");
+  });
+
 });
 
 // The picture store on disk. One file per node id, named by the node's signature

@@ -6,7 +6,7 @@ for: *which extension's JavaScript is actually costing me frames while I pan
 this graph, and what is eating main-thread time that no draw hook owns?* —
 without opening DevTools and without restarting ComfyUI to bisect.
 
-Version **2.7.0**. Everything runs from page load: no node has to be placed,
+Version **2.7.1**. Everything runs from page load: no node has to be placed,
 nothing executes, and the tool never changes your graph or your workflows.
 
 - **Measure** — per-extension and per-node-type frame cost, canvas draw
@@ -396,18 +396,24 @@ handed back (a reused element must not come back invisible), and an element it
 has given to *another* node keeps that node's mark (`lodVueClaimsOther`) — taking
 it off would show that node through its own box. The readout counts the re-marks,
 the stale elements and the pane watchers, so the claim is visible from the user's
-own page (`vueRedressed`, `vueStaleEls`, `vuePaneWatches`).
+own page (`vueRedressed`, `vueStaleEls`, `vuePaneWatches`), and it counts what the
+pictures carry: the icons drawn (`vueIcons`) and the ones the reader had to leave
+as holes rather than paint a blob for (`vueIconSkip`).
 
 **Pictures work here as well, and so do the disk files.** Below the threshold
 the idle lane builds a stand-in *picture* for each boxed node — not a
 screenshot of the element, which no browser API can make, but the same drawing
 the live box makes (the box, its title bar and state marks, the node's structure
-read out of the DOM — surface, header, body panel, slot dots — every widget's own
-row, drawn with the box, border and radius the browser gave it — and the reader
-is sized for a real node rather than a fixture: 256 text lines, 400 characters per
-string, 96 widget elements, 128 structural boxes and 96 slot dots, the widget text the
-frontend mounts as DOM, and the node's own `<img>`/`<canvas>` elements at the
-rows the layout gave them) drawn into the same offscreen capture surface the
+read out of the DOM — surface, header, body panel, slot dots, the badge pills the
+frontend renders beside its own badge anchors and the footer band under its tab
+buttons — every widget's own row, drawn with the box, border and radius the
+browser gave it, every icon the node shows — read out of the SVG *mask* the
+frontend's iconify plugin puts in the computed style, because an icon here is a
+data URL and not an element — and the reader is sized for a real node rather than
+a fixture: 256 text lines, 400 characters per string, 96 widget elements, 128
+structural boxes, 96 slot dots and 64 icons, the widget text the frontend mounts
+as DOM, and the node's own `<img>`/`<canvas>` elements at the rows the layout gave
+them) drawn into the same offscreen capture surface the
 canvas renderer uses. **A node is only photographed once it has stood still**: a
 settle window (300 ms) opens when a node is first drawn as a stand-in and re-opens
 on every change the page reports or the signature notices, so a burst of rendering
@@ -753,7 +759,7 @@ short version:
 ## Development
 
 ```bash
-node tests/run-tests.mjs              # all tests — 232 passing, zero dependencies
+node tests/run-tests.mjs              # all tests — 236 passing, zero dependencies
 node tests/run-tests.mjs <substring>  # one suite or test
 python3 tests/test_init.py            # the Python side (routes, node contract)
 node tests/demo.mjs                   # prints what every tab says, against a synthetic graph

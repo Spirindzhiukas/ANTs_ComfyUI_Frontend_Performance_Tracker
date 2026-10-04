@@ -27,7 +27,7 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.7.0";
+const VERSION = "2.7.1";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
 // The class key ComfyUI stores in a workflow. The old key is still recognised so
 // a graph saved before the rename does not lose this node.
@@ -1021,6 +1021,9 @@ const LOD = {
   vueWaitLayout: 0,
   vueWaitMedia: 0,
   vueWaitFonts: 0,
+  vueIcons: 0, // icon glyphs drawn into the boxes and the pictures (see lodVueIconInk)
+  vueIconCache: null, // Map<data URL, parsed icon>: one parse per glyph the page shows
+  vueIconSkip: 0, // icons the reader could not read (counted, never invented)
   vueStaleEls: 0, // cached elements that turned out to belong to another node
   vuePaneWatches: 0, // node containers the pane watcher has been attached to
   vueElSeq: null, // WeakMap<element, serial>: what the signature uses to see a replaced element
@@ -1213,6 +1216,18 @@ const LOD_VUE_MEDIA_BUDGET = 6;
 // than where the first card felt cheap.
 const LOD_VUE_TEXT_MAX = 256; // strings read from a node's DOM, per measurement
 const LOD_VUE_TEXT_CHARS = 400; // per string (a label is short; a caption is not)
+// The node's own icons. `icon-[lucide--info]` — the iconify Tailwind plugin this
+// frontend ships — compiles to `mask-image: url("data:image/svg+xml,…")` with
+// `background-color: currentColor` and `mask-size: 100% 100%`, so the glyph exists
+// only inside that data URL: an element that is an icon has no text, no children and
+// no background of its own beyond the colour the mask shapes. Without reading it the
+// picture has a hole where the node's icons are (and, if the reader had drawn the
+// element's box instead, a solid blob of the icon's colour) — part of why a stand-in
+// still read as "semi" against the node.
+const LOD_VUE_ICON_MAX = 64; // icons read from one node's DOM, per measurement
+const LOD_VUE_ICON_URL_MAX = 8192; // bytes of data URL one icon may carry
+const LOD_VUE_ICON_CACHE_MAX = 128; // parsed icons kept (a page reuses a handful)
+const LOD_VUE_ICON_SHAPES_MAX = 64; // primitives one icon may hold
 // How long a "no video in this node" answer stands before it is re-probed. The
 // guarantee it protects (a video is never photographed) is enforced freshly at
 // capture time; this window is only about a *held* picture of a node that has just
@@ -4866,6 +4881,14 @@ function lodVueTextStyle(el, boxH) {
   let lineH = 0;
   let spacing = 0;
   let clampLines = 0;
+  // The two properties an icon lives in, read from the same computed style the text
+  // already needed: asking for a second `getComputedStyle` per element per
+  // measurement is exactly the per-frame cost this pathway exists to avoid.
+  let bg = "";
+  let mask = "";
+  let maskSize = "";
+  let bgImage = "";
+  let bgSize = "";
   try {
     if (typeof getComputedStyle === "function") {
       const cs = getComputedStyle(el);
@@ -4894,6 +4917,11 @@ function lodVueTextStyle(el, boxH) {
         const lc = parseInt(String(cs.getPropertyValue("-webkit-line-clamp") || ""), 10);
         if (Number.isFinite(lc) && lc > 0 && lc < 64) clampLines = lc;
       }
+      bg = cs && cs.backgroundColor ? String(cs.backgroundColor) : "";
+      mask = lodVueStyleProp(cs, ["maskImage", "webkitMaskImage", "-webkit-mask-image"]);
+      maskSize = lodVueStyleProp(cs, ["maskSize", "webkitMaskSize", "-webkit-mask-size"]);
+      bgImage = cs && cs.backgroundImage ? String(cs.backgroundImage) : "";
+      bgSize = lodVueStyleProp(cs, ["backgroundSize"]);
     }
   } catch (e) {
     /* the fallbacks below are the answer, not a guess about the theme */
@@ -4903,7 +4931,327 @@ function lodVueTextStyle(el, boxH) {
   if (!color) color = (LG && LG.WIDGET_TEXT_COLOR) || "#DDD";
   if (!family) family = (LG && LG.NODE_FONT) || "Arial";
   if (!(lineH > 0)) lineH = size * 1.25;
-  return { size, color, family, weight, style, lineH, spacing, clampLines };
+  // `icon` is only worked out for an element that actually carries an image: the
+  // walk visits every element in the node, and most of them have no mask at all.
+  const icon = mask || bgImage ? lodVueIconOf({ bg, mask, maskSize, bgImage, bgSize, color }) : null;
+  return { size, color, family, weight, style, lineH, spacing, clampLines, icon };
+}
+
+// One computed property, however this engine spells it: Chromium exposes
+// `maskImage` camel-cased, WebKit may only fill in the `-webkit-` alias, and both
+// may be absent. `none` and the empty string are both "unset".
+function lodVueStyleProp(cs, names) {
+  if (!cs) return "";
+  for (const name of names) {
+    let v = "";
+    try {
+      v = name.charAt(0) === "-" && typeof cs.getPropertyValue === "function" ? cs.getPropertyValue(name) : cs[name];
+    } catch (e) {
+      v = "";
+    }
+    if (v && v !== "none") return String(v);
+  }
+  return "";
+}
+
+// The icon an element is showing, if it is one — the glyph, the mode and the colour
+// it is painted in. A mask is painted in the element's own background colour
+// (`background-color: currentColor` is the plugin's rule; the SVG's own colours were
+// replaced with `black` when the CSS was generated, so they carry no information);
+// a `background-image` icon carries its own colours and falls back to the element's
+// text colour where it says `currentColor`.
+//
+// Only a data URL stretched over the element's whole box is read. An SVG that is
+// tiled or sized some other way would be stretched into a shape the page never
+// painted, and a glyph where the page has a pattern is worse than a hole — those are
+// counted (`vueIconSkip`) rather than guessed at.
+function lodVueIconOf(st) {
+  if (!st) return null;
+  const mask = st.mask && /data:image\//i.test(st.mask) && /100%\s+100%/.test(st.maskSize || "") ? st.mask : "";
+  if (mask) {
+    // The mask shows the element's background through the glyph: no paint, no icon
+    // (which is also what the page shows).
+    if (!lodVuePaintable(st.bg) && !lodVuePaintable(st.color)) return null;
+    return { url: mask, mask: true, paint: lodVuePaintable(st.bg) ? st.bg : st.color };
+  }
+  const img = st.bgImage && /data:image\//i.test(st.bgImage) && /100%\s+100%/.test(st.bgSize || "") ? st.bgImage : "";
+  if (img) return { url: img, mask: false, paint: st.color || "" };
+  return null;
+}
+
+// ---------------------------------------------------------------- the icons ---
+// An inline SVG read as geometry and painted into the capture surface: the same
+// glyph the browser clips out of the element's background, drawn where the element
+// is. Parsed once per data URL (a node shows the same few icons over and over) and
+// cached; what the reader cannot read — a non-SVG image, an unreadable viewBox, a
+// shape this reader has no primitive for — is counted and left unpainted.
+function lodVueIconParse(raw) {
+  const key = raw == null ? "" : String(raw);
+  if (!key || key.length > LOD_VUE_ICON_URL_MAX) return null;
+  const cache = LOD.vueIconCache || (LOD.vueIconCache = new Map());
+  if (cache.has(key)) return cache.get(key);
+  let out = null;
+  try {
+    out = lodVueIconRead(key);
+  } catch (e) {
+    out = null;
+  }
+  if (out) out.key = lodVueIconKey(out);
+  if (cache.size >= LOD_VUE_ICON_CACHE_MAX) {
+    const first = cache.keys().next();
+    if (!first.done) cache.delete(first.value);
+  }
+  cache.set(key, out);
+  return out;
+}
+
+// What tells two icons apart in a picture: their geometry, not their URL. Every icon
+// in a set shares its SVG header and its closing bytes, so hashing the *URL* by its
+// ends — the cheap way the signature hashes a long string — reads two different
+// glyphs as one, and a picture showing the old one would be kept. Two URLs that
+// spell the same glyph are the same glyph, and must not look like a change.
+function lodVueIconKey(icon) {
+  const parts = [icon.vb.join(",")];
+  for (const s of icon.shapes) parts.push(s.d, s.fill, s.stroke, s.sw, s.rule);
+  const text = parts.join("|");
+  let h = 2166136261;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return `${(h >>> 0).toString(36)}-${text.length}`;
+}
+
+function lodVueIconRead(raw) {
+  const at = raw.indexOf("data:image/svg+xml");
+  if (at < 0) return null;
+  let body = raw.slice(at + "data:image/svg+xml".length);
+  let base64 = false;
+  if (body.charAt(0) === ";") {
+    const comma = body.indexOf(",");
+    if (comma < 0) return null;
+    base64 = /base64/i.test(body.slice(0, comma));
+    body = body.slice(comma + 1);
+  } else if (body.charAt(0) === ",") {
+    body = body.slice(1);
+  } else {
+    return null;
+  }
+  // The CSS wrapper's end: `url("data:…")`. A browser's computed value may keep the
+  // quotes or drop them, so both are handled.
+  body = body.replace(/["']\s*\)\s*$/, "").replace(/["']\s*$/, "");
+  let svg = body;
+  if (base64) {
+    if (typeof atob !== "function") return null;
+    svg = atob(body);
+  } else if (svg.indexOf("%") >= 0) {
+    try {
+      svg = decodeURIComponent(svg);
+    } catch (e) {
+      svg = body;
+    }
+  }
+  const open = svg.indexOf("<svg");
+  if (open < 0) return null;
+  const tagEnd = svg.indexOf(">", open);
+  if (tagEnd < 0) return null;
+  const root = svg.slice(open, tagEnd);
+  const vb = lodVueIconViewBox(root);
+  if (!vb) return null;
+  let paint = lodVueIconPaint(root, null);
+  const shapes = [];
+  const re = /<(path|circle|rect|ellipse|line|polyline|polygon|g)\b([^>]*)>/gi;
+  let m;
+  while ((m = re.exec(svg))) {
+    const tag = m[1].toLowerCase();
+    const attrs = m[2] || "";
+    if (tag === "g") {
+      // A group's paint attributes are inherited by the shapes inside it. (Icon sets
+      // rarely nest, and one level is folded in here rather than a tree walk per
+      // measurement.)
+      const g = lodVueIconPaint(attrs, paint);
+      paint = { fill: g.fill, stroke: g.stroke, sw: g.sw, rule: g.rule };
+      continue;
+    }
+    const d = lodVueIconShape(tag, attrs);
+    if (!d) continue;
+    const p = lodVueIconPaint(attrs, paint);
+    shapes.push({ d, fill: p.fill, stroke: p.stroke, sw: p.sw, rule: p.rule });
+    if (shapes.length >= LOD_VUE_ICON_SHAPES_MAX) break;
+  }
+  if (!shapes.length) return null;
+  return { vb, shapes };
+}
+
+function lodVueIconAttr(attrs, name) {
+  const re = new RegExp("(?:^|\\s)" + name + "\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)')", "i");
+  const m = re.exec(String(attrs || ""));
+  if (!m) return undefined;
+  return m[1] !== undefined ? m[1] : m[2];
+}
+
+function lodVueIconViewBox(root) {
+  const raw = lodVueIconAttr(root, "viewBox");
+  if (raw) {
+    const p = raw.trim().split(/[\s,]+/).map(Number);
+    if (p.length === 4 && p.every((v) => Number.isFinite(v)) && p[2] > 0 && p[3] > 0) return p;
+    return null;
+  }
+  const w = parseFloat(lodVueIconAttr(root, "width"));
+  const h = parseFloat(lodVueIconAttr(root, "height"));
+  if (Number.isFinite(w) && w > 0 && Number.isFinite(h) && h > 0) return [0, 0, w, h];
+  return null;
+}
+
+// What a shape (or the root, or a group) says about how it is painted. Colours are
+// kept as the strings the SVG gave: `currentColor` only resolves in the page the
+// element lives in, and `black` is what the plugin wrote when it generated the CSS.
+function lodVueIconPaint(attrs, base) {
+  const d = base || { fill: "black", stroke: "none", sw: 1, rule: "nonzero" };
+  const f = lodVueIconAttr(attrs, "fill");
+  const st = lodVueIconAttr(attrs, "stroke");
+  const w = parseFloat(lodVueIconAttr(attrs, "stroke-width"));
+  const fr = String(lodVueIconAttr(attrs, "fill-rule") || "").toLowerCase();
+  return {
+    fill: f === undefined ? d.fill : f,
+    stroke: st === undefined ? d.stroke : st,
+    sw: Number.isFinite(w) ? w : d.sw,
+    rule: fr === "evenodd" ? "evenodd" : d.rule,
+  };
+}
+
+// One primitive as path data, so a single `Path2D` can take it: the browser's own
+// path grammar is the one thing this reader does not have to implement.
+function lodVueIconShape(tag, attrs) {
+  const n = (name, fallback = 0) => {
+    const v = parseFloat(lodVueIconAttr(attrs, name));
+    return Number.isFinite(v) ? v : fallback;
+  };
+  if (tag === "path") {
+    const d = String(lodVueIconAttr(attrs, "d") || "");
+    // The path grammar only: a `d` carrying anything else (a script, a data URI) is
+    // not a path, and handing it to `Path2D` would be a parse error per measurement.
+    return /^[\sMmLlHhVvCcSsQqTtAaZz0-9.,+-]*$/.test(d) ? d.trim() : "";
+  }
+  if (tag === "circle" || tag === "ellipse") {
+    const cx = n("cx");
+    const cy = n("cy");
+    const rx = tag === "circle" ? n("r") : n("rx");
+    const ry = tag === "circle" ? n("r") : n("ry");
+    if (!(rx > 0) || !(ry > 0)) return "";
+    return "M" + (cx - rx) + "," + cy + "a" + rx + "," + ry + " 0 1,0 " + rx * 2 + ",0a" + rx + "," + ry + " 0 1,0 " + -rx * 2 + ",0";
+  }
+  if (tag === "rect") {
+    const x = n("x");
+    const y = n("y");
+    const w = n("width");
+    const h = n("height");
+    if (!(w > 0) || !(h > 0)) return "";
+    return "M" + x + "," + y + "h" + w + "v" + h + "h" + -w + "Z";
+  }
+  if (tag === "line") return "M" + n("x1") + "," + n("y1") + "L" + n("x2") + "," + n("y2");
+  if (tag === "polygon" || tag === "polyline") {
+    const pts = String(lodVueIconAttr(attrs, "points") || "").trim();
+    if (!pts || !/^[\s0-9.,+-]*$/.test(pts)) return "";
+    const v = pts.split(/[\s,]+/).filter(Boolean);
+    if (v.length < 4) return "";
+    let d = "M" + v[0] + "," + v[1];
+    for (let i = 2; i + 1 < v.length; i += 2) d += "L" + v[i] + "," + v[i + 1];
+    return tag === "polygon" ? d + "Z" : d;
+  }
+  return "";
+}
+
+// The icons of one node, drawn into the capture surface and the live box, over the
+// structure the node is made of and under its pictures. Every icon is drawn in its
+// own element's box, scaled from the icon's own `viewBox`, in the colour the element
+// would show it in.
+function lodVueIconInk(ctx, icons, out) {
+  if (!icons || !icons.length) return;
+  if (typeof Path2D !== "function" || !ctx || typeof ctx.fill !== "function") {
+    // No `Path2D`, no glyph: counted, and nothing invented in its place.
+    LOD.vueIconSkip += icons.length;
+    return;
+  }
+  if (typeof ctx.save !== "function" || typeof ctx.restore !== "function") {
+    // The glyph is drawn scaled into its own box, and a transform this code cannot
+    // put back would move everything drawn after it — the media and the widget
+    // contents. Without save/restore the icons are left out and counted.
+    LOD.vueIconSkip += icons.length;
+    return;
+  }
+  for (let k = 0; k < icons.length; k++) {
+    const it = icons[k];
+    const p = it && it.icon;
+    if (!p || !p.shapes || !p.shapes.length) {
+      LOD.vueIconSkip++;
+      continue;
+    }
+    const vb = p.vb;
+    const sx = Number(it.w) / vb[2];
+    const sy = Number(it.h) / vb[3];
+    if (!(sx > 0) || !(sy > 0)) {
+      LOD.vueIconSkip++;
+      continue;
+    }
+    let drew = 0;
+    try {
+      ctx.save();
+      ctx.translate(it.x, it.y);
+      ctx.scale(sx, sy);
+      ctx.translate(-vb[0], -vb[1]);
+      for (const sh of p.shapes) {
+        let path = null;
+        try {
+          path = new Path2D(sh.d);
+        } catch (e) {
+          path = null;
+        }
+        if (!path) continue;
+        if (sh.fill !== "none") {
+          const c = lodVuePaint(lodVueIconColor(sh.fill, it));
+          if (c) {
+            ctx.fillStyle = c;
+            ctx.fill(path, sh.rule === "evenodd" ? "evenodd" : "nonzero");
+            drew++;
+          }
+        }
+        if (sh.stroke !== "none") {
+          const c = lodVuePaint(lodVueIconColor(sh.stroke, it));
+          if (c) {
+            ctx.strokeStyle = c;
+            ctx.lineWidth = Number(sh.sw) > 0 ? Number(sh.sw) : 1;
+            ctx.stroke(path);
+            drew++;
+          }
+        }
+      }
+    } catch (e) {
+      /* one icon that cannot be drawn is not a reason to lose the picture */
+    } finally {
+      try {
+        if (typeof ctx.restore === "function") ctx.restore();
+      } catch (e) {
+        /* a context that cannot restore is already lost */
+      }
+    }
+    if (drew) {
+      LOD.vueIcons++;
+      if (out) out.ink = (out.ink || 0) + 1;
+    } else {
+      LOD.vueIconSkip++;
+    }
+  }
+}
+
+// The colour one shape of an icon paints in. Through a mask the visible colour is the
+// element's own background (that is what the mask clips); a background-image icon
+// carries its own colours, and `currentColor` in it means the element's text colour.
+function lodVueIconColor(declared, it) {
+  const d = String(declared || "");
+  if (it && it.mask) return String(it.paint || "");
+  if (it && it.mask === false && (d === "" || d === "currentColor")) return String(it.paint || "");
+  return d;
 }
 
 // One item from a form control, in the same shape the ink already draws: the
@@ -5100,7 +5448,7 @@ function lodVueTextAlign(el) {
 // Read in the same pass as the node's media, from the same single measurement:
 // node-local units, so the draw itself is a handful of fillText calls and costs
 // nothing per frame.
-function lodVueTextLines(root, rr, domScale, title) {
+function lodVueTextLines(root, rr, domScale, title, icons) {
   const out = [];
   try {
     const els = root.querySelectorAll("*") || [];
@@ -5111,6 +5459,23 @@ function lodVueTextLines(root, rr, domScale, title) {
       const box = lodVueBoxOf(el, rr, domScale, title);
       if (!box) continue; // hidden, collapsed or not laid out yet
       const style = lodVueTextStyle(el, box.h);
+      // An icon is an element with no text and no children whose glyph is in its
+      // mask. Read here, in the same walk and from the same computed style the text
+      // already needed: an extra `getComputedStyle` per element per measurement is
+      // the per-frame cost this pathway exists to avoid. The parse is cached by the
+      // data URL (a node shows the same few icons over and over), and an unreadable
+      // one is carried as a hole and counted when the picture is drawn.
+      if (icons && style.icon && icons.length < LOD_VUE_ICON_MAX) {
+        icons.push({
+          x: box.x,
+          y: box.y,
+          w: box.w,
+          h: box.h,
+          paint: style.icon.paint,
+          mask: style.icon.mask,
+          icon: lodVueIconParse(style.icon.url),
+        });
+      }
       // A form control's *value* is not its text: `textContent` of an input is its
       // default value, which is why these were skipped outright — and in this
       // renderer a widget's value *is* a form control (a number field's input, a
@@ -5176,7 +5541,7 @@ function lodVueTextLines(root, rr, domScale, title) {
 function lodVueChromeInk(ctx, chrome, out, key) {
   if (!chrome || !chrome.length || !ctx || typeof ctx.fillRect !== "function") return out;
   const into = key || "chrome"; // which gauge the caller wants counted
-  const order = { frame: 0, panel: 1, widget: 2, ring: 3, header: 4, dot: 5 };
+  const order = { frame: 0, panel: 1, widget: 2, ring: 3, header: 4, dot: 5, badge: 6, footer: 7 };
   const list = chrome.slice().sort((a, b) => (order[a.kind] || 9) - (order[b.kind] || 9));
   for (const c of list) {
     if (!(c.w > 0) || !(c.h > 0)) continue;
@@ -5486,40 +5851,72 @@ function lodVueChromeBoxes(node, root, rr, domScale, title) {
     // it changes.)
     [".slot-dot", "dot", 96],
   ];
-  for (const [sel, kind, cap] of spec) {
+  const seen = new Set();
+  // One structural element, measured: its own laid-out box, one computed style. A
+  // box smaller than half a node unit is not a surface (a 1px divider, a collapsed
+  // element), and an element already read as one kind is not read again as another
+  // — the same surface drawn twice is not more of the node.
+  const read = (el, kind) => {
+    if (!el || !el.getBoundingClientRect || out.length >= LOD_VUE_CHROME_MAX) return null;
+    if (seen.has(el)) return null;
+    let r = null;
+    try {
+      r = el.getBoundingClientRect();
+    } catch (e) {
+      r = null;
+    }
+    if (!r) return null;
+    const w = Number(r.width) / domScale;
+    const h = Number(r.height) / domScale;
+    if (!(w > 0.5) || !(h > 0.5)) return null;
+    const x = (Number(r.left) - Number(rr.left)) / domScale;
+    const y = (Number(r.top) - Number(rr.top)) / domScale - title;
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+    seen.add(el);
+    const st = lodVueChromeStyle(el);
+    const box = { el, kind, x, y, w, h, fill: st.fill, border: st.border, borderW: st.borderW, radius: st.radius };
+    out.push(box);
+    return box;
+  };
+  const qsa = (sel) => {
     let els = null;
     try {
       els = root.querySelectorAll(sel) || [];
     } catch (e) {
       els = null;
     }
+    return els ? Array.prototype.slice.call(els) : [];
+  };
+  for (const [sel, kind, cap] of spec) {
+    let els = qsa(sel);
     // The grid the frontend renders its widgets in: its rows are its children, read
     // through `children` rather than a child-combinator selector — a selector the
     // page has to parse is a selector that can silently match nothing, and a row that
     // is never read is a widget that never appears in the picture.
-    if (sel === '[data-testid="node-widgets"]' && els && els.length && els[0] && els[0].children) {
-      els = els[0].children;
+    if (sel === '[data-testid="node-widgets"]' && els.length && els[0] && els[0].children) {
+      els = Array.prototype.slice.call(els[0].children);
     }
-    if (!els || !els.length) continue;
     const n = Math.min(els.length, cap);
-    for (let i = 0; i < n; i++) {
-      const el = els[i];
-      if (!el || out.length >= LOD_VUE_CHROME_MAX) break;
-      let r = null;
-      try {
-        r = typeof el.getBoundingClientRect === "function" ? el.getBoundingClientRect() : null;
-      } catch (e) {
-        r = null;
-      }
-      if (!r) continue;
-      const w = Number(r.width) / domScale;
-      const h = Number(r.height) / domScale;
-      if (!(w > 0.5) || !(h > 0.5)) continue;
-      const x = (Number(r.left) - Number(rr.left)) / domScale;
-      const y = (Number(r.top) - Number(rr.top)) / domScale - title;
-      if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
-      const st = lodVueChromeStyle(el);
-      out.push({ el, kind, x, y, w, h, fill: st.fill, border: st.border, borderW: st.borderW, radius: st.radius });
+    for (let i = 0; i < n; i++) read(els[i], kind);
+  }
+  // The badge row and the footer tabs, read by their *anchors* rather than by class:
+  // `NodeBadges.vue` puts a test id on the Comfy badge alone, `NodeFooter.vue` puts
+  // one on each tab, and the surfaces the user sees are the elements around them —
+  // the pills a badge sits in, the band the tabs sit on. This renderer's node is a
+  // set of rounded boxes with a computed colour, so reading the relatives of the
+  // page's own anchors assumes nothing about which Tailwind utilities a build
+  // generated (a class selector that stops matching is a silent hole in every
+  // picture; a parent is not).
+  for (const anchor of qsa('[data-testid="comfy-badge"]').slice(0, 4)) {
+    read(anchor, "badge");
+    const row = anchor.parentNode;
+    if (row && row.children) for (const el of Array.prototype.slice.call(row.children).slice(0, 8)) read(el, "badge");
+  }
+  for (const sel of ['[data-testid="subgraph-enter-button"]', '[data-testid="advanced-inputs-button"]']) {
+    for (const btn of qsa(sel).slice(0, 4)) {
+      read(btn, "footer");
+      // The band the tabs sit on, one element up: the footer styles its own wrapper.
+      if (btn.parentNode) read(btn.parentNode, "footer");
     }
   }
   return out;
@@ -5880,7 +6277,8 @@ function lodVueRootMetrics(node, canvas, force) {
       items.push({ el, x, y, w, h });
     }
   }
-  const texts = rr ? lodVueTextLines(root, rr, domScale, title) : [];
+  const icons = [];
+  const texts = rr ? lodVueTextLines(root, rr, domScale, title, icons) : [];
   // The widgets the frontend mounts *inside* the node's element (WidgetDOM.vue does
   // `domEl.replaceChildren(widget.element)` in this renderer). Their rows are laid
   // out by the browser, not by LiteGraph's `arrange()` — in this renderer the canvas
@@ -5893,7 +6291,7 @@ function lodVueRootMetrics(node, canvas, force) {
   // the same pass: a picture without them is a sketch of the node, not the node.
   const chrome = rr ? lodVueChromeBoxes(node, root, rr, domScale, title) : [];
   LOD.vueChromeNow = chrome.length; // what the last measurement read, kept until the next one
-  const rec = { root, key, scale: domScale, at: now, items, boxH, texts, wboxes, chrome, opacity: lodVueOpacity(root) };
+  const rec = { root, key, scale: domScale, at: now, items, boxH, texts, wboxes, chrome, icons, opacity: lodVueOpacity(root) };
   cache.set(node, rec);
   return rec;
 }
@@ -6013,6 +6411,10 @@ function lodVueContentInk(node, canvas, ctx, into) {
     const beforeC = out.control || 0;
     lodVueTextInk(ctx, metrics.texts, out);
     LOD.vueControlInk += (out.control || 0) - beforeC; // values drawn as their own control (a slider, a tick, a swatch)
+    // The node's icons, over its structure and under its pictures: the glyphs the
+    // frontend draws with an inline SVG in a mask (`icon-[lucide--info]`, the badge
+    // icons, the footer buttons). Without this pass the picture has a hole there.
+    lodVueIconInk(ctx, metrics.icons, out);
   }
   lodSnapDomInk(node, ctx, canvas, out, metrics ? metrics.wboxes : null);
   const boxes = metrics ? metrics.items : null;
@@ -6375,6 +6777,20 @@ function lodSnapSignature(node, canvas) {
         num(b && b.y);
         num(b && b.w);
         num(b && b.h);
+      }
+    }
+    const icons = (metrics && metrics.icons) || null;
+    num(icons ? icons.length : 0);
+    if (icons) {
+      for (let i = 0; i < icons.length && i < LOD_VUE_ICON_MAX; i++) {
+        const ic = icons[i];
+        // The glyph itself: an icon's CSS is injected asynchronously, so a picture
+        // taken before it arrived has a hole where the node's icons are — this is
+        // what makes that picture stale the moment they land. Hashed by the ends of
+        // its data URL rather than in full (see `str`).
+        str(ic && ic.icon ? ic.icon.key : "");
+        num(ic && ic.x);
+        num(ic && ic.y);
       }
     }
     const lines = (metrics && metrics.texts) || null;
@@ -12359,7 +12775,8 @@ function buildTweaksTab(container) {
                     `frontend mounts — with a pack's own HTML left blank and counted. The node's *structure* goes in the same way: the element's own ` +
                     `box (the coloured surface), the header bar that carries the title, the body panel under it, the row of every widget the frontend ` +
                     `mounts there (its own box, border and radius) and the connection dot of every slot, each at the rect the browser gave it and in the ` +
-                    `colours the browser computed for it (${LOD.vueChrome} structural box(es) and ${LOD.vueWidgetInk} widget row(s) drawn so far). What is not obtainable is a pixel *screenshot* (no browser API draws a DOM element into a canvas; the ` +
+                    `colours the browser computed for it (${LOD.vueChrome} structural box(es) and ${LOD.vueWidgetInk} widget row(s) drawn so far) — including the badge pills and the footer tabs, read from the test ids the frontend puts on them and from the elements directly above and below those. Its *icons* go in too: this frontend paints a glyph as an SVG mask on an element (a data URL in the computed style; there is no element to read), so the reader parses that SVG and re-draws its shapes in the element's own box and colour ` +
+                    `(${LOD.vueIcons} icon(s) drawn so far${LOD.vueIconSkip ? `, ${LOD.vueIconSkip} unreadable and left as holes` : ""}). What is not obtainable is a pixel *screenshot* (no browser API draws a DOM element into a canvas; the ` +
                     `canvas renderer's capture works only because LiteGraph itself draws the node), so the picture is *drawn* into the same capture ` +
                     `surface: the ratio ladder, the mips, the RAM budget and the ` +
                     `thumbnails folder all apply to it` +
@@ -15165,6 +15582,12 @@ function installDebugApi() {
             vuePaneWatches: LOD.vuePaneWatches,
             vueWaitLayout: LOD.vueWaitLayout,
             vueWaitMedia: LOD.vueWaitMedia,
+            // The node's own icons: the frontend draws them as a CSS mask on an
+            // element (an SVG data URL, nothing in the markup), so this is how many
+            // glyphs the reader could read and re-draw, and how many it could not —
+            // a number for the pictures rather than a promise about them.
+            vueIcons: LOD.vueIcons,
+            vueIconSkip: LOD.vueIconSkip,
             vueWaitFonts: LOD.vueWaitFonts,
             // The node's own structure — frame, header, body panel, slot dots —
             // read out of the DOM and drawn into the boxes and the pictures. A
@@ -15605,7 +16028,10 @@ app.registerExtension({
 //    colours the browser computed, the text wrapped into the box the browser
 //    laid it out in and drawn in the element's own font, the values of its form
 //    and ARIA controls drawn as the controls they are, the node's composited
-//    opacity, and the node's own `<img>`/`<canvas>` elements at the rows the
+//    opacity, the node's **icons** — parsed out of the SVG the frontend's iconify
+//    plugin puts in a CSS `mask-image` data URL, because an icon here is not an
+//    element at all: no `<svg>`, no `<img>`, and nothing in the markup that names
+//    the glyph — and the node's own `<img>`/`<canvas>` elements at the rows the
 //    layout gave them — into the same capture surface the canvas renderer uses,
 //    with the same capture resolution, mip chain, RAM budget and disk files.
 //    Every colour goes through `lodVueColor` first: this frontend's themed
@@ -15613,7 +16039,16 @@ app.registerExtension({
 //    `fillStyle` ignores *silently* (the previous colour stays, so a node wears
 //    the previous node's palette). The parts that are neither an image, a canvas
 //    nor plain text (a pack's own HTML) stay blank in the picture and are
-//    counted. A picture made in one renderer is not reused in the other:
+//    counted. An icon the reader cannot read — a raster mask, a mask that is
+//    tiled rather than stretched over the element, a `d` that is not path data, an
+//    engine without `Path2D` or without `save`/`restore` — is a hole in the picture
+//    and a count (`vueIconSkip`), never the element's box: a solid block of the
+//    icon's colour where the page shows a glyph is worse than a gap. A node whose
+//    icons the page *injects* after a picture was taken (a stylesheet arriving
+//    between two reports) is not noticed until that node next changes, because a
+//    watched node is re-measured on the page's own reports rather than on a timer;
+//    the glyphs drawn are counted (`vueIcons`). A picture made in one renderer is
+//    not reused in the other:
 //    switching renderers releases what was held and makes the pictures again,
 //    because the box, the padding and the content route all differ. There is no
 //    zoom-dependent level of detail to reproduce, either: this frontend binds a

@@ -816,6 +816,30 @@ callbacks (a replacement as two reports — the orphan memory), a report that ca
 no added nodes (the sweep), the identity check, the hand-back and claims-other
 rules, the completeness gate, the font token, and the no-write steady state.
 
+### The fourteenth pass (v2.7.1): the parts of a node that are not elements
+
+The thirteenth pass left "the picture must look like the node the user sees" as a
+standing criterion, and the reader still had two invisible holes in it. Both were
+found by following the frontend's own DOM rather than by a report.
+
+| # | Finding | What it actually was | What changed |
+| --- | --- | --- | --- |
+| 1 | **The node's icons were missing from every picture** (and from the live box). | This frontend paints an icon as an SVG **mask** on an element: the iconify Tailwind plugin compiles `icon-[comfy--comfy-c]` to `mask-image: url("data:image/svg+xml,…")` with `background-color: currentColor` and `mask-size: 100% 100%` (`packages/design-system/src/css/iconifyDynamicPlugin.ts`; the vocabulary is generated with `@source inline("icon-[comfy--{…}]")` in `style.css`). There is no `<svg>`, no `<img>` and nothing in the markup that names the glyph, so a reader that reads `textContent` and rects sees nothing at all — and a reader that read the element's box instead would paint a solid blob of the icon's colour. Confirmed against the plugin's own source (`getIconsCSSData` → `common.rules` plus an SVG data URL per name). | `lodVueTextStyle` now returns the mask, its size, the background image and its size from the computed style it already read; `lodVueIconParse` parses the SVG once per data URL (Map cache, capped) and `lodVueIconInk` re-draws its shapes as a `Path2D` in the element's own box, scaled out of the icon's own `viewBox`. A mask is painted in the colour the mask clips out of (the element's own background); a background-image icon keeps its own colours. Unreadable candidates (a raster mask, a tiled mask, a `d` that is not path data, no `Path2D`, no `save`/`restore`) are counted (`vueIconSkip`) and left as holes. |
+| 2 | **The badge pills and the footer band were missing from the picture's structure.** | `NodeBadges.vue` puts a test id on the Comfy badge alone (`data-testid="comfy-badge"`) and `NodeFooter.vue` on each tab (`subgraph-enter-button`, `advanced-inputs-button`); the visible surfaces are the pills those badges sit in and the band the tabs sit on, and neither carries a stable name. | `lodVueChromeBoxes` reads them **by relationship**: the anchor's own box, the anchor's siblings inside the badge row (capped at 8), the tab button and its parent, as two new kinds (`badge`, `footer`) drawn after the panel and under the content. A class-name selector was rejected deliberately — those are generated Tailwind utilities that a frontend rebuild can rename under this reader without any test noticing, which is a silent hole in every picture. An element already read as one kind is not measured again as another. |
+| 3 | **The icon's URL is not a key.** | While writing the invalidation test: the check-mark `<path>` and the `<circle>` dot produced the *same* signature entry, because the key was the URL's head and tail — and every icon in a set shares its SVG header and closing bytes. The picture showing the first glyph was kept when the page showed the second. | The key is the parsed **geometry**: a hash of the viewBox and every shape's path data, fill, stroke, width and fill-rule (`lodVueIconKey`). Two URLs spelling the same glyph are the same glyph and invalidate nothing. |
+
+**What this stretch could not do, recorded rather than engineered around.** An icon
+whose CSS the page injects *after* a picture was taken is not seen until something
+else makes that node stale: a node the page is watching is re-measured on the
+page's own reports, not on a timer (`LOD_VUE_MEDIA_MS_WATCHED` is 5 s, and that is
+what keeps the steady state free of DOM work), so a stylesheet arriving between two
+reports is invisible to the signature. A fresh measurement always reads the icons as
+they are then, and on the built frontend the icon vocabulary is generated into the
+stylesheet before the first node element is measured — the window exists for a
+dynamically added icon, and it closes on the node's next change. Closing it with a
+per-frame query would be a per-frame cost in exactly the pathway that exists to
+remove one.
+
 ## The stand-in pictures: what a capture actually contains, and where the cache went wrong
 
 The user's report was specific: image loaders and mask editors show a stand-in
@@ -922,7 +946,7 @@ apply, not just in the docs.
   other than the Node harness was executed in this pass.
 - **The Vue-nodes stand-in has not been run against a live page *by this
   project*.** It is verified against the frontend's sources and the harness
-  (forty tests), and its failure modes are contained by construction (a box
+  (forty-four tests), and its failure modes are contained by construction (a box
   only ever follows a real blanking, and every blanked element is handed back on
   the frame the setting stops applying) — but the user's page is the live test, and
   it has already caught four defects this harness could not: a class that Vue
@@ -937,7 +961,9 @@ apply, not just in the docs.
   put back on an element the frontend replaced), `vueStaleEls` (a cached element
   that turned out to belong to another node), `vuePaneWatches` (node containers
   watched for replacements) and `vueWaitLayout` / `vueWaitMedia` / `vueWaitFonts`
-  (captures held for a node that had not finished), and — since v2.6.6 — `vuePaintSkipped` (nodes
+  (captures held for a node that had not finished), `vueIcons` (glyphs read out of
+  the page's own CSS masks and drawn) and `vueIconSkip` (icon candidates the reader
+  had to leave as holes), and — since v2.6.6 — `vuePaintSkipped` (nodes
   whose paint the frontend no longer owes), `vueChrome` / `vueChromeBoxes` (the
   node's structure drawn), `vueSettleMs` / `vueSettleArms` / `vueSettleHeld` (the
   settle window, and how many capture slices it held back), and — since v2.6.7 —
