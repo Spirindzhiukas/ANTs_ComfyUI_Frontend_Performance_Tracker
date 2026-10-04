@@ -247,7 +247,9 @@ call, never latched:
   a timer, and the ration still bounds what a frame may ask. In the steady state
   — pictures held, nothing changing — a frame costs the page **no** DOM write, no
   layout read and no DOM query of any kind, at any node count: the tool's whole
-  per-frame cost is the blits it was asked to make. Measured at 40 boxed nodes in
+  per-frame cost is the blits it was asked to make: the whole canvas work of a
+  frame in the steady state is one `drawImage` per boxed node and nothing else.
+  Measured at 40 boxed nodes in
   the Vue-nodes renderer, 2.6.4 alongside, steady state: attribute writes per
   frame 40 (every one of them a re-write of a mark that had not changed) → 0, DOM
   queries per frame 82.4 → 0, layout reads per frame 2.4 → 0; at 150 nodes
