@@ -678,7 +678,9 @@ await pump();
 bullets("SUMMARY BAR (always visible)");
 dump(h.document.getElementById("ants-tracker-summary"));
 
-const TABS = ["tweaks", "timing", "nodes", "stalls", "governor", "load", "memory", "gpu", "testing"];
+// Every tab the panel builds, in the panel's own order. The labels come from the
+// buttons themselves, so a renamed tab cannot print under its old name.
+const TABS = ["tweaks", "status", "timing", "nodes", "stalls", "governor", "load", "memory", "gpu", "testing"];
 const tabBar = h.document.getElementById("ants-tracker-tabs");
 const body = h.document.getElementById("ants-tracker-body");
 for (let i = 0; i < TABS.length; i++) {
@@ -693,7 +695,10 @@ for (let i = 0; i < TABS.length; i++) {
     for (const caret of carets.slice(0, 3)) caret.click();
     await pump();
   }
-  bullets(`${TABS[i].toUpperCase()} TAB`);
+  // The label the panel gave the tab, not the markup around it: a badge ("!")
+  // can be appended to a button and is not part of its name.
+  const tabLabel = tabBar.children[i]._text || tabBar.children[i].textContent || TABS[i];
+  bullets(`${String(tabLabel).toUpperCase()} TAB`);
   dump(body.children[i]);
 }
 
@@ -709,14 +714,15 @@ console.log(
     "\n      hand at quarter speed, and the repaint timer capped by the AUTOPILOT (target 150 ms/s, one" +
     "\n      round every 5s) — so the GOVERNOR TAB above shows both: a source limited by hand, and the" +
     "\n      autopilot's own line saying which source it capped, at what gap, and what it was costing." +
-    "\nnote: the LOW-ZOOM DRAWING section of the Tweaks tab and the report line above are the other" +
+    "\nnote: the LOW-ZOOM DRAWING section of the Node Rendering Settings tab and the report line above are the other" +
     "\n      answer for this kind of page: every node is inside the viewport at zoom 0.10, so culling has" +
     "\n      nothing to remove and the cost is drawing a thousand nodes properly several times a second." +
     "\n      The mode paints every node as one rectangle below the zoom you pick, and caps redraws while" +
     "\n      nobody is touching the page — opt-in, and off the moment you say so." +
-    "\n      Its preview setting is the other half: image, preview and compare nodes blit a full-resolution bitmap every" +
-    "\n      redraw, so below the zoom you set (60% by default) those draws are served from a cached copy of about the" +
-    "\n      resolution the screen can show — 64px on the long side at 10% zoom, 512px around 60% for a big node." +
+    "\n      Its stand-in setting is the other half: below the zoom you pick, a node whose picture has been captured" +
+    "\n      is drawn as one drawImage of that picture instead of a live draw, and the picture is taken once while the" +
+    "\n      page is idle. An image or preview node is not a second system — the picture is the preview, and it" +
+    "\n      replaces the node itself, not a box inside it." +
     "\nnote: the three settings are independent, and each one only changes its own subject. The node setting decides what a" +
     "\n      NODE costs; the link setting decides a LINK's shape (curves, or straight lines if you ask for them — nothing else" +
     "\n      can turn a link straight); the thinning setting decides how much INK a curve uses (1px instead of 3, without the" +

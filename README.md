@@ -1,20 +1,32 @@
 # ANTs_ComfyUI_Frontend_Performance_Tracker
 
-A frontend-side profiler for ComfyUI. Answers "which extension is
-actually costing me FPS while panning this graph?" without needing
-Chrome DevTools open, and without restarting ComfyUI to bisect.
+**ANTs Frontend Optimizer** — a frontend-side profiler *and* a small set of
+drawing rules for ComfyUI. It answers the question DevTools makes you work
+for: *which extension's JavaScript is actually costing me frames while I pan
+this graph, and what is eating main-thread time that no draw hook owns?* —
+without opening DevTools and without restarting ComfyUI to bisect.
 
-Version 2.1. The v2 rewrite changed the semantics (costs are now per
-drawn frame, not per 4-second window), added five tabs, and fixed a
-handful of v1 bugs that could make the panel lie. 2.1 adds an eighth
-tab that can **act** on what the others find: a tunable scheduler layer
-over the page's own timers, rAF callbacks and redraw requests. If you
-are coming from v1, read **"What changed in v2"** at the bottom.
-`REVIEW.md` in this repo documents the v1 defects with line references.
+Version **2.7.3**. Everything runs from page load: no node has to be placed,
+nothing executes, and the tool never changes your graph or your workflows.
+
+- **Measure** — per-extension and per-node-type frame cost, canvas draw
+  stages, main-thread stalls, redraw-request callers, load time, memory, GPU.
+- **Act** — mute a draw hook, cap a runaway timer, or turn a node into a
+  stand-in bitmap below a zoom you pick. Every effect is opt-in, remembered,
+  and reversible.
+- **Say what it cannot see** — GPU cost per extension, Vue draws, Firefox's
+  memory API and more are named as unmeasurable rather than guessed at
+  (the canonical list is the LIMITS block at the bottom of `web/tracker.js`).
+  A Vue-nodes stand-in is a *drawing*, not a screenshot, and the readout says
+  which parts of a node it could not draw.
+
+This README describes the current code. Version history moved to
+[`CHANGELOG.md`](CHANGELOG.md); the rules for changing the code are in
+`CLAUDE.md`; the decisions behind it are in `memory.md`.
 
 ## Install
 
-Drop this whole folder into `ComfyUI/custom_nodes/` so it sits at:
+Drop the whole folder into `ComfyUI/custom_nodes/` so that it sits at:
 
 ```
 ComfyUI/custom_nodes/0000_ANTs_nasty_bastards_tracker/
@@ -23,67 +35,488 @@ ComfyUI/custom_nodes/0000_ANTs_nasty_bastards_tracker/
     web/window.html
 ```
 
-The `0000_` prefix is deliberate — it makes this load before other
-custom nodes' web directories (alphabetically), which it needs to do
-in order to catch every other extension's `registerExtension` call.
-Don't rename it unless you also rename it to something that still
-sorts first.
+The `0000_` prefix is deliberate: web directories load in alphabetical
+order, and this file must load **before** other custom nodes' scripts so it
+can wrap their `registerExtension` calls and see their draw hooks. If you
+rename it, keep something that still sorts first.
 
-Restart ComfyUI. No dependencies, nothing to `pip install`, no build
-step. The panel button's position is remembered in the browser. Node
-thumbnails, when that setting is on, are written under the running
-ComfyUI `temp/ANTs_Frontend_Optimizer_THUMBNAILS/` folder. Nothing else
-is written server-side.
+Restart ComfyUI. There is no build step, no bundler, and nothing to
+`pip install`; the extension ships by being copied.
+
+Two things are written server-side, and nothing else:
+
+- **Node pictures**, if "Keep stand-in previews on disk" is on, under
+  ComfyUI's `temp/ANTs_Frontend_Optimizer_THUMBNAILS/` folder — one PNG per
+  node id plus a signature of what the node draws, at most 8 MB per file,
+  swept after 7 days, deleted when the node is deleted.
+- The panel's own settings and position, in the browser's `localStorage`
+  (`ants.lowZoom.v1`, `ants-governor-v1`, `ants-tracker-corner-pos`,
+  `ants-tracker-panel-box`, `ants-tracker-panel-size`).
+
+The node (`Add Node → ANTs → ANTs Frontend Optimizer`) does nothing and has
+no inputs, outputs or execution. Its only job is to carry its own tick/gear
+buttons on the canvas for people who keep the floating pill hidden. The old
+class key `ANTsNastyBastardsTracker` is still recognised, so graphs saved
+before the rename keep working.
+
+### Optional backend routes
+
+`__init__.py` registers nine routes, best-effort, and the frontend works
+without them:
+
+| Route | What it is |
+| --- | --- |
+| `GET /ants_tracker/gpu` | Read-only `nvidia-smi` snapshot (utilisation, VRAM, temperature, power, process), cached 2 s. If `nvidia-smi` is missing the route says so and the GPU tab falls back to ComfyUI's own `/system_stats`. |
+| `GET /ants_optimizer/thumbs/info` | Where the picture folder is and how much it holds. |
+| `GET/PUT/DELETE /ants_optimizer/thumbs/{node_id}` | Read, write (`?sig=`), delete one node's picture. |
+| `POST /ants_optimizer/thumbs/sweep` | Delete pictures older than a week. |
+| `GET /ants_optimizer/window` | The separate-window page. |
+| `GET/POST /ants_optimizer/ui` | The settings/telemetry link between the ComfyUI page and that window. Memory only: a revision, an origin, the current settings and the last report. Neither side is the master. |
 
 ## Use
 
-The tracker starts recording automatically the moment the page loads —
-you don't need to place any node for it to work. The gear opens a
-separate window. The panel on this page is only the fallback, for when
-the browser blocks that window.
+The tracker starts recording the moment the page loads.
 
-1. A small pill appears pinned to the screen at all times, with two
-   round controls in it: a **switch** on the left and a **gear** on the
-   right. The gear opens the separate window (`/ants_optimizer/window`),
-   centered on the ComfyUI window. It is its own page: it is not drawn
-   on the canvas, and it does not hold the canvas document. Settings
-   and the live numbers go through `/ants_optimizer/ui`, so a change in
-   the window is a change on the page, and the other way around. A
-   second click brings that window forward. If the browser blocks the
-   popup, the panel on this page opens and says so. Press and hold
-   anywhere on the pill for a moment, then drag — it switches into move
-   mode instead of clicking, and remembers wherever you drop it (via
-   `localStorage`), even across page reloads. The switch on the left is
-   the tool's master switch (see below), and neither control is ever
-   taken off the screen — not by a setting, not by the switch itself.
-2. Or drag in the **"ANTs Nasty Bastards Tracker"** node (category
-   `ANTs/debug`). It carries the same pill as the floating button —
-   `[switch][gear]`: the gear opens the panel, the checkbox is the
-   tool's master switch. The node does nothing else — no inputs, no
-   outputs, never executes. The pill is exempt from every setting this
-   extension has, so it stays usable at any zoom, including at 10% on a
-   graph it is otherwise flattening to rectangles.
+1. A small pill appears pinned to the screen (drag it anywhere; the position
+   is remembered). It carries the same two controls as the tracker's node:
+   the **checkbox** switches the whole tool off — hooks unwrapped, sampling
+   stopped, every drawing change handed back — without forgetting your
+   settings, and the **gear** opens the UI.
+2. The gear opens the **separate window** at `/ants_optimizer/window`: its
+   own page, centred on the ComfyUI window, for a second monitor. If the
+   browser blocks the popup, the in-page panel opens instead and says why.
+3. The **panel** can also be opened from the tracker node's own gear, and
+   closed with `✕`. It has a header (Copy · On/Off · Pause · Reset · Window ·
+   Close), a summary bar that is always visible, and ten tabs.
 
-Panel header buttons:
+The two surfaces are one tool. Both read the same settings through
+`/ants_optimizer/ui`, a change carries a revision and an origin so neither
+side applies its own echo, and a live number is not a settings change. The
+window shows five tabs — Node Rendering Settings, Status, Timing, Nodes and
+Stalls — which is the reading half of the panel; the panel itself adds the
+Governor, Load, Memory, GPU and Testing tabs. The window shows live telemetry
+only while the ComfyUI page is open and answering; when that page is gone it
+says so instead of pretending.
 
-- **📋 Copy** — dumps a plain-text snapshot of every tab to the
-  clipboard in one go, meant for pasting into a chat or bug report
-  instead of a screenshot.
-- **⏻ Off / On** — the same master switch as the checkbox on the
-  floating pill. Off means off: nothing is wrapped, sampled, deferred or
-  drawn differently, the page is handed back whole, and the panel keeps
-  your settings for when you switch it on again.
-- **⏸ Pause** — freezes sampling. Drawing keeps happening; it just
-  stops being timed, so a jumpy table holds still long enough to read.
-  Meters are marked stale while paused.
-- **⟲ Reset** — clears every recorded sample. Mutes, the redraw cap
-  and the panel's own position are kept, so you can reset between
-  experiments without redoing your setup.
+### The ten tabs
+
+| Tab | The question it answers |
+| --- | --- |
+| **Node Rendering Settings** | The controls that change what is drawn (see the next section). |
+| **Status** | One paragraph: what this page is, what the frontend reports about itself, and what the settings are doing right now. |
+| **Timing** | Which extension's hooks cost frames, per hook, with off-frame time kept separate. |
+| **Nodes** | Where the frame went inside LiteGraph's own calls, and per node type. |
+| **Stalls** | Main-thread blocking that is *not* canvas drawing, with the script, the invoker, forced-layout time — and who asked for redraws. |
+| **Governor** | The scheduler layer: every timer/rAF source the page registers, what it costs, the limit you can put on it, the off-thread lane and the long-frame traces. |
+| **Load** | Startup cost per extension pack from Resource Timing. |
+| **Memory** | JS heap and the tracker's own footprint, with a 60-sample sparkline. |
+| **GPU / VRAM** | ComfyUI's `/system_stats` (torch's view), plus the optional `nvidia-smi` route. Says out loud that per-extension VRAM attribution is impossible from page JavaScript. |
+| **Testing** | Deliberate traffic generators and the scripted-pan A/B benchmark. |
+
+The panel remembers its position and size, the corner grip grows the edge you
+drag, and the header can move it. Rows are keyed and updated in place: scroll
+position and expanded rows survive the twice-a-second refresh, ordering is
+frozen while the pointer is inside a table, and the panel slows its own
+refresh (1 s above 6 ms per pass, 2 s above 12 ms) so measuring the page does
+not become the page's problem.
+
+## Node Rendering Settings
+
+Everything here changes only its own subject: the node setting never moves a
+link, the link setting never paints a node, and the widget setting never
+touches either. All of it is off the moment you click **Back to full
+drawing**, and "off" is a real restoration, not a memory of one.
+
+| Setting | Choices | Default | What it does |
+| --- | --- | --- | --- |
+| Replace node previews with bitmap stand-ins at zoom levels | off — draw every node · below 5 · 10 · 15 · 20 · 25 · 30 · 40 · 50 % | **below 50 %** | Below this zoom a node is a flat box instead of a live draw. The decision is the zoom, never a node's pixel size. In the Nodes 2.0 (Vue-nodes) renderer the same setting blanks the node's own element and the canvas paints the same box in its place — see the section further down. Hover, selection and a drag keep the picture; a selected node gets a ring; a link drag, a running progress bar and an error still draw live. |
+| Stand-in | plain fill · title bar colour · title + error ring + progress + muted · picture of the node | **picture of the node** | What the box is made of. *plain* is a fill, *title* adds each node's own title bar, *state* adds error rings, progress bars and muted dimming, *picture* stores a bitmap of the node and blits it instead. In the Nodes 2.0 (Vue-nodes) renderer *picture* works too, drawn rather than photographed — see the section further down. Changing this choice never hands an element back and forth: the nodes that were boxes stay boxes, and the ones that were pictures stay pictures, so the canvas does not flicker. |
+| Keep these node types live | comma-separated node types | empty | Types never served from a picture, however far you zoom out. They keep the painted fill or draw live, and the readout counts them as "kept live on purpose", not as failures. |
+| Stand-in capture resolution | 0.25× · 0.5× · 1× · 2× · 3× | **1×** | Pixels per graph unit in the picture. Below 1× the picture is a quarter (0.25×) or a half (0.5×) of the node's size — that is what makes it cheap to hold a thousand of them, and it is drawn at that size, not at 1× with a smaller name. Half and quarter copies are still made for the screen. Zoomed in past the ratio a picture is softer than live drawing, which is why a node being worked at is never served from one. Changing this value re-captures and re-keys the disk files (see below). |
+| Stand-in memory (RAM) budget | 256 · 512 · 1024 · 2048 · 4096 · 8192 MiB | **4096 MiB** | How much RAM the pictures may hold. A full budget refuses a new capture rather than evicting a picture that is on screen (that is what flicker looks like). On Execute or Run-to-node, at 85 % system RAM the off-screen pictures leave memory; at 95 % all of them do. Disk files stay and are loaded back after the run. |
+| Keep stand-in previews on disk | on · off | **on** | Store those pictures under `temp/ANTs_Frontend_Optimizer_THUMBNAILS/` and load them back next session. One file per node, named by the node's id and a key of what is *inside* the picture: the node's own signature **plus the capture resolution it was drawn at and a hash of the theme**. The key is the whole promise — a file written at 3× is never served to a page asking for 0.25×, and a file drawn in a light theme is never served in a dark one; a change of either re-keys the file, so the setting is followed in both directions. A picture the budget forced coarser than your setting is **not** written, because it is not what the setting asked for. A change overwrites the file; deleting the node deletes it. Disabled after 8 failures; the memory cache keeps working. |
+| Idle redraw cap | 0 · 250 · 500 · 1000 ms | **0 (off)** | While nobody is touching the page, redraws are limited to this rate. One input event lifts the cap at once. |
+| Link shape | spline · straight | **spline** | The shape of a link and nothing else. There is deliberately no "auto" that follows the node setting: a link must not change shape because a *node* threshold was crossed. |
+| Link thinning | full link and node detail · links thinned below 100 · 80 · 60 · 40 · 20 % zoom | **links thinned below 60 % zoom** | Below this zoom links are stroked 1 px instead of 3 and lose the dark outline. Curves stay where they were — this is ink, and only ink. |
+| Measure link thinning | button | — | Alternates thinning on and off on this page and compares the two halves, then puts the setting back. |
+| Widgets stop answering | never (nodes stay live) · below 20 · 30 · 40 · 50 · 60 % | **never** | Below this zoom a node's widgets ignore the pointer. The nodes themselves still select, drag, edit and open their menu. |
+| Widget's threshold linked to the picture threshold | checkbox | **on** | The higher of the two zooms wins, so a picture never sits behind a live widget. |
+| Off-screen nodes | off · on | **off** | Off-screen nodes get the same boxed, inert treatment at every zoom, past the margin below. |
+| Off-screen margin | 0.25 · 0.5 · 1 · 2 screens | **0.5** | How far outside the visible area a node has to be before its widgets are taken away. |
+| Come back | all at once · 1 per frame · 4 per frame | **1 per frame** | How many off-screen nodes may be handed back per drawn frame. On-screen nodes come back immediately. |
+| Display scale | auto · 1× · 1.25× · 1.5× · 2× · 2.5× · 3× | **auto** | Windows display scaling. Auto reads it at startup and re-checks; pin it if the Status line disagrees. |
+| How widgets go | hide · inert | **hide** | *hide* takes the element out of the picture as well as out of the pointer's way; *inert* only takes pointer events away and leaves it on screen. Both add a CSS class and restore exactly what was there. |
+| Way back | button | — | Back to full drawing: every drawing change off, the disk cache left as you set it. |
+
+### What is inside a stand-in picture
+
+A node is not only what the canvas draws. In both frontends a widget's content
+lives in a DOM element *over* the canvas — a prompt is a `<textarea>`, an image
+preview an `<img>`, a 3D viewport a `<canvas>` — and the canvas row underneath
+is blank (ComfyUI paints a placeholder there only in its own low-quality
+mode). A picture of the canvas alone therefore showed a text or image node's
+chrome and nothing else. The capture composites what is honestly drawable:
+
+| The widget's content | What the picture gets |
+| --- | --- |
+| An image (`<img>`, and an image inside a wrapping `<div>`) | The image itself, drawn at the widget's row — pixel for pixel. |
+| A canvas (a 3D viewport, a mask editor, a curve editor) | The canvas as it stands at that moment, pixel for pixel. |
+| A text field (`<textarea>`, `<input>`) | Its value **re-painted** in the theme's widget colours, wrapped and clipped to the row — a rendering of the text the widget holds, not a screenshot of the browser's rendering. The readout counts these separately for exactly that reason. |
+| Anything else (a pack's own HTML) | Nothing: the row stays blank and the count of what could not be drawn goes up. Inventing a picture of arbitrary DOM would be inventing ink. |
+| A wrapper with the real thing inside it | The image or canvas inside, if there is exactly one (`widget.element` holding the `<img>`). Two is a guess about which one you are looking at, so it is left blank and counted. |
+| A `<video>` (or an element holding one) | The node is never photographed at all: a still picture of a video is one frame presented as if it were the node. |
+
+The picture is re-made when anything it contains changes. The signature covers
+the node's own fields (title, size, colours, mode, error, progress, widget
+values, the images a node draws into itself) **and** what its DOM widgets are
+showing — an image's source, its `complete` flag and its size, a text field's
+value — so dropping a new image into a loader, typing in a prompt or a mask
+editor redrawing invalidates the picture and the idle lane photographs the
+node again. A picture taken before an image finished loading has a blank where
+the image will be, and is replaced as soon as it arrives.
+
+The lookup is the frontend's own contract — `widget.element` / `widget.inputEl`,
+which is where ComfyUI's own nodes put their previews and text fields — so a
+pack that keeps a preview element off its widget list, or that paints into a
+detached canvas, is not reachable and stays blank and counted.
+
+Two things this deliberately does not do: it never makes a node's picture out
+of *live* state (a running progress bar, an error, a link drag and a video
+keep the node live, as the table above says), and it never writes a picture it
+could not fully make to disk when the budget forced it coarser than your
+setting asked for.
+
+The first of those two is checked on both renderers rather than asserted. In
+the canvas renderer a box *can* stand for a running or erroring node, and its
+progress bar and error stroke are read from the node's own fields
+(`node.progress` is what the frontend itself puts on the node object in either
+renderer — `nodeProgressCanvasSync.ts` — and `node.has_errors` comes from
+`useNodeErrorFlagSync.ts`), drawn per frame, with the node refused both for
+photographing and for blitting while either is set: a bar frozen at the instant
+of a capture cannot outlive the run it belonged to. In the Nodes 2.0 renderer
+such a node is never boxed at all — it keeps its own element, with the
+frontend's own bar, its own error ring and its own outline around the node that
+is executing — so a stand-in never stands in for a state. A selected node's
+ring is drawn at the box the node was *pictured* in, so it does not jump or sit
+inside the node when a picture replaces the live box. And the number the panel
+reports as "N element(s) hidden" is the page's own number: a walk of the
+document for the two marks this feature uses (`.ants-lod-box` on the DOM a
+node's widgets are built from, `data-ants-dom-hidden` on a Vue node's root)
+finds exactly what the panel says.
+
+### What these settings do in the Nodes 2.0 (Vue) frontend
+
+ComfyUI's newer frontend can render every node as a DOM element
+(`LiteGraph.vueNodesMode`, the **Nodes 2.0** setting). The canvas then draws
+links, groups and the grid, and no node chrome. There is no *screenshot* to
+take there — no browser API draws a DOM element into a canvas — but there is a
+stand-in to paint and a picture to *draw*, so the tool runs a second pathway
+behind the same settings and picks it from the frontend's own flag on every
+call, never latched:
+
+* **canvas renderer** — a picture of the node (or its box) blitted where the
+  canvas would have drawn the node;
+* **Vue-nodes renderer** — the node's own element is *marked* so the frontend
+  stops painting it: its children are `visibility: hidden` (the one property an
+  engine honours by skipping a subtree in the paint phase — `opacity: 0`, which
+  this pathway used until v2.6.6, is still painted) and the element's own box
+  keeps its place, transparent and hit-testable — selecting and dragging a node
+  are bound on the root and never look at `event.target` — and the one thing
+  inside left live is a slot's dot, because that is where a link drag starts. The
+  elements stay in the page, in the layout and
+  in the frontend's own observers, and the canvas paints the same box in the same
+  place, with the same detail ladder. The mark is an **attribute** on the element
+  (`data-ants-vue-standin`) plus an `!important` stylesheet rule, deliberately
+  not a class: `LGraphNode.vue` binds `:class` on that element and rewrites it
+  wholesale on every re-render, so a tool-added class is silently thrown away
+  and the node comes back visible behind its box. The same reasoning applies to
+  the fovea's hide mark on a node's own element and to its inert mark
+  (`data-ants-dom-hidden` / `data-ants-dom-inert`). LiteGraph still calls `drawNode` for every visible node in this
+  renderer — that is how it keeps slot metrics in sync — so this tool's
+  existing seam fires with the context already in node-local space, and the box
+  lands exactly where a picture lands in the canvas renderer.
+  While the stand-in setting is **picture of the node**, each box also carries
+  what the node is showing, drawn live, from the places a node's content
+  reaches the page. **The frontend's own widget rows** (`WidgetGrid.vue` renders
+  a `data-testid="node-widgets"` grid, one child per widget, the control inside a
+  `lg-node-widget` element) are read as rows, and the value inside each control is
+  read from the control itself: an `<input>`/`<textarea>`/`<select>` value, a reka
+  slider's `aria-valuenow` with its track and thumb colours measured off its own
+  children, a checkbox's tick, a colour input's swatch of the colour it holds —
+  drawn where the browser laid the element out, in its own font, size and colour,
+  with its own alignment. **A widget a pack mounted through `addDOMWidget`** (the
+  route `WidgetDOM.vue` takes) is drawn from its element too, in the box the
+  browser laid it out in when the frontend has mounted the element inside the
+  node's own element, and otherwise at the row geometry the frontend positions it
+  by. So that nothing is drawn twice, a *measured* text control is drawn by the
+  node's own text pass and no longer by the DOM-widget composite, while images
+  and canvases still come from that composite, because no text pass can draw
+  those; a textarea lays its text out from its own top, the way the element does. **Everything the node renders itself** — the frontend's
+  `ImagePreview.vue` puts the node's pictures in `<img>` elements inside the
+  node's DOM, and a custom node may render a `<canvas>` for a viewport or a curve
+  editor — is found by walking the node's element and drawn at the position the
+  browser laid it out in, which is readable while the node is a stand-in because
+  the mark takes the *painting* away and never the layout: a hidden element still
+  answers `getBoundingClientRect`, still has its text metrics and is still
+  reported by every observer. **Everything the node renders as text** — its title, its
+  widget labels and the values the frontend draws itself — is read out of the
+  DOM, string by string, with the box the browser laid each one out in and the
+  styles it computed for it, and re-painted there: wrapped into that box, line by
+  line, in the element's own font (family, weight, style, line height, letter
+  spacing, `-webkit-line-clamp`), with the text that does not fit marked the way
+  the browser marks it. Page JavaScript cannot *screenshot* rendered text, but it
+  can read every string, its position and its font, which is what a stand-in
+  needs; a field's *value* is drawn from the value the field holds, as before.
+  Two things about colour and transparency are worth stating because both were
+  wrong in v2.6.7 and both are visible from across the room. The frontend's
+  themed colours are Tailwind 4 `oklch()`/`oklab()` strings, and assigning one to
+  a canvas `fillStyle` is **silently ignored** — the previous fillStyle stays, so
+  a node's surface came out in the previous node's colour — so every colour a
+  stand-in draws is translated to `rgba()` first, and what cannot be translated is
+  counted and sampled in the readout rather than left to the engine. And the
+  node's composited opacity (a muted or dragged node) is read with the rest of the
+  measurement and baked into the picture, since in this renderer the picture *is*
+  what the user sees of the node. The content is clipped to the node's box **and its
+  title bar**, so the node's own name is in the picture rather than cut off above
+  it. **The node's own structure** is read the same way and drawn the same way:
+  the element's box (the coloured surface), the header bar that carries the title,
+  the body panel under it and the connection dot of every slot, each at the rect
+  the browser gave it and in the background colour the browser computed for it
+  (the frontend's own `[data-testid=node-inner-wrapper]`, `node-header-<id>`,
+  `node-body-<id>` and `.slot-dot`), and every widget's own row — the element the
+  frontend mounts for it, with its background, border and radius, read in the same
+  measurement pass so a row's rect and its colour can never come from two different
+  layouts. Without that, the picture was the node's text
+  and media floating on the canvas with no surface under them — the "semi, not
+  fully there" the stand-ins were reported as. A pack's own drawn HTML is still blank and counted. Nothing is drawn twice, and **the page is asked for nothing while nothing
+  changes**. The tool watches the node's element instead of interrogating it: a
+  `ResizeObserver` on the element and the elements inside it, and a
+  `MutationObserver` on its children and text, drop the stored measurement the
+  moment the page reports a change — a widget row moving, content arriving, the
+  element growing — and the next frame re-measures it through a ration of a few
+  node layouts per frame. Everything downstream follows from that one
+  measurement: the box, the ink, the signature that decides whether a stored
+  picture is still a picture of this node, and the capture surface the picture is
+  drawn on, so a node that grew or gained content cannot be photographed at the
+  height it had a moment earlier and then clipped. Panning and zooming cost no
+  read at all, because every number stored is node-local and a transform is not a
+  box change. On a page without those observers the tool falls back to asking on
+  a timer, and the ration still bounds what a frame may ask. In the steady state
+  — pictures held, nothing changing — a frame costs the page **no** DOM write, no
+  layout read and no DOM query of any kind, at any node count: the tool's whole
+  per-frame cost is the blits it was asked to make: the whole canvas work of a
+  frame in the steady state is one `drawImage` per boxed node and nothing else.
+  Measured at 40 boxed nodes in
+  the Vue-nodes renderer, 2.6.4 alongside, steady state: attribute writes per
+  frame 40 (every one of them a re-write of a mark that had not changed) → 0, DOM
+  queries per frame 82.4 → 0, layout reads per frame 2.4 → 0; at 150 nodes
+  150 / 302.1 / 4.5 → 0 / 0 / 0.
+  The box covers the **box the frontend rendered**, not the node's graph size:
+  `LGraphNode.vue` renders an image node `IMAGE_PREVIEW_HEIGHT_RESERVE`
+  (220 + 8 + 4 px) taller than its graph size and puts the picture in that
+  reserve, so a box built from `node.size` would clip off exactly the picture
+  being looked for. The element's own rect is measured, divided by the zoom the
+  *element* is laid out at — read from the frontend's own transform pane
+  (`[data-testid=transform-pane]`, one computed matrix for the whole graph, and
+  the first answer), then from the element that carries the node's declared
+  width, then from the node's root, and only from `canvas.ds.scale` if nothing
+  about the DOM can be read at all (which the readout says, because a capture
+  sets that number to 1 while the DOM keeps the frontend's transform) — so
+  content lands where it belongs even in a capture taken mid-zoom.
+
+**There is no level of detail to reproduce, and that is verified rather than
+assumed.** A recurring question about this pathway was whether the frontend draws
+nodes at a simpler *tier* when they are small — which would make a stand-in a
+faithful picture of a simplified node. It does not, and the answer comes from the
+frontend's own sources: the node's root element binds its size, position, z-index
+and opacity and nothing else, the transform pane carries a single transform for the
+whole graph, and LiteGraph's `drawNode` draws nothing at all in this renderer — so a
+zoom is compositor work, and no element is re-laid out, no computed style changes
+with scale and no text is simplified at any zoom. The tool reports that answer from
+the user's own page in the readout's picture clause (`lodVueLodProbe`: the element
+count under the node's element, the computed font size of its text, whether
+`content-visibility` is doing anything, and the transform scale the measurement was
+divided by), so the claim can be re-checked at any zoom without reading this file.
+What made stand-ins look simpler than the node was the picture, not a level of
+detail: colour, text, opacity and the widget rows — all four fixed in v2.6.8, above.
+
+**In this renderer the mark is the mechanism, and v2.6.6 is where it became one.**
+A stand-in has to make the frontend stop *painting* the node — that is the whole
+saving in a renderer whose node drawing is ordinary DOM work, and on a machine
+with hardware acceleration off it is CPU work on every frame. `opacity: 0`
+(v2.6.0–v2.6.5) does not do that: an opacity-0 subtree stays in the render tree
+and is still painted, which is exactly why the stand-ins could cost performance
+here while saving it in the canvas renderer, where the expensive drawing was
+LiteGraph's own `drawNode` and the box replaced it. What an engine actually skips
+is a *hidden* subtree, so the node's children are `visibility: hidden` — and only
+its children: the node's own box keeps its place and stays hit-testable (which is
+what keeps selecting and dragging a node working through a stand-in — both are
+bound on the root), and the slot dots are re-shown inside the hidden subtree, since
+a link drag starts on the dot and the canvas renderer keeps linking working through
+its own canvas hit test. Nothing is removed: the elements stay
+in the page, in the layout and in the frontend's own `ResizeObserver` (upstream
+`useVueNodeResizeTracking.ts` measures the same rects), so every number the box and
+the picture are made of still comes from the DOM, and a change inside a stand-in is
+still reported and still re-makes the picture. What the mark trades away is the
+*painted* node, not the node: a widget inside a stand-in no longer receives its own
+clicks at that zoom — the pointer goes to the node, which is what the user sees
+there — and the node's accessibility-tree entry is that of a hidden subtree while
+its picture stands in. **Both halves are measured and pinned by tests:** the paint
+the frontend no longer has to do is counted (`vuePaintSkipped`), a box that changes
+inside a stand-in is still reported (and the picture re-made), and with the
+stand-ins on a frame costs the page no attribute writes, no layout reads, no DOM
+queries and no computed styles, at 40, 60 and 150 nodes alike. What page JavaScript
+cannot measure is the rasteriser's own bill; on the machine the graph runs on, that
+is what DevTools' *paint flashing* shows (boxed nodes stop flashing) next to this
+tool's frame budget and Stalls tab. Every marked element is handed back the moment the
+zoom leaves the setting, the setting or the tool is switched off, or the
+renderer changes — the per-frame plan compares one boolean in the steady state,
+so a stale mark cannot be left behind, and an element the frontend unmounted
+mid-flight (it renders the whole pane with `v-if`) has the mark taken off it
+too, so a reused element does not come back invisible. That plan asks the *same*
+predicate the draw loop does, in one function: a mode that is not a picture is
+not a reason to stop standing in, so nothing is handed back and forth while the
+setting rests — which is what a per-frame fight between the two would look like,
+nodes flickering between a box and the frontend's own rendering.
+
+**A mark is put back the moment the frontend reports the element it belongs on,
+not on the next frame.** That sentence is the answer to the flicker the twelfth
+report showed on some nodes, and it took three rules: a cached element is trusted
+only while the `data-node-id` it carries still equals the node's own id (this
+frontend reuses elements, and a box painted for one node while another node's
+element was blanked is a node fighting its own stand-in); the container the
+frontend renders node elements into is watched (`MutationObserver`, `childList`
+only), and the report's own `addedNodes` are resolved back to a node and
+re-marked **inside the observer callback — a microtask after the DOM change,
+before the browser paints** (`vueRedressed`); and a node that has just lost its
+element is remembered for half a second, because Vue can deliver a replacement as
+a removal in one task and an addition in the next (`vueOrphan`). The same ledger
+decides the other direction: an element the frontend takes off *this* node is
+handed back (a reused element must not come back invisible), and an element it
+has given to *another* node keeps that node's mark (`lodVueClaimsOther`) — taking
+it off would show that node through its own box. The readout counts the re-marks,
+the stale elements and the pane watchers, so the claim is visible from the user's
+own page (`vueRedressed`, `vueStaleEls`, `vuePaneWatches`), and it counts what the
+pictures carry: the icons drawn (`vueIcons`) and the ones the reader had to leave
+as holes rather than paint a blob for (`vueIconSkip`).
+
+**Pictures work here as well, and so do the disk files.** Below the threshold
+the idle lane builds a stand-in *picture* for each boxed node — not a
+screenshot of the element, which no browser API can make, but the same drawing
+the live box makes (the box, its title bar and state marks, the node's structure
+read out of the DOM — surface, header, body panel, slot dots, the badge pills the
+frontend renders beside its own badge anchors and the footer band under its tab
+buttons — every widget's own row, drawn with the box, border and radius the
+browser gave it, every icon the node shows — read out of the SVG *mask* the
+frontend's iconify plugin puts in the computed style, because an icon here is a
+data URL and not an element — and the reader is sized for a real node rather than
+a fixture: 256 text lines, 400 characters per string, 96 widget elements, 128
+structural boxes, 96 slot dots and 64 icons, the widget text the frontend mounts
+as DOM, and the node's own `<img>`/`<canvas>` elements at the rows the layout gave
+them) drawn into the same offscreen capture surface the
+canvas renderer uses. **A node is only photographed once it has stood still**: a
+settle window (300 ms) opens when a node is first drawn as a stand-in and re-opens
+on every change the page reports or the signature notices, so a burst of rendering
+costs one picture at the end of it instead of one picture per step. The window
+is a grace period and not a veto: a node that keeps changing past
+`LOD_SNAP_SETTLE_MAX_MS` (900 ms, measured from the first change of the burst) is
+photographed anyway. **Inside that window the lane also checks that the node is
+*finished*, and says what it is waiting for**: an element with no laid-out box
+yet (`vueWaitLayout`), a node whose own `<img>` still reports `complete === false`
+(`vueWaitMedia`), or a node with content of its own while the page's fonts are
+still loading (`vueWaitFonts`, `document.fonts.status === "loading"`) is left for
+the next slice, named in the report the readout prints (`waiting: its images are
+still arriving`, `waiting: the page's fonts are still loading`). The page's font
+state is also part of the picture's signature, so a picture made in the fallback
+font is dropped and re-made the moment the webfont arrives rather than served for
+the rest of the session. **And a change no longer takes the picture away**: what is on
+screen is a complete picture of the moment before, so it stays there while its
+replacement is made — a node whose value changed used to fall back to a plain box
+until the new picture arrived, and a node whose value changes often was never
+anything but a box (measured: 1020 of 1800 frames on a 24-node graph at the zoom
+this feature is for, against 17 now). A node still out of date after 2 s (it is
+changing faster than the lane can photograph it) gets its box back for 2 s and
+keeps being asked; a capture that turns out slower than 60 ms buys a doubling
+cooldown (10 s, 20 s, 40 s …, capped at 120 s) rather than blocking that node for
+the session — the readout counts the cooldowns and says when the next try is. That is the
+answer to a node being photographed while the frontend was still filling it in —
+the frontend mounts a node and then writes its parts over the following frames,
+and an image is decoded when it is decoded, so "capture immediately" is a picture
+of a half-built node. **A picture also has a floor under its rate, not only a
+window before it.** A node the page keeps changing — a poller writing a widget
+value, a live counter — has an ask in the lane on every slice, and a capture is the
+most expensive thing the tool does: it re-reads the node's laid-out boxes and
+re-composites them. Past the settle ceiling, every one of those asks used to buy a
+full capture, which on the user's graph was the per-frame cost they measured. A
+node photographed a moment ago (`LOD_SNAP_PHOTO_MS`, 600 ms) is now postponed the
+same way a node that has not stood still is — *in the lane's picker*, so it stays
+queued and the slice sleeps for the longer of the two windows instead of the node
+being dropped — and a successful capture re-arms the settle window, so every later
+change gets the same 300 ms grace the first one did rather than being photographed
+mid-render. The disk copy has its own floor (5 s) while a node churns: the file is
+a cache for the next page load, and the signature check would make a churning
+node's file a miss anyway. Measured on the harness scene: a scene whose widget
+values are rewritten on every frame went from 2.79–6.80 ms/frame at 1.39
+captures/frame to 0.92–1.53 at 0.17, and twelve nodes with sixty live rows from
+15.37 ms/frame to 3.00. **The capture lane is this tool's own, and that is
+deliberate**: it runs on the idle lane (32 ms between slices, a 12 ms budget per
+slice, nothing while the page has had input in the last 400 ms) rather than on the
+frontend's own tick, because upstream has no per-node tick to ride — in this
+renderer nodes are Vue components, the transform is one property on one pane
+(`useTransformState.ts`), and what looks like tiers is the frontend mounting a node
+in passes (the component, then `NodeSlots`' watcher, then the layout store's size,
+then `NodeWidgets`, then `NodeContent` and the media) with its own notion of a
+settled gesture (`useTransformSettling(…, { settleDelay: 256 })`, which is why the
+window is 300 ms). A browser's incremental rasterisation is not observable from
+page JavaScript, so the honest form of "capture the node the way the user sees it"
+is to read what the browser laid out and computed, which is what this does.
+Everything downstream is therefore identical: the capture
+resolution ladder (0.25× → 3×), the half and quarter mip copies blitted on
+screen, the RAM budget, the disk cache and its key, and the files in
+`temp/ANTs_Frontend_Optimizer_THUMBNAILS/`. **The key names the pathway** —
+`…r<ratio>t<theme><pc|pv>`, canvas or Vue — because the two pictures are not
+interchangeable: one is a photograph of LiteGraph's own drawing, the other is
+this tool's drawing of the node's DOM. A picture made in one renderer is never
+reused in the other, in RAM or from disk: switching renderers releases what was
+held and makes the pictures again, and a file written before that token existed
+is re-made rather than served. **A node whose element is not on the page is
+never photographed** — the picture *is* that element, so what the tool could
+draw then is a bare box, and a bare box stored under the node's key would be
+served to every later frame as if it were the node. It is drawn as a box
+instead, and counted (`vueNoElement`). What stays impossible is a pack widget that is
+neither an image, a canvas nor plain text (its own HTML): it is blank in the
+picture and counted, exactly as in the canvas renderer.
+
+| Setting | In the Vue-nodes frontend |
+| --- | --- |
+| Replace node previews with bitmap stand-ins at zoom levels | **Works, as boxes.** Below the setting each node's element stops *painting* — its contents are `visibility: hidden`, which an engine skips in the paint phase, and it stays in the layout and in every observer — and the canvas draws its box; above it, every element is handed back. |
+| Stand-in (plain / title / title + state) | **Works** — the same box ladder, same marks, same colours, and no content drawn (that is what "plain" means here too). Choosing one of these instead of *picture* changes nothing else: the elements stay handed over and the boxes keep standing, frame after frame. |
+| Stand-in: *picture of the node* | **Works, drawn rather than photographed.** No browser API can draw a DOM element into a canvas, so a screenshot of a Vue node is impossible; the picture is instead *drawn* — the box at the picture level (title bar, error ring, progress, dimming) with the node's own structure (surface, header bar, body panel, each widget's own row, slot dots, at their laid-out rects and computed colours) and its content: the images and canvases the node renders (the frontend's preview `<img>` elements among them) at their real laid-out position, text fields re-painted, a pack's HTML blank and counted. A node is photographed only after it has stood still (300 ms, re-opened by every change) *and* only once it is finished: not before its element has a laid-out box, not while one of its own images is still arriving, and not while the page's fonts are still loading — and a picture made in the fallback font is dropped the moment they arrive. Until the idle lane has the picture, the box carries the same content live. |
+| Capture resolution, RAM budget, disk cache | **Work.** The picture is made on the same idle lane, at the same resolution ladder, with the same mip chain, RAM budget and disk files (`temp/ANTs_Frontend_Optimizer_THUMBNAILS/`, keyed by signature + ratio + theme + pathway). Switching renderer releases the pictures the other renderer made and builds them again, because the box, the padding and the content route all differ. |
+| Keep these node types live | **Works** — a listed type is never blanked and stays in full detail at any zoom. |
+| Link shape, link thinning, Measure link thinning | **Work.** Links are still drawn by the canvas, so the 1 px/no-outline thinning and the straight-line style reach the ink exactly as in canvas mode. |
+| Idle redraw cap | **Works** — it caps the canvas redraws, nodes or not. |
+| Widgets stop answering, off-screen nodes, margin, come back, display scale, how widgets go | **Work.** These act on DOM elements and on the pointer, which exist in both renderers. The stand-in pathway is the only thing that blanks a node's own root element, and only below your threshold; the widget and focus settings never touch it. |
+| The governor, Timing, Stalls, Nodes, Load, Memory, GPU tabs | Unaffected: they measure timers, main-thread stalls, redraw requests and resources, not node painting. In this renderer the Nodes tab's per-type table is the frontend's own per-node layout pass (it draws no chrome), and the readout names the renderer next to it. |
+
+The Status tab names the renderer and the pathway in its first line
+("Vue nodes", "blanked", "boxes"), says how many pictures are held, and — when
+the stand-in setting itself is off — says that pictures are made here too
+rather than leaving the reader to guess, so a setting that is quiet for a
+structural reason is not mistaken for a broken one. Switching Nodes 2.0 off in ComfyUI's
+settings takes effect on the same page — the flag is read per call, not latched
+at load — and the elements this tool blanked are handed back in the same frame.
+
+Retired: the v2.1.5 separate image-preview thumbnail ladder. The node's
+picture *is* the thumbnail — a second, hidden copy of an image that is
+already a bitmap never paid for itself, so the setting answers `0` and
+cannot be re-enabled by a script or a saved record. `lowZoom.previews` still
+exists so old scripts get an answer rather than `undefined`.
 
 ## Reading the numbers
 
-Every cost in the Timing and Nodes tabs is given in **four units**, and
-the first is the one to reason with:
+Every cost in the Timing and Nodes tabs is given in **four units**, and the
+first is the one to reason with:
 
 | Unit | Meaning |
 | --- | --- |
@@ -92,1366 +525,328 @@ the first is the one to reason with:
 | `ms/call` | cost of one invocation (spikes vs. steady load) |
 | `calls/fr` | how often it runs per displayed frame |
 
-`ms/frame` and `% fr` are what let you compare a row to the 16.6ms
-budget of a 60fps frame, to another graph, or to the same graph a
-minute ago. They do not change if you pan faster; v1's window sums did.
+`ms/frame` and `% fr` are what let you compare a row to the 16.6 ms budget of
+a 60 fps frame, to another graph, or to the same graph a minute ago. They do
+not change if you pan faster; v1's window sums did. Rates (`fps`,
+`requests/s`, stalls/s) are wall-clock and say so.
 
-Rates (`fps`, `requests/s`, stalls/s) are wall-clock and say so.
+**Windows.** Hook and node-type costs cover the last 4 seconds. Frame
+statistics cover 10 seconds, and widen to 30 seconds when a redraw cap
+leaves fewer than 4 frames in the window, so a 1 fps cap still produces
+meaningful `fps` and p95 numbers instead of `0`. The panel prints which
+window it used.
 
-Windows, if you need them: hook and node-type costs cover the last 4
-seconds. Frame statistics cover 10 seconds, and automatically widen to
-30 seconds when a redraw cap leaves fewer than 4 frames in the window —
-so a 1 fps or 5-second cap still produces meaningful `fps` and p95
-numbers instead of `0`. The panel prints which window it used.
-
-### Sorting and long lists
-
-Every column header in the Timing, Nodes and Stalls tables is a sort
-button: click to sort by that column, click again to reverse, click a
-third time to go back to the table's default (most expensive first).
-
-Two details that matter on live data:
-
-- Sorting uses the underlying numbers, never the displayed text.
-  As text, `1,234.5ms` sorts before `9.2ms`.
-- A row with no value for the chosen column (`—`) sorts **last in both
-  directions**. A dash means unmeasured, not cheap — a node pack that
-  never reported off-frame time should not outrank one that did.
-
-Ordering is frozen while the pointer is inside the table, so rows do not
-move out from under your cursor during the twice-a-second refresh; an
-explicit header click still applies immediately.
-
-A thousand-node graph produces several hundred owners and node types.
-Rendering all of them twice a second costs real milliseconds, so the
-tables render the most expensive 120 owners / 60 node types / 60 scripts
-and print how many are hidden, with a **Show all rows** button that lifts
-the cap for that tab. The caps live on `window.__antsTracker.rowCaps`
-(`{ timing, nodes, stalls }`), so a console can lower them further — the
-Stalls tab will happily show you what this panel costs if you get greedy.
-
-The panel also measures its own refresh and backs off when a pass costs
-real time: over 6ms per pass it refreshes every second, over 12ms every
-two seconds, and it speeds back up when the list gets short again. The
-Memory tab's "tracker's own footprint" line says when this is happening.
+**Sorting and long lists.** Every column header in the Timing, Nodes and
+Stalls tables is a sort button: click to sort, click again to reverse, a
+third time to return to the default. Sorting uses the underlying numbers,
+never the displayed text (`1,234.5ms` sorts after `9.2ms`), and a row with no
+value (`—`) sorts last in both directions — a dash means unmeasured, not
+cheap. A thousand-node graph produces hundreds of owners and types, so the
+tables render the most expensive 120 owners / 60 node types / 60 scripts /
+60 tick sources and print how many are hidden, with a **Show all rows**
+button per tab. The caps live on `window.__antsTracker.rowCaps`.
 
 ### Timing tab
 
-Rows are *other* extensions (this tracker never lists itself).
-Columns: `ms/frame`, `% fr`, `ms/call`, `calls/fr`, plus `off-frame ms`
-— hook time that ran outside a canvas draw (from `onExecuted`, a timer,
-a DOM event). Off-frame time is real cost but it is not part of a
-frame, so it is kept out of the budget instead of being silently folded
-into the next frame the way v1 did.
+Rows are *other* extensions; this tracker never lists itself. Columns:
+`ms/frame`, `% fr`, `ms/call`, `calls/fr`, plus `off-frame ms` — hook time
+that ran outside a canvas draw (`onExecuted`, a timer, a DOM event).
+Off-frame time is real cost but it is not part of a frame, so it is kept out
+of the budget instead of being folded into the next frame.
 
-Red = above 15% of the frame, orange = above 5%, both relative to the
-frame budget rather than an absolute millisecond count.
+Red is above 15 % of the frame, orange above 5 %, both relative to the frame
+budget rather than an absolute millisecond count.
 
-Expand a row (▸) for the per-hook breakdown: which hook
-(`onDrawForeground`, `onDrawBackground`, `onDrawCollapsed`,
-`onBounding`), per-hook `ms/frame`, calls, and off-frame numbers.
-
-Node types that assign their **own** `this.onDrawForeground = ...`
-inside `onNodeCreated` — a common pattern, invisible to v1 — are adopted
-while drawing and listed as `(unattributed) <Type> · instance hook`
-(named after the extension when that can be inferred). Hooks that were
-already present on a node prototype before this extension loaded are
-adopted too, and labelled `(pre-existing) <Type>`.
-
-When an instance hook *delegates* to the prototype method (or one
-extension wraps another's hook), the same work appears in two rows. The
-outer row carries the milliseconds and the inner one is tagged
-**nested**: its calls are counted, its time is not, because the outer
-hook's measured time already contains it. That is what keeps the table
-adding up to the frame budget instead of reporting double the truth —
-and it is why a row can legitimately show `calls/frame 2.0` with
-`ms/call —`.
+Expand a row (▸) for the per-hook breakdown. Node types that assign their
+**own** `this.onDrawForeground = …` inside `onNodeCreated` are adopted while
+drawing and listed as `(unattributed) <Type> · instance hook`; hooks that
+already existed on a prototype before this extension loaded are labelled
+`(pre-existing) <Type>`. When a hook delegates to another wrapped hook, the
+outer row carries the milliseconds and the inner one is tagged **nested**:
+its calls are counted, its time is not, because the outer hook already
+contains it.
 
 ### Nodes tab
 
-Where the frame actually went, measured around LiteGraph's own calls
-rather than through extension hooks:
+Where the frame went, measured around LiteGraph's own calls rather than
+through extension hooks:
 
-- **drawNode** — per-node chrome: title bar, borders, slots, widgets,
-  embedded preview bitmaps. Split into `wrapped hooks` (the part the
-  Timing tab already accounts for) and `LiteGraph chrome` (everything
-  else in `drawNode`).
-- **drawConnections** — link rendering, usually negligible on a big
-  graph and usually a surprise when it isn't.
-- **everything else** — the rest of the frame. If this line is big,
-  the cost is in a canvas method this tool does not wrap, a widget's
-  own `draw()`, or a Nodes-2.0/Vue component; the Stalls tab is the
-  next place to look.
+- **drawNode** — per-node chrome, split into `wrapped hooks` (the part the
+  Timing tab accounts for) and `LiteGraph chrome` (everything else).
+- **drawConnections** — link rendering.
+- **everything else** — the rest of the frame. If this line is big, the cost
+  is in a canvas method this tool does not wrap, a widget's own `draw()`, or a
+  Nodes-2.0/Vue component; the Stalls tab is the next place to look.
 
-A per-node-type table follows, sortable by any column. `calls/frame` is
-calls per redraw of the canvas, so for a type painted every frame it is
-close to the number of instances on screen, and a value well below 1
-means most of that type is off-screen or culled on a given redraw. The
-interesting pair is `% of frame` (how much of the budget this type eats)
-and `ms/call` (whether that is one heavy node or many cheap ones). A
-sampled `canvas.setDirty()` caller table follows — see Stalls below.
+A per-node-type table follows, sortable by any column. `calls/frame` is calls
+per redraw of the canvas, so for a type painted every frame it is close to
+the number of instances on screen, and a value well below 1 means most of
+that type was off-screen or culled. The interesting pair is `% of frame`
+(how much of the budget this type eats) and `ms/call` (one heavy node or many
+cheap ones).
 
 ### Stalls tab
 
-Frame cost is not the only way to lose FPS, so this tab reports
-main-thread blocking *outside* the draw path, from Long Animation
-Frames (Chrome 123+) with a `longtask` fallback. Columns, all sortable:
+Frame cost is not the only way to lose FPS, so this tab reports main-thread
+blocking *outside* the draw path, from Long Animation Frames (Chrome 123+)
+with a `longtask` fallback. Columns, all sortable:
 
-- **blocking ms/s** and **stalls/s**, the honest headline numbers.
-- **where** — script URL, function name, source line, and the
-  extension pack when the script lives under `/extensions/`. Scripts
-  from ComfyUI's own bundle appear as `assets/<file>.js` with pack
-  `unknown`, which is itself the answer: it is the frontend, not a custom
-  node pack.
-- **invoker** — e.g. `TimerHandler:setInterval`, which names the
-  mechanism behind a heartbeat.
-- **count / blocking / % of blocking / ms per stall / worst** — a high
-  count with a low ms-per-stall is a cheap heartbeat; a low count with a
-  high ms-per-stall is one expensive operation worth a DevTools trace.
-- **forced layout ms** — style/layout time inside the long frame,
-  which is the signature of a DOM-thrashing extension.
-- **redraw requests/s by caller** — `canvas.setDirty()` wrapped
-  exactly (the request rate is precise) and its call stack sampled
-  ~20×/second to say *who* is asking for redraws. A rogue heartbeat
-  shows up here by name instead of as "something is ticking".
+- **blocking ms/s** and **stalls/s**, the headline numbers.
+- **where** — script URL, function name, source line, and the extension pack
+  when the script lives under `/extensions/`. Scripts from ComfyUI's own
+  bundle appear as `assets/<file>.js` with pack `unknown`, which is itself
+  the answer: it is the frontend, not a custom node pack.
+- **invoker** — e.g. `TimerHandler:setInterval`, which names the mechanism
+  behind a heartbeat.
+- **count / blocking / % of blocking / ms per stall / worst** — a high count
+  with a low ms-per-stall is a cheap heartbeat; a low count with a high
+  ms-per-stall is one expensive operation worth a DevTools trace.
+- **forced layout ms** — style/layout time inside the long frame, the
+  signature of a DOM-thrashing extension.
+- **redraw requests/s by caller** — `canvas.setDirty()` wrapped exactly (the
+  rate is precise) and its call stack sampled ~20×/second to say *who* is
+  asking. A rogue heartbeat shows up here by name.
 
-This tab also names **this panel** when the panel itself stalls the
-thread — look for `ANTs_ComfyUI_Frontend_Performance_Tracker/tracker.js`
-— and the Memory tab's "tracker's own footprint" block gives the
-per-second cost. If those numbers are not small, say so: it is a bug.
+This tab also names **this panel** when the panel itself stalls the thread —
+look for `tracker.js` — and the Memory tab's "tracker's own footprint" block
+gives the per-second cost. If those numbers are not small, it is a bug.
 
 ### Governor tab
 
-The Stalls tab tells you *what* blocked the main thread; this tab is the
-one that can do something about it. Every `setInterval`, `setTimeout`
-and `requestAnimationFrame` the page registers after this module loads
-is measured by source — function name, the file that registered it, the
-delay it asked for — and each source can be given a limit:
+The scheduler layer measures every `setInterval`, `setTimeout` and
+`requestAnimationFrame` the page registers after this module loads, by
+source, and each source can be given a limit:
 
 | Limit | Effect |
 | --- | --- |
 | normal | measured only: same call, same arguments, same ids |
-| ½ speed / ¼ speed | one run per 2× / 4× the delay it asked for (floored at 33ms / 66ms) |
-| 2/s, 1/s | one run per 500ms / 1000ms |
+| ½ speed / ¼ speed | one run per 2× / 4× the delay it asked for (floored at 33 ms / 66 ms) |
+| 2 /s, 1 /s | one run per 500 ms / 1000 ms |
 | paused | the callback is not run at all |
 
 Two rules make it safe to leave switched on:
 
-- **A source on "normal" is untouched.** Same arguments, same `this`,
-  and the ids returned by `setInterval`/`setTimeout` are the browser's
-  own, so `clearInterval`, `clearTimeout` and `cancelAnimationFrame`
-  keep working exactly as before. That is why the table can report
-  "was 50/s before the limit, now 12/s" without having changed anything
-  until you asked it to.
-- **A limited source is slowed, never silenced.** A skipped interval
-  tick is covered by the next one; a skipped one-shot or chained
-  `setTimeout`/rAF callback is re-scheduled for when its window opens,
-  and a callback that re-registers itself is respected, so a loop
-  cannot be killed or duplicated by accident. The only exception is
-  "paused", which is exactly what it says.
+- **A source on "normal" is untouched.** Same arguments, same `this`, and
+  the ids returned by the platform functions are the browser's own, so
+  `clearInterval`, `clearTimeout` and `cancelAnimationFrame` keep working.
+- **A limited source is slowed, never silenced.** A skipped interval tick is
+  covered by the next one; a skipped one-shot or chained callback is
+  re-scheduled for when its window opens, and a callback that re-registers
+  itself is respected. The only exception is "paused", which is exactly what
+  it says.
 
-Above the table: the frame budget, the rAF governor (`off` = measure
-only, `adaptive` = skip rAF ticks while the main thread is behind the
-budget and mouse/keyboard are quiet, or a fixed floor in Hz), redraw
-merging, the input guard, and the trace threshold. Limits and controls
-live in `localStorage` (`ants-governor-v1`) so a tuning session survives
-a reload; **Reset to untouched** clears them, and **Suggest limits from
-this session** proposes a limit per source from its measured cost —
-nothing is applied until you pick it.
+Above the table: the frame budget, the rAF governor (`off` = measure only,
+`adaptive` = skip rAF ticks while the main thread is behind the budget and
+input is quiet, or a fixed floor in Hz), redraw merging, the input guard and
+the trace threshold. Limits and controls live in `localStorage`
+(`ants-governor-v1`), so a tuning session survives a reload; **Reset to
+untouched** clears them, and **Suggest limits from this session** proposes a
+limit per source from its measured cost — nothing is applied until you pick
+it. **Turn the layer off** restores the browser's own functions immediately.
 
-**Autopilot** (off by default) is for the case this tab was built
-around: you open it, see one row burning 646 ms/s with 0 skipped, and the
-question is which policy to pick. With the autopilot on, the layer caps
-the worst source it is allowed to touch every five seconds until the
-limitable sources are under the target you set (150/250/400/600 ms/s),
-then stops and prints what it did — *"limited renderFrame to 2/s (it was
-burning 646 ms/s, ≈600 after — still 1208 ms/s in total)"*. When the row
-it just capped is still the worst thing on the page it steps the same row
-up the ladder next round, so a 316ms-per-run chain ends at 1/s rather
-than sitting at a 2/s cap that changed nothing; when a row reaches 1/s
-and is *still* too expensive, it says so — *"renderFrame is at the
-tightest cap a limit can use (300 ms/s left) — that loop needs fixing at
-its source"* — instead of pretending the problem is handled. It never
-touches the tracker's own timers, never touches rAF loops (those have
-their own governor), never touches a limit you set by hand, and **Reset
-to untouched** turns it off and lifts everything.
+**Autopilot** (off by default) caps the worst source it is allowed to touch
+every five seconds until the limitable sources are under the target you set
+(150/250/400/600 ms/s), then stops and prints what it did. When the row it
+just capped is still the worst thing on the page it steps the same row up the
+ladder next round; when a row reaches 1/s and is still too expensive it says
+so instead of pretending the problem is handled. It never touches the
+tracker's own timers, never touches rAF loops (those have their own
+governor), and never touches a limit you set by hand.
 
-Two rules make the difference between a limit that works and one that
-only looks like it does, and both came out of a real CPU-rendered page:
+Two rules decide whether a limit does anything at all:
 
-- **A limit has to be wider than the source's own period to bite.** A
-  timer that asks for 10ms but takes 300ms of work runs every ~300ms, so
-  "half speed" (33ms) and "quarter speed" (66ms) change *nothing* for it —
-  only `2/s` or `1/s` do. The table now says so on the row's `allowed`
-  cell (`33ms — no effect`), and the autopilot and **Suggest limits**
-  both skip the multipliers and go straight to a cap for a source like
-  that (measured against its own runs, not against the delay it asked
-  for).
-- **The ranking is by cost, not by rate.** Both real offenders on that
-  page ran 1.3–3 times a second, so anything that filtered on "runs
-  often" missed them entirely and offered limits to a dozen 0.1 ms/s
-  heartbeats instead.
-- **A limit that bites but does not help is a sticker.** A cap that
-  leaves a source at 97% of what it cost before (a 316ms-per-run chain
-  capped at 2/s) looks like a working limit in every table. So both the
-  suggestion engine and the autopilot aim at a *cost* instead of at a
-  gap: the suggestion engine at half of what the row is burning, the
-  autopilot at whatever brings the page to the target you set. The
-  mildest limit that reaches that cost wins, and neither goes below the
-  floor (30 ms/s by default) — a 20ms heartbeat still gets half speed,
-  while a runaway chain gets 1/s, because nothing milder is worth the
-  behaviour change it costs a page whose extension owns that loop.
+- **A limit has to be wider than the source's own period to bite.** A timer
+  that asks for 10 ms but takes 300 ms of work runs every ~300 ms, so "half
+  speed" (33 ms) changes nothing for it; only `2/s` or `1/s` do. The row's
+  `allowed` cell says `33ms — no effect`, and both the autopilot and
+  **Suggest limits** skip the multipliers for such a source.
+- **The ranking is by cost, not by rate.** The real offenders usually run
+  one to three times a second, so filtering on "runs often" misses them
+  entirely.
 
-**Low-zoom drawing** is the answer when the problem is not *when* the
-canvas draws but *what* it draws. At low zoom on a big graph, every node
-is inside the viewport (so a culling scan has nothing to remove), each
-one is a few dozen pixels wide (so its title, slots, widgets and preview
-are invisible anyway), and a redraw costs hundreds of milliseconds — at
-which point there is nothing to schedule: the cost is the drawing itself.
-The mode paints every node as a flat rectangle below a zoom you pick,
-degrades the links (thinner strokes, curves kept), hides the DOM content
-of the nodes it boxed, and rate-limits redraws while nobody is touching
-the page. Those rectangles do not have to be blank: **box detail** puts
-each node's own title-bar colour on them, and — one level up — the marks
-that would otherwise disappear at that zoom, a validation-error ring, the
-progress bar of the node that is running, and the dimming of a muted,
-bypassed or ghosted node. Every mark is read from the node's own fields
-(`has_errors`, `progress`, `mode`, `flags.ghost`), never guessed, and the
-panel counts them — each mark is one more rectangle call per node per
-frame, and the count is the honest price of it. One step further: **node
-snapshots** (off by default) paint a box as a *picture of the node* instead of
-a fill. Each picture is captured once while the page is idle, through the
-node's own draw path, reused as a single `drawImage`, and thrown away the
-moment the node it describes changes. It only ever replaces a box — the
-flatten threshold above it remains the only thing that decides which nodes
-stop being drawn in full — so this is a readability setting, not a speed
-setting; whether it can also pay for itself by replacing live nodes during
-movement is a question with a measurement attached (see the roadmap in
-plan.md).
+Also on this tab: the **off-thread lane** and the **long-frame traces**.
 
-**Redraw merging** is the other half of the same idea. `setDirty`
-requests were already counted exactly (and the Testing tab's cap can
-delay them); with merging on, requests inside one frame are combined:
-the first goes through, later ones only pass on flags the frame has not
-asked for yet, and a request that asks for nothing new is dropped and
-counted. Nothing is ever cleared, so the worst case is one extra redraw
-— never a stale canvas.
-
-**Long-frame traces** record frames over a threshold (50ms default) with
-the scripts the browser named inside them, their forced layout, which
-governed sources ran inside that window with what cost, which limits
-were active, and which script asked for a redraw while the frame was
-blocked ("state was mutated / a redraw was asked for by"). This is the
-card for one of your own `renderFrame @ .../settingStore-*.js` frames:
-the Scripts tab names the frame, this card says what else was in it and
-who made it long. Click a row to expand it.
-
-**Off-thread lane**: a worker is offered for pure computation, with a
-sanity check that runs the same seeded sort-and-sum on both threads and
-compares the answer. The boundary is worth being blunt about: Vue's
-render, the DOM and canvas drawing cannot leave the main thread — no
-scheduler can move them, and `OffscreenCanvas` only helps an application
-that created its canvas that way (ComfyUI does not). That is why the
-answer to a 280ms redraw is not a thread but *less drawing*: see
-**low-zoom drawing** in the Tweaks tab, which paints every node as one
-rectangle below the zoom you pick, thins links instead of straightening
-them, hides the DOM content of the nodes it boxed, and rate-limits
-redraws while nobody is touching the page. What a scheduler
-layer *can* do is serialise and rate-limit the main thread's competing
-tick sources, which is what this tab is for.
-
-**"normal" means no gate at all.** A source on `normal` is not rate
-checked even against the delay it asked for: the browser fires "100ms"
-timers a millisecond or two early under load, and a repaint interval
-that loses those ticks stops repainting. Limits are per *row* (tuning a
-row is how you tell this tracker that one heavy function used by three
-graph views is one offender), while the deferred copy that a skipped
-tick needs is per *chain*, so one chain's pending copy can never starve
-another's.
-
-**It fails open, and it can be switched off.** A profiler that replaces
-`setTimeout` is patch-level surgery on somebody else's application, so
-every wrapper catches its own errors, a callback that could not be
-measured is still registered and still runs, and after three internal
-errors the layer restores the browser's own timer functions and stops
-governing anything — the panel and the copied report both say so, and
-**Turn the layer off** does the same on demand. The Governor also
-measures and reports its own bookkeeping cost, and the tracker's own
-timers are exempt from limits (marked as such in the table). Without
-`Worker`/`Blob` support the lane says so and answers on the main thread
-instead of pretending.
+- The off-thread lane is a worker that can run pure compute (a named job plus
+  structured-cloneable arguments, or a self-contained function source) with a
+  deterministic sanity check that compares the two threads' answers. Only
+  pure compute can leave the main thread — Vue's render, the DOM and canvas
+  drawing are main-thread-only by specification, and OffscreenCanvas only
+  helps an application that created its canvas that way (ComfyUI does not).
+  When the page has no Worker, the lane says so and answers on the main
+  thread instead of pretending. Today its only shipped job is that sanity
+  check plus the `offload` API — no page work is moved off the main thread
+  yet, and the lane does not claim otherwise (real aggregation work is
+  Track G in `plan.md`).
+- The trace card lists long frames, worst first, with the scripts the browser
+  named, the governed ticks that ran inside them, and how many redraw
+  requests arrived while it was blocked. Expand a row for the per-script and
+  per-source breakdown.
 
 ### Load tab
 
-Page-load cost per extension pack from the browser's own Resource
-Timing data, reported as a **span** (first request → last response, so
-parallel fetches are not summed into an impossible number the way v1
-did) with file count, slowest file, and cache-served count. A pack can
-be heavy to load and cheap to run, or the other way around.
+Startup cost per extension pack from the browser's Resource Timing entries:
+transferred bytes, file count, the span from the pack's first fetch to its
+last, and the slowest single file. Spans overlap, so they are not summed; a
+pack with many files, a long span and a high slowest-file time is the one
+blocking first paint. Runtime cost is not here — that is the Timing, Nodes
+and Stalls tabs.
 
 ### Memory tab
 
-JS heap (Chromium only — Firefox does not expose
-`performance.memory` to page JS at all, by design). Set a baseline,
-then mute a suspect and watch the trend — **MB/min** and a sparkline,
-so you can see whether a muting experiment changed the slope instead of
-comparing two noisy snapshots. No per-extension breakdown is possible
-here; that is a browser boundary, not a missing feature.
+`performance.memory` (Chrome) with a 60-sample sparkline, ring-buffer
+occupancy, and the tracker's own footprint: panel rendering µs/s and
+bookkeeping µs/s, with the refresh backoff state. Firefox exposes no
+`performance.memory`, so this tab stays empty there by design and says so.
 
 ### GPU / VRAM tab
 
-Genuinely unobtainable from page JavaScript: *per-extension* VRAM.
-That is stated in the tab rather than faked. What the tab does show,
-all of it real:
+ComfyUI's `/system_stats` (torch's view per device: allocated, reserved,
+free) plus the optional `nvidia-smi` snapshot (driver view: utilisation,
+VRAM, temperature, power, process). Actionable readings: headroom under
+~10 % means the driver will start evicting to system RAM, which shows up as
+multi-hundred-millisecond frames and is not a JavaScript problem; a large gap
+between torch "allocated" and the driver's "used" means fragmentation, which
+is fixed on the Python side (`PYTORCH_CUDA_ALLOC_CONF`, `--reserve-vram`),
+not in any node's frontend code. Per-extension VRAM attribution is not
+possible from page JavaScript — that is a sandbox boundary, not a missing
+feature.
 
-- Per-device VRAM totals and free space, and the VRAM headroom
-  percentage (turns red under 10%), from ComfyUI's own `/system_stats`.
-- Torch's allocated/reserved view next to the driver's numbers; a large
-  gap between them is normal caching, a growing `reserved` with flat
-  `allocated` is fragmentation.
-- Optional nvidia-smi side-channel: utilization, temperature, power,
-  and per-process VRAM, via the `/ants_tracker/gpu` route added by this
-  extension (see below). If nvidia-smi is missing, the tab says why
-  instead of showing nothing.
+### Testing tab
 
-## Optional backend route
+- **Redraw throttle presets** — deliberately hand the canvas a fixed redraw
+  gap (30 fps down to 1 redraw/10 s) to see what a cap would buy.
+- **Synthetic tick** — off, or force a redraw at a fixed rate from 5 s to
+  16 ms, to reproduce "something is ticking" with a number attached.
+- **Scripted pan benchmark** — a deterministic pan for 3 / 6 / 10 seconds
+  (6 s default), run as A and then B over the same span (one screen plus the
+  fovea margin), so a mute or a setting change is priced with the same
+  motion. The two runs are what the mute feature is judged against.
+- **Sampling state** — Pause / Reset samples / Unmute everything.
 
-`__init__.py` registers one read-only route:
+## Muting
 
-```
-GET /ants_tracker/gpu
-```
+"Mute" skips that owner's draw hooks outright, so the FPS change you then
+measure is real rather than merely unmeasured, and it is reversible
+instantly. A muted owner always keeps a row, even at zero activity, with a
+way to unmute — a mute must never become invisible. Because a muted extension
+may take a different code path on the next call (caches, internal state),
+treat a muted/unmuted delta as an **upper bound**, not an exact price.
 
-It runs `nvidia-smi` (2-second in-process cache, 5-second timeout) and
-returns either
+## What this cannot catch
 
-```json
-{"available": true, "gpus": [...], "processes": [...]}
-```
+The honest list is the LIMITS block at the bottom of `web/tracker.js`; the
+short version:
 
-or `{"available": false, "reason": "..."}` — no NVIDIA tooling, a
-timeout, or no GPUs are all reported as a reason, never as a crash.
-Absolute paths and `[N/A]` fields are handled; unparseable numbers
-become `null` instead of `NaN` or a fabricated 0. `/system_stats` is
-used first and always works even when this route does not, so the tab
-degrades field by field.
+- Anything drawn by a widget's own `draw()`, a Vue component (the Nodes 2.0
+  style frontend) or an unwrapped canvas method is not attributed by name —
+  it still lands in the frame budget's "everything else" line and in the
+  Stalls tab.
+- Redraw callers are sampled (~20/s) plus an exact total rate; a source that
+  requests redraws in rare bursts can be missed between samples.
+- GPU time and per-extension VRAM are not obtainable from page JavaScript in
+  any browser.
+- Firefox exposes neither `performance.memory` nor long tasks, so the Memory
+  and Stalls tabs stay empty there by design.
+- The scheduler layer can only govern callbacks that reach the page's own
+  timer/rAF functions: microtasks, promise chains, browser-internal work
+  (style, layout, paint, compositor threads) and a loop that never
+  re-registers are outside its reach.
+- A snapshot is a picture of the node at the moment it was captured, checked
+  against the node's signature at most every 100 ms; a change between two
+  checks can be shown stale for that long. Anything the panel can see cheaply
+  — selection, hover, an error, a progress bar, a drag — is checked every
+  frame and never uses a bitmap.
 
-## Testing tab
+## Compatibility
 
-Four tools, all opt-in, none persisted across a reload:
-
-- **Canvas redraw rate cap** (Off … 1 redraw / 10s) — delays any real
-  redraw arriving sooner than the chosen interval, regardless of what
-  asked for it. Unlike v1, a capped redraw is **deferred, not
-  dropped**: exactly one trailing redraw is scheduled so the canvas
-  cannot be left showing stale pixels, and the Testing tab counts
-  capped vs. deferred redraws so you can see the mechanism working.
-  The fps number in the summary bar should settle near your pick; that
-  is it working, not a bug. This doubles as a genuine, low-risk
-  mitigation for huge graphs — if a workflow feels fine capped at
-  15fps, that is immediate relief with no node-code changes.
-- **Synthetic forced-tick generator** — forces a full redraw at a
-  fixed, known interval. It shares the redraw path above, so an active
-  cap throttles these ticks too; set the cap to Off first if you want
-  to measure the raw cost of a tick.
-- **Scripted pan benchmark (A/B)** — the honest way to answer "did that
-  change help?". It pans the real canvas along a fixed sine path for
-  3/6/10 seconds, forces the redraws itself, and reports mean ms/frame,
-  p95, fps and attributed share **over exactly that span**, so two runs
-  are comparable even though your hand is not. Run A (current state),
-  mute something, run B, and the delta line says how many fps and
-  ms/frame you gained — with a warning if A and B were not captured
-  under the same mutes. The graph is restored to its original offset
-  and the node count is recorded with each run.
-- **Mute list / clear** — everything currently muted, with one-click
-  unmute, plus the live count of node types being drawn.
-
-## Muting: what it does and does not do
-
-**Mute** on a Timing row skips that extension's draw hooks outright —
-`return undefined`, no timing, nothing drawn by those hooks. This is
-the bisection tool: mute a suspect and watch the fps number change.
-
-- Muted owners keep their row (marked `muted`, with a **skipped N
-  calls** counter) even if they go completely idle, so a mute can
-  always be undone. v1 could delete a muted extension's row after 4
-  seconds of silence, leaving the hooks permanently skipped with no
-  visible way to unmute short of a page reload.
-- Muting changes what is drawn by definition, and an extension can take
-  a different code path afterwards (caches, internal state). Treat a
-  muted/unmuted delta as an upper bound on that extension's cost, not
-  an exact price list. The scripted benchmark records the mute set for
-  exactly this reason.
-- Mute state is per page load. Nothing is written to disk.
-
-## What this can't catch
-
-- Anything drawn by a widget's own `draw()`, by a Vue/HTML node (the
-  Nodes 2.0 style frontend), or by a canvas method this tool does not
-  wrap is not attributed *by name*. It still lands in the Nodes tab's
-  "everything else" line, and if it blocks the main thread it lands in
-  Stalls with a file and function. It just cannot be named by extension.
-- Per-extension GPU memory. Not obtainable in any browser; the GPU tab
-  does not invent it.
-- `fps` and frame cost here are JS/canvas cost. Compositor and GPU time
-  are not visible from the page.
-- Redraw callers are sampled (~20/s), so a source that requests
-  redraws in rare bursts can be missed between samples. The total
-  request *rate* is exact.
-- Firefox exposes neither `performance.memory` nor long tasks; the
-  Memory and Stalls tabs say so rather than showing zeroes.
-- A hook's share of frame is a share of the *mean* frame in the same
-  window, not of the specific frame it ran in.
-- The Governor can only see what is registered after this module loads.
-  A long-lived timer created at page bootstrap that never re-registers
-  is invisible to it (ComfyUI's own rAF loops re-register every frame,
-  so they are picked up).
-- Nothing can move Vue's render, the DOM or canvas drawing off the main
-  thread. The Governor removes work from the main thread by making
-  offenders run less often, not by parallelising them.
-
-## Compatibility note
-
-This assumes the classic LiteGraph canvas frontend
-(`app.canvas.constructor.prototype.draw`, `.drawNode`,
-`.drawConnections`, `.setDirty`, and `nodeType.prototype.onDraw*`). If a
-ComfyUI frontend version changes these internals, each patch point
-degrades on its own *and the panel says which one failed*:
-
-- losing `draw` costs you frame totals, fps, the budget and unattributed
-  time,
-- losing `drawNode`/`drawConnections` costs you the Nodes tab's split,
-- losing `setDirty` costs you redraw-caller attribution,
-- per-extension hook timing keeps working regardless of any of them.
-
-Canvas patching is retried for ~20 seconds after load (v1 tried once and
-gave up if the canvas was not ready), and a console warning is still
-logged for DevTools.
+- Chrome/Chromium gives the full panel (Long Animation Frames on 123+).
+  Firefox and Safari have no long-task or `performance.memory` API, so the
+  Memory and Stalls tabs are empty there by design; everything else works.
+- ComfyUI's classic canvas frontend is fully covered. In the Vue-based
+  ("Nodes 2.0") frontend the canvas draws links, groups and the grid only, so
+  the node stand-in settings are idle by design (see *What these settings do
+  in the Nodes 2.0 (Vue) frontend*); link ink, the idle redraw cap, the widget
+  and focus settings and every measurement still apply. Node visuals that are
+  DOM rather than canvas cannot be attributed by name, and that frontend also
+  exposes no LOD threshold on the canvas — the Status tab says both.
+- Nothing here depends on a specific ComfyUI version; every patch fails open
+  and says so in the console rather than half-applying.
 
 ## Development
 
-Three documents exist for whoever works on this next: `CLAUDE.md` (the rules and
-the architecture map — read this first), `memory.md` (what was built and why,
-what was rejected, what is still unverified), and `plan.md` (the roadmap and its
-open questions). The code follows the rules in `CLAUDE.md` deliberately; a change
-that breaks one of them is a bug even if the tests pass.
-
-```
-node tests/run-tests.mjs          # 161 tests, no dependencies, no browser
-node tests/run-tests.mjs timing   # filter by name fragment
-python3 tests/test_init.py        # backend route parsing + graceful fallbacks
-node tests/demo.mjs               # print what the panel says, with no ComfyUI
-node tools/pill-preview.mjs       # the pill, drawn with the real CSS and the real glyphs
+```bash
+node tests/run-tests.mjs              # all tests — 240 passing, zero dependencies
+node tests/run-tests.mjs <substring>  # one suite or test
+python3 tests/test_init.py            # the Python side (routes, node contract)
+node tests/demo.mjs                   # prints what every tab says, against a synthetic graph
+node tools/pill-preview.mjs > preview/pill.html   # regenerate the pill page
+node tools/box-preview.mjs  > preview/boxes.html  # the flat boxes at each detail level
 ```
 
-`tests/demo.mjs` drives a synthetic graph (two packs, four node types, a
-status heartbeat, one long animation frame per second) through the real
-tracker and prints the summary bar, all eight tabs and the text report —
-the fastest way to see exactly what the panel reports without installing
-anything, and a useful before/after when changing the UI.
+The suite runs `web/tracker.js` **unmodified** in Node against a fake browser
+and a fake ComfyUI (`tests/harness.mjs`), with a clock you control. There is
+no npm, no bundler and no jsdom: the extension's only dependency is ComfyUI
+itself.
 
-The JS suite loads `web/tracker.js` into a fake browser and a fake
-ComfyUI/LiteGraph with a controllable clock, then asserts the numbers
-(per-frame attribution, budget additivity, mute semantics, cap
-deferral, fps under loose caps, instance/pre-existing hook adoption,
-stall and redraw attribution, panel row identity, and the A/B
-benchmark) rather than only the code paths. The Governor has its own
-suite: limits applied to a real foreign heartbeat, the "slowed, never
-silenced" guarantees (a deferred callback still runs; a source that
-re-registers itself is not duplicated), adaptive rAF with the input
-guard, merging semantics, persistence, the trace contents, and the
-worker lane's fallback when there is no `Worker` — plus a suite that
-exists to keep the layer from breaking the page it measures: nothing is
-skipped or deferred while nothing is limited, several chains sharing one
-row do not starve each other, and internal errors fail open and end in
-the layer turning itself off — and a suite that keeps it from becoming
-the scapegoat: relayed frames are attributed to the source measured
-inside them, and the saved timer functions are called with a receiver
-Chrome accepts (the fake timers can be made Chrome-strict for that) — and
-a suite for the parts that have to target the *right* source: a
-suggestion for a slow, expensive chain has to be a cap that can bite it,
-a cheap heartbeat still gets the mildest limit, and the autopilot has to
-leave rAF loops and the tracker's own timers alone. Two fakes exist because
-the drawing work needs them: `makeStubCtx()` is a *class* whose prototype is
-installed as the sandbox's `CanvasRenderingContext2D` (the preview ladder
-patches `drawImage` there, the same way a browser exposes it), and
-`createImageBitmap` records the resize it was asked to perform instead of
-resizing anything.
+`docs/` holds the evidence the stand-in pathway is built on: a structured reading
+of ComfyUI-NodeSnapshots (the extension this feature learned from, and the lever it
+uses that this tool does not), the Nodes 2.0 renderer contract as read from the
+frontend's own sources, and the measurement behind the v2.7.2 capture-rate fix.
 
-## What changed in v2.5.3
+`CLAUDE.md` is the operating manual (golden rules, the end-to-end recipe for
+adding a setting, testing seams, release checklist); `ANALYSIS.md` is the
+works/fails audit with the fixed defects and the retired ideas;
+`memory.md` is the decision history. `preview/` is generated and never
+hand-edited. Reusable pieces you can call from a console are on
+`window.__antsTracker` — `snapshot`, `report`, `open`/`close`, `lowZoom.*`,
+`link.*`, `governor.*`, `runStart`/`runFinish`, `ramCheck`, `rowCaps`.
 
-- The corner grip grows the edge you drag. The panel is anchored on the left and the top, so a drag to the right makes it wider to the right. Dragging the header moves that same left edge, and does not put the anchor back on the right.
-- Window is no longer this panel moved into an empty document. It is a separate page at `/ants_optimizer/window`, centered on the ComfyUI window. The gear opens that page. The panel on this page opens only if the browser blocks the popup.
-- The page and the window share `/ants_optimizer/ui`. A settings change carries a revision and who made it, so neither side applies its own echo, and a live number does not count as a settings change. The window is not on the canvas. The page posts telemetry only while that window is asking.
+## Credits
 
-## What changed in v2.5.2
+Ideas, designs and one example app from other people went into this tool.
+Where code was ported, it was re-implemented on this file's own seams,
+budget and idle-lane design; the licences of the upstream projects are
+reproduced in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
-- Dragging a pictured node keeps the picture. A link drag, a running bar and an error still draw live. The switch under Widgets stop answering, on by default, links that zoom to the preview zoom; the higher one wins, in both How widgets go modes.
-- Stand-in capture resolution adds 0.25x and 0.5x. 1x stays the default. Stand-in memory adds 4096 and 8192; a missing saved budget is 4096, a saved 256/512/1024/2048 stays.
-- Execute and Run-to-node, when `/system_stats` reports system RAM: off-screen stand-ins leave memory at 85% used, all of them at 95%. Disk files stay and are asked for again when the run finishes. No reading, no release.
-- The panel opens on Node Rendering Settings. Status is the next tab. The panel has a resize grip on both axes, and rows stack when it is narrow. The graph node is marked resizable on both axes; growing it docks the panel into the node. Vue node mode may still ignore a LiteGraph resize flag — the grip does not depend on that.
-- Window opens this same panel in its own browser window, for a second monitor. It is not a second ComfyUI. A blocked popup leaves the panel here and says so.
+- **[ComfyUI-NodeSnapshots](https://github.com/SparknightLLC/ComfyUI-NodeSnapshots)**
+  — SparknightLLC / EricBCoding, MIT. The stand-in pictures are this tool's
+  version of their idea: capture a node off-frame into a bitmap and blit it
+  instead of redrawing it. What was taken: that a snapshot replaces a *flat
+  box*, never a live node; that the capture has to run off the frame clock,
+  with its own attribution so the packs' hooks are not blamed for it; the
+  per-node signature so a stale picture is never shown; and that a node which
+  is too slow to capture is left live for the session (upstream cuts at
+  32 ms; this tool at 60 ms). What this tool added on top: the ratio ladder
+  (1× default, coarser under budget pressure), and — since 2.4.0 — no
+  upstream-style refusal list, but a named reason in the readout for every
+  node that stays a box. What was deliberately not taken: the
+  upstream refusal list of node types — 2.4.0 replaced it with "whatever the
+  canvas draws", measured — and its fixed 2 px-per-graph-unit capture size,
+  which is what makes a 1000-node graph run out of budget; the ratio here is a
+  setting that defaults to 1×. Separately, the image-preview thumbnail ladder
+  was this tool's own experiment, tried in v2.1.5 and retired in v2.5.0 (see
+  Node Rendering Settings); it never came from upstream.
+- **[ComfyUI-DisableBrowserLogs](https://github.com/SparknightLLC/ComfyUI-DisableBrowserLogs)**
+  — SparknightLLC / EricBCoding. Its measured case (one `console.log` per
+  wheel event taking a large workflow to 5 FPS with DevTools closed) is the
+  source of the *idea* for a console-attribution mode: count and attribute
+  console traffic per owner before offering to mute it, never mute
+  permanently. That mode is not built yet (plan.md, Track L); no code was
+  copied from that repository, and no licence file is shipped at its root,
+  so it is credited as an idea, not as a dependency.
+- **`examples/pop_up_window`** — the console example in this repository
+  shaped `/ants_optimizer/ui`: a revision plus an origin so a live number is
+  not mistaken for a settings change, and neither side of the link is the
+  master. It is a reference example, not part of the extension.
+- **ComfyUI** (comfyanonymous and contributors, GPL-3.0) supplies the
+  extension APIs this tool is built on (`app.registerExtension`, the canvas
+  draw hooks, `/scripts/app.js`, `/system_stats`), and its own `console`
+  chatter is why a log mode is on the roadmap at all.
+- **Chrome's Long Animation Frames API** and `performance.memory` are used
+  as documented, including their absence on other browsers.
 
-## What changed in v2.5.1
+## Licence
 
-- Selecting a node no longer swaps its picture for a painted box. The picture stays, and a ring is drawn on it. Drag, a running bar and an error still draw live.
-- Image-node photographs were missing from the smaller copies, which are what the screen uses past about 25% zoom on a 200% display. ComfyUI draws that photograph a moment after the node itself. The copies now wait for it. Thumbnails of image nodes already on disk are photographed again; other nodes' files are left as they are.
-
-## What changed in v2.5.0
-
-- The node is **ANTs_Frontend_Optimizer**. Graphs saved with the old class key still load; that key is an alias. The Tweaks tab is **Node Rendering Settings**, one row per setting.
-- Image previews are no longer a second system. Below the zoom you set, the node is replaced by a picture of itself — the same mechanism the boxes used. Hover keeps that picture. Select, drag, a running bar or an error still draws live, and the node stays clickable.
-- Fresh installs replace nodes below 50% and capture at 1x. A saved choice is left alone. Half and quarter copies are made from the capture and chosen by on-screen device pixels. Canvas2D has no mipmap format, so the copy is picked here rather than sampled from one.
-- Pictures are kept on disk under ComfyUI's temp folder, keyed by node id and a signature. A change overwrites the file, deleting the node deletes it, and files older than a week are removed. If the route is missing, the memory cache continues.
-
-## What changed in v2.4.1
-
-- **The scripted pan was a fidget, and it could not measure foveation.** It moved the view by ±40 by ±15 graph units — about 4 by 1.5 CSS pixels at zoom 0.10 — and put it back. A node never left the viewport, so the off-screen margin (half a screen by default) never came into it, and two runs of it could not show what that setting costs or saves. The sweep is now one screen plus the margin you have set, the result says how many screens it swept and the peak number of elements foveation hid, and the view is still put back where it started. Ten times the old fidget would still have been inside the margin. Run A and B with that setting the only thing changed between them.
-
-## What changed in v2.4.0
-
-- **Every node the canvas can draw gets a picture, not just the ones a
-  conservative guess trusts.** The refusal rule this feature was built with came
-  from the tool it learned from (ComfyUI-NodeSnapshots), whose own issue #1 is the
-  report that custom nodes then never get a picture: a widget that is a DOM
-  element, a `dom`/`custom` widget type, a function-valued value, a string over
-  4 kB — all of them were refused for the session. The line is now drawn where the
-  canvas is: if the node's own draw path can put ink on a surface for it, it is
-  captured. What the browser draws *over* the node (an image preview, a DOM
-  widget, a 3D viewport) cannot be in a bitmap of the canvas, so those pictures
-  are counted as **"the canvas part only"** — the node's frame, title, slots and
-  whatever the canvas still draws, which is what a box was standing in for anyway.
-- **A node that draws nothing into a canvas keeps its box.** A node whose whole
-  visual is a DOM element can leave a canvas transparent, and a transparent
-  picture would *erase* it at the zoom where pictures are used — worse than the
-  rectangle it replaced. Five 8x8 pixel probes of the capture (about a kilobyte of
-  reads, on the idle lane) decide that, the canvas is released again, and the
-  readout says how many nodes are like this. Anything unmeasurable answers "there
-  is ink": the probe must never be the reason a node disappears.
-- **A tall node is fitted, not skipped.** The dimension cap (2,048 px per side)
-  used to end a node's chances for the session, and — worse — the refusal was
-  re-attempted on every capture slice, so a real report's "375 too large to
-  capture" was a couple of dozen nodes tried many times. Now the largest ladder
-  ratio that fits the cap is used instead (1x for a node up to about 1,994 units
-  tall), those pictures are counted, and a node too big at *any* ratio is blocked
-  once and named in the readout with its height. At the zooms where nodes are
-  flattened a 1x picture still has more pixels than the screen shows, so fitting a
-  monster node is worth far more than skipping it.
-- **A node whose drawing changes faster than the idle lane can photograph it keeps
-  its box** — three pictures dropped before a single one was drawn — and the
-  readout names it. That is the honest answer for a node something rewrites every
-  frame (a polling extension): a fresh picture of it cannot exist, and capturing
-  it once per slice forever is work with nothing to show for it.
-- **When the budget cannot hold the ratio you asked for, a coarse picture beats
-  none.** A capture that the budget would refuse is re-tried at 1x (a quarter of
-  the memory) and only refused if even that does not fit. Refusing used to mean
-  running the node's whole draw and then throwing the result away, so coarse is
-  the cheaper answer as well as the more useful one — and the readout counts them
-  apart from the fits.
-- **The readout leads with the number that is actually being asked for**:
-  `N of M remembered node(s) have a picture`, then the reasons (too slow, too big,
-  nothing drawn, changing, kept live by your list, refusals for budget) and, for
-  the first time, the **names** of the nodes that will not get one. A node's
-  drawing also counts its own images in the signature now (an image node
-  photographed before its image loaded is re-photographed once it has), and long
-  strings are hashed by their ends, which is what made the old 4 kB refusal look
-  like a reason when it was only a cost.
-- **Worth knowing before choosing the ratio** (this is the measurement, not a
-  default): at the zooms where nodes are flattened a picture is drawn at half size
-  or less, so 1x already carries more pixels than the screen shows — 2x and 3x buy
-  sharpness only for a picture that is being reused in the foveated margin at a
-  high zoom, and cost four and nine times the memory. Since coverage is bounded by
-  the budget, the ratio is also what decides how much of a large graph can be
-  pictured at all; watch `have a picture` while switching 1x/2x on a real
-  workflow. That comparison is plan.md's K3.
-- **New tests** (5, 161 total): the browser's half of a node is not a reason to
-  leave it a box (a DOM widget, a function-valued property and a 20 kB string are
-  all captured, and a change at the far end of the long string still invalidates);
-  a node too tall for the cap is fitted, at the size the cap allows; a node no
-  ratio can fit keeps its box and is tried exactly once, with its height named; a
-  node whose own draw leaves the canvas empty keeps its box and gives the canvas
-  back; a font of churn leaves a node a box instead of a capture per slice; and a
-  full budget with room for a coarse copy produces coarse pictures, not refusals.
-
-## What changed in v2.3.1
-
-- **The flicker was the budget's eviction policy, and it is fixed.** A real report
-  from a 1,041-node graph showed 7,040 captures for 1,041 nodes with 255.6 MB held
-  of a 256 MiB budget — the cache thrashing at its cap. The old policy released
-  the *least recently used* bitmap; with the whole graph on screen every bitmap is
-  touched every frame, so "least recently used" meant "drawn earliest in this
-  frame", i.e. something visible. Each new capture therefore took a picture off
-  the screen, the node fell back to a box, got queued again, was captured, and
-  evicted another one. That loop is the flicker.
-- **A picture that is being drawn is now never released.** "In use" is measured in
-  *drawn frames*, not in milliseconds: a bitmap is in use while its node is being
-  drawn, and stops being protected a frame or two after it is not. When the budget
-  is full of in-use pictures, new captures are refused and the panel counts them
-  (`N capture(s) refused`); the nodes that could not be captured stay boxes, which
-  is stable. What makes room is pictures of nodes that have stopped being drawn —
-  off screen, or in a graph you switched away from.
-- **The budget ladder is 256 MiB → 2 GiB in the same doubling steps** (256, 512,
-  1024, 2048), with 512 MiB as the default. Everything below 256 MiB was removed:
-  nothing useful fit, and the thrashing above is what the old floor produced. A
-  saved or scripted value below the floor now lands on it. A budget you lower
-  yourself is enforced immediately, in-use pictures included — you asked for the
-  number. Note what this memory is: canvas surfaces outside the JS heap, which the
-  Memory tab (a heap report) cannot see, so the number stays one you pick.
-- **The canvas's own shadow flag left the per-node signature.** Another extension
-  (NodeSnapshots' "simplify live nodes during navigation") flips `render_shadows`
-  around every gesture, and hashing it meant throwing every bitmap in the cache
-  away twice a gesture. It is now compared cheaply at reuse time instead: a
-  mismatch pauses reuse for that node (the box is drawn, the picture kept), so
-  when the gesture ends the pictures are simply back, with no recapture.
-- **Two bugs found while fixing this, both by the new tests:** a refused or
-  too-slow capture subtracted its own size from the byte total it had never been
-  added to (the budget under-reported itself, and the slower path made it worse);
-  and a selection change used to invalidate a node's bitmap for no reason, since a
-  selected node is drawn live anyway.
-- **A flicker counter, so this is measurable rather than asserted.** The panel's
-  readout now counts every switch of a node between picture and box, plus the
-  refusals, the held-because-shadows-changed cases and what is held. A high
-  switch count is what the report above would have shown; after this change it
-  should stay near zero.
-- **New tests** (4): a full budget refuses captures instead of evicting what is on
-  screen, and does not spin; bitmaps nobody is drawing any more are what makes
-  room; the ladder is 256 MiB to 2 GiB with a floor that saved values land on; a
-  shadow-flag change pauses reuse and throws nothing away; and the flicker counter
-  counts a change of state.
-
-## What changed in v2.3.0
-
-- **A flat box can now be a picture of the node it stands for.** New **node
-  snapshots** setting in the Tweaks tab (off by default): the nodes the flatten
-  threshold turns into rectangles are captured once while the page is idle —
-  drawn through their own draw path into their own offscreen canvas, at the
-  capture ratio you pick — and later frames blit that picture with one
-  `drawImage` instead of painting a fill. Panning and zooming keep reusing the
-  pictures on purpose: the camera moved, the node did not.
-- **It replaces boxes, never live nodes.** The flatten threshold is still the
-  only setting that decides which nodes stop being drawn in full, so snapshots
-  can never change what a zoom you have not already flattened looks like. A node
-  that is selected, hovered, carrying a validation error, running (`progress`),
-  or being dragged stays live and is drawn by ComfyUI — a bitmap of a transient
-  state cannot exist, because those nodes are not captured at all.
-- **A node the canvas cannot own is never captured.** As shipped in v2.3.0 this
-  was upstream's line: a widget that is a DOM element, a `dom`/`custom` widget
-  type, a function-valued widget or property, or a string over 4 kB was refused
-  for good. **v2.4.0 moved that line to where the canvas is** — such nodes are
-  captured now, the browser-drawn part of them is not in the picture, those
-  pictures are counted as "the canvas part only", and what keeps a box is the
-  smaller, provable set of reasons (nothing drawn into the canvas, too big at any
-  ratio, too slow to capture, changing faster than it can be photographed, or a
-  type you put on the keep-live list).
-- **Staleness is bounded and stated.** A picture is only used while the node's
-  signature — title, size, flags, mode, colours, connections, widget values,
-  progress, error state, the canvas's own render flags, the theme — still
-  matches, re-checked at most every 100 ms per node. Anything the tool can see
-  cheaply is checked every frame instead. A node whose own capture took longer
-  than 60 ms is blocked for the session rather than stalling the page twice.
-- **A capture's cost is the tool's, not the pack's.** The capture runs the
-  node's real draw path, including other extensions' hooks, but attribution
-  steps aside while it runs and the time lands in the snapshot's own counter
-  (`captureMs`). Without that, a capture would show up in the Timing tab as the
-  pack being slow.
-- **The idle lane is the one this tool already had.** Captures are batched under
-  the same budget as everything else in the Governor tab, pause the moment
-  there is input (pointer, wheel, key), and slice with a gap between them, so a
-  thousand-node graph is captured over a second or two rather than in one
-  visible pause. No second scheduler.
-- **Memory is bounded and given back.** The bitmap budget (256 MiB to 2 GiB,
-  default 512 MiB since v2.3.1) is enforced by eviction, and releasing a bitmap
-  zeroes its canvas so the pixels return to the browser. A picture that is being
-  drawn is never released to make room (v2.3.1), a capture that does not fit is
-  tried at 1x before being refused (v2.4.0), and the readout counts refusals,
-  coarse pictures, fits and releases separately. Bitmaps are also
-  released when you switch snapshots off, when the tool's master switch goes off,
-  when the flatten threshold goes to zero, when the graph's theme changes, and
-  for nodes that have left the graph.
-- **Everything fails open.** A fault in the reuse path turns the feature off and
-  paints boxes, with the reason in the panel's own error line; a fault in a
-  capture blocks that node and, after five in a row, turns the feature off the
-  same way.
-- **A picture of the box itself**, generated from the real paint path:
-  `preview/boxes.html` (open it in a browser) and `preview/boxes.png`, plus the
-  fourth panel showing what a snapshot bitmap covers — the body, LiteGraph's
-  30-unit title bar, 24 units of padding, and the frontend's own error stroke
-  landing inside that rectangle. Regenerate with `node tools/box-preview.mjs`.
-- **Honest limits, written down** (also in the LIMITS block at the bottom of
-  `web/tracker.js`): a signature is re-checked every 100 ms, so a change can be
-  shown stale for up to that long; a picture is the node at the moment it was
-  captured, so a node whose live drawing animates without changing a signature
-  field shows that frozen frame; and zoomed in past the capture ratio a picture
-  is softer than live drawing — which is why the ratio is a setting and why the
-  nodes you are working with are never served from one.
-- The capture ratio (1x/2x/3x per graph unit) and the budget are provisional
-  defaults: the next step measures hit rate, bytes and frame time on real graphs
-  and sets them from numbers (plan.md, Track K3). The budget ladder changed in
-  v2.3.1, above, after the first real numbers arrived, and v2.4.0 added the
-  fit-to-cap and coarse-instead-of-refused rules; the ratio question is now also a
-  coverage question, because how many nodes can hold a picture is the budget
-  divided by the pixels per picture.
-- **New tests** (16): off by default (no captures, no canvases, no blits); an
-  idle slice captures what was boxed and the next frame blits it, at the padded
-  rect and the chosen ratio; nothing is captured while the page is being used;
-  the always-live set is never served from a picture (and a ghosted node is,
-  because its dimming is part of the drawing); dragging keeps nodes live while
-  panning and zooming reuse everything; a changed widget drops the picture;
-  a slow capture blocks that node for good; a capture runs other extensions'
-  hooks without attributing their time to them; DOM-widget and
-  function-valued nodes are refused; the budget evicts and zeroes canvases;
-  switching off, zeroing the threshold and the master switch all release the
-  memory; a deleted node's record is pruned by the sweep; a fault in the reuse
-  path hands the page back with the reason in the panel.
-- Deliberately **not** built in this step: snapshots replacing *live* nodes
-  during movement. That is the version with a performance claim attached, and it
-  needs the measurement first (K3) rather than a promising default.
-
-## What changed in v2.2.0
-
-- **The flat boxes now say what they stand for.** Painting 1,000 nodes as grey
-  rectangles removes nearly all of a node's draw cost, but it also removes the
-  node: at 10% zoom a node with a validation error looked exactly like a healthy
-  one, a muted node looked live, and nothing on screen said which node was which.
-  A new **box detail** setting next to the flatten threshold offers three levels:
-  `plain` (exactly what was painted before), `title` (each box gets the node's own
-  title-bar colour, drawn above the body where LiteGraph draws it, at its own
-  30-unit height), and `state` (adds the marks that vanish at this zoom a
-  validation-error ring, the progress bar of the node that is running, and the
-  dimming of a muted, bypassed or ghosted node).
-- **Every mark is the frontend's own, at the frontend's own numbers.** The error
-  ring is LiteGraph's error stroke (`#E00`, 10 units wide, 12 units outside the
-  node — the same geometry the full-detail node gets), the progress bar is the
-  frontend's own bar (green, as wide as `progress` says, with a floor of a few
-  screen pixels so it survives a low zoom), and the dimming uses its own alphas
-  (muted 40%, bypassed 20%, ghosted 30%). Nothing is inferred from a colour or a
-  name, and a node that says nothing gets no mark.
-- **It cannot change which nodes are boxes.** The ladder is about a box that
-  already exists: it does nothing while the zoom setting is off, nothing above
-  the flatten threshold, and switching it back to `plain` restores the previous
-  paint exactly. The panel counts every mark it drew (`N title bar(s)`, `N error
-  ring(s)`, `N progress bar(s)`, `N dimmed`), so the price of a mark is a number
-  rather than an assumption.
-- The copyable report's settings line now names the box-detail level, and a
-  small text bug is fixed with it (`idle redraw cap offms` reads `off`).
-- **New tests** (5): the default paints one rectangle per node and nothing else;
-  `title` adds a bar above the body at LiteGraph's own height, clamped so a short
-  node does not become nothing but title; `state` adds exactly one ring, one bar
-  and three dimmings to a graph where exactly one node has each condition; the
-  ladder never changes which nodes are flat and going back to `plain` restores
-  the paint byte for byte; and the panel and the API report the level and price
-  the marks. The demo prints one frame of each level's marks.
-
-## What changed in v2.1.16
-
-- **The pill belongs on the floating button, not only on the node.** v2.1.15 put
-  it on the node's DOM widget, which is a place the frontend can still take away
-  from it (it is the same layer every other widget lives in, and at low zoom the
-  node itself stops being drawn). The floating control — the thing that has always
-  been pinned to the screen — is now the pill: `[switch][gear]`, the same builder,
-  the same geometry, the same handlers as the node's widget. The old 🔧 emoji is
-  the drawn gear glyph, so both places look and behave identically.
-- **Switching the tool off no longer takes the tool's own UI with it.**
-  v2.1.15 closed the panel and hid the corner button when the switch went off,
-  which left the screen empty except for the node's pill — the worst possible
-  moment to make someone hunt for the way back. Now: the pill stays exactly where
-  it is (marked `.ants-own`, so no sweep, gate or hover rule of this tool can box
-  it, inert it or swallow a click aimed at it), the panel stays open if it was
-  open, and both the panel's banner and the panel's own ⏻ button say what
-  happened. What the switch does is hand the *page* back — hooks, sampling,
-  deferrals, the redraw cap, the low-zoom drawing, the DOM it dressed — and
-  nothing else.
-- **The switch is described as what it switches off**, in the tooltips, the
-  banner and here: the hooks and the optimisations. Its state is the same
-  `S.enabled` as before, so everything v2.1.15 gated is still gated.
-- Dragging the pill is still a drag: a press that moves past the long-press
-  threshold does not flip the switch it started on, and does not toggle the panel.
-- While the switch is off the panel keeps repainting itself, so its controls and
-  the banner stay truthful. That repaint is the panel's own cost, not a
-  measurement: nothing is sampled, and every number it shows is the frozen last
-  one from before the switch went off.
-- **New tests** (2): the floating pill carries the switch and the gear, the gear
-  opens the panel without switching anything off, the switch toggles without the
-  pill being hidden or the open panel being closed; and dragging the pill moves it
-  while flipping nothing. The low-zoom sweep test now also asserts the floating
-  pill is untouched by a sweep that hides an ordinary node's widget next to it.
-
-## What changed in v2.1.15
-
-- **The node's own controls are back, and they are the way in and out of the whole
-  tool.** *(v2.1.16 moved the primary copy of this pill to the floating button; the
-  node keeps its widget.)* v2.1.14's focus mode fixed the widgets but took the tracker's *own* widget
-  with it: below the flatten zoom the node is a rectangle, the frontend stops drawing
-  its header and its canvas-drawn button, and the node DOM that used to carry the
-  gear was hidden by the same sweep that hid everybody else's. There is now a pill on
-  the node — `[switch][gear]`, one rounded frame, round ends — and it is exempt from
-  every rule this extension has: it is marked `.ants-own` and the sweeps, the widget
-  gate, the hover hooks and the event gate all skip it by construction, so at 10% zoom
-  with every setting on it is the one live element on the page.
-- **The switch is a real off, not a quieter tracker.** Clicking the checkbox sets the
-  master switch (`S.enabled`) and, with it off: nothing is wrapped, nothing is sampled
-  or timed, no redraw is capped or deferred, no drawing setting is applied (every
-  low-zoom class is removed and node DOM is handed back), no hover hook is held back
-  and the event gate's set is empty, the raf monitor and the memory sampler stop.
-  (That release also closed the panel and hid the corner button for one version —
-  v2.1.16 takes that back: the tool's own UI stays put.) What is *not* touched is
-  your settings, the pill, and ComfyUI: the page goes back to being exactly ComfyUI's own, and the
-  checkbox — or ⏻ On in the panel — brings everything back with the settings you had.
-  The panel stays openable (the gear still works) and says so in a banner.
-- **Both controls are the same size and the same colour, by geometry rather than by
-  eye.** The button box is 22px with `box-sizing: border-box`, and the glyph is drawn
-  in a 22-unit viewBox where one unit is one pixel — so the switch's ring, drawn as a
-  1.5px border *inside* the box, has its centre line at r = (22 − 1.5) / 2 = 10.25,
-  and the gear's teeth end on exactly that circle in exactly that 1.5px line. Both are
-  `#AE7719` in every state: hover only moves the background behind them.
-  - Unchecked, nothing of ours is painted inside the ring — the ComfyUI theme's own
-    background shows through — and the ring is the accent colour.
-  - Checked, the interior becomes `#0D2A2A`, and the ring and the checkmark stay the
-    accent.
-- **Nothing in the suite could look at the pill**, so `tools/pill-preview.mjs` renders
-  it — the real CSS and the real glyph builders extracted from `web/tracker.js` — into
-  a page you can open (`preview/pill.html`, and `preview/pill-4x.png` /
-  `preview/pill-8x.png` if you would rather just look at a picture). It exits non-zero
-  if the extraction stops matching, so the picture cannot quietly disagree with the
-  extension.
-- **New tests** (3): the pill survives a sweep that hides everything else and its
-  switch still toggles the tool; switching off hands the page back (links drawn at
-  ComfyUI's own width, elements un-hidden, nothing recorded, no widget gate left in
-  the way) and switching on restores the same settings; and the panel's banner and its
-  own ⏻ button say and do what the checkbox does.
-
-## What changed in v2.1.14
-
-- **Why v2.1.13's focus mode did not stop the widgets, in one line each.** The
-  report from the real page was "all node widgets are still clickable at 10%
-  zoom, and the 3D viewports are still fully interactive", with the panel showing
-  144 elements carrying the inert class. All three of these were true at once:
-  - **Most widgets are not DOM elements at all.** A slider, a combo, a text box or
-    a button is drawn *on the canvas* and hit-tested by arithmetic:
-    `LGraphNode.getWidgetOnPos(x, y)` walks the node's widgets and returns the one
-    under the cursor. No CSS class can reach that — which is why a page can have
-    every node's DOM switched off and every widget still answering the pointer.
-  - **A 3D viewport's render loop is driven by the *node's* hover flag.** The
-    extension chains `node.onMouseEnter`/`onMouseLeave` when the node is created
-    (see `useLoad3d`), and the canvas calls those from its own hit-testing — not
-    from DOM events. Its `isActive()` is
-    `mouseOnNode || mouseOnScene || mouseOnViewer || recording || !initialRenderDone
-    || animationPlaying`, so `pointer-events: none` on the wrapper could never make
-    `mouseOnNode` false. Switching the DOM off stops `mouseOnScene`; the canvas
-    hover path keeps `mouseOnNode` alive and the Three.js frame keeps being drawn.
-  - **An element whose owner cannot be worked out was skipped entirely.** The
-    registry resolved a wrapper to a node by position arithmetic, and only looked
-    at the layer for nodes it was already flattening — so a page where the
-    arithmetic comes out differently (a display scale, a transformed container)
-    ended up with live viewports and a panel that still reported work done.
-- **Four mechanisms now, and they do not depend on each other.**
-  1. **The canvas widget gate.** `LGraphNode.prototype.getWidgetOnPos` answers
-     "no widget" below the focus zoom and for any node past the fovea margin. That
-     is the one gate that can be closed without taking the node with it:
-     `processMouseDown` asks for a widget *first* and only then falls through to
-     dragging the node, and mousemove asks for the widget under the cursor to build
-     its hover report. So a slider cannot be grabbed, dragged, hovered or
-     scrolled — and the node still selects, drags, edits and opens its menu. The
-     panel reports `blocked / seen`.
-  2. **The node hover hooks.** `onMouseEnter` and `onMouseMove` are wrapped per
-     node and held back while its widgets are off, so a 3D viewport's
-     "pointer is over me" flag never becomes true and its render loop stays idle.
-     `onMouseLeave` is deliberately *not* held back (it is what clears the flag),
-     and when a node is switched off while the pointer is on it the leave is called
-     by the tool — otherwise the flag would stay stuck and the viewport would keep
-     rendering forever. The canvas's own hover bookkeeping (`node.mouseOver`,
-     `canvas.node_over`) is cleared at the same time, so the two states cannot
-     disagree.
-  3. **Node DOM is hidden outright, not just made inert** (a new "widgets: hidden
-     outright / inert only" control, hidden by default). An element with
-     `display: none` cannot be clicked, hovered, dragged onto, scrolled into or
-     entered at all, whatever its own CSS says — and the registry now finds these
-     elements by `.dom-widget` anywhere in the page, and *does not require* an
-     owner: the focus half switches off every node-DOM element, because "which node
-     is this" is only needed for the per-node decisions (flattening, off-screen).
-  4. **The event gate.** While an element is switched off, the events that would
-     start or continue an interaction with it (pointer, mouse, click, contextmenu,
-     wheel) are stopped in the capture phase at the document, before any handler
-     anywhere can see them — counted, and reported. This is the part that does not
-     depend on the page's CSS or on a framework leaving this tool's classes alone.
-     It is blind to everything else by construction: the test is a set lookup on
-     the target's ancestors, and the set is empty whenever nothing is switched off.
-- **Honest verification, in the panel.** On the once-a-second sweep the tool reads
-  `getComputedStyle` for a sample of the elements it believes it switched off and
-  reports how many the *page* agrees about (`N of the sampled ones confirmed by the
-  page's own computed style`, plus `M still reachable` when the answer is no). A
-  readout that only counted what this tool wrote would be describing its
-  intentions, not the page.
-- The readout line now names all four counts, and the demonstration in
-  `tests/demo.mjs` prints the same numbers with none of the page present.
-
-## What changed in v2.1.13
-
-- **Viewport focus reaches the 3D nodes this time, and stops taking the nodes
-  with it.** Two corrections to v2.1.12's focus mode, both from the report that
-  the 3D nodes were still clickable and the ordinary nodes had lost their
-  selectability:
-  - **A node is no longer made unclickable.** The frontend's own node hit-test
-    (`LGraph.getNodeOnPos`) is left exactly as ComfyUI wrote it, so nodes still
-    select, drag, edit and open their menus at any zoom. What is switched off is
-    the *widget* UI: the class now lands on the widget's wrapper plus everything
-    inside it (`pointer-events: none !important`, descendants included, because a
-    child that sets `pointer-events: auto` overrides an inert ancestor — and the
-    frontend's own widget layer sets it inline on the very wrappers we touch).
-  - **The 3D viewports are reachable at all.** The core 3D nodes are
-    `ComponentWidgetImpl`s: the widget object has no `element` to walk from, and
-    its DOM is a wrapper the frontend renders into the DOM widget layer. The old
-    sweep walked `node.widgets` and then only looked at the layer for nodes it was
-    already flattening, so with the node-flattening setting off a 3D viewport was
-    invisible to it. There is now one registry of node DOM — built from widget
-    elements, Vue node roots and the layer wrappers — and it is consulted for
-    every node, flattened or not.
-- **Why the 3D nodes care, specifically.** ComfyUI's 3D viewer decides whether to
-  render by asking whether the pointer is over it (`isLoad3dActive` =
-  `mouseOnNode || mouseOnScene || mouseOnViewer || recording || !initialRenderDone
-  || animationPlaying`), and its render loop runs a Three.js frame per rAF tick
-  while that is true. So merely moving the mouse across a 3D node makes it render
-  its scene every frame *on top of* the canvas redraw, and its wheel handler
-  captures scrolling to zoom the model instead of the graph. `pointer-events:
-  none` turns both off at the source: the viewer is told the pointer is not over
-  it, so it stops rendering; the wheel goes to the canvas, so the graph zooms.
-- **Foveation costs less than it saves, this time.** The first version re-walked
-  the DOM widget layer every 250 ms while the view moved, which is the one thing
-  that must not happen inside a pan. Now the layer is read once a second and
-  ownership is cached per element (an unchanged wrapper costs a float comparison),
-  while the per-frame work is arithmetic over the registry with a class written
-  only where the answer changed. Two more knobs:
-  - **margin: ½ a screen by default** (¼, ½, 1, 2), instead of a full viewport;
-  - **coming back is rationed: one element per drawn frame by default** (1, 4, or
-    all at once). Going away is a class on something nobody is looking at;
-    coming back re-runs layout for that widget and re-measures a 3D renderer, so
-    it is the expensive direction — and whatever is *on screen* is handed back
-    immediately regardless of the budget, so a visible widget is never blank.
-- **The display-scale check, run at startup.** Windows display scaling (System →
-  Display → Scale, 200% on a 4K screen) makes the canvas backing store larger than
-  the element it is drawn in, and anything that divides by the backing store is
-  out by exactly that factor. The check reads `window.devicePixelRatio`, the
-  canvas backing store against its own CSS box, and the frontend's own
-  `visible_area` against this tool's independent computation of it — then says
-  which unit that rectangle is in. The maths itself no longer depends on the
-  answer: the viewport comes from the canvas's *CSS* box and the draw state,
-  LiteGraph's own arithmetic in the unit that cannot be scaled. The check runs
-  once at startup, once a second with the sweep, whenever the panel refreshes,
-  and it is in the readout and in `snapshot().lowZoom.focus.display`. If it reads
-  wrong, "display scale" can be pinned by hand (auto / 100%…300%).
-- Everything here is off by default, remembered across sessions, and handed back
-  by "Back to full drawing".
-
-## What changed in v2.1.11
-
-- **Component widgets are hidden through the frontend's DOM widget layer.** The
-  core 3D nodes (`Save 3D (Advanced)`, `Save 3D Model`, `Preview 3D`, point
-  clouds) build their viewport as a `ComponentWidgetImpl`, and the frontend
-  renders it in a separate layer — one wrapper per widget, positioned at its
-  node's origin, with nothing on the widget object pointing at it. v2.1.10
-  stopped setting the canvas's low-quality flag, and that flag turned out to be
-  the *only* thing that made `hideOnZoom` hide anything (`DomWidgets.vue` reads
-  `hideOnZoom && lowQuality`), so those viewports went back to floating over
-  their own flattened rectangles. The sweep now finds the wrappers directly:
-  each one is positioned at its node's origin in client pixels, so the owning
-  node is found by containment in graph coordinates, and the same
-  `.ants-lod-box` class that hides every other DOM widget is applied. No element
-  handle, no per-widget layout read, and it is handed back on the same sweep
-  that unboxes the node.
-- **The panel stops claiming work it is not doing.** `hideOnZoom` only takes
-  effect in the frontend's low-quality mode, which this tool deliberately no
-  longer switches on, so the readout now separates the two: elements hidden by
-  class (real, now including the 3D viewports), and widgets carrying the
-  hide-on-zoom flag (real only when the frontend's own LOD is on).
-- **The links line tells you where the connections stage actually goes.** Every
-  `renderLink` call is now timed, so the panel can split the stage in two: the
-  strokes themselves (what a link setting can change) and the rest — the
-  frontend walking every input slot of every node in the graph before it decides
-  which links are on screen, which no ink setting can reach. On a graph with a
-  thousand nodes that second part is the larger one, and pretending otherwise
-  would be the dishonest part of a performance panel.
-- **"Measure link thinning" — the panel answers "does this actually help?" with
-  a measurement instead of a claim.** It alternates the setting on and off,
-  1.2 s each, three times over, and compares the connections stage of the same
-  page against itself, then reports the delta in ms/frame with the frame counts.
-  Nothing is saved, nothing else changes, and the setting is put back when it
-  finishes. If the difference is inside the noise it says so.
-
-## What changed in v2.1.10
-
-- **Link thinning is a link setting, and nothing else.** It used to put the canvas
-  into the frontend's low-quality mode for the frame it was thinning: that skips
-  node shadows and rounded corners, and it is the same flag ComfyUI consults
-  before placing widgets that asked to hide when zoomed out. On a page whose zoom
-  sits below the thinning threshold, the visible result was *nodes looking
-  half-flattened all the time* — a link setting quietly repainting nodes. The
-  flag is no longer touched at all. The setting now changes exactly two things,
-  for the one call that draws a link: the stroke is 1px instead of 3, and the dark
-  outline under it is skipped. Both are put back immediately.
-- **Straight links are opt-in, and no longer follow the node setting.** The link
-  dropdown had an `auto` answer — "straight while the graph is rectangles" — which
-  meant the *node* setting decided the shape of a link. That is gone: the choices
-  are **keep every curve** (the default, and what ComfyUI draws) and **always
-  straight lines**. A saved `auto` becomes "keep every curve" and the panel says
-  the setting changed hands. So flattening never straightens a link, and thinning
-  never touches a node: each setting changes its own subject and nothing else.
-- The panel's readout for these settings now states that promise in words, and
-  the test suite holds it to it: nodes are asserted to be drawn by LiteGraph's
-  own path, outside any borrowed low-quality frame, with the canvas flag exactly
-  as ComfyUI left it, while links are thinned.
-
-## What changed in v2.1.9
-
-- **The node threshold is a zoom now, not a node size.** "Nodes under 64px" asked
-  the wrong question. A node's size on screen is not a property of the camera: a
-  JS node that hides, greys or adds a widget while you work changes its own size,
-  so a pixel rule paints the same node flat on one frame and draws it in full on
-  the next — and the nodes that move are exactly the ones with dynamic UIs, whose
-  widgets are the thing you were looking at. The setting is now **flat nodes below
-  N% zoom** (5% to 50%, off by default): one decision per frame, taken from the
-  camera, applied to every node the same way, and nothing at all is touched above
-  the zoom. A node being small can no longer flatten anything on its own. The
-  zoom rule also removes the sampling: the panel can say exactly how many nodes
-  are rectangles instead of estimating a share from 64 samples.
-- **Links follow the same trigger.** `auto` (the default) means "straight while
-  the graph is rectangles" — the v2.1.4 behaviour, now tied to the same zoom
-  instead of to a sample of node widths, so the link style and the node style
-  cannot disagree about whether the graph is being flattened.
-- **Collapsed nodes and this tool's own node are never flattened**, and the node
-  you have selected keeps its outline, so a rectangle at 10% zoom still tells you
-  what is selected.
-- **A pixel setting carries over once, and says so.** If `localStorage` holds a
-  v2.1.8 record, its `minPx` is translated to the nearest zoom below (64px on a
-  typical 350px node is 18%, so 20%), and the panel explains the change with the
-  old number quoted until you pick a value yourself. Nothing else about the mode
-  changes, and an install with no saved record behaves exactly as before.
-- **The whole-graph note names what is still walking the graph.** When the graph
-  is fully on screen — so culling has nothing to remove — the panel now lists any
-  periodic source whose worst run is over 120 ms by name, with its worst time and
-  rate, because a scan that costs 800 ms in one go is worth capping even when its
-  average looks small.
-
-## What changed in v2.1.8
-
-- **A tab of its own, first in the row: Tweaks.** The drawing settings used to
-  live halfway down the Nodes tab, under a budget table they have nothing to do
-  with. They are now the first tab — the one place a person goes to *change*
-  something, with the other tabs answering questions — and the Nodes tab keeps
-  what it is for: where the frame went, per node type, and who asks for redraws.
-- **Link drawing is its own setting.** v2.1.4 tied straight links to the node
-  threshold: flatten most of the graph and the links went straight with it, which
-  is exactly the shape a workflow built out of curves cannot survive. There is
-  now a link-style dropdown — **straight while the graph is rectangles** (the old
-  behaviour, and still the default), **keep every curve**, or **always straight
-  lines** — independent of the node threshold and of the thinning setting. The
-  three are meant to be combined: flattening decides what a node costs, the link
-  style decides a link's shape, thinning decides how much ink that shape uses.
-  "Keep every curve" with thinning on is the combination the old design made
-  impossible.
-- **Vue-component widgets are boxed with their node.** The core 3D nodes
-  (`Save 3D (Advanced)`, `Save 3D Model`, `Preview 3D`, point clouds) build their
-  viewport as a `ComponentWidgetImpl`, which — unlike an image or a curve editor
-  — has **no `element` of its own**: the frontend renders the wrapper in its DOM
-  widget layer. So v2.1.6's element hook never saw them, and a boxed node kept a
-  live 3D viewport on top of its rectangle. The sweep now recognises component
-  widgets by their `component` and stands them down through the same
-  `hideOnZoom` flag, which is what the widget store consults before positioning
-  anything. Nodes whose visuals are canvas-drawn (not DOM) are untouched, and
-  everything is restored when the node is drawn properly again.
-- **The settings are remembered across sessions.** The five drawing settings are
-  written to `localStorage` (`ants.lowZoom.v1`) as you change them and restored
-  on the next page load, before the first frame draws, so the panel's controls
-  and the canvas agree from the start. An install nobody has configured has
-  nothing saved and behaves exactly as before; "Back to full drawing" clears the
-  saved state along with the settings.
-- **Stalls that are the canvas repaint say so.** The Stalls tab is titled
-  "main-thread blocking that is NOT canvas drawing", and on a page with the
-  drawing optimised the biggest row is often the repaint itself — a display-lane
-  source, tagged **canvas repaint** in the table, so drawing time and genuine
-  stalls are not read as the same thing.
-
-## What changed in v2.1.7
-
-- **A cap on the thing that repaints the page is now lifted while you are
-  dragging.** A limit is a bet that the tick it skips is a tick nobody sees.
-  That bet holds for a heartbeat polling state and fails hard for anything that
-  draws: on a 4K graph the source that repaints the canvas is a timer, and
-  capping it to 1/s turns a pan into a slideshow — the page asks for a redraw
-  on every pointer move and gets one per second. So a source that has ever run
-  the canvas draw *inside itself* is marked as part of the **display lane**
-  (shown as `· display` in the Governor table). Two things follow: the
-  autopilot never suggests a limit for a display-lane source, and while a
-  pointer, wheel or key event has arrived recently its cap is lifted to about
-  30 runs a second, back to the limit the moment the input stops. The ticks that
-  ran only because of that lift are counted and reported, which turns "is my
-  drag slow, or is my own limit the thing making it slow?" into a number.
-- **A boxed node's DOM widget now also leaves the per-frame layout pass.** v2.1.6
-  hid the elements of a boxed node with one CSS class. That stops them being
-  *painted*, but not the frontend stepping through every DOM widget of every
-  node on every drawn frame to set its position and z-order — on a graph of a
-  thousand DOM widgets that is a thousand components' worth of layout work per
-  redraw, for content that is currently a rectangle. ComfyUI's own escape hatch
-  is `hideOnZoom`, which its widget store consults before doing any of that:
-  while a node is a rectangle, its widgets get that flag (the ones that already
-  asked for it are left alone, and image and video previews deliberately ask for
-  the opposite), and they get their own value back the moment the node is drawn
-  properly again. If the option object is frozen the class still hides the
-  element, so the fallback is exactly the old behaviour. The panel reports how
-  many widgets left that pass, and the API exposes the widget objects themselves
-  rather than only a count.
-- **Cost per second, not just cost in the last four seconds.** A scan that runs
-  every 700ms and does real work on some of its runs can look cheap in a
-  4-second window (its early-exit runs land there) and be expensive in fact.
-  Rows now carry the figure that catches it: mean run cost × current rate. The
-  autopilot and the suggestions rank by the larger of the two, the Governor
-  table's tooltip shows both, and the reason line of an applied limit says when
-  they disagree. This is how a third-party culling pass that costs ~150ms/s
-  while reporting single-digit ms/s gets offered a limit instead of being
-  skipped for looking cheap.
-
-## What changed in v2.1.6
-
-- **Links are degraded, not straightened.** The old "links straight"
-  option is the one thing a spline-based workflow cannot survive: the
-  author placed the nodes to be read through the curves, so replacing
-  them with lines is a different graph, not a cheaper one. The new
-  setting — **links thinned below N% zoom**, 60% by default — keeps
-  every curve exactly where it was and changes how much ink it takes to
-  lay them down: strokes are 1px wide instead of 3, and the dark outline
-  ComfyUI draws under each link is skipped. That outline is a *second
-  full stroke* 4 units wider than the link (`render_connections_border`,
-  on by default), so on a long link it is most of the pixels the redraw
-  spends. Both are set on the canvas for the duration of that one
-  `renderLink` call and put back before it returns, so hit-testing,
-  dragging, selection and the panel never see the change. Measured on the
-  4K graph this was built for: 976 links cost ~101ms/frame as splines and
-  ~22ms as straight lines, and the difference between those two numbers
-  is the outline plus the extra width — this recovers a large part of it
-  *with the shapes intact*. Curves whose endpoints are close together
-  barely change at all; that is the point. The straight-line option
-  remains, but it is now described for what it is: a mode for graphs
-  already built out of straight links, where most nodes are rectangles
-  anyway.
-- **The DOM content of a boxed node is hidden with it.** Nodes whose
-  visuals are DOM — Nodes 2.0/Vue nodes, and any node with a DOM widget
-  (image and video previews, curve editors, custom node UIs) — live in
-  absolutely-positioned elements *on top of* the canvas and were
-  completely unaffected by flattening: the node became a rectangle and
-  its contents stayed at full size on top of it, which is the worst of
-  both. While a node is drawn as a rectangle, its elements get one CSS
-  class (`ants-lod-box`, `display: none`), and the class is removed the
-  moment the node is drawn properly again — zoom in, raise the threshold,
-  switch the mode off, or let it fail open, and the page is exactly as it
-  was. Nothing is moved, re-parented or edited; Vue nodes are found by
-  their `data-node-id` attribute and DOM widgets through the `.dom-widget`
-  wrapper ComfyUI positions. The panel and the report say how many
-  elements of how many nodes are hidden, so "nothing happened" is never
-  the only evidence. The set is re-checked when the zoom or the setting
-  changes and once a second, so nodes and widgets that arrive later (a
-  workflow load, an execution result) are picked up too.
-- **The frontend's own low-quality rendering is brought forward to your
-  zoom.** ComfyUI already has a cheaper drawing path — no node shadows,
-  no rounded corners, no link outline — gated on a font-size threshold
-  ("Zoom Node Level of Detail", 8px by default) that on a 4K screen at
-  10% zoom may or may not have engaged on its own. Below the zoom you
-  pick (60% by default), this tool now switches that flag on for the
-  duration of each frame and hands it back in a `finally` block, so what
-  you see is what ComfyUI itself
-  draws when you zoom out far enough. If a frontend version does not
-  expose the flag, the panel says so instead of pretending: the link
-  thinning above does not depend on it.
-- **The panel says what it did.** A new line in the low-zoom block
-  reports link segments thinned per frame and whether the low-quality
-  path is in use; a second reports DOM elements hidden, or that there
-  was no DOM content to hide on the nodes this threshold catches (their
-  visuals are canvas-drawn). The text report carries both. The preview
-  counters stay where they were — 489 of 496 image draws served from
-  thumbnails on the 4K test page, which is the answer to "do thumbnails
-  even work": they do, and what they recover is bounded by how much of
-  the frame the previews are; on a graph painted mostly by node chrome
-  that is a smaller number than it looks.
-
-## What changed in v2.1.5
-
-- **Nodes under N px now reaches 4K.** The ladder was 8/12/16/24/32px, which
-  assumed a node lands at 32px or less when the graph is zoomed out. On a 4K
-  screen at 10% zoom a node is around 43px wide, so the setting caught almost
-  nothing and the report looked like the mode had no effect. The ladder is now
-  0/8/12/16/24/32/48/64/96/128/192/256px, covering that case and the ones past
-  it. The panel also stops leaving you to guess: it reports what share of the
-  graph the current setting catches at the current zoom, and, when it catches
-  little, the width of a typical node and the setting that would flatten most
-  of the graph. *"Nodes under" is a property of the zoom, not of the graph* —
-  at 10% on a 4K screen the answer is 48 or 64, not 32.
-- **New: image previews are served from thumbnails** (on by default at 60%
-  zoom, one dropdown to change or switch off). Image, preview, load and compare
-  nodes blit a full-resolution bitmap into whatever box the node occupies —
-  a 4096px image into a 40px box, several times a second. Below the zoom you
-  set, those draws are served from a cached copy at about the resolution the
-  screen can show, taken from a ladder of 64/128/256/512/1024/2048px on the
-  long side: 64px at 10% zoom, 512px around 60% for a big node. So the same
-  image can have several copies, one per size the zoom asks for, and never a
-  copy of a copy. Only image draws that happen *inside* a node are touched
-  (the graph's own icons and grid are not), only when the destination is
-  smaller than the source, and only until the copy exists: the frame that
-  discovers a new image still draws the full one, so what you see never goes
-  blank. The cache holds at most 48 thumbnails and 64 MB (oldest first out), it
-  reports how many draws it served, how many it skipped and how much memory it
-  is holding, and eight failures switch it off rather than keep retrying.
-
-## What changed in v2.1.4
-
-- **New: low-zoom drawing** (Nodes tab, off by default). The frame budget
-  on a big graph at low zoom is not a scheduling problem — it is a
-  thousand nodes being drawn properly several times a second, and at
-  zoom 0.10 the whole graph is inside the viewport, so culling has
-  nothing to remove. Three levers, one switch, all of them reversible
-  and all of them measured by the same wrapping of `drawNode` /
-  `drawConnections` that produced the numbers they change:
-  - nodes that land under N px on screen are painted as one flat
-    rectangle (N = 8/12/16/24/32, or off),
-  - links are painted as straight lines while most of the graph is that
-    small, and go back to LiteGraph's renderer the moment you zoom in,
-  - and while no pointer, wheel or key event has arrived for a moment,
-    redraws are rate-limited (4/s, 2/s, 1/s, or off) — a rate limit, not
-    data loss: the last request of a burst still gets one trailing
-    redraw, and the first touch lifts the cap instantly.
-  Anything that throws inside the cheap path switches the whole mode off
-  and falls back to the original draw call, with the reason printed in
-  the panel: a rendering change a tool cannot explain must never be left
-  half-applied on somebody's canvas.
-- **The frontend's own LOD is shown next to ours.** ComfyUI has a
-  `LiteGraph.Canvas.MinFontSizeForLOD` setting (default 8px, `0`
-  switches it off) that flips `canvas.low_quality` below a zoom
-  threshold — and when it is on, it still only skips shadows and
-  rounded corners, it does not draw fewer nodes. The block reads the
-  canvas and says which state it is in, because *"my frames are slow
-  with LOD on"* deserves an answer rather than a shrug.
-- **New: a culling reality check.** The same block reports how many nodes
-  are inside the viewport at the current zoom and how wide they land on
-  screen, and says the quiet part out loud when ~all of them are visible:
-  *"the whole graph is on screen, so culling cannot save anything here"*.
-  That is the answer to "why does my culling extension not help my
-  frames?" — and it is measured, not assumed.
-
-## What changed in v2.1.3
-
-- **Fixed: limits that could not bite looked like they worked, and the
-  ones that mattered were never suggested.** A source whose runs are
-  300ms apart is unaffected by "half speed" (33ms) — and on a real
-  CPU-rendered page the two worst offenders (a Vue render chain at
-  646 ms/s and a culling scan at 474 ms per run) were exactly that shape.
-  Both were also invisible to **Suggest limits**, which required 4 runs/s
-  and so offered limits to a dozen 0.1 ms/s heartbeats instead. The
-  suggestion engine now ranks by measured cost per second, picks the
-  mildest policy whose gap is actually wider than the source's observed
-  period (skipping the multipliers when they cannot bite), and the table
-  marks such a limit as `no effect`, with the panel and the report
-  saying how many limited sources are in that state and how much they
-  still cost.
-- **New: autopilot** (off by default) — cap the worst source it may
-  touch every five seconds until the limitable sources are under a
-  target you set (150–600 ms/s), then stop. A row it capped that is
-  still the worst stays in play and is stepped up the ladder (2/s → 1/s)
-  until it is cheaper or the ladder runs out; a row that reaches the
-  tightest cap and is still expensive is reported as needing a fix at
-  its source, with what it still costs. Limits set by hand are never
-  touched, and every action is logged in the panel and in the copied
-  report — with the cost it measured and the cost the cap should leave.
-
-## What changed in v2.1.2
-
-- **Fixed: relayed frames were blamed on this tool.** With every timer of
-  the page passing through the layer, Chrome attributed each of those
-  frames' *whole* cost to the wrapper in `tracker.js` (it reports a
-  script frame's duration inclusively) — on a real page: 891 frames and
-  300 s of blocking credited to `(anonymous) @ tracker.js` while the time
-  belonged to the extensions whose timers were being relayed. Frames whose
-  only named script is this file are now attributed to the source the
-  Governor measured *inside* that frame, labelled `(via the tracker's
-  pass-through)`; with nothing measurable inside, the row says
-  `(pass-through timer)` instead of claiming the time.
-- **Fixed: "Illegal invocation" switched the layer off.** The saved
-  originals were called as methods of the layer's own bookkeeping object,
-  and Chrome throws `Illegal invocation` for `setTimeout`/`clearTimeout`
-  called with any other receiver. The originals are now bound to the
-  page's global — the fail-open path did its job (the page kept working),
-  but it should never have been needed. The `limiter` pill and the copied
-  report now give the turned-off state its own wording.
-
-## What changed in v2.1.1
-
-- **Fixed: the scheduler layer could stop the workspace from drawing.**
-  A source on `normal` was still gated at the delay it asked for, so a
-  100ms repaint interval that fires a millisecond early lost those ticks
-  — and when several chains share one row (the same function registered
-  by more than one graph view), the shared gate starved them outright:
-  measured on a real page, 21,699 ticks skipped, 12,752 deferred, and a
-  graph canvas that never repainted. `normal` now means no gate at all,
-  and the deferred copy that a skipped tick needs is per chain instead of
-  one shared slot. Regression tests cover all three scheduling styles
-  (interval, chained timeout, self-scheduling rAF) and assert that
-  nothing is skipped or deferred while nothing is limited.
-- **Fail open, and a way out.** Every wrapper now catches its own
-  errors: an internal failure never stops a callback from running or a
-  timer from being registered, and after three errors the layer restores
-  the browser's own timer functions and turns itself off. The panel
-  reports when that happened, the report leads with `TURNED OFF`, and a
-  new **Turn the layer off** button does it on demand.
-
-## What changed in v2.1
-
-- **New Governor tab** (see above): per-source limits on the page's own
-  timers and rAF callbacks, an adaptive rAF gate with an input guard,
-  redraw-request merging, long-frame traces, and an off-thread lane.
-  Everything is opt-in and persistent; with the defaults the only
-  difference is that these sources are measured.
-- **Traces name the caller.** A long frame now records which script
-  asked for a redraw while it was blocked, so a frame attributed to
-  ComfyUI's own `renderFrame` can be traced back to the extension that
-  triggered it (and to the ticks that ran inside it).
-
-## What changed in v2
-
-Fixed (all of these had regression tests written against the v1
-behaviour first; see `REVIEW.md` for line references):
-
-- **Muting could permanently hide an extension.** v1 deleted a
-  silent extension's stats bucket after a few seconds; wrapped hooks
-  kept writing into the orphaned bucket, so the row — and the Unmute
-  button with it — was gone for the rest of the session while the hooks
-  stayed skipped.
-- **Hook time outside a frame was attributed to the next frame**, could
-  make "attributed" exceed "frame", and could force "unattributed" to
-  clamp at 0.00ms. Off-frame time is now its own column.
-- **The unit was milliseconds per 4 seconds**, so every row's number
-  scaled with how fast you panned and could not be compared to a frame
-  budget. Now `ms/frame` and `% of frame`, with window sums only in the
-  detail view and the text report.
-- **`fps` was 0 or wrong under the loose caps the Testing tab offers.**
-  Now computed from intervals over a 10s window that widens to 30s.
-- **The panel rebuilt itself via `innerHTML` every 500ms** — scroll
-  position reset, rows moved under the pointer, focused controls were
-  destroyed. Rows are now updated in place.
-- **The redraw cap dropped frames** instead of deferring them; one
-  trailing redraw is now guaranteed.
-- **The canvas patch was attempted once**; now retried, and failures
-  are reported in the panel.
-- **The shared-tick detector guessed** a period from call-count
-  multiples. Replaced by measurement: exact `setDirty` request rate
-  plus sampled call stacks and Long Animation Frame invokers.
-- **Load times summed concurrent fetches**, which could exceed the page
-  load itself. Now a span.
-- **Instance hooks and pre-existing hooks were invisible.** Now adopted
-  and labelled.
-- **No percentiles, no stalls lane, no self-cost check, no pause.**
-  All present now: p50/p95/p99 frame time, the Stalls tab, the
-  tracker's own footprint (wrapped hooks, ring memory, panel cost per
-  second) in the report, and Pause/Reset.
-
-Also new: ring buffers are typed arrays written in place instead of
-allocating one object per hook call and shifting arrays, and long tables
-render the top rows with an explicit count of what is hidden (a
-10,000-hook graph made the panel itself a visible entry in the Stalls
-tab, which is a bug report against this tool, so the row caps are
-deliberate and tunable).
+See [`LICENSE`](LICENSE) for this project, and
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) for the notices carried
+with it. Version history: [`CHANGELOG.md`](CHANGELOG.md).

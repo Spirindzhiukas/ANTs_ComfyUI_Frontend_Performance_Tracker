@@ -278,6 +278,192 @@ nodes. Its own README and reports show the consequences (long warm-up, nodes lef
 live when the budget runs out). Our version keeps the engine, changes the storage
 strategy, and credits every byte of it (Track M).
 
+**K7. Pictures that contain the node (v2.5.6).** A capture is the canvas plus
+what can honestly be drawn of the node's DOM widgets: images and canvases pixel
+for pixel, a text field's value re-painted in the theme's colours, a pack's HTML
+left blank and counted, and a video node never photographed. The signature
+covers the elements' own content, so a new image or an edited prompt makes a new
+picture. The disk cache is keyed by what is inside the file — the node's
+signature plus the capture resolution and a theme hash — which is what makes the
+resolution setting behave in both directions. Evidence and the tests are in
+`ANALYSIS.md`.
+
+**K8. The Vue-nodes stand-in — built (v2.6.0).** The same setting, the other
+mechanism: below the zoom threshold each node's own element is blanked (`opacity:
+0`, keyed on the `data-ants-vue-standin` attribute rather than a class since
+v2.6.3 — the frontend rewrites that element's `class` and `style` on every
+re-render — and it keeps its layout and its pointer events, so interaction is
+unchanged) and the canvas paints the same box in the same place,
+through the seam LiteGraph still calls in that renderer (`drawNode` with the
+context in node-local space). The pathway is chosen per call from
+`LiteGraph.vueNodesMode`, a box is painted only after a real blanking, and every
+blanked element is handed back on the frame the setting, the zoom, the tool or the
+renderer changes. **v2.6.3 closed two defects this plan had recorded as design:**
+the mark is an *attribute* (`data-ants-vue-standin`, `!important` rule) because
+Vue rewrites the element's `class` and `style` on every re-render, and the
+capture/ratio/budget/disk half is **not** idle in this renderer — a picture is
+*drawn* into the capture surface (`lodVueCapturePaint`), so the ratio ladder, the
+mips, the RAM budget and the disk files behave exactly as in the canvas renderer.
+**v2.6.4 closed the two defects the seventh report named.** A picture now carries
+the node's own text (read out of the DOM — every string, its box and its computed
+styles — and re-painted, title included, with the content clip reaching into the
+title bar), the zoom it is measured in comes off the frontend's own transform pane
+first and `canvas.ds.scale` only as a last resort, a capture whose element is not
+on the page is refused rather than stored as a bare box, and the pathway is part
+of the picture's signature *and* of its file name (`…<pc|pv>`) so neither
+renderer can ever be served the other's picture. The flicker was the frame plan
+and the draw loop asking two different questions: the plan wanted the picture
+setting, the draw loop only the zoom, so with any other stand-in mode the plan
+handed the whole set of elements back every frame while the draw loop blanked
+them again. One predicate (`lodVuePathOn`) is asked by both now, and a box counts
+as standing in.
+**v2.6.5 answered the eighth report's two questions with measurements.** The frame
+cost of the stand-ins was the tool's own per-frame work, not the blits: 40 mark
+re-writes and 82 DOM queries a frame at 40 nodes (38 and 80 of them no-ops the
+browser charged for), plus a layout read per boxed node on a 400/800 ms timer. The
+mark is now written only on the transition, the video verdict is cached, and the
+measurement is *reported* rather than polled (`ResizeObserver` + `MutationObserver`
+over the node's element, a report dropping that node's measurement), so the steady
+state costs the page zero writes, reads, queries and probes at any node count —
+40/82.4/2 → 0/0/0 per frame at 40 nodes, 60/122/2 → 0/0/0 at 60. The early picture
+was two numbers that should have been one: the signature now mixes the height the
+frontend rendered the element at and the rows the browser laid its widgets out in,
+and a capture takes a single measurement, so surface, box and ink agree and a node
+that finishes rendering after its first look is re-pictured instead of kept
+half-drawn.
+
+**v2.6.6 answered the ninth report, and the answer was a mechanism rather than a
+measurement.** Three things. **(1) The mark was the wrong property.** v2.6.5 had
+already measured the tool's own per-frame cost to zero and the performance still
+dropped, so the cost left could only be the frontend's own painting — which
+`opacity: 0` does not stop (an opacity-0 subtree stays in the render tree and is
+still painted). The stand-in attribute now hides the element's *children* with
+`visibility: hidden`, which an engine skips in the paint phase, while the element
+itself keeps its box, its layout, its observers and its hit-testing; a frame at low
+zoom no longer owes the browser a single node's DOM paint. The trade is stated,
+not hidden: a widget inside a stand-in does not take its own clicks at that zoom,
+and the node's accessibility entry is that of a hidden subtree. **(2) The picture
+was missing the node.** The frame, the header bar, the body panel, every widget's
+own row and the slot dots are read from the frontend's own structure
+(`node-inner-wrapper`, `node-header-<id>`, `node-body-<id>`, each widget's element,
+`.slot-dot`) and drawn by the same ink the live box uses — the surface the content
+sits on was simply absent, which is what "semi, not fully there" described. **(3) The capture was not waiting.** Upstream
+has no per-node tick; a node is assembled over several passes (mount, slot sync,
+layout, widgets, media decoding), and the capture lane is deliberately its own, so
+a capture right after a change read the DOM between two of those passes. A settle
+window (`LOD_SNAP_SETTLE_MS` = 300 ms, opened when a node is first drawn as a
+stand-in and re-opened by every change, enforced as a lane gate) makes a burst of
+rendering cost one picture at the end. The "capture process of our own" the report
+offered is what this pathway already is: DOM-to-canvas does not exist, and the
+library routes would re-rasterise the node tree per capture on the CPU — the cost
+the pathway exists to remove.
+
+What the boxes carry (v2.6.1, completed in v2.6.2, made to work in v2.6.3): the
+node's own content, drawn live from the two routes it takes to the page —
+widget-borne elements (`WidgetDOM.vue` mounts `widget.element` into the node) and
+everything the node renders itself (`ImagePreview.vue`'s `<img>` elements, a
+custom node's `<canvas>`), the latter drawn at its laid-out position through
+`lodVueRootMetrics` (rect arithmetic in node-local units, cached on the node's own
+size, rationed per frame). A *photograph* of the node remains impossible: no
+browser API draws a DOM element into a canvas, and the `<foreignObject>` route
+cannot fetch the images that matter. Recorded in `ANALYSIS.md` with the two
+rejected routes, so nobody re-opens it without new information. The box is the
+*element's* box (image nodes are rendered 232 px taller than their graph size),
+and the zoom used to convert the measurements is measured from the element, never
+read from `canvas.ds.scale` — a capture sets that to 1.
+
+Remaining gap, deliberately not closed: a pack whose preview is a *canvas* widget
+(`drawWidget`) with no DOM rendering has nothing on the page for the box to
+carry in this renderer — unlike the frontend's own preview, which `ImagePreview.vue`
+also renders as DOM. Closing it would mean running a pack's canvas draw against
+the live frame context for every blanked node, which is exactly the per-frame
+cost this pathway exists to remove.
+
+Open, and deliberately not guessed at: **how much this saves on a real heavy
+Vue-nodes graph — and whether the v2.6.3–v2.6.6 fixes are enough on the user's own
+page.** Since v2.6.6 the saving has a mechanism as well as a count: the frontend's
+own painting of the stand-in nodes is skipped (`visibility`, and `vuePaintSkipped`
+counts it), the picture carries the node's structure, and the capture waits for the
+node to settle; since v2.6.7 it is not dropped while it is out of date either, so
+the saving is not paid back as a box on screen (1020 of 1800 frames with a box in
+the A/B, 17 after; an average of 7.14 boxed nodes a frame against 0.45, and 23.8
+blits a frame against 20.4). v2.6.8 closed the fidelity half of the same question:
+the frontend has no zoom-based level of detail (verified against `LGraphNode.vue`,
+`TransformPane.vue` and `drawNode`, and reported from the page by `lodVueLodProbe`),
+and what made a stand-in look unlike the node was the picture itself — Tailwind 4
+`oklch()`/`oklab()` colours a canvas silently ignores, text drawn as one Arial line,
+a muted node drawn at full strength, and the frontend's own widget rows never read
+(now read, with the control's value drawn as the control it is). v2.6.9 closed the
+two items that were still open between reports, both by tracing rather than
+guessing: the panel's "N element(s) hidden" is the page's own count (the class
+`ants-lod-box` for a node's DOM widgets, the attribute `data-ants-dom-hidden` for a
+Vue node's own element, one mark per element dressed, and a walk of the page finds
+exactly that number — pinned by a test), and a Vue stand-in never has to say
+anything about a run at all, because a node whose state is live is never boxed
+there: it keeps its element and the frontend draws its own bar, its error ring and
+its executing outline, while the canvas renderer's boxes read the marks from the
+node's own fields (`node.progress`, `node.has_errors`), per frame, from nodes the
+capture lane and the blit both refuse while either is set. The tracing also turned
+up one visible defect and fixed it: the selection ring on a picture was drawn at
+the node's graph size rather than at the box the node was pictured in (in the Vue
+renderer the element's own body), so a node the frontend renders taller than its
+`size` was ringed inside itself, and the ring changed size the moment its picture
+replaced the live box. What is still not measurable from here is the rasteriser's bill on
+the user's machine (Electron, GPU/hardware acceleration off) — DevTools' paint
+flashing is the direct way to see it, and the frame budget plus the Stalls tab are
+the tool's own instruments. Each report has been a state the harness could model only after the fact:
+a class Vue rewrote, a picture half that was off, a picture with no text in it, a
+plan fighting the setting once per frame, a picture taken before the node had
+finished rendering, a poll the page could have answered itself. The user's page
+remains the live test. The nine live reports so far (v2.5.6 "pictures with no
+content"; v2.6.0 "nothing in Nodes 2.0"; v2.6.2 "only text nodes have content";
+v2.6.3 "no pictures and no disk files at all"; v2.6.4 "captured box previews,
+cached boxes in the canvas workspace, and a canvas that flickers when the stand-in
+mode is not pictures"; v2.6.5 "photographed too early, and the stand-ins drop the
+frame rate"; v2.6.6 "the performance hit is the same, and the stand-ins still look
+half-rendered"; v2.6.7 "still not there yet: flat rectangles at 42 % and the
+performance hit unchanged"; v2.6.8 "we are still half-way there — and does the
+frontend have its own zoom-based LOD?") each found something the harness could not, and the harness has been
+strengthened by each one — the last pass added the two change observers (with
+`withQuiet` so a pan or a zoom is not mistaken for a box change), a walk of the page
+for the two hide marks (so a count the panel prints can be held to the page it is
+about), a Vue re-render
+that rewrites `className`, an `isConnected` that tells the truth, the element's
+real height, the frontend's transform pane (so the DOM zoom is exercised the way
+the page writes it), a `getComputedStyle` that resolves transforms the way a
+browser reports them, a shim that *says* when a selector is one its own grammar
+cannot express (`document._qsaUnsupported` — the v2.6.8 pass found the reader had
+been asking for the widget grid's rows with a child-combinator selector the tests
+silently answered with nothing), and `ANTS_TRACKER` so the suite can be pointed at
+a copy of the tracker for the mutation battery.
+A stand-in picture in this renderer is drawn, not photographed. The frontend composites all nodes in one transformed container
+(O(1) pan/zoom by design — `useTransformState.ts`), so panning and zooming are not
+where the cost is; v2.6.5 measured the rest and **withdrew the "fewer node pixels"
+claim**: `opacity: 0` keeps the element rendering, so the saving is not
+established, while the *cost* is now zero per frame (no attribute writes, layout
+reads, DOM queries or computed styles at 40, 60 and 150 nodes). Whether it saves
+frames on a given graph is what the tool's own frame budget and its Stalls tab
+measure on that page — and if the frame rate still drops, the honest next step is
+to price the blits and the blanked DOM's paint with those instruments rather than
+to add another mark that would cost the node its hit-testing. A second
+open question: the frontend is growing an ECS-based renderer (`arrangeForLegacyRender`,
+`hitTargetAuthority`, `canvasRedrawBudget`), which may itself introduce a
+low-quality node mode — if it does, this pathway should hand that work over rather
+than compete with it.
+
+**Renderer compatibility — checked against the frontend, not assumed
+(v2.5.5).** On ComfyUI's newer frontend (Nodes 2.0 / Vue nodes,
+`LiteGraph.vueNodesMode`) every node is a DOM element and `drawNode` returns
+immediately, so a stand-in box would be painted *behind* the thing it replaces
+and a capture of it would be blank. The engine now reads the same flag the
+frontend sets, reports itself off there rather than queueing blank captures,
+and the readout names the renderer instead of blaming a setting; the focus
+half (widgets stop answering, off-screen culling) still works, and the link
+settings are canvas-side and unaffected. The upstream contract this was
+checked against, file by file, is in `ANALYSIS.md`. Not otherwise a change to
+this track: nothing about the capture design depends on which renderer the
+page uses.
+
 **K1. The capture engine, ported and credited (M) — DELIVERED in v2.3.0.**
 Shipped as designed, with three decisions the code argues for and this file
 records: (a) a snapshot replaces a *flat box*, never a live node, so the flatten
@@ -458,6 +644,98 @@ must never be entangled with node stand-ins, and must prove its own value in the
 link A/B (the thinned-link work already has that harness). Deliberately after K2,
 and only if K2 shows that bitmap reuse survives real graphs.
 
+**K9. The flicker ledger and the completeness gate — built (v2.7.0).** The
+twelfth report's two defects and one question, all landed: a node's element is
+identified by the `data-node-id` it carries (a cached element is trusted only
+while it still says it is this node's), the mark is re-applied inside the
+observer callback that reports the frontend's new element — additions first, so a
+removal cannot answer for a node whose replacement is already in the report —
+with a 500 ms memory for a replacement split across tasks (`lodVueOrphan`), two
+explicit hand-back rules (an element taken off this node is handed back; an
+element given to another node keeps that node's mark), and a capture only taken
+once the node is finished (`lodVueShotWait`: laid out, its own images arrived, the
+page's fonts loaded — each wait named in the readout and counted, with the settle
+ceiling still the backstop). The page's font state joined the signature, so a
+fallback-font picture cannot outlive the font. Tests and the mutation battery are
+in `CHANGELOG.md`; the one edit that survives (the ordering inside one callback) is
+recorded there as unobservable in a harness that delivers one record per DOM
+operation.
+
+**K11. What a picture still cannot carry — the honest remainder (S, ongoing).**
+v2.7.1 closed the two structural holes the thirteenth pass left (the node's icons —
+an SVG mask in a computed style, not an element — and the badge pills/footer band,
+read from the page's own anchors by relationship). What is left, in the order it is
+worth doing, each only with evidence from the user's own page:
+
+- **A page-injected icon stylesheet is not noticed until the node changes** (the
+  watched beat is 5 s by design). Recorded in `ANALYSIS.md` and `memory.md` §7. A
+  fix would have to be *free* in the steady state — a per-frame query is not.
+- **The collapsed-node bar** (a collapsed node in this renderer is a header strip with
+  its own dots and progress line) is not read as its own shape; the reader draws the
+  header and the dots, and the bar only exists while a collapsed node is executing —
+  which is a node that keeps its own element, so nothing is lost today. Revisit only
+  if a report shows a collapsed stand-in that looks wrong.
+- **A pack's canvas-drawn widget content** is still invisible in this renderer (the
+  widget has no element to walk), and a pack's own HTML stays blank and counted. That
+  is a limit of the page, not of the reader.
+- **The state marks** (progress, error ring, executing outline) are the frontend's own
+  live drawing — a running, erroring or dragged node keeps its own element, so a
+  picture never has to carry them. The one case left is a node that *starts* running
+  while its picture stands in: `lodVueFlatNode` hands the element back on the next
+  draw, and the readout counts it (`vueRestored` / the stand-in counters). If a user
+  reports seeing a stale picture during a run, the answer is in the counters first.
+
+**K12. After the capture floor, what else the lane costs (S, ongoing).** v2.7.2
+bounded the *rate* (600 ms between two pictures of one node, 5 s between two files
+while it churns) and measured what the harness can measure. What is left to prove on
+the user's own page, in the order it is worth doing: the re-measure that follows a
+**page report** for a node that already holds a picture (attributed 30/24/6 ⇒
+pictured 168 / live 90 / skip 36, captures Δ0, with `lodVueMediaBudget`'s one ration
+per frame explaining the skips) — bounded by design, but the first number to look at
+if the frame cost is still high after the floor; the frontend's own `renderFrame`
+stalls the report attributes through this tool's pass-through wrapper (743 calls,
+55.6 s, 4.3 s of forced layout in the thirteenth report), which is *not* the capture
+lane and needs its own attribution pass on a real page; and the per-setting price of
+the stand-in pathway once the graph is quiet, which the panel's abortable A/B
+(`lowZoom.measureLinks`'s sibling for node drawing) does not yet cover.
+
+**K13. The containment lever: `content-visibility: auto` on node bodies (M).**
+NodeSnapshots ships this as its Nodes 2.0 optimization (`vue.mjs`): the browser then
+may skip layout/paint of a body that is offscreen, so the cost falls on the browser's
+own render path rather than on a picture this tool draws, and the node is *not*
+photographed at all. It is the one lever of theirs this tool leaves unused, and the
+reason is not preference — it interacts with two things this project has already
+been burned by. (1) A skipped body's intrinsic size must be pinned
+(`contain-intrinsic-size` from a measured value) and the frontend's own resize
+observer re-fires while the browser churns, which re-makes pictures here through the
+signature; their README records exactly that churn and a long warm-up as the price.
+(2) A subtree the browser is not laying out is a subtree the reader cannot measure,
+and this project's rule is that a node is measured when the page reports a change —
+so the lever needs a *paid-for* exception path for the node the user is pointing at
+(`:hover`/`:focus-within`/state outline, as theirs does). To try it: on the user's
+graph, with the invalidation counters and the stall counters visible, compare
+pictures-warm + rects/frame + `renderFrame` stalls for bodies with and without
+containment, at 10 % zoom and at 100 %. Ship only if the counters improve and a
+picture is never made from a skipped body.
+
+**K10. A real pixel screenshot — speculative, needs a machine with a browser
+(S–M).** The twelfth report asked for the capture to be "simple screenshots of the
+nodes as the frontend is showing them to the human". A DOM element cannot be drawn
+into a canvas by any page API; the only route is a rasteriser: clone the node,
+inline its computed styles with a diff (the `getDiffStyle` pattern
+`modern-screenshot` uses), wrap it in `<svg><foreignObject>`, encode it as a data
+URL, `createImageBitmap` it and `drawImage` it onto the capture surface. Written
+out against documented behaviour and **not shipped** — a picture path that cannot
+be A/B'd is exactly the change this feature's live page has caught five times. To
+try it: on the user's own Electron, compare a rasterised node against the drawing
+this tool already makes, per node type, at the capture ratios, on a CPU-only
+machine — the question is not whether it looks better in one case but whether it
+is *cheaper* than the DOM read plus the settle gate, per capture, at 40+ nodes.
+The same experiment answers the other half: whether the tool can hand the
+rasterised node to the compositor instead of blanking the element (`plan.md`'s
+old "an `<img>` overlay" note), which is the only version of a screenshot that
+could also stop the paint.
+
 ## Track L — Console: attribution before silencing (M)
 
 [DisableBrowserLogs](https://github.com/SparknightLLC/ComfyUI-DisableBrowserLogs)
@@ -513,6 +791,18 @@ version is stronger than the legal minimum, and the user asked for credit
 - While that file exists, this repo should carry its own `LICENSE` — it currently
   has none, which is a poor look for a project that is about to embed someone
   else's notice.
+
+**Done (v2.5.4):** `LICENSE` (MIT, this repository),
+`THIRD_PARTY_NOTICES.md` with the NodeSnapshots notice verbatim (and the
+PHOSPHOR note), the README **Credits** section, and the same text in this
+pass's commit message. What was actually taken is smaller than the plan
+assumed: no code was copied from either upstream project — the stand-in
+engine is a re-implementation of the idea on this file's own seams, and the
+console mode is still unbuilt. DisableBrowserLogs carries no licence file at
+its root, so it is credited as an idea only; `THIRD_PARTY_NOTICES.md` says
+that plainly rather than shipping a notice it cannot vouch for. A source
+header naming the upstream work sits above the snapshot engine in
+`web/tracker.js`.
 
 ## What this must not become
 
