@@ -1,10 +1,10 @@
 # What works, what fails, and what was taken out
 
-An audit of the repository as of v2.6.8, done by reading the sources rather
-than the docs, running the suites, and running the demo. Every claim below
-has a file and (where it matters) a line reference. Found defects were fixed
-in the same pass; retired ideas were removed rather than documented as if
-they still existed.
+The initial audit was written against v2.6.8 by reading the sources rather
+than the docs, running the suites, and running the demo. Follow-up pass notes
+below extend that evidence through v2.7.4. Every claim has a file and (where it
+matters) a line reference; defects found in each pass were fixed or recorded as
+open rather than documented as if they no longer existed.
 
 ## How this was checked
 
@@ -893,6 +893,24 @@ independent witness: NodeSnapshots' `theme_signature()` filters root class names
 to a moved colour, which is the half this tool now reads (see
 `docs/node-snapshots.md`).
 
+### The seventeenth pass (v2.7.4): state marks, the warning badge and text bounds
+
+This pass closes the state-overlay request and verifies text through each distinct
+reader instead of treating the phrase "2,000-character cap" as one behaviour.
+
+| # | What was required | Implementation / test evidence |
+| --- | --- | --- |
+| 1 | Keep a Vue stand-in visible while progress/error state changes; do not freeze those marks into the held picture. | `lodSnapLive` allows progress/error for the Vue reuse path; `lodSnapPaint` blits the held picture and draws marks from current `node.progress` / `node.has_errors`. Those fields are excluded from the Vue signature and active-state enqueue, so the picture is neither invalidated nor recaptured. Tests hold a captured picture through both state changes and their clearing, and assert one blit, live marks, unchanged capture/invalidation counts. Canvas-renderer nodes with progress/errors remain live. Video and link drag still hand the Vue element back. The Vue executing outline is not recreated; only progress/error marks are overlaid. |
+| 2 | Put the requested amber/black high-voltage symbol on a stand-in at first use and in stored pictures. | `lodSnapWarningBadge` paints on the live fallback box and on the capture only after the ink check, before mips/disk write. Its version is mixed into the signature so older RAM/disk pictures miss. Test observes the live badge before capture, its order after `getImageData`, and that a badge alone cannot validate a blank capture. |
+| 3 | Preserve pathway-specific text behavior. | Ordinary Vue DOM leaves cap at 2,000 characters and mark the cut; the test places sentinels on both sides. Vue textarea values are passed without that hard cut and wrap/clip by available line room (tested with a >2,000-character value that fits its enlarged box). The canvas DOM-widget route remains a hard 2,000-character / 12-line slice, separately tested. The previous wrapper ellipsized solely because a string exceeded 2,000; it now reports clipping from line overflow, leaving the canvas caller to apply its own explicit cap. |
+
+The suite is **246**. These are harness correctness claims, not a live Electron
+performance or pixel-fidelity result. The user's report with low-zoom drawing off
+does not establish the estimated ~15 fps with stand-ins versus ~25 fps without;
+that needs paired reports with the setting actually enabled/disabled and all other
+conditions held constant. The reported dark control/background mismatch is still
+undiagnosed, and no screenshot-level A/B was available here.
+
 ## The stand-in pictures: what a capture actually contains, and where the cache went wrong
 
 The user's report was specific: image loaders and mask editors show a stand-in
@@ -993,6 +1011,7 @@ apply, not just in the docs.
 
 ## Still open
 
+- **The performance claim and thumbnail appearance still need the user's live Electron.** The supplied telemetry had low-zoom drawing off, so it cannot substantiate the estimated ~15 fps with stand-ins versus ~25 fps without. Run paired reports with the stand-in threshold actually on/off, same graph/zoom/display scale, and compare FPS, p95/p99/max, `bound renderFrame` stalls/forced layout, and stand-in counts. The dark control/background difference also remains undiagnosed; the harness asserts draw operations/layout, not pixel equivalence. Disk-path tests cover renderer switching and re-capture, but the user's empty-folder repopulation check remains unconfirmed. Progress/error overlays are implemented in v2.7.4; the separate Vue executing outline is not recreated.
 - **Firefox and Safari behaviour** is design-verified, not run-verified here:
   the code paths that read `performance.memory` and long tasks are guarded
   and the panel prints "not available" instead of a number, but no browser

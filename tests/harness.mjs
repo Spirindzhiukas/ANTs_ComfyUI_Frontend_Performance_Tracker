@@ -214,6 +214,7 @@ export function createHarness(options = {}) {
     "beginPath",
     "moveTo",
     "lineTo",
+    "closePath",
     "bezierCurveTo",
     "arc",
     "rect",

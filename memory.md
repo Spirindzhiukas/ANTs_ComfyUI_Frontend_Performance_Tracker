@@ -4,11 +4,12 @@ A running record for whoever picks this up next (including me). `CLAUDE.md` is t
 rules for changing the code; `plan.md` is where it is going. This file is the past:
 what was built, what was rejected, and what the evidence was.
 
-Last updated at **v2.7.3**, 240 tests green, PR #2 on
-`Spirindzhiukas/ANTs_ComfyUI_Frontend_Performance_Tracker` (merged into `main`).
+Last updated at **v2.7.4**, 246 Node tests green. Current work is on
+`arena/01a1089b-ants-comfyui-frontend-performa`; the live Electron checks below
+remain open, and this update is not yet merged into `main`.
 
-**Not the end of the work: `task_continuation.md` opens with what the user is still
-waiting for and the first thing the next session should do.**
+`task_continuation.md` is the current handover: the code-level criteria that are
+closed, the checks still to run, and the user's two remaining live-page questions.
 
 ---
 
@@ -16,8 +17,8 @@ waiting for and the first thing the next session should do.**
 
 | | |
 | --- | --- |
-| Version | 2.7.3 (`web/tracker.js` `VERSION`) |
-| Tests | 240 (`node tests/run-tests.mjs`), plus `tests/test_init.py` |
+| Version | 2.7.4 (`web/tracker.js` `VERSION`) |
+| Tests | 246 (`node tests/run-tests.mjs`), plus `tests/test_init.py` and `tests/demo.mjs` release checks |
 | Frontend | `web/tracker.js`, one ES module, no dependencies. The separate window is `web/window.html`, served at `/ants_optimizer/window`, not loaded as an extension. |
 | Backend | `__init__.py` — node `ANTs_Frontend_Optimizer` (old class key kept as an alias), nine best-effort routes (GPU, five thumbnail routes, the window page, `/ants_optimizer/ui`), and thumbnail read/write under ComfyUI's temp folder |
 | Panel | 10 tabs: Node Rendering Settings, Status, Timing, Nodes, Stalls, Governor, Load, Memory, GPU / VRAM, Testing |
@@ -39,6 +40,14 @@ something has to be drawn less or hit-tested less.
 ## 2. Version log
 
 The commit log is the full record; this is the "why", newest first.
+
+**v2.7.4 — live Vue state marks, the high-voltage badge, and route-specific text bounds.** Kept the Node 2.0 stand-in up through progress/error changes: `lodSnapLive` can permit state marks for the Vue blit path while video/link-drag remain live-element exceptions; `lodSnapSignature` leaves `progress` / `has_errors` out of the Vue signature; `lodSnapEnqueue` drops a pending capture while either is active; `lodSnapPaint` draws `lodSnapStateMarks` after blitting the held picture, from the current fields. Clearing state takes the overlay away on the next draw without capture churn. The classic canvas renderer is unchanged: running/erroring nodes remain live. Regression covers state arriving over one held picture, both marks painted, no invalidation/recapture, clear state, and the existing video/link-drag handback; the previous no-flicker lifecycle remains covered. The Vue root's separate executing outline is not reconstructed and should not be claimed as preserved by this pass.
+
+Added the classic amber/black warning triangle with bolt to every stand-in. `lodSnapWarningBadge` paints on the live fallback and the capture after the ink test but before mipmaps/disk persistence; `LOD_SNAP_BADGE_VERSION` is in the signature, so old memory/disk pictures are re-made. Its regression checks live-before-capture, ink-test ordering, and that the decorative badge cannot make a blank capture pass. The badge helper now explicitly restores the canvas style state as well as using `save`/`restore`, because the test context's no-op restore had leaked black `strokeStyle` into the next node draw (the first full-suite run exposed it; after the fix the full suite passes). The fake context now records `closePath`, and `tools/box-preview.mjs` serializes path fills/strokes as SVG, so regenerated HTML/SVG previews visibly include the triangle, outline and bolt instead of silently dropping the badge.
+
+Separated the three text routes, correcting a 2,000-character form-value cap that was introduced during implementation and did not match the user's explicit distinction: (1) ordinary Vue DOM leaves slice at `LOD_VUE_TEXT_CHARS = 2000`, with same-length middle edits hashed in the actual visible prefix; (2) Vue `<textarea>` / form values are not hard-sliced at 2,000 and are wrapped/clipped to the available box lines; (3) the classic canvas DOM-widget composite still hard-slices at `LOD_SNAP_TEXT_CHARS = 2000` and limits to 12 lines. Tests pin each distinction: ordinary Vue text's prefix/cut mark, a >2,000-character textarea whose tail fits after enlarging the box, the 12-line/two-thousand-character canvas path, and the existing middle-edit recapture. The generic wrapper no longer ellipsizes merely because the source string exceeds 2,000; callers decide clipping from their own character/line limits.
+
+**Tests: 246 passing.** The report that estimated ~15 fps with stand-ins / ~25 without had low-zoom drawing off; it cannot substantiate that delta. No CPU-only Electron A/B was run in this sandbox. Also still open: the reported dark control/background mismatch and pixel-level comparison of the reconstructed Nodes 2.0 picture. Documentation (`README.md`, `CHANGELOG.md`, this log, `ANALYSIS.md`, `plan.md`, and the renderer contract) records these as unverified rather than claiming a visual/performance win.
 
 **v2.7.3 — the theme signature was reacting to words instead of colours.** Found while attributing the capture lane's rect reads: the lane's theme signature was the roots' `className` plus inline styles, so it did the exact opposite of what a theme watcher is for. A probe (`/tmp/probe/theme.mjs`, 20-node scene, 300 frames after warm-up) showed 120 captures / 6 clears / 15 600 rects from flipping a transient `<body>` class every 50 frames, and **0 / 0 / 0** from moving a background colour — the store was being wiped by a drag class and left alone by a real palette change. The fix splits the two jobs: `lodSnapThemeSig` builds a cheap key (class names + every inline style name/value) and, only when that key moves, re-samples `LOD.snapThemeCols = lodSnapThemeColors(roots)` — the roots' `getComputedStyle().backgroundColor|color`, inside a `try` so an unreadable palette is not a change — and **the colour sample is the signature**; inline `--*` properties still go into the signature directly. A palette can move with the capture lane idle, so `lodVueFramePlan` re-samples on a 2 s beat (`snapThemeAt`) and clears via `lodSnapClear("theme")` only then. Probe after: class ⇒ 0/0/1 300, colour ⇒ 120/6/15 600. New test (*a class the page toggles is not a theme change, and a moved colour is*, 4 nodes, 6 × 500 ms flips then `rgb(9, 9, 9)` + `advance(2200)`): fails pre-fix, passes now. **Tests: 240.** The same pitfall independently appears in NodeSnapshots, whose `theme_signature()` keeps only class names matching `dark|light|theme` — read on 2026-10-04 together with its `dom-cache.mjs` (the raster-overlay design: a `<canvas data-node-snapshot-raster>` appended inside the node element, `[data-node-snapshot-image]` hiding `[data-testid="node-inner-wrapper"]`, `:hover`/`:focus-within`/state-outline CSS restoring the live node) and its `settings.mjs` (`capture_budget_ms` 3, `slow_capture_ms` 32, `idle_delay_ms` 50, `max_dimension` 2048, `pixel_ratio` 2, `memory_mb` 256). Its one lever this tool still leaves unused is `content-visibility` on node bodies — see `plan.md` K13.
 

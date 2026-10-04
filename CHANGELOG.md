@@ -4,6 +4,47 @@ Version history for ANTs_ComfyUI_Frontend_Performance_Tracker. Newest first.
 The current behaviour is in `README.md`; the reasoning behind each release is in
 `memory.md`; the rules for changing the code are in `CLAUDE.md`.
 
+## What changed in v2.7.4
+
+- **Progress and errors now stay live over a held Nodes 2.0 picture.** The stand-in
+  remains in place while a Vue node runs or errors; the current `node.progress` bar
+  and `node.has_errors` stroke are drawn over the existing bitmap on each reuse.
+  Those transient fields are excluded from the Vue picture signature and capture
+  queue, so they are never frozen into the bitmap and do not trigger a recapture;
+  clearing either mark removes it on the next draw. The classic canvas renderer
+  still draws running/erroring nodes live. Video and link-drag handling still hands
+  the Vue element back to the frontend. The separate Vue executing outline is not
+  reconstructed by this change.
+
+- **Every stand-in gets the requested high-voltage badge.** An amber triangle with a
+  dark border and lightning bolt is drawn on the live fallback box immediately,
+  then baked into a picture only after the capture has passed its ink check — so a
+  decorative mark cannot make an otherwise blank capture look valid. It is included
+  before mipmaps and disk persistence. A badge-version token invalidates older RAM
+  and disk pictures so they cannot silently reappear without the mark.
+
+- **Text limits are now explicit per pathway.** Ordinary Vue DOM text is capped at
+  2,000 characters per string; same-length edits inside that prefix are hashed in
+  full and refresh the picture. Vue form values, especially textarea prompts, are
+  passed to wrapping intact and clipped by available lines rather than hard-sliced
+  at 2,000. The separate canvas DOM-widget composite still slices values at 2,000
+  characters and keeps its 12-line limit. Regressions cover each route, including a
+  textarea value beyond 2,000 characters that fits its enlarged box and is drawn
+  through its tail sentinel.
+
+- **Tests: 246.** New coverage also proves that marks overlay a held picture without
+  capture/signature churn, the badge is live before capture and appears only after
+  the ink probe, and a badge alone cannot validate blank content. Both
+  `preview/boxes.html` and `preview/boxes.svg` were regenerated; the preview tool now
+  serializes the painter's path operations so the amber triangle, dark outline and
+  lightning bolt are visible there too.
+
+- **What is not claimed:** these are source/harness correctness results, not a live
+  CPU-only Electron FPS or pixel-fidelity result. The supplied performance report
+  had low-zoom drawing off, so it does not establish the user's estimated ~15 fps
+  with stand-ins versus ~25 fps without. Dark control/background differences in
+  Nodes 2.0 remain undiagnosed; both require a real-page comparison.
+
 ## What changed in v2.7.3
 
 - **The theme signature was backwards: it reacted to class names and was blind to

@@ -3105,20 +3105,72 @@ suite("drawing: the Nodes 2.0 (Vue nodes) frontend", () => {
     assertEqual(h.tracker.lowZoom.state.nodes, simplified, "and not one more node draw is counted as simplified");
   });
 
-  test("a node that is running, erroring or playing a video keeps its own element", async () => {
+  test("execution and error marks stay on Vue stand-ins; video and link drag keep the live element", async () => {
     const h = await boot();
-    const { nodes } = vueGraph(h, 3);
-    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true });
-    nodes[0].progress = 0.5; // a running node draws its own bar
-    nodes[1].has_errors = true; // an error stroke is live state
+    const { nodes, vue } = vueGraph(h, 4);
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true, diskOn: false });
+    nodes[0].progress = 0.5;
+    nodes[1].has_errors = true;
     const video = h.document.createElement("video");
     const host = h.document.createElement("div");
     host.appendChild(video);
     nodes[2].addDOMWidget("preview", "video", host, { hideOnZoom: false });
     draw(h, 2);
-    const api = snapApi(h);
-    assertEqual(api.vueBlanked, 0, "none of the three is blanked");
-    assertEqual(api.vueBoxes, 0, "and no box is painted over a node that draws itself");
+    assert(vue.rootFor(nodes[0]).hasAttribute("data-ants-vue-standin"), "a running node stays a stand-in");
+    assert(vue.rootFor(nodes[1]).hasAttribute("data-ants-vue-standin"), "an erroring node stays a stand-in");
+    assert(!vue.rootFor(nodes[2]).hasAttribute("data-ants-vue-standin"), "a video keeps its live element");
+    assert(vue.rootFor(nodes[3]).hasAttribute("data-ants-vue-standin"), "an ordinary node is still a stand-in");
+    const marks = h.canvas.ctx.ops;
+    assert(marks.some((o) => o[0] === "fillRect" && o[1] === 0 && o[2] === 0 && o[3] === 100), "the live progress value is painted over its stand-in");
+    assert(marks.some((o) => o[0] === "strokeRect" && o[1] === -12), "the live error stroke is painted over its stand-in");
+    assertEqual(snapApi(h).captured, 0, "a transient state is never frozen into a picture");
+
+    // Link-drag handling still returns the element before the browser paints it.
+    h.canvas.connecting_node = nodes[3];
+    draw(h, 1);
+    for (const n of nodes) assert(!vue.rootFor(n).hasAttribute("data-ants-vue-standin"), "link drag keeps every node element live");
+    h.canvas.connecting_node = null;
+    draw(h, 1);
+    assert(vue.rootFor(nodes[3]).hasAttribute("data-ants-vue-standin"), "the stand-in returns when link drag ends");
+  });
+
+  test("progress and error marks overlay a held Vue picture without changing or recapturing it", async () => {
+    const h = await boot();
+    const { nodes, vue } = vueGraph(h, 1);
+    stripWidgets(nodes);
+    const n = nodes[0];
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true, diskOn: false });
+    draw(h, 2);
+    await idle(h);
+    assertEqual(snapApi(h).captured, 1, "the stable node has one held picture");
+    const rec = snapApi(h).captured;
+    const invalidated = snapApi(h).invalidated;
+
+    n.progress = 0.25;
+    n.has_errors = true;
+    h.advance(150); // past the signature check window
+    await h.flush();
+    h.canvas.ctx.ops.length = 0;
+    draw(h, 1);
+    assert(vue.rootFor(n).hasAttribute("data-ants-vue-standin"), "the live element stays blanked behind its stand-in");
+    assertEqual(h.canvas.ctx.ops.filter((o) => o[0] === "drawImage").length, 1, "the existing picture stays on screen");
+    assert(h.canvas.ctx.ops.some((o) => o[0] === "fillRect" && o[1] === 0 && o[2] === 0 && o[3] === 50), "the quarter-width progress mark is painted over the picture");
+    assert(h.canvas.ctx.ops.some((o) => o[0] === "strokeRect" && o[1] === -12 && o[2] === -12), "the error stroke is painted over the picture");
+    assertEqual(h.tracker.lowZoom.flat.boxBars, 1, "the dynamic progress mark is counted");
+    assertEqual(h.tracker.lowZoom.flat.boxErrors, 1, "the dynamic error mark is counted");
+    assertEqual(snapApi(h).captured, rec, "neither live mark was baked into a replacement picture");
+    assertEqual(snapApi(h).invalidated, invalidated, "state changes do not invalidate the held visual");
+
+    n.progress = 0;
+    n.has_errors = false;
+    h.advance(150);
+    await h.flush();
+    h.canvas.ctx.ops.length = 0;
+    draw(h, 1);
+    assertEqual(h.canvas.ctx.ops.filter((o) => o[0] === "drawImage").length, 1, "the same clean picture remains held");
+    assertEqual(h.canvas.ctx.ops.filter((o) => o[0] === "strokeRect" && o[1] === -12).length, 0, "the error mark vanishes when the live field clears");
+    assertEqual(h.canvas.ctx.ops.filter((o) => o[0] === "fillRect" && o[1] === 0 && o[2] === 0 && o[3] === 50).length, 0, "and so does the progress mark");
+    assertEqual(snapApi(h).captured, rec, "clearing state still needs no recapture");
   });
 
   // The fixture gives every node a canvas DOM widget (a 3D viewport's shape), so
@@ -4029,6 +4081,159 @@ suite("drawing: the Nodes 2.0 (Vue nodes) frontend", () => {
     // leads in by half the leftover line height (1.5) — y 24, the next one 18 down.
     assertEqual(`${Math.round(lines[0][2])},${Math.round(lines[0][3])}`, "12,24", "the first line at its own box");
     assertEqual(Math.round(lines[1][3] - lines[0][3]), 18, "and the next one a line height down");
+  });
+
+  test("long Vue text survives the per-string cap and a middle edit refreshes the picture", async () => {
+    const h = await boot();
+    const { nodes, vue } = vueGraph(h, 1);
+    const n = nodes[0];
+    stripWidgets(nodes);
+    vue.growRoot(n, 500); // enough room for the whole laid-out paragraph
+    const root = vue.rootFor(n);
+    const span = h.document.createElement("span");
+    const text = "a".repeat(312) + "MIDDLE_A" + "b".repeat(400) + "TAIL_SENTINEL";
+    span.textContent = text;
+    span.style.fontSize = "12px";
+    span.style.fontFamily = "Inter, sans-serif";
+    span.style.lineHeight = "18px";
+    span.style.color = "rgb(200, 210, 220)";
+    root.appendChild(span);
+    span._rect = { left: root._rect.left + 10 * 0.1, top: root._rect.top + (30 + 20) * 0.1, width: 180 * 0.1, height: 580 * 0.1 };
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true, diskOn: false });
+    draw(h, 2);
+    await idle(h);
+    const hasText = (needle) => h.canvases.filter((c) => c._ctx && c._ctx.ops.some((o) => o[0] === "fillText" && String(o[1]).includes(needle)));
+    assertEqual(snapApi(h).captured, 1, "the paragraph reached one stable picture");
+    assertEqual(hasText("TAIL_SEN").length, 1, "text past the former 400-character cap is present");
+    assertEqual(hasText("MIDDLE_A").length, 1, "the middle of the string is carried too");
+
+    // Same length, same layout, only a character in the middle changes. A head +
+    // tail-only signature misses this, leaving the old glyph in the stand-in.
+    const edited = text.replace("MIDDLE_A", "MIDDLE_B");
+    span.textContent = edited;
+    h.fireMutation(span);
+    await h.flush();
+    h.advance(400); // settle window plus the 100 ms signature gate
+    await h.flush();
+    draw(h, 1);
+    assertGreater(snapApi(h).invalidated, 0, "the same-length middle edit invalidates the held picture");
+    await idle(h);
+    assertEqual(snapApi(h).captured, 2, "the idle lane makes the replacement picture");
+    assertEqual(hasText("MIDDLE_B").length, 1, "the replacement carries the edited text");
+  });
+
+  test("ordinary Vue DOM text is capped at 2,000 characters and marks the cut", async () => {
+    const h = await boot();
+    const { nodes, vue } = vueGraph(h, 1);
+    const n = nodes[0];
+    stripWidgets(nodes);
+    n.size = [500, 700];
+    vue.place();
+    const root = vue.rootFor(n);
+    const span = h.document.createElement("span");
+    span.textContent = "a".repeat(1900) + "VISIBLE_TAIL" + "b".repeat(120) + "AFTER_CAP_SENTINEL";
+    span.style.fontSize = "12px";
+    span.style.fontFamily = "Inter, sans-serif";
+    span.style.lineHeight = "12px";
+    root.appendChild(span);
+    span._rect = { left: root._rect.left + 10 * 0.1, top: root._rect.top + 40 * 0.1, width: 500 * 0.1, height: 700 * 0.1 };
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true, diskOn: false });
+    draw(h, 1);
+    const lines = h.canvas.ctx.ops.filter((o) => o[0] === "fillText");
+    assert(lines.some((o) => String(o[1]).includes("VISIBLE_TAIL")), "content inside the first 2,000 characters is drawn");
+    assert(!lines.some((o) => String(o[1]).includes("AFTER_CAP_SENTINEL")), "ordinary Vue DOM text beyond 2,000 characters is not read into the picture");
+    assert(lines.some((o) => String(o[1]).endsWith("…")), "the ordinary-text cap is marked at the cut line");
+  });
+
+  test("a textarea keeps its top-aligned layout, clips by available lines, and has no 2,000-character cap", async () => {
+    const h = await boot();
+    const { nodes, vue } = vueGraph(h, 1);
+    const n = nodes[0];
+    stripWidgets(nodes);
+    const root = vue.rootFor(n);
+    const ta = h.document.createElement("textarea");
+    ta.value = "alpha\nbravo\ncharlie\ndelta";
+    ta.style.fontSize = "12px";
+    ta.style.lineHeight = "12px";
+    root.appendChild(ta);
+    ta._rect = { left: root._rect.left + 10 * 0.1, top: root._rect.top + (30 + 20) * 0.1, width: 100 * 0.1, height: 30 * 0.1 };
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true, diskOn: false });
+    draw(h, 1);
+    const lines = h.canvas.ctx.ops.filter((o) => o[0] === "fillText");
+    assertEqual(lines.length, 2, "only the two lines that fit in this textarea are drawn");
+    assertEqual(lines[0][1], "alpha", "the first explicit line is preserved");
+    assertIncludes(String(lines[1][1]), "…", "the clipped last visible line is marked");
+    assertEqual(lines[0][3], 22, "textarea text starts at the top of its laid-out box, not its centre");
+    assertEqual(lines[1][3] - lines[0][3], 12, "and follows the computed line height");
+
+    // Give the field enough room to display more than 2,000 characters. Vue form
+    // values are wrapped and clipped by their box, unlike ordinary DOM text and the
+    // separate canvas DOM-widget composite, which use a bounded character prefix.
+    n.size = [500, 700];
+    vue.place();
+    ta.value = "a".repeat(2400) + "TEXTAREA_TAIL";
+    ta._rect = { left: root._rect.left + 10 * 0.1, top: root._rect.top + 40 * 0.1, width: 500 * 0.1, height: 700 * 0.1 };
+    h.fireMutation(ta);
+    await h.flush();
+    h.canvas.ctx.ops.length = 0;
+    draw(h, 1);
+    const longLines = h.canvas.ctx.ops.filter((o) => o[0] === "fillText");
+    assertGreater(longLines.length, 12, "the Vue textarea uses the lines its larger box can hold, not the canvas widget's 12-line budget");
+    assert(longLines.some((o) => String(o[1]).includes("TEXTAREA_TAIL")), "text after the first 2,000 characters is still paintable when the box has room");
+  });
+
+  test("the high-voltage badge is visible immediately and baked only after a capture passes its ink check", async () => {
+    const h = await boot();
+    const { nodes } = vueGraph(h, 1);
+    stripWidgets(nodes);
+    const createElement = h.document.createElement.bind(h.document);
+    h.document.createElement = (tag, ...args) => {
+      const el = createElement(tag, ...args);
+      if (String(tag).toLowerCase() === "canvas" && el && typeof el.getContext === "function") {
+        const getContext = el.getContext.bind(el);
+        el.getContext = (...ctxArgs) => {
+          const ctx = getContext(...ctxArgs);
+          if (ctx && !ctx.__antsInkProbeLogged) {
+            const getImageData = ctx.getImageData.bind(ctx);
+            ctx.getImageData = (...probeArgs) => {
+              ctx.ops.push(["getImageData", ...probeArgs]);
+              if (ctx.paintLog) ctx.paintLog.push({ op: "getImageData", fill: ctx.fillStyle, alpha: ctx.globalAlpha });
+              return getImageData(...probeArgs);
+            };
+            ctx.__antsInkProbeLogged = true;
+          }
+          return ctx;
+        };
+      }
+      return el;
+    };
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true, diskOn: false });
+    h.canvas.ctx.paintLog.length = 0;
+    draw(h, 1);
+    assert(h.canvas.ctx.paintLog.some((p) => p.op === "fill" && p.fill === "#FFC000"), "the amber warning badge is on the live stand-in before capture");
+    await idle(h);
+    assertEqual(snapApi(h).captured, 1, "the node still gets its picture");
+    const cap = h.canvases.find((c) => c.width > 0 && c._ctx && c._ctx.paintLog.some((p) => p.op === "getImageData"));
+    assert(cap, "the capture's ink probe is observable");
+    const probeAt = cap._ctx.paintLog.findIndex((p) => p.op === "getImageData");
+    const amberAt = cap._ctx.paintLog.findIndex((p) => p.op === "fill" && p.fill === "#FFC000");
+    const blackAt = cap._ctx.paintLog.findIndex((p, i) => i > amberAt && p.op === "fill" && p.fill === "#111111");
+    assertGreater(amberAt, probeAt, "the amber triangle is baked after the original ink test");
+    assertGreater(blackAt, amberAt, "the black lightning bolt is drawn over the amber triangle");
+    assert(cap._ctx.ops.some((o) => o[0] === "stroke"), "the triangle has the classic dark outline");
+
+    const blank = await boot({ ink: "none" });
+    const { nodes: blankNodes } = vueGraph(blank, 1);
+    stripWidgets(blankNodes);
+    blank.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true, diskOn: false });
+    draw(blank, 1);
+    await idle(blank);
+    assertEqual(snapApi(blank).captured, 0, "the badge alone cannot turn a blank node into a valid picture");
+    assertEqual(snapApi(blank).blank, 1, "the original empty capture is still rejected");
+    assert(
+      !blank.canvases.some((c) => c._ctx && c._ctx.paintLog.some((p) => p.op === "fill" && p.fill === "#FFC000")),
+      "a rejected capture never stores the warning badge"
+    );
   });
 
   test("a colour the canvas cannot parse is translated, not dropped", async () => {
@@ -5267,6 +5472,25 @@ suite("drawing: what a stand-in picture contains", () => {
       1,
       "and the new picture has the new text in it"
     );
+  });
+
+  test("the canvas DOM-widget route hard-slices text values at 2,000 characters", async () => {
+    const h = await boot();
+    const n = domNode(h, "CLIPTextEncode", [2000, 1000]);
+    const ta = h.document.createElement("textarea");
+    ta.value = "x".repeat(2100) + "CANVAS_AFTER_CAP";
+    n.addDOMWidget("text", "text", ta, { hideOnZoom: false, y: 20, computedHeight: 800, width: 1980 });
+    h.tracker.lowZoom.set(gateBooter());
+    draw(h, 1);
+    await idle(h);
+    const lines = capturesWith(h, (o) => o[0] === "fillText" && String(o[1]).startsWith("xxxxxxxxxx"))
+      .flatMap((c) => c._ctx.ops.filter((o) => o[0] === "fillText" && String(o[1]).startsWith("xxxxxxxxxx")));
+    assertEqual(snapApi(h).captured, 1, "the wide node is captured");
+    assertGreater(lines.length, 0, "the text widget is repainted");
+    const visibleText = lines.map((o) => String(o[1])).join("");
+    assertEqual(visibleText.length, 2000, "the first 2,000 characters are repainted, with the cut mark replacing the final glyph");
+    assert(visibleText.endsWith("…"), "the hard cut is visible");
+    assert(!visibleText.includes("CANVAS_AFTER_CAP"), "text after the canvas route's limit is not drawn");
   });
 
   test("an image that has not loaded yet is left out, and drawn in when it arrives", async () => {

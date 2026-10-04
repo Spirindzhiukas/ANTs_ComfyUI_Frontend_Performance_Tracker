@@ -51,15 +51,18 @@ one of these files.
 | --- | --- |
 | `node.progress` and `progressValue` are set only while a node runs. | `nodeProgressCanvasSync.ts` |
 | `node.has_errors` is reconciled with `node:property:changed`. | `useNodeErrorFlagSync.ts` |
-| In Vue mode there is **no execution state on the canvas**. | Vue-mode `drawNode` early-return |
-| A running, erroring or dragged node keeps its own element here. | `lodVueFlatNode` refuses exactly the nodes `lodSnapLive` refuses |
+| In Vue mode there is **no execution state on the canvas** until this tool paints it. | Vue-mode `drawNode` early-return |
+| A video or active link drag keeps the Vue element live. | `lodVueFlatNode` / `lodSnapLive` |
+| Progress and error marks are read from the node each draw and overlay a held Vue picture. | `lodSnapPaint` → `lodSnapStateMarks`; they are excluded from the picture signature and capture queue. |
 
-That last row is the whole answer to "may a stand-in draw the executing ring, the
-progress bar or the error stroke?": in this renderer it never has to, because the
-frontend draws them on the live element and this tool hands that element back. In
-the canvas renderer, where a box does stand for such a node, the two marks come
-from the node's own fields (`node.progress`, `node.has_errors`), read per frame and
-never out of a picture.
+The stand-in no longer hands a running or erroring Vue node back to the frontend:
+its progress bar and error stroke are painted over the held picture from the live
+node fields, and clearing the fields removes the marks without a recapture. They
+are never baked into a new bitmap. Video and link drag remain live-element
+exceptions. The frontend's separate executing outline is still hidden with the
+blanked DOM and is not reconstructed by this overlay. In the classic canvas
+renderer, running/erroring nodes continue to be drawn live rather than served from
+a picture.
 
 ## 5. The one thing this tool could not verify here
 
@@ -68,5 +71,9 @@ document is a claim about **source code plus the Node harness** (`tests/harness.
 models the DOM, computed styles, observers and the canvas). The live page has
 already caught defects this harness could not: a class Vue rewrote wholesale, a
 picture half switched off, a picture with no text in it, a zoom measured off the
-wrong element, and a plan that fought the stand-in setting once per frame. That
-record is why untested picture paths are recorded in `plan.md` rather than shipped.
+wrong element, and a plan that fought the stand-in setting once per frame. Dark
+control/background differences reported for Nodes 2.0 remain undiagnosed; the
+harness tests operations and layout, not pixel equality. The user's CPU-only
+Electron FPS comparison also remains open: the supplied report had low-zoom drawing
+off, so it does not measure stand-ins on versus off. That paired live-page evidence
+is required before claiming a performance change.

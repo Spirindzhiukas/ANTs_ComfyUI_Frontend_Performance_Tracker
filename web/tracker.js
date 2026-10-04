@@ -27,7 +27,7 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.7.3";
+const VERSION = "2.7.4";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
 // The class key ComfyUI stores in a workflow. The old key is still recognised so
 // a graph saved before the rename does not lose this node.
@@ -1097,7 +1097,8 @@ const LOD_BOX_PROGRESS_PX = 3; // a bar is at least this tall in CSS pixels
 //     no zoom this tool does not already touch can change appearance (golden
 //     rule 6). Reuse while panning is the point — panning moves the camera, not
 //     the node — so a canvas pan does not disable it, and neither does dragging a
-//     node. A link drag, a running bar and an error still draw live.
+//     node. In Vue mode progress/error are live overlays on the picture; video
+//     and link drag keep the element live. Canvas-mode state nodes still draw live.
 //   * the capture draws into its own offscreen canvas rather than the visible
 //     one. The live context is never touched, so there is no canvas state to
 //     restore (upstream had to copy sixteen properties and put them back).
@@ -1140,6 +1141,9 @@ const LOD_SNAP_HOLD_MS = 5000;
 const LOD_SNAP_PAD = 24; // graph units of margin around the node, so hooks that
 // draw outside the body (selection rings, glow) are not cut off
 const LOD_SNAP_TITLE_H = 30; // graph units above the body: LiteGraph's title bar
+const LOD_SNAP_BADGE_VERSION = "hv-warning-1"; // changing the baked warning mark invalidates RAM and disk pictures
+const LOD_SNAP_BADGE_AMBER = "#FFC000";
+const LOD_SNAP_BADGE_BLACK = "#111111";
 const LOD_SNAP_MAX_DIM = 2048; // px; a capture is fitted down to this, or the node stays a box
 const LOD_SNAP_SLOW_MS = 60; // slower than this: stop, cool down, and try again later
 const LOD_SNAP_SIG_MS = 100; // a signature is re-checked at most this often
@@ -1223,19 +1227,15 @@ const LOD_VUE_MEDIA_MS = 400;
 // worse than late. Captures read unconditionally — one layout per picture is
 // part of making the picture.
 const LOD_VUE_MEDIA_BUDGET = 6;
-// How much of a node's own rendered text one measurement may carry, and how long a
-// single string may be. A node's DOM text is its widget labels and values as the
-// frontend draws them; the cap keeps a node with a hundred spans (or one with a
-// 40 kB string in it) from turning the read into a walk of the whole subtree.
-// How much of a node a reconstruction will read and draw. These were caps chosen
-// for the *cost* of a read — 16 strings and 12 widget rows per node — and on a
-// real node they are what made a picture look like a sketch: the node the user
-// photographed has ~30 widget rows with a label and a value each, so two thirds of
-// it was never read at all. A measure happens once per capture (never per frame)
-// and the read is batched, so the caps are now set where a real node ends rather
-// than where the first card felt cheap.
+// How much of a node's own rendered text one measurement may carry, and how long
+// an ordinary DOM text leaf may be. The 2,000-character bound applies to that
+// ordinary-text reconstruction only; Vue form values (including textarea prompts)
+// are wrapped and clipped by their available box lines instead of sliced here.
+// The item count was raised from fixture-sized caps after real nodes with ~30 widget
+// rows came back as sketches; measurement is batched and happens on change/capture,
+// never once per node per frame in the steady state.
 const LOD_VUE_TEXT_MAX = 256; // strings read from a node's DOM, per measurement
-const LOD_VUE_TEXT_CHARS = 400; // per string (a label is short; a caption is not)
+const LOD_VUE_TEXT_CHARS = 2000; // per ordinary DOM text string
 // The node's own icons. `icon-[lucide--info]` — the iconify Tailwind plugin this
 // frontend ships — compiles to `mask-image: url("data:image/svg+xml,…")` with
 // `background-color: currentColor` and `mask-size: 100% 100%`, so the glyph exists
@@ -1761,15 +1761,10 @@ function lodBoxAlpha(node) {
 // the frontend's own bridge keeps current for the node object (`nodeProgressCanvasSync.ts`
 // copies the execution store's progress state onto every node it adds, in both
 // renderers), and `node.has_errors`, kept by `useNodeErrorFlagSync.ts`. Neither is a
-// DOM read, and neither can go stale: `lodSnapLive` refuses to photograph *and*
-// refuses to blit a node whose `progress` is set or which has errors, so those nodes
-// are drawn as a box, every frame, from the live value. (A picture of a running node
-// would carry the bar of the instant it was taken, still there after the run.)
-//
-// In the Vue-nodes renderer neither mark is ever needed: `lodVueFlatNode` refuses the
-// same nodes `lodSnapLive` does, so a running or erroring node keeps its own element
-// and the frontend draws the mark itself (its own bar, its own error ring). These are
-// the canvas renderer's marks, where the box does stand for such a node.
+// DOM read. In the classic canvas renderer, a running/erroring node stays live and
+// its flat fallback box draws the current mark. In the Nodes 2.0 renderer, the node
+// may keep its held picture; `lodSnapPaint` calls this after the blit with current
+// fields. The marks never enter that picture, its signature, or the capture queue.
 function lodSnapStateMarks(ctx, node, spec) {
   const out = { bars: 0, errors: 0 };
   if (!ctx || !node || typeof ctx.fillRect !== "function") return out;
@@ -1805,6 +1800,80 @@ function lodSnapStateMarks(ctx, node, spec) {
     }
   }
   return out;
+}
+
+// A small, classic high-voltage mark that makes the flat picture legible as a
+// stand-in. Live boxes paint it here; captures add the same mark after the ink
+// probe, so the badge can never make an otherwise blank node pass that probe.
+function lodSnapWarningBadge(ctx, w, h, alpha) {
+  const width = Math.abs(Number(w)) || 0;
+  const height = Math.abs(Number(h)) || 0;
+  if (!ctx || !(width > 0) || !(height > 0) || typeof ctx.beginPath !== "function" || typeof ctx.fill !== "function") return false;
+  const titleH = Math.min(LOD_BOX_TITLE_H, height * LOD_BOX_TITLE_MAX);
+  if (!(titleH > 0)) return false;
+  const side = Math.max(10, Math.min(34, width * 0.16, titleH * 0.95 / 0.9));
+  const badgeH = side * 0.9;
+  const margin = Math.max(2, Math.min(8, width * 0.025));
+  const x = width - side - margin;
+  const y = -titleH + (titleH - badgeH) / 2;
+  const prior = {
+    globalAlpha: ctx.globalAlpha,
+    shadowColor: ctx.shadowColor,
+    fillStyle: ctx.fillStyle,
+    strokeStyle: ctx.strokeStyle,
+    lineWidth: ctx.lineWidth,
+    lineJoin: ctx.lineJoin,
+  };
+  let saved = false;
+  let painted = false;
+  try {
+    if (typeof ctx.save === "function") {
+      ctx.save();
+      saved = true;
+    }
+    const opacity = Number(alpha);
+    if (Number.isFinite(opacity)) ctx.globalAlpha = Math.max(0.05, Math.min(1, opacity));
+    ctx.shadowColor = "transparent";
+    ctx.lineJoin = "round";
+    ctx.beginPath();
+    ctx.moveTo(x + side / 2, y);
+    ctx.lineTo(x + side, y + badgeH);
+    ctx.lineTo(x, y + badgeH);
+    if (typeof ctx.closePath === "function") ctx.closePath();
+    ctx.fillStyle = LOD_SNAP_BADGE_AMBER;
+    ctx.fill();
+    if (typeof ctx.stroke === "function") {
+      ctx.strokeStyle = LOD_SNAP_BADGE_BLACK;
+      ctx.lineWidth = Math.max(1, side * 0.075);
+      ctx.stroke();
+    }
+    // The bolt sits inside the triangle, with a broad zig-zag silhouette that
+    // remains recognizable in the small on-screen copy.
+    ctx.beginPath();
+    ctx.moveTo(x + side * 0.57, y + badgeH * 0.16);
+    ctx.lineTo(x + side * 0.37, y + badgeH * 0.53);
+    ctx.lineTo(x + side * 0.51, y + badgeH * 0.53);
+    ctx.lineTo(x + side * 0.43, y + badgeH * 0.84);
+    ctx.lineTo(x + side * 0.68, y + badgeH * 0.41);
+    ctx.lineTo(x + side * 0.54, y + badgeH * 0.41);
+    if (typeof ctx.closePath === "function") ctx.closePath();
+    ctx.fillStyle = LOD_SNAP_BADGE_BLACK;
+    ctx.fill();
+    painted = true;
+  } catch (e) {
+    painted = false;
+  } finally {
+    if (saved && typeof ctx.restore === "function") {
+      try { ctx.restore(); } catch (e) { /* direct state restoration below is the fallback */ }
+    }
+    // Real canvas contexts restore these through save/restore; setting them back
+    // explicitly also keeps light test contexts and wrappers from leaking styles.
+    for (const key of Object.keys(prior)) {
+      if (prior[key] === undefined) continue;
+      try { ctx[key] = prior[key]; } catch (e) { /* state is best-effort */ }
+    }
+  }
+  return painted;
 }
 
 function lodPaintNode(node, canvas, ctx, content, detailOverride, sizeOverride, alphaOverride) {
@@ -1875,6 +1944,10 @@ function lodPaintNode(node, canvas, ctx, content, detailOverride, sizeOverride, 
     LOD.boxBars += marks.bars;
     LOD.boxErrors += marks.errors;
   }
+  // The live fallback box is still a stand-in, so it gets the mark before the
+  // idle capture arrives. Captures skip this call and add the badge after the
+  // ink probe instead.
+  if (drawable && !LOD.inCapture) lodSnapWarningBadge(ctx, w, h, alpha);
   if (node.selected) {
     ctx.globalAlpha = alpha;
     ctx.strokeStyle = "#ffb300";
@@ -3755,7 +3828,13 @@ function patchCanvasDraw() {
       // drawing any chrome — so the box lands exactly where a picture lands in
       // the canvas renderer. The frontend's own draw runs first because its
       // `arrange()` is what the box's geometry reads afterwards.
-      if (ctx && lodVueFlatNode(node, this)) {
+      const vueFlat = !!(ctx && lodVueFlatNode(node, this));
+      // The per-frame plan is intentionally a no-op while Vue stand-ins are steady.
+      // If a true live exception appears meanwhile (video or link drag), hand that
+      // node's element back here, before the browser paints; state marks are not an
+      // exception because the stand-in overlays them.
+      if (ctx && lodVueNodesMode() && !vueFlat && LOD.vueFlat && LOD.vueFlat.has(node)) lodVueBlank(node, false);
+      if (vueFlat) {
         const tv = performance.now();
         const retV = originalDrawNode.call(this, node, ctx, ...rest);
         const dtv = performance.now() - tv;
@@ -4016,16 +4095,18 @@ function lodDomWanted() {
 // Is this node one that must be drawn by ComfyUI, right now? Every answer here is
 // a field the frontend maintains itself. Anything uncertain answers "live": a
 // stale picture is a worse failure than a slow frame.
-function lodSnapLive(node, canvas) {
+function lodSnapLive(node, canvas, allowVueStateMarks) {
   try {
     if (!node) return true;
     // Hover is not live, and neither is selection or a node drag. Those used to
     // drop a pictured node back to a painted box. The picture stays, and it moves
     // with the node. A selected node gets a ring on top of it (see the blit).
-    // A link drag, a running bar and an error still draw live. The node stays
-    // clickable either way.
-    if (node.has_errors) return true; // the error stroke is live state
-    if (Number(node.progress) > 0) return true; // a running node draws a bar
+    // In the canvas renderer an error/progress node stays live. In Nodes 2.0 its
+    // stand-in stays up and these two marks are painted over the held picture;
+    // captures still use the default (false) and can never freeze either mark.
+    const vueMarks = !!(allowVueStateMarks && lodVueNodesMode());
+    if (node.has_errors && !vueMarks) return true; // error state is live outside the Vue overlay path
+    if (Number(node.progress) > 0 && !vueMarks) return true; // progress is live outside the Vue overlay path
     // A video widget is never a still picture, however idle the graph is.
     if (lodSnapHasVideo(node)) return true;
     const c = canvas || null;
@@ -4113,11 +4194,10 @@ function lodVueFlatNode(node, canvas) {
   if (!node) return false;
   if (node.flags && node.flags.collapsed) return false; // already a small box
   if (lodOwnNode(node)) return false; // the panel has to stay reachable
-  // A node whose state is live keeps its own element, and with it every mark the
-  // frontend draws about that state: its progress bar, its error stroke and the
-  // outline it puts around the node that is executing. That is why a Vue stand-in
-  // never has to say anything about a run — it is never used while one is on.
-  if (lodSnapLive(node, canvas)) return false; // running, erroring, dragging, video
+  // Progress and error are independent of the picture: the stand-in stays in
+  // place and receives their live marks on top. Video and link-drag handling still
+  // need the frontend's live element, as do canvas-renderer snapshots.
+  if (lodSnapLive(node, canvas, true)) return false; // video or a link is being dragged
   return true;
 }
 
@@ -5518,6 +5598,9 @@ function lodVueTextLines(root, rr, domScale, title, icons) {
       if (form) {
         const item = lodVueFormItem(el, tag);
         if (!item) continue;
+        // Form values are not ordinary DOM text. In particular, do not slice a
+        // Vue textarea at the shared 2,000-character canvas-widget limit: its text
+        // is wrapped here and lodVueTextInk clips it to the lines its box can hold.
         item.x = box.x;
         item.y = box.y;
         item.w = box.w;
@@ -5550,13 +5633,14 @@ function lodVueTextLines(root, rr, domScale, title, icons) {
       // paragraph into one line of text the node never showed.
       raw = raw.replace(/[^\S\n]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
       if (!raw) continue;
-      if (raw.length > LOD_VUE_TEXT_CHARS) raw = raw.slice(0, LOD_VUE_TEXT_CHARS);
+      const truncated = raw.length > LOD_VUE_TEXT_CHARS;
+      if (truncated) raw = raw.slice(0, LOD_VUE_TEXT_CHARS);
       const align = lodVueTextAlign(el);
       // Everything the ink needs to draw the string the way the browser did: the
       // size, the colour, the family, the weight, the line height and the clamp the
       // element asked for. (A picture that draws Arial at 12px where the page drew
       // Inter at 11px is a picture of a node nobody has.)
-      const item = { kind: "text", text: raw, align, x: box.x, y: box.y, w: box.w, h: box.h };
+      const item = { kind: "text", text: raw, truncated, align, x: box.x, y: box.y, w: box.w, h: box.h };
       lodVueTextStyleInto(item, style);
       out.push(item);
     }
@@ -5755,11 +5839,9 @@ function lodVueTextInk(ctx, lines, out) {
       const pad = 2;
       const room = Math.max(1, Math.min(64, Number(it.clampLines) || Math.floor((it.h - pad) / lineH) || 1));
       const wrapped = lodSnapWrapText(it.text, Math.max(4, it.w - pad * 2), room + 1, size, ctx);
-      if (wrapped.length > room) {
-        const last = wrapped[room - 1];
-        wrapped[room - 1] = last && last.length > 1 ? `${last.slice(0, last.length - 1)}\u2026` : "\u2026";
-      }
+      const clipped = wrapped.length > room || !!it.truncated;
       const drawn = wrapped.length > room ? wrapped.slice(0, room) : wrapped;
+      if (clipped && drawn.length) lodSnapEllipsizeLine(drawn, drawn.length - 1);
       // Where the browser puts the first line: its line box starts at the top of
       // the measured box and leads into the glyphs by half the leftover between the
       // line height and the font's own content height. A single line in a taller row
@@ -6708,9 +6790,9 @@ function lodSnapWhyText() {
 // Deliberately NOT in here: position, the pan, and the zoom. Those change while
 // you look at the node and change nothing about the picture — including them
 // would throw the work away on every frame of a pan, which is exactly when it is
-// worth having. `progress`, `has_errors` and the node's own flags are in, even
-// though those nodes stay live anyway, so a bitmap can never be used after one of
-// them starts.
+// worth having. The canvas pathway hashes progress/errors because those nodes
+// remain live there. The Vue pathway overlays those marks on the held picture, so
+// they are dynamic draw state and deliberately do not invalidate the bitmap.
 function lodSnapSignature(node, canvas) {
   let h = 2166136261;
   const mix = (n) => {
@@ -6722,33 +6804,43 @@ function lodSnapSignature(node, canvas) {
     if (Number.isFinite(n)) mix(Math.round(n * 100));
     else mix(0);
   };
-  // A long string is hashed by its length and its two ends: the head because that
-  // is the part a node's canvas actually draws (a text widget is clipped to its
-  // row), and the tail because that is where a growing payload changes. Walking a
-  // 40 kB data URL or a serialized link graph in full on every re-check was the
-  // real reason this tool used to refuse such nodes outright; refusing was never
-  // about the picture.
+  // Ordinary Vue DOM text and canvas DOM-widget values are reconstructed from a
+  // bounded prefix and hashed in full, so a same-length middle edit in the visible
+  // prefix cannot leave a stale bitmap. Vue form values are passed intact to the
+  // line wrapper; large serialized values and data URLs stay cheap through length
+  // plus head, middle and tail samples rather than a full walk every 100 ms.
+  const fullTextLimit = 4096;
   const str = (v) => {
     const s = v == null ? "" : String(v);
     mix(s.length);
-    if (s.length <= 512) {
-      for (let i = 0; i < s.length; i++) {
+    const put = (from, to) => {
+      for (let i = from; i < to; i++) {
         h ^= s.charCodeAt(i);
         h = Math.imul(h, 16777619);
       }
+    };
+    if (s.length <= fullTextLimit) {
+      put(0, s.length);
       return;
     }
-    for (let i = 0; i < 256; i++) {
-      h ^= s.charCodeAt(i);
-      h = Math.imul(h, 16777619);
-    }
-    for (let i = s.length - 64; i < s.length; i++) {
-      h ^= s.charCodeAt(i);
-      h = Math.imul(h, 16777619);
-    }
+    put(0, 256);
+    const middle = Math.max(256, Math.floor(s.length / 2) - 32);
+    put(middle, Math.min(s.length - 64, middle + 64));
+    put(s.length - 64, s.length);
+  };
+  // The canvas DOM-widget composite deliberately hard-slices form values at
+  // LOD_SNAP_TEXT_CHARS; hash that same visible prefix plus the original length.
+  // Vue form values take a separate route through `metrics.texts` below, where a
+  // textarea is passed intact to the box-aware wrapper and clipped by line room.
+  const strVisible = (v, limit) => {
+    const s = v == null ? "" : String(v);
+    mix(s.length);
+    str(s.slice(0, Math.max(0, Number(limit) || 0)));
   };
   const flag = (v) => mix(v ? 1 : 0);
+  const vuePath = lodVueNodesMode();
 
+  str(LOD_SNAP_BADGE_VERSION);
   str(node.title);
   const size = node.renderingSize || node.size;
   num(size && size[0]);
@@ -6763,8 +6855,13 @@ function lodSnapSignature(node, canvas) {
   str(node.renderingColor || node.color);
   str(node.renderingBgColor || node.bgcolor);
   str(node.boxcolor);
-  flag(node.has_errors);
-  num(node.progress);
+  // In Vue mode these marks are overlays on top of a stable picture, not picture
+  // content. Keeping them out of the signature lets one bitmap survive a whole run.
+  // The canvas pathway keeps its original live-node behavior and signature.
+  if (!vuePath) {
+    flag(node.has_errors);
+    num(node.progress);
+  }
   // `selected` is deliberately absent. The ring is drawn on top of the picture
   // at blit time, and the capture clears the flag so it is not baked in. In the
   // signature it would mean dropping and recapturing a bitmap every click.
@@ -6778,7 +6875,7 @@ function lodSnapSignature(node, canvas) {
   // way a widget value does: a new image in a loader, a mask editor redrawing,
   // an element replaced. The serial catches a replacement whose strings match;
   // the numbers catch the layout moving.
-  if (lodVueNodesMode()) {
+  if (vuePath) {
     // One measurement, asked for once: what the node's element is showing. This is
     // the picture's content, so it is the picture's signature — and *everything* a
     // Vue picture draws belongs here. What was missing was the node's own text and
@@ -6846,10 +6943,11 @@ function lodSnapSignature(node, canvas) {
     if (lines) {
       for (let i = 0; i < lines.length && i < LOD_VUE_TEXT_MAX; i++) {
         const tx = lines[i];
-        // The string is what the picture shows, so it is what invalidates it. Hashed
-        // by its ends rather than in full: a label is one line, and a very long one
-        // differs where the reader looks (the head) and where it grows (the tail).
+        // Ordinary Vue DOM leaves are capped at 2,000 characters when measured;
+        // form values arrive intact and their ink is bounded by the box's line room.
+        // Hash the measured string so a same-length middle edit invalidates it.
         str(tx && tx.text);
+        flag(tx && tx.truncated);
         num(tx && tx.x);
         num(tx && tx.y);
         num(tx && tx.size);
@@ -6923,7 +7021,7 @@ function lodSnapSignature(node, canvas) {
         num(el.width);
         num(el.height);
       } else if (tag === "TEXTAREA" || tag === "INPUT") {
-        str(el.value);
+        strVisible(el.value, LOD_SNAP_TEXT_CHARS);
       }
       // The row the composite draws this element at. `lodSnapWidgetBox` reads the
       // frontend's own layout (`y`, `computedHeight`, `width`, `margin`), and that
@@ -6974,7 +7072,7 @@ function lodSnapSignature(node, canvas) {
   // way that matters (box, padding, content route). Mixing the pathway in means a
   // picture made in one can never be trusted in the other, whatever order the user
   // switches renderers in.
-  str(lodVueNodesMode() ? "pathway-vue" : "pathway-canvas");
+  str(vuePath ? "pathway-vue" : "pathway-canvas");
   void canvas;
   return (h >>> 0).toString(36);
 }
@@ -7471,9 +7569,17 @@ function lodSnapMeasureText(cctx, text, size) {
   return String(text).length * size * 0.55;
 }
 
-// Words wrapped to the row, at most `maxLines` of them, with the last line marked
-// with an ellipsis when the text does not fit — the same thing the browser does to
-// a textarea's overflow, done by hand because there is no other way to get it.
+// Wrap a string to at most `maxLines`. Callers request one extra line beyond the
+// visible room to detect clipping, then mark the last visible line themselves. This
+// helper does not impose a character cap: Vue form values are limited by line room,
+// while the separate canvas DOM-widget caller slices its input before wrapping.
+function lodSnapEllipsizeLine(lines, index) {
+  if (!lines || index < 0 || index >= lines.length) return;
+  const last = String(lines[index] == null ? "" : lines[index]);
+  if (last.endsWith("\u2026")) return;
+  lines[index] = last.length > 1 ? `${last.slice(0, last.length - 1)}\u2026` : "\u2026";
+}
+
 function lodSnapWrapText(raw, maxW, maxLines, size, cctx) {
   const text = String(raw == null ? "" : raw).replace(/\r\n?/g, "\n");
   const out = [];
@@ -7516,10 +7622,6 @@ function lodSnapWrapText(raw, maxW, maxLines, size, cctx) {
       }
     }
     if (line && out.length < maxLines) out.push(line);
-  }
-  if ((text.length > LOD_SNAP_TEXT_CHARS || out.length >= maxLines) && out.length) {
-    const last = out[out.length - 1];
-    out[out.length - 1] = last.length > 1 ? `${last.slice(0, Math.max(1, last.length - 1))}\u2026` : "\u2026";
   }
   return out;
 }
@@ -7566,12 +7668,13 @@ function lodSnapTextInk(el, cctx, box) {
     // value that plainly fit came back as "a ca…". The visible rows are what is
     // trimmed, and the trim is marked the way the wrapper marks its own.
     const room = Math.max(1, Math.min(64, Math.floor((Number(box.h) - 6) / lineH) || 1));
-    const wrapped = lodSnapWrapText(raw.slice(0, LOD_SNAP_TEXT_CHARS), Math.max(4, box.w - 6), LOD_SNAP_TEXT_LINES, size, cctx);
-    if (wrapped.length > room) {
-      const last = wrapped[room - 1];
-      wrapped[room - 1] = last && last.length > 1 ? `${last.slice(0, last.length - 1)}\u2026` : "\u2026";
-    }
-    const lines = wrapped.length > room ? wrapped.slice(0, room) : wrapped;
+    const lineLimit = Math.min(room, LOD_SNAP_TEXT_LINES);
+    const truncated = raw.length > LOD_SNAP_TEXT_CHARS;
+    const visible = raw.slice(0, LOD_SNAP_TEXT_CHARS);
+    const wrapped = lodSnapWrapText(visible, Math.max(4, box.w - 6), lineLimit + 1, size, cctx);
+    const clipped = truncated || wrapped.length > lineLimit;
+    const lines = wrapped.length > lineLimit ? wrapped.slice(0, lineLimit) : wrapped;
+    if (clipped && lines.length) lodSnapEllipsizeLine(lines, lines.length - 1);
     for (let i = 0; i < lines.length; i++) {
       if (typeof cctx.fillText === "function") cctx.fillText(lines[i], box.x + 3, box.y + 3 + i * lineH);
     }
@@ -8105,6 +8208,15 @@ function lodSnapCaptureNode(node, canvas) {
     domInk = lodSnapDomInk(node, made.ctx, canvas);
     LOD.snapMs += nowMs() - dc0;
   }
+  // This persistent badge is part of the stand-in, not evidence that the node
+  // itself drew ink. Add it only after the probe and the content composite, but
+  // before mipmaps and disk persistence, so every stored resolution carries it.
+  const badgeAt = nowMs();
+  const badgeAlpha = lodVueNodesMode()
+    ? dom && Number.isFinite(Number(dom.opacity)) ? Number(dom.opacity) : 1
+    : lodBoxAlpha(node);
+  lodSnapWarningBadge(made.ctx, geom.bodyW, geom.bodyH, badgeAlpha);
+  LOD.snapMs += nowMs() - badgeAt;
   if (!lodSnapMakeRoom(made.bytes)) {
     // The budget is full of bitmaps that are being looked at. Refusing is the
     // honest answer: releasing one would take a picture off the screen, and
@@ -8129,6 +8241,8 @@ function lodSnapCaptureNode(node, canvas) {
   rec.y = made.y;
   rec.w = made.w;
   rec.h = made.h;
+  rec.bodyW = geom.bodyW;
+  rec.bodyH = geom.bodyH;
   rec.bytes = made.bytes;
   rec.sig = sig;
   rec.checkedAt = nowMs();
@@ -8614,6 +8728,8 @@ function lodThumbDiskInstall(node, canvas, sig, blob) {
       rec.y = geom.y;
       rec.w = geom.w;
       rec.h = geom.h;
+      rec.bodyW = geom.bodyW;
+      rec.bodyH = geom.bodyH;
       rec.bytes = bytes;
       rec.sig = sig;
       rec.checkedAt = nowMs();
@@ -8726,6 +8842,13 @@ function lodThumbDiskAsk(node, canvas) {
 function lodSnapEnqueue(node, canvas, restale) {
   if (!lodSnapBitmaps(canvas)) return;
   lodSnapEnsure();
+  // The Vue picture has dynamic progress/error overlays, so a transient state does
+  // not request a new frozen bitmap. If one was queued before the state arrived,
+  // remove it and resume the ordinary capture lane when the live field clears.
+  if (lodVueNodesMode() && node && (node.has_errors || Number(node.progress) > 0)) {
+    if (LOD.snapQueue) LOD.snapQueue.delete(node);
+    return;
+  }
   // A node the Vue lane has never seen starts its window now — the frame it was
   // first drawn as a stand-in is the frame it appeared. Only the *first* time: the
   // box path calls this every frame while a node has no picture, and re-arming
@@ -8785,7 +8908,7 @@ function lodSnapPaint(node, canvas, ctx) {
     LOD.snapMisses++;
     return false;
   }
-  if (lodSnapLive(node, canvas)) {
+  if (lodSnapLive(node, canvas, lodVueNodesMode())) {
     LOD.snapMisses++;
     return false;
   }
@@ -8846,13 +8969,38 @@ function lodSnapPaint(node, canvas, ctx) {
   ctx.globalAlpha = 1; // and its own alpha (a muted node was captured dimmed)
   const src = lodSnapPick(rec, canvas);
   ctx.drawImage(src || rec.canvas, rec.x, rec.y, rec.w, rec.h);
+  // Progress and errors are live Vue-node fields, not picture content. Paint their
+  // marks over the stable bitmap at reuse time; captures and disk files never carry
+  // these transient marks. The canvas pathway continues to leave these nodes live.
+  const progress = Number(node && node.progress);
+  if (lodVueNodesMode() && (node.has_errors || (Number.isFinite(progress) && progress > 0))) {
+    const size = Number(rec.bodyW) > 0 && Number(rec.bodyH) > 0
+      ? [Number(rec.bodyW), Number(rec.bodyH)]
+      : lodVueBoxSize(node, canvas) || (node && (node.renderingSize || node.size)) || [0, 0];
+    if (typeof ctx.save === "function" && typeof ctx.restore === "function") {
+      ctx.save();
+      try {
+        ctx.shadowColor = "transparent";
+        ctx.globalAlpha = 1;
+        const marks = lodSnapStateMarks(ctx, node, {
+          x: 0,
+          y: 0,
+          w: Math.abs(Number(size[0])) || 0,
+          h: Math.abs(Number(size[1])) || 0,
+          scale: (canvas && canvas.ds && Number(canvas.ds.scale)) || 1,
+        });
+        LOD.boxBars += marks.bars;
+        LOD.boxErrors += marks.errors;
+      } finally {
+        ctx.restore();
+      }
+    }
+  }
   // The selection ring, around the box the node was pictured in — the same size the
   // live box had (`lodVueBoxSize`), which in the Vue renderer is the element's own
   // measured body rather than the node's graph size. Without that the ring would
   // jump, and sit inside the node the user just selected, on the frame the picture
-  // replaced the live box. Nothing else belongs on a blit: a picture is only ever
-  // served for a node with no progress and no errors (`lodSnapLive`), so there is no
-  // state mark for a picture to be missing.
+  // replaced the live box.
   if (node.selected) lodSnapSelectionRing(node, canvas, ctx);
   if (src && src !== rec.canvas) LOD.snapMipDrawn++;
   rec.usedFrame = LOD.snapFrame; // this frame is looking at it
@@ -12398,7 +12546,7 @@ function buildTweaksTab(container) {
   settingRow(
     "Replace node previews with bitmap stand-ins at zoom levels",
     lodFlatSel,
-    "Below this zoom a node is one picture instead of a live draw. Hover, selection and a drag keep the picture. A selected node gets a ring, not a box. A link drag, a running bar or an error still draws live.",
+    "Below this zoom a node is one picture instead of a live draw. Hover, selection and node drag keep the picture; selection gets a ring. In Nodes 2.0, progress/error marks update live over the held picture, while video or link drag keeps the element live. In the classic canvas renderer, running/erroring nodes stay live.",
     "A zoom, not a node size. Past this percentage means zoomed out below it. A node whose own UI hides or adds a widget changes size while you look at it, and a per-node pixel rule then flips that node in and out of the stand-in. A zoom classifies every node the same way, once per frame. Collapsed nodes and this tool's own node are never replaced. Nothing about the graph changes. Off, or Back to full drawing, restores ComfyUI's own draw. The node stays clickable either way. While the link below is on, this zoom and the widget-stop zoom are the same, and the higher one wins."
   );
 
@@ -16100,23 +16248,21 @@ app.registerExtension({
 //    computed styles at 40, 60 and 150 nodes. What page JavaScript cannot measure
 //    is the rasteriser's own bill; that is what the frame budget, the Stalls tab
 //    and DevTools' paint flashing show on the machine the graph runs on.
-//  * A stand-in never carries a node's execution state, in either renderer, and
-//    the panel's "N element(s) hidden" is the page's own count. In the Vue
-//    renderer a node whose state is live (a progress value, errors, a drag, a
-//    video) is never boxed at all — `lodVueFlatNode` refuses the same nodes
-//    `lodSnapLive` refuses, so the element stays and the frontend draws its own
-//    bar, its own error stroke and its own outline around the node that is
-//    executing. In the canvas renderer a box does stand for such a node, and the
-//    two marks are read from `node.progress`/`node.has_errors` — fields the
-//    frontend itself mirrors onto the node object in both renderers
-//    (`nodeProgressCanvasSync.ts`, `useNodeErrorFlagSync.ts`) — on every frame:
-//    neither is ever photographed nor blitted (see `lodSnapLive`), so a bar of the
-//    instant of a capture cannot be served after the run it belonged to. The
-//    hidden count is per *element* dressed, one class (`.ants-lod-box`) or one
-//    attribute (`data-ants-dom-hidden`) each, and equals what a walk of the page
-//    for those two marks finds. (The Vue-nodes pathway's stand-in mark is a third
-//    one — the attribute `data-ants-vue-standin` on the node's root, counted as
-//    `vueBlanked` — and the panel names the renderer it is reporting on.)
+//  * A bitmap never contains transient execution state, but the live handling is
+//    renderer-specific. In the Vue renderer a progress/erroring node stays blanked
+//    behind its held picture; `lodSnapPaint` draws current `node.progress` /
+//    `node.has_errors` marks over the bitmap. Those fields are excluded from the
+//    picture signature and any queued capture is removed while either is active,
+//    so the marks cannot freeze into a RAM or disk picture. Clearing the state
+//    removes its overlay on the next draw without recapture. Video and link drag
+//    still hand the Vue element back to ComfyUI. The Vue executing outline is not
+//    reconstructed. In the classic canvas renderer, a running/erroring node stays
+//    live and uses its flat fallback box with marks read from those same frontend-
+//    mirrored fields; the snapshot blit refuses it. The panel's "N element(s)
+//    hidden" is the page's own count: one per *element* dressed by `.ants-lod-box`
+//    or `data-ants-dom-hidden`, matching a page walk. (The Vue-nodes pathway's
+//    stand-in mark is a third one — `data-ants-vue-standin` on the node root,
+//    counted as `vueBlanked` — and the panel names the renderer.)
 //  * A picture is only taken once its node has stopped changing: a settle window
 //    (LOD_SNAP_SETTLE_MS, 300ms) opened when a node is first drawn as a stand-in
 //    and re-opened by every change the page reports — or by a signature that no
@@ -16150,9 +16296,9 @@ app.registerExtension({
 //    node's file a miss anyway.
 //  * What a Vue-nodes stand-in cannot be is a *screenshot*: no browser API
 //    draws a DOM element into a canvas (not drawImage, not createImageBitmap,
-//    not captureStream). The picture is therefore *drawn* — the box, its title
-//    bar and state marks, the node's own structure and widget rows in the
-//    colours the browser computed, the text wrapped into the box the browser
+//    not captureStream). The picture is therefore *drawn* — the box and title,
+//    the node's own structure and widget rows in the colours the browser
+//    computed, the text wrapped into the box the browser
 //    laid it out in and drawn in the element's own font, the values of its form
 //    and ARIA controls drawn as the controls they are, the node's composited
 //    opacity, the node's **icons** — parsed out of the SVG the frontend's iconify
@@ -16161,6 +16307,8 @@ app.registerExtension({
 //    the glyph — and the node's own `<img>`/`<canvas>` elements at the rows the
 //    layout gave them — into the same capture surface the canvas renderer uses,
 //    with the same capture resolution, mip chain, RAM budget and disk files.
+//    The warning badge is baked into the stable picture after the ink check;
+//    progress/error marks are live overlays and never part of a captured bitmap.
 //    Every colour goes through `lodVueColor` first: this frontend's themed
 //    surfaces are Tailwind 4 `oklch()`/`oklab()` strings, which a canvas
 //    `fillStyle` ignores *silently* (the previous colour stays, so a node wears
@@ -16286,18 +16434,18 @@ app.registerExtension({
 //    includes an image from another origin is tainted by the browser, which is
 //    allowed to blit but not to read back: such a picture works in memory and
 //    simply cannot be written to disk.
-//  * Node snapshots reuse a bitmap that was checked against the node's signature
-//    at most LOD_SNAP_SIG_MS ago (100ms), so a change that happens between two
-//    checks can be shown stale for that long. Anything the panel can see cheaply
-//    — selection, hover, an error, progress, a drag — is checked every frame
-//    instead and never uses a bitmap. A bitmap is also a *picture of the node at
-//    the moment it was captured*: while a node's own live drawing animates
-//    without changing any field in the signature (a shader-like hook with its own
-//    clock), the picture is the frame it was taken from, not a moving image.
-//  * A capture is drawn at the capture ratio (default 1 pixel per graph unit)
-//    and scaled into the node's box on screen. Zoomed in past that, a snapshot is
-//    softer than the live drawing — which is why a node that is being worked at,
-//    selected or hovered is never served from one, and why the ratio is a
-//    setting rather than a constant. The ratio is also the coverage knob on a
-//    large graph: the budget divided by the pixels per picture decides how many
-//    nodes can hold one at all.
+//  * Node snapshots reuse a bitmap whose signature is rechecked at most
+//    LOD_SNAP_SIG_MS apart (100ms), so a content change can remain in the picture
+//    until that check and its replacement. Position, pan and zoom do not enter the
+//    signature, and selection does not either: the selected-node ring is drawn on
+//    top at reuse time. Vue progress/error marks are also read live at reuse time
+//    and overlaid; a classic-canvas node carrying either mark stays live rather
+//    than using a bitmap. Video and link drag keep the Vue element live. A bitmap
+//    remains a *picture of the node at capture time*: animation with no changing
+//    signature field (for example a shader-like hook with its own clock) is frozen
+//    at that frame rather than becoming a moving image.
+//  * A capture is drawn at the selected capture ratio (default 1 pixel per graph
+//    unit) and scaled into the node's box on screen. At zooms above that ratio a
+//    snapshot can look softer than live drawing; the ratio is a setting and a
+//    coverage knob on a large graph, because the budget divided by pixels per
+//    picture decides how many nodes can hold one at all.
