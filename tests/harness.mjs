@@ -10,7 +10,7 @@ import fs from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
 import { fileURLToPath } from "node:url";
-import { computedStyle, createDocument, createStorage, fireResize, observerClasses, withQuiet } from "./dom-shim.mjs";
+import { computedStyle, createDocument, createStorage, fireMutation, fireResize, observerClasses, withQuiet } from "./dom-shim.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const TRACKER_PATH = path.join(HERE, "..", "web", "tracker.js");
@@ -715,6 +715,12 @@ export function createHarness(options = {}) {
     // is derived from below.
     const growth = new Map(); // node id -> extra node-local height the frontend adds
     const media = []; // { el, node, box }
+    // The structure `LGraphNode.vue` renders inside the node element: the coloured
+    // surface, the header bar, the body panel and a row per slot with its
+    // connection dot. `box` is *element*-local (y = 0 is the top of the node
+    // element, one title bar above the node's own origin), which is the space the
+    // browser lays these out in and the space the tool's reader inverts.
+    const structure = []; // { el, node, box }
     const addMedia = (node, el, box) => {
       const root = roots.get(String(node.id));
       if (root) root.appendChild(el);
@@ -771,6 +777,17 @@ export function createHarness(options = {}) {
           height: m.box.h * scale,
         };
       }
+      for (const s of structure) {
+        const n = s.node;
+        const root = roots.get(String(n.id));
+        if (!root || !root._rect) continue;
+        s.el._rect = {
+          left: (n.pos[0] + s.box.x + ox) * scale + originX,
+          top: (n.pos[1] - 30 + s.box.y + oy) * scale + originY,
+          width: s.box.w * scale,
+          height: s.box.h * scale,
+        };
+      }
       for (const n of nodes()) {
         for (const w of n._domWidgets || []) {
           if (!w.wrapper) continue;
@@ -792,6 +809,72 @@ export function createHarness(options = {}) {
       wrappers,
       place,
       rootFor: (n) => roots.get(String(n.id)) || null,
+      // The frontend's own node structure, so a test can hold the tool to drawing
+      // it: everything inside the node element that is not text, not an image and
+      // not a widget — the surface, the header, the body panel, the slot dots.
+      // Returns the pieces so a test can move one and see the picture follow.
+      addStructure: (n, opts = {}) => {
+        const root = roots.get(String(n.id));
+        if (!root) return null;
+        const w = Math.abs(Number(opts.w || (n.size && n.size[0]))) || 200;
+        const h = (Math.abs(Number(n.size && n.size[1])) || 100) + 30 + (growth.get(String(n.id)) || 0);
+        const inputs = opts.inputs || ["image", "model"];
+        const keep = [];
+        const put = (el, box) => {
+          el._localBox = box;
+          structure.push({ el, node: n, box });
+          keep.push(el);
+          return el;
+        };
+        const surface = put(document.createElement("div"), { x: 0, y: 0, w, h });
+        surface.setAttribute("data-testid", "node-inner-wrapper");
+        surface.style.backgroundColor = opts.surface || "rgb(40, 40, 48)";
+        surface.style.borderTopWidth = "1px";
+        surface.style.borderTopColor = "rgb(18, 18, 22)";
+        surface.style.borderTopLeftRadius = "6px";
+        root.appendChild(surface);
+        const header = put(document.createElement("div"), { x: 0, y: 0, w, h: 30 });
+        header.setAttribute("data-testid", `node-header-${n.id}`);
+        header.style.backgroundColor = opts.header || "rgb(64, 84, 116)";
+        header.appendChild(document.createTextNode(String(opts.title || n.title || n.type || "Node")));
+        surface.appendChild(header);
+        const body = put(document.createElement("div"), { x: 0, y: 30, w, h: Math.max(0, h - 30) });
+        body.setAttribute("data-testid", `node-body-${n.id}`);
+        body.style.backgroundColor = opts.body || "rgb(30, 30, 36)";
+        surface.appendChild(body);
+        const dots = [];
+        inputs.forEach((name, i) => {
+          const row = put(document.createElement("div"), { x: 0, y: 34 + i * 20, w, h: 20 });
+          row.className = "lg-slot lg-slot--input";
+          body.appendChild(row);
+          const dot = put(document.createElement("div"), { x: 0, y: 34 + i * 20, w: 12, h: 20 });
+          dot.className = "slot-dot";
+          dot.style.backgroundColor = "rgb(150, 160, 180)";
+          row.appendChild(dot);
+          const label = put(document.createElement("div"), { x: 12, y: 34 + i * 20, w: w - 12, h: 20 });
+          label.appendChild(document.createTextNode(String(name)));
+          row.appendChild(label);
+          dots.push(dot);
+        });
+        // One more slot later on, the way a promoted widget or a new input turns
+        // up: a dot and nothing else, so a test can move the node's *structure*
+        // without moving its text or its size.
+        const addDot = (row = 3) => {
+          const dot = put(document.createElement("div"), { x: 0, y: 34 + Number(row) * 20, w: 12, h: 20 });
+          dot.className = "slot-dot";
+          dot.style.backgroundColor = "rgb(150, 160, 180)";
+          body.appendChild(dot);
+          dots.push(dot);
+          place();
+          fireMutation(root); // the page reports the new child inside the node
+          return dot;
+        };
+        place();
+        // The frontend reported it: a new subtree inside the node is a change, and
+        // the observer the tool put on the node's subtree is what says so.
+        fireMutation(root);
+        return { root, surface, header, body, dots, addDot, keep };
+      },
       addMedia,
       media,
       // The frontend lays an image node out taller than its graph size. The tool
@@ -807,6 +890,7 @@ export function createHarness(options = {}) {
         root.setAttribute("data-node-id", String(n.id));
         root.style.transform = `translate(${n.pos[0]}px, ${n.pos[1] - 30}px)`;
         for (const m of media) if (m.node === n && old && m.el.parentNode === old) root.appendChild(m.el);
+        for (const s of structure) if (s.node === n && old && s.el.parentNode === old) root.appendChild(s.el);
         if (old) old.remove();
         pane.appendChild(root);
         roots.set(String(n.id), root);

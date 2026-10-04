@@ -332,6 +332,32 @@ and a capture takes a single measurement, so surface, box and ink agree and a no
 that finishes rendering after its first look is re-pictured instead of kept
 half-drawn.
 
+**v2.6.6 answered the ninth report, and the answer was a mechanism rather than a
+measurement.** Three things. **(1) The mark was the wrong property.** v2.6.5 had
+already measured the tool's own per-frame cost to zero and the performance still
+dropped, so the cost left could only be the frontend's own painting — which
+`opacity: 0` does not stop (an opacity-0 subtree stays in the render tree and is
+still painted). The stand-in attribute now hides the element's *children* with
+`visibility: hidden`, which an engine skips in the paint phase, while the element
+itself keeps its box, its layout, its observers and its hit-testing; a frame at low
+zoom no longer owes the browser a single node's DOM paint. The trade is stated,
+not hidden: a widget inside a stand-in does not take its own clicks at that zoom,
+and the node's accessibility entry is that of a hidden subtree. **(2) The picture
+was missing the node.** The frame, the header bar, the body panel, every widget's
+own row and the slot dots are read from the frontend's own structure
+(`node-inner-wrapper`, `node-header-<id>`, `node-body-<id>`, each widget's element,
+`.slot-dot`) and drawn by the same ink the live box uses — the surface the content
+sits on was simply absent, which is what "semi, not fully there" described. **(3) The capture was not waiting.** Upstream
+has no per-node tick; a node is assembled over several passes (mount, slot sync,
+layout, widgets, media decoding), and the capture lane is deliberately its own, so
+a capture right after a change read the DOM between two of those passes. A settle
+window (`LOD_SNAP_SETTLE_MS` = 300 ms, opened when a node is first drawn as a
+stand-in and re-opened by every change, enforced as a lane gate) makes a burst of
+rendering cost one picture at the end. The "capture process of our own" the report
+offered is what this pathway already is: DOM-to-canvas does not exist, and the
+library routes would re-rasterise the node tree per capture on the CPU — the cost
+the pathway exists to remove.
+
 What the boxes carry (v2.6.1, completed in v2.6.2, made to work in v2.6.3): the
 node's own content, drawn live from the two routes it takes to the page —
 widget-borne elements (`WidgetDOM.vue` mounts `widget.element` into the node) and
@@ -354,17 +380,24 @@ the live frame context for every blanked node, which is exactly the per-frame
 cost this pathway exists to remove.
 
 Open, and deliberately not guessed at: **how much this saves on a real heavy
-Vue-nodes graph — and whether the v2.6.3–v2.6.5 fixes are enough on the user's own
-page.** Each report has been a state the harness could model only after the fact:
+Vue-nodes graph — and whether the v2.6.3–v2.6.6 fixes are enough on the user's own
+page.** Since v2.6.6 the saving has a mechanism as well as a count: the frontend's
+own painting of the stand-in nodes is skipped (`visibility`, and `vuePaintSkipped`
+counts it), the picture carries the node's structure, and the capture waits for the
+node to settle. What is still not measurable from here is the rasteriser's bill on
+the user's machine (Electron, GPU/hardware acceleration off) — DevTools' paint
+flashing is the direct way to see it, and the frame budget plus the Stalls tab are
+the tool's own instruments. Each report has been a state the harness could model only after the fact:
 a class Vue rewrote, a picture half that was off, a picture with no text in it, a
 plan fighting the setting once per frame, a picture taken before the node had
 finished rendering, a poll the page could have answered itself. The user's page
-remains the live test. The six live reports so far (v2.5.6 "pictures with no
+remains the live test. The seven live reports so far (v2.5.6 "pictures with no
 content"; v2.6.0 "nothing in Nodes 2.0"; v2.6.2 "only text nodes have content";
 v2.6.3 "no pictures and no disk files at all"; v2.6.4 "captured box previews,
 cached boxes in the canvas workspace, and a canvas that flickers when the stand-in
 mode is not pictures"; v2.6.5 "photographed too early, and the stand-ins drop the
-frame rate") each found something the harness could not, and the harness has been
+frame rate"; v2.6.6 "the performance hit is the same, and the stand-ins still look
+half-rendered") each found something the harness could not, and the harness has been
 strengthened by each one — the last pass added the two change observers (with
 `withQuiet` so a pan or a zoom is not mistaken for a box change), a Vue re-render
 that rewrites `className`, an `isConnected` that tells the truth, the element's

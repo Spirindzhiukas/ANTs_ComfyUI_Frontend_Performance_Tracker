@@ -343,6 +343,15 @@ export function computedStyle(el) {
     fontSize: style.fontSize || "12px",
     color: style.color || "rgb(220, 220, 230)",
     fontFamily: style.fontFamily || "Arial",
+    // The box colours a browser actually resolves for an element, which is what a
+    // stand-in reads to draw a node's own structure (the coloured surface, the
+    // header bar, the body panel, a slot's dot). A test sets them on the fixture;
+    // the defaults are the CSS initial values, so an element with no colour is not
+    // painted rather than painted black.
+    backgroundColor: style.backgroundColor || "rgba(0, 0, 0, 0)",
+    borderTopWidth: style.borderTopWidth || "0px",
+    borderTopColor: style.borderTopColor || "rgba(0, 0, 0, 0)",
+    borderTopLeftRadius: style.borderTopLeftRadius || "0px",
   };
 }
 

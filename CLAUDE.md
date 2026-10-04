@@ -28,7 +28,7 @@ this is going. Read the golden rules before the code.
 ## Commands
 
 ```bash
-node tests/run-tests.mjs              # all 215 tests — must be green before any commit
+node tests/run-tests.mjs              # all 220 tests — must be green before any commit
 node tests/run-tests.mjs <substring>  # one suite/test, e.g. ... pill
 python3 tests/test_init.py            # the Python side (route parsing, node contract)
 node tests/demo.mjs                   # prints what the panel says against a synthetic graph
@@ -183,14 +183,28 @@ Seams worth knowing:
   `!important` `opacity: 0` rule) and `lodPaintNode` paints the same box the canvas
   renderer paints; `lodVueFramePlan` hands every element back when the setting,
   the zoom, the tool or the renderer changes, and a box is only painted after a
-  *successful* blanking (`lodVueBlank`). **Never a class**: `LGraphNode.vue` binds
+  *successful* marking (`lodVueBlank`). **The mark is `visibility`, not
+  `opacity`** (v2.6.6, and this is the whole point of the pathway): the attribute
+  carries `[data-ants-vue-standin] { opacity: 0 !important }` *and*
+  `[data-ants-vue-standin] > * { visibility: hidden !important }`. An engine skips
+  a hidden subtree in the paint phase, which is the only saving available in a
+  renderer whose node drawing is the browser's own DOM painting; an opacity-0
+  subtree is still painted (that is what v2.6.0–v2.6.5 shipped, and why the
+  stand-ins could cost performance here). The element's own box stays visible and
+  therefore hit-testable — dragging, selecting and link-dragging are that DOM — so
+  the *children* are hidden, never the root, and the layout is untouched: rects,
+  text metrics and both observers still answer, which is where every number the
+  box and the picture are made of comes from. Trade, stated in README/`LIMITS`:
+  a widget inside a stand-in no longer takes its own clicks at that zoom, and the
+  node's accessibility entry is that of a hidden subtree. **Never a class**: `LGraphNode.vue` binds
   `:class` on that element and Vue rewrites it on every re-render, so a class is
   dropped and the node comes back visible behind its box — that was the v2.6.3 bug,
   and the harness was blind to it until `exit()` started detaching the pane and the
   shim started reporting `isConnected` truthfully. The fovea's hide/inert marks on
   a node's own element are attributes too (`LOD_DOM_ATTR`, `LOD_DOM_INERT_ATTR`);
   only widget wrappers, which Vue does not own, still use classes. The readout/API
-  name it: `lowZoom.snapshots.pathway` / `.bitmaps` / `.vueBlanked` / `.vueBoxes` /
+  name it: `lowZoom.snapshots.pathway` / `.bitmaps` / `.vuePaintSkipped` /
+  `.vueBlanked` / `.vueBoxes` /
   `.vueRestored` / `.vueUnreached`. A test in that mode asserts the attribute, the
   box ink, the re-render survival and the hand-back; the harness shim supports tag
   selectors and `querySelector` for the nested-`<video>` and wrapper-`<img>` cases.
@@ -200,6 +214,12 @@ Seams worth knowing:
   canvas blitted), `lodVueRootMetrics` for what the node renders itself
   (`img`/`canvas` children of the node's element, drawn at their laid-out
   position — `(childRect - rootRect)/zoom` in graph units, minus the title bar)
+  `lodVueChromeBoxes`/`lodVueChromeInk` for its **structure** (v2.6.6: the
+  element's own box, the header bar (`node-header-<id>`), the body panel
+  (`node-body-<id>`) and every `.slot-dot`, each from its own rect and the
+  background colour the browser computed, drawn biggest-first and rounded; a node
+  with no header has none — a picture of the text and media alone had no surface
+  under it, which is the "semi, not fully there" the user reported),
   and `lodVueTextLines`/`lodVueTextInk` for its **text** (v2.6.4: every leaf string
   with its laid-out box and computed font/colour, at most `LOD_VUE_TEXT_MAX` lines
   of `LOD_VUE_TEXT_CHARS` characters, each clipped to its own box — a picture of a
@@ -209,7 +229,7 @@ Seams worth knowing:
   clips content to the node's box **and its title bar** (a DOM node's title is
   content like any other, and a clip on the body alone cut it off the picture);
   the canvas renderer passes none of them. Gauges: `lowZoom.snapshots.vueContent`
-  / `.vueMedia` / `.vueText`.
+  / `.vueMedia` / `.vueText` / `.vueChrome` / `.vueChromeBoxes`.
   Three things here are load-bearing, learned the hard way in v2.6.3:
   (1) **the box is `lodVueBoxSize`** — the element's measured box, not `node.size`
   (`LGraphNode.vue` renders image nodes `IMAGE_PREVIEW_HEIGHT_RESERVE` = 232 px
@@ -240,7 +260,17 @@ Seams worth knowing:
   unwatched, and a capture probes fresh), and the steady state must cost the page
   nothing — three tests assert exactly zero writes, reads, queries and probes per
   frame at any node count.
-  (4) **a capture takes one measurement.** `lodVueRootMetrics(node, canvas, true)`
+  (4) **a capture waits for the node to stand still** (v2.6.6): `LOD_SNAP_SETTLE_MS`
+  (300 ms) is a window opened when a node is first drawn as a stand-in and
+  re-opened by every reported change or signature mismatch (`lodVueChanged`), and
+  `lodVueSettleLeft` is the gate in the capture lane — `lodSnapTake` skips a node
+  inside its window and the slice is scheduled for the moment it opens (never
+  polled). The frontend mounts a node and fills it over the following passes
+  (slots sync, layout, widgets, media decoding), so "capture immediately" is a
+  picture of a half-built node. Canvas pathway: no window (its drawing is
+  synchronous with the frame). Gauges: `vueSettleMs` / `.vueSettleArms` /
+  `.vueSettleHeld`.
+  (5) **a capture takes one measurement.** `lodVueRootMetrics(node, canvas, true)`
   → `lodSnapGeometry(node, canvas, dom.boxH)` → surface, box and ink from the same
   number, and the signature mixes that height, the text lines and the measured
   widget boxes (`lodVueWidgetBoxes`), so a picture is dropped and re-made when the
@@ -262,7 +292,12 @@ Seams worth knowing:
   other's picture — RAM or file. If you touch this, keep it that way: a photograph
   of a DOM element is impossible (no browser API), and the harness shim supports
   `el._rect`, `h.rectReads`, `getComputedStyle` (display/pointer-events/transform
-  matrix/font/colour) and `vue.growRoot()` for testing layout. v2.6.5 added the
+  matrix/font/colour — and, since v2.6.6, the box colours a stand-in reads:
+  `backgroundColor`, `borderTopWidth`, `borderTopColor`, `borderTopLeftRadius`),
+  `vue.growRoot()` for testing layout and `vue.addStructure(node, {title, inputs})`
+  (v2.6.6) for the frontend's own node structure — surface, header, body panel and
+  one row + dot per input, laid out in element-local units the way `LGraphNode.vue`
+  lays it out, so the reader and the ink are pinned against the real shape. v2.6.5 added the
   two observers to the sandbox (on by default — a browser has them; a test can
   call `h.setDomObservers(false)` to exercise the timer fallback) with
   `withQuiet` so the fixture's own pan/zoom layout is not mistaken for a box

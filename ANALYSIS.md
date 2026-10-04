@@ -1,6 +1,6 @@
 # What works, what fails, and what was taken out
 
-An audit of the repository as of v2.6.5, done by reading the sources rather
+An audit of the repository as of v2.6.6, done by reading the sources rather
 than the docs, running the suites, and running the demo. Every claim below
 has a file and (where it matters) a line reference. Found defects were fixed
 in the same pass; retired ideas were removed rather than documented as if
@@ -9,8 +9,8 @@ they still existed.
 ## How this was checked
 
 ```bash
-node tests/run-tests.mjs        # 215 passing (172 before the stand-in passes; forty-three added)
-node tests/run-tests.mjs "Nodes 2.0"        # the thirty-two that cover that renderer
+node tests/run-tests.mjs        # 220 passing (172 before the stand-in passes; forty-eight added)
+node tests/run-tests.mjs "Nodes 2.0"        # the thirty-six that cover that renderer
 node tests/run-tests.mjs "cache on disk"    # the six that cover the picture store
 node tests/run-tests.mjs "stand-in picture" # the five that cover what a picture holds
 python3 tests/test_init.py      # Ran 9 tests ... OK
@@ -162,8 +162,10 @@ put things. What it needed was to look where the *node* puts things.
 
 **The fix (v2.6.2).** `lodVueMediaBoxes` walks the node's own element for `img`
 and `canvas` children and draws them in the box at the position the browser laid
-them out in. Two properties make that honest rather than clever: `opacity: 0`
-keeps every box intact, so the layout is readable while a node is a stand-in;
+them out in. Two properties make that honest rather than clever: the stand-in
+mark keeps every box intact (v2.6.2 blanked with `opacity: 0`; since v2.6.6 the
+children are `visibility: hidden`, which keeps the layout *and* stops the paint),
+so the layout is readable while a node is a stand-in;
 and the node's element and its children sit in the frontend's one transformed
 pane, so the difference between two client rects divided by the zoom is a
 distance in graph units (`(childRect - rootRect) / scale`, minus the title bar the
@@ -174,6 +176,18 @@ comparison per drawn box and no layout read at all (pinned by a test that counts
 layout reads). Elements the widget route already drew are skipped, so an image
 shown by both routes is drawn once. The content is clipped to the node's box,
 because nothing spills out of a node.
+
+**The node's structure is part of the node (v2.6.6).** A picture built from text
+and media alone has no surface under it: the node's coloured frame, its header bar
+(the one that carries the title), the body panel inside it and the connection dot
+of every slot are DOM elements with a box and a computed colour like everything
+else, so they are read in the same single measurement — the frontend's own
+`[data-testid=node-inner-wrapper]`, `node-header-<id>`, `node-body-<id>` and
+`.slot-dot` — and drawn by the same ink function the live box and the capture
+share (`lodVueChromeBoxes` → `lodVueChromeInk`), biggest first, each rounded the
+way the browser rounded it. A node with no header (a reroute) simply has no
+header box to draw. This is what the user was describing as "semi, not fully
+there": the stand-in was the node's *content* with no node around it.
 
 **What the boxes carry instead, and why that is the honest maximum.** A node's *content* is not chrome: an image preview is an `<img>` (or, in the
 canvas renderer, an image drawn by a widget), a mask editor or a 3D viewport is a
@@ -192,9 +206,11 @@ pack's HTML blank and counted), and the readout says exactly that.
 **How the blanking works.** The two things that do exist are the node's element
 and the canvas, so the stand-in is made of those:
 
-1. **The element is blanked** — `opacity: 0`, carried by an attribute on the
-   element the frontend renders the node into (`data-ants-vue-standin`, with an
-   `!important` stylesheet rule). **Not a class**: `LGraphNode.vue` binds `:class`
+1. **The element is marked** — an attribute on the element the frontend renders
+   the node into (`data-ants-vue-standin`), carrying two `!important` rules: the
+   element's own box is `opacity: 0`, and its **children are
+   `visibility: hidden`** (v2.6.6; until then the attribute carried `opacity: 0`
+   alone, which takes no paint away at all — see the ninth-report section below). **Not a class**: `LGraphNode.vue` binds `:class`
    on that element (`cn('group/node lg-node absolute isolate touch-none text-xs', …)`)
    and Vue rewrites `class` wholesale on every re-render, so a tool-added class is
    dropped within a frame or two and the node comes back visible *behind* its box.
@@ -202,14 +218,19 @@ and the canvas, so the stand-in is made of those:
    was painted, and the node was painted too. The same reasoning moved the fovea's
    hide mark and the inert mark on a node's own element to attributes
    (`data-ants-dom-hidden`, `data-ants-dom-inert`); widget wrappers, which Vue does
-   not own, keep their classes. `opacity: 0` is the whole
-   mechanism and it was chosen for what it does *not* do: the element keeps its
-   layout box, keeps its children (slots, widgets, resize handles) and keeps its
-   pointer events, so clicking, dragging, selecting and link-dragging behave
-   exactly as they do in full detail. It stops painting; nothing is hidden and no
-   frontend state is touched. (`display: none` would collapse the box and
-   `content-visibility: hidden` would take the node's slots out of hit-testing —
-   both break interaction for a saving that is not worth it.)
+   not own, keep their classes. The mechanism was chosen for what it does *not*
+   do: the element keeps its layout box, keeps its children (slots, widgets,
+   resize handles — *kept* means kept in the DOM and in layout), and its own box
+   keeps its pointer events, so dragging, selecting and link-dragging behave
+   exactly as they do in full detail. What it *does* is take the paint away: an
+   engine skips a hidden subtree in the paint phase, so a stand-in costs the
+   frontend nothing to draw while everything the tool measures still answers. The
+   trade is stated rather than hidden — a widget *inside* a stand-in no longer
+   receives its own clicks at that zoom, and the node's accessibility-tree entry
+   is that of a hidden subtree. (`display: none` would collapse the box;
+   `content-visibility: hidden` would take the subtree's layout away with the
+   paint and blank the rects the frontend's own `useVueNodeResizeTracking.ts`
+   reads; a hidden subtree is the one that keeps them.)
 2. **The canvas paints the box in its place.** LiteGraph still calls `drawNode`
    for every visible node in this renderer (line ~5204: `ctx.translate(px, py)`
    then `this.drawNode(node, ctx)`, with `drawNode` returning early), so this
@@ -217,27 +238,28 @@ and the canvas, so the stand-in is made of those:
    the box lands exactly where a picture lands in the canvas renderer — the same
    detail ladder, the same colours, the same progress bar and error ring.
 
-**Why this is the right target, not a consolation prize — and what it is *not*
-allowed to claim (corrected in v2.6.5).** The frontend's own `useTransformState.ts`
-states its design: all nodes live in one transformed container, "O(1) transform
-updates regardless of node count", so panning and zooming are already compositor
-work; what a zoomed-out heavy graph then spends its frame on is node pixels. The
-canvas renderer's saving (cheaper canvas drawing) does not exist in this renderer
-— its `drawNode` draws no node chrome at all. But this renderer's saving is **not
-established either**: `opacity: 0` keeps the element in the render tree (only
-`display: none` / `visibility: hidden` remove one, and both would take the node's
-own hit-testing with them — in this renderer dragging and selection are handled by
-that DOM), so the node's style, layout and paint work are still the page's, and
-whether an engine skips rasterising a fully transparent subtree is not observable
-from page JavaScript. Earlier revisions of this file asserted "fewer node pixels
-for the browser to paint, which is where a heavy zoomed-out graph spends its
-frame"; that claim was not supported by the evidence collected here and is
-withdrawn. What *is* supported, measured and pinned by tests is the cost: with the
-stand-ins on, a frame writes nothing, reads no layout, runs no DOM query and reads
-no computed style (at 40, 60 and 150 nodes), and a held picture means the node's
-content is not re-drawn every frame. Whether it saves frames on a given graph is
-for the frame budget and the Stalls tab to say on that page. Same setting, same
-threshold, same boxes, two different mechanisms — and one honest claim each.
+**Why this is the right target — and how v2.6.6 turned the claim into a
+mechanism (the correction is in the ninth-report section below).** The frontend's
+own `useTransformState.ts` states its design: all nodes live in one transformed
+container, "O(1) transform updates regardless of node count", so panning and
+zooming are already compositor work; what a zoomed-out heavy graph then spends its
+frame on is node pixels. The canvas renderer's saving (cheaper *canvas* drawing)
+does not exist in this renderer — its `drawNode` draws no node chrome at all — so
+the only saving available here is the frontend's own DOM painting, and a stand-in
+has to make the browser skip it. v2.6.5 measured the tool's own per-frame cost
+down to zero and correctly noted that `opacity: 0` takes no paint away; the honest
+reading of that was not "therefore nothing can be claimed", it was "therefore the
+mark is the wrong mark". Since v2.6.6 the node's contents are `visibility: hidden`
+(an engine skips a hidden subtree's paint) while the element stays in the layout,
+in the observers and hit-testable, and the count of nodes whose paint the frontend
+no longer owes (`vuePaintSkipped`) is in the readout beside the measured cost:
+with the stand-ins on, a frame writes nothing, reads no layout, runs no DOM query
+and reads no computed style (at 40, 60 and 150 nodes), a held picture means the
+node's content is not re-drawn every frame, and the node's DOM painting is not the
+page's work any more. What page JavaScript still cannot measure is the rasteriser's
+own bill on a given machine — that is the frame budget's, the Stalls tab's and
+DevTools' paint flashing's job on that page. Same setting, same threshold, same
+boxes, two different mechanisms — and one honest claim each.
 
 **Pictures too, and the disk files with them (v2.6.3).** The mistaken belief that
 a Vue-nodes stand-in cannot have a picture was never about the browser: it was
@@ -385,8 +407,8 @@ stand-ins", which the tracker reported as in use.* Four causes, all fixed:
 1. **The picture had no text in it.** A box, a title bar and (at best) an image
    is most of what a user calls a box. In this renderer the node's text *is* DOM
    text and cannot be photographed — but every string, its laid-out box and the
-   styles the browser computed for it are readable while the node is blanked
-   (`opacity: 0` keeps the layout). `lodVueTextLines` reads them in the same
+   styles the browser computed for it are readable while the node is a
+   stand-in (the mark takes the painting, never the box). `lodVueTextLines` reads them in the same
    single measurement the media pass already made, capped at
    `LOD_VUE_TEXT_MAX` = 16 lines of `LOD_VUE_TEXT_CHARS` = 80 characters, and
    `lodVueTextInk` re-paints each one clipped to its own box. The node's title
@@ -468,16 +490,92 @@ pathway token dropped from the key → three fail; the no-element refusal remove
 test fails; the text keeping the title-bar offset → the text test fails.
 
 **What is not verified.** The mechanism is verified against the frontend's
-sources and the harness (thirty-two tests now cover that renderer); it had not
+sources and the harness (thirty-six tests now cover that renderer); it had not
 been run against a live Vue-nodes page by this project when the fourth report
 arrived, and that report is exactly why the defects above were invisible from
 here — the harness put a class on an element nothing rewrote, it reported
 pictures "off" in that renderer as a *decision* rather than a bug, and it had no
 text in a node's element for a picture to omit. It has still not been run against
 a live page by this project: the user's page is the live test, and the size of the saving on a real heavy graph is not measured here — the
-tool's own frame budget and Stalls tab can measure it on the page. One honest nuance: while a node is blanked, its
-accessibility-tree entry is that of a blank element (`opacity: 0` keeps the
-elements rather than removing them).
+tool's own frame budget and Stalls tab can measure it on the page. Two honest
+nuances: while a node is a stand-in its accessibility-tree entry is that of a
+hidden subtree, and a widget inside a stand-in does not receive its own clicks at
+that zoom (the pointer lands on the node, which is what the picture shows there).
+
+**The ninth report (v2.6.6): the paint was never taken away, and a picture could
+be taken mid-render.** The user reported that the v2.6.5 fixes helped not at all —
+performance unchanged, and the stand-ins still captured "in the same semi 'not
+fully there' way" — and asked three things: give the capture a grace period, check
+whether the capture tick rides the frontend's own tick and whether the frontend
+redraws nodes in a staggered way, and, if that is the cause, build a capture
+process of our own. All three were answered against the frontend's sources
+(`LGraphNode.vue`, `NodeHeader.vue`, `NodeSlots.vue`, `NodeContent.vue`,
+`ImagePreview.vue`, `useNodePointerInteractions.ts`, `useVueNodeResizeTracking.ts`,
+`useTransformSettling.ts`) and the harness.
+
+*The performance half was a wrong mark, not a missing optimisation.* v2.6.5 had
+already driven the tool's own per-frame DOM work to zero (40/60/150 nodes: 0
+writes, 0 layout reads, 0 queries), and the performance still dropped — so the
+remaining cost could only be the frontend's own painting, which the mark was
+supposed to remove and did not. `opacity: 0` keeps a subtree in the render tree
+and keeps painting it. The engine honours the other property: `visibility:
+hidden`, carried by the stand-in attribute's children (v2.6.6), while the element
+itself keeps its place, its layout, its observers and its hit-testing — so a frame
+at low zoom no longer owes the browser a single node's DOM paint, and the numbers
+the tool reads (rects, text metrics, change reports) still come from the DOM. Two
+consequences are recorded rather than glossed: `vuePaintSkipped` counts the nodes
+the frontend no longer has to paint, and what a stand-in trades away is the
+*painted* node — a widget inside a stand-in no longer takes its own clicks at that
+zoom, and its accessibility entry is that of a hidden subtree.
+
+*The timing half was ours, and the frontend's "tiers" are its mounting order.*
+The frontend has **no per-node animation tick**: nodes are Vue components, the
+transform is one property on one pane (`useTransformState.ts`), and the browser
+paints them on its own schedule. What the frontend does have is an *assembly
+order*: `LGraphNode.vue` mounts, `NodeSlots` syncs slot offsets in a watcher, the
+layout store hands the size over, `NodeWidgets` renders the widgets, `NodeContent`
+mounts the node's media and an image appears when it decodes, `LivePreview` covers
+an executing node, `useVueNodeResizeTracking.ts` re-measures elements through a
+shared `ResizeObserver` (and its own code comments note that the observer "can
+repeat an unchanged entry"), and `useTransformSettling(…, { settleDelay: 256 })`
+is the frontend's own notion of a transform having settled. So there are tiers —
+of *rendering passes*, not of pixels — and the tool's capture does not ride them:
+it runs on its own idle lane by design (running inside the frontend's frame is
+what the lane exists to avoid). A capture that ran immediately after a change
+therefore read the DOM between two of those passes: a picture of a half-built
+node. The fix is a **settle window**: `LOD_SNAP_SETTLE_MS` (300 ms) opened when a
+node is first drawn as a stand-in, re-opened by every change the page reports or
+the signature notices, enforced as a gate in the capture lane (`lodVueSettleLeft`
+→ `lodSnapTake`), scheduled to the moment the window opens rather than polled. A
+burst of rendering now costs one picture at the end of it instead of one picture
+per step, and nothing is read or written while a node is quiet.
+
+*A capture process "of our own" is what the pathway already is — and it is the
+only possible one.* Page JavaScript cannot screenshot a DOM element (no
+`drawImage`, no `createImageBitmap`, no `captureStream`); the two library-shaped
+routes (an SVG `foreignObject` re-render or an html2canvas-style re-implementation)
+would re-rasterise the whole node tree on the CPU per capture — on a machine with
+hardware acceleration off, that is the cost this pathway exists to remove — and
+would still mis-render real stylesheets. What the tool does instead is a capture
+of its own in the sense the user meant: it reads what the browser laid out
+(every rect and text metric) and what the browser computed (every background
+colour, border and radius), blits the pixels that exist (`<img>`, `<canvas>`),
+re-paints the strings that exist, counts what it cannot draw, and — since v2.6.6 —
+takes the frontend's own paint away while the picture stands in. That is
+"screenshot the node the way the user sees it" by construction: the picture and
+the live node can no longer disagree, because the live node is not painted.
+
+*Four tests, and the mutations that bind them.* The new tests: the paint-skip rule
+is in the stylesheet and the element's layout is untouched (a box that changes
+inside a stand-in is still reported); the picture carries the node's structure
+(frame at the element's own rect, dots as arcs) both live and in the capture; a
+node is photographed only after the window (nothing captured inside it, the lane
+reports the wait, the picture lands after it); and a change re-opens the window
+(the picture is dropped, no replacement inside the window, a fresh one after it).
+A eight-mutation battery was run over the tracker — the gate bypassed, the
+re-arming removed, the structure not drawn, the stylesheet rule removed, the slot
+dots not drawn, the first-time window never opened, the structure reader reduced
+to the frame — and **all eight are caught**.
 
 Two things the Nodes 2.0 pass confirmed rather than changed: the Vue node's
 **root element is never hidden or inerted** (`via: "root"` records are exempt from
@@ -597,7 +695,7 @@ apply, not just in the docs.
   other than the Node harness was executed in this pass.
 - **The Vue-nodes stand-in has not been run against a live page *by this
   project*.** It is verified against the frontend's sources and the harness
-  (thirty-two tests), and its failure modes are contained by construction (a box
+  (thirty-six tests), and its failure modes are contained by construction (a box
   only ever follows a real blanking, and every blanked element is handed back on
   the frame the setting stops applying) — but the user's page is the live test, and
   it has already caught four defects this harness could not: a class that Vue
@@ -608,7 +706,10 @@ apply, not just in the docs.
   heavy graph can show. The tool measures both: the frame budget, the Stalls tab
   and `lowZoom.snapshots.vueBlanked` / `vueBoxes` / `vueMedia` / `vueContent` /
   `vueText` / `vueScale` / `vueScaleFrom` / `vueRestored` / `vueCleared` /
-  `vueUnreached` / `vueNoElement`.
+  `vueUnreached` / `vueNoElement`, and — since v2.6.6 — `vuePaintSkipped` (nodes
+  whose paint the frontend no longer owes), `vueChrome` / `vueChromeBoxes` (the
+  node's structure drawn), `vueSettleMs` / `vueSettleArms` / `vueSettleHeld` (the
+  settle window, and how many capture slices it held back).
 - **The Vue box's media positions and its height come from layout**, read when the
   node's own size changes and otherwise at most every 400 ms, with those refreshes
   rationed per frame. Node-local numbers do not change with the camera (a pan is
@@ -640,13 +741,21 @@ apply, not just in the docs.
   a pack that does not gets nothing, and the box says so by being empty rather
   than by inventing ink. A pack that wants the box to carry its content can add a
   DOM widget; the tool cannot take what was never on the page.
-- **A picture of a Vue node is not obtainable** without a DOM-to-canvas
+- **A pixel screenshot of a Vue node is not obtainable** without a DOM-to-canvas
   library (or an SVG `foreignObject` trick), which would mis-render real
-  stylesheets and cross-origin images. The Vue pathway is boxes by design, and
-  the readout says so rather than offering a choice that cannot exist. The
-  remaining picture-shaped question — an `<img>` overlay positioned over a node
-  — is not taken: it would add a per-frame transform copy per node to save less
-  than the blanking does (`plan.md`, Track K).
+  stylesheets and cross-origin images, and which on a GPU-less machine would
+  rasterise the whole node tree per capture — the cost this pathway exists to
+  remove. What a stand-in *is* instead (since v2.6.3, structure included since
+  v2.6.6) is the node re-drawn from the browser's own numbers: every rect and
+  text metric the layout gives, every background colour the browser computed
+  (a widget's own row included, since v2.6.6: the element the frontend mounts,
+  drawn with its box, border and radius under the widget's text),
+  every `<img>`/`<canvas>` blitted pixel for pixel, with the parts that are
+  neither (a pack's own HTML) blank and counted. A screenshot of a node the
+  browser no longer paints is also no longer needed: the picture is the only copy
+  of that node on the screen. The remaining picture-shaped question — an `<img>`
+  overlay positioned over a node — is not taken: it would add a per-frame
+  transform copy per node to save less than the mark does (`plan.md`, Track K).
 - **The console-attribution mode** (plan.md, Track L) is still unbuilt. The
   credit for the idea stands; the honest thing is that nothing in the shipped
   code depends on it.

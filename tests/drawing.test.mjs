@@ -2993,7 +2993,8 @@ suite("drawing: the Nodes 2.0 (Vue nodes) frontend", () => {
     assertIncludes(text, "Vue nodes", "the readout says which renderer this is");
     assert(!text.includes("collapsed boxes or this tool's own node, which are never flattened"), "and does not blame collapsed nodes for a decision this renderer made");
     assert(!text.includes("snapshots are on but not painting anything"), "nor the flatten setting, which is switched on and below its zoom");
-    assertIncludes(text, "blanked", "it says what a stand-in is in this renderer");
+    assertIncludes(text, "node element(s) marked", "it says what a stand-in is in this renderer");
+    assertIncludes(text, "the browser skips the paint of those subtrees", "and says what the mark costs the frontend: the paint, not the layout, so the numbers still come from the DOM");
     // The copyable report is read by people who never open the panel, so it has
     // to be as honest as the panel is.
     const report = h.tracker.report;
@@ -3766,6 +3767,169 @@ suite("drawing: the Nodes 2.0 (Vue nodes) frontend", () => {
     h.tracker.lowZoom.setEnabled(false);
     for (const n of nodes) assert(!vue.rootFor(n).hasAttribute("data-ants-vue-standin"), "and the master switch hands them back too");
     assertGreater(h.tracker.lowZoom.snapshots.vueRestored, 0, "the hand-backs are counted");
+  });
+
+  // Why this test is the one that matters for what a user feels: in this renderer
+  // the node *is* DOM, so a stand-in has to take the frontend's own painting away
+  // to be worth anything. `opacity: 0` does not (Blink/WebKit keep the subtree in
+  // the render tree), which is how the tool could cost performance here while
+  // saving it in the legacy renderer. `visibility: hidden` on the children is what
+  // an engine skips in the paint phase — and taking the paint away must not take
+  // the *layout* away, because every number the stand-in is made of comes from it.
+  test("the stand-in takes the live DOM out of the paint and leaves it in the layout", async () => {
+    const h = await boot();
+    const { nodes, vue } = vueGraph(h, 2);
+    const struct = vue.addStructure(nodes[0], { title: "KSampler", inputs: ["model"] });
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true, diskOn: false });
+    draw(h, 2);
+    await idle(h);
+    const api = snapApi(h);
+    assertEqual(api.pictured, 2, "both nodes have their picture");
+    assertEqual(api.vuePaintSkipped, api.vueBlanked, "the readout counts the subtrees the browser is told not to paint");
+    assertEqual(api.vuePaintSkipped, 2, "which is every node drawn as a stand-in");
+    const css = (h.document.querySelectorAll("style") || []).map((el) => String(el.textContent || "")).join("\n");
+    assert(css.includes("[data-ants-vue-standin] > *"), "the stylesheet targets the node's children");
+    assert(css.includes("visibility: hidden !important"), "with the one property a paint phase actually honours");
+    // And the node's own box stays visible: without it the node would stop being
+    // hit-testable, and selecting or dragging a node at that zoom would stop
+    // working — a stand-in may replace the pixels, not the node.
+    assert(!/\[data-ants-vue-standin\]\s*\{[^}]*visibility/.test(css), "the node's own box is not hidden, only its contents");
+    assertEqual(struct.surface.parentNode, vue.rootFor(nodes[0]), "the node's own structure is still in the DOM");
+    const stale0 = api.vueStale;
+    vue.growRoot(nodes[0], 232); // the frontend reserves room inside the node
+    assertGreater(snapApi(h).vueStale, stale0, "and a box that changes is still reported: what was taken away is the paint, not the layout");
+  });
+
+  // The picture has to carry the node, and a node in this renderer is its frame,
+  // its header bar, its body panel and its slot dots as much as it is its text and
+  // its media. A picture of the content alone is the "semi — not fully there" a
+  // user reported twice: the node's own surface was never drawn, so the stand-in
+  // could only ever look like a sketch floating on the canvas.
+  test("the picture carries the node's own structure, not only its content", async () => {
+    const h = await boot();
+    const { nodes, vue } = vueGraph(h, 1);
+    const n = nodes[0];
+    const struct = vue.addStructure(n, { title: "KSampler", inputs: ["model"] });
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true, diskOn: false });
+    // Before a picture exists the box draws the structure live, from the same ink
+    // function: the node's frame is the element's own box, one title bar above the
+    // node's origin, rounded the way the browser rounded it.
+    const before = fills(h).length;
+    draw(h, 1);
+    assertGreater(fills(h).length, before, "the live box paints the node's structure, not only its text");
+    const live = h.canvas.ctx.ops.filter((o) => o[0] === "roundRect");
+    assert(
+      live.some((o) => o[1] === 0 && o[2] === -30 && o[3] === 200 && o[4] === 130),
+      "the frame is drawn where the browser laid the element out"
+    );
+    // And the picture is a freeze of exactly that.
+    await idle(h);
+    const api = snapApi(h);
+    assertEqual(api.captured, 1, "the node is photographed");
+    assertEqual(api.vueChromeBoxes, 4, "the frame, the body panel, the header bar and the slot dot are read out of the DOM");
+    assertGreater(api.vueChrome, 0, "and drawn into the picture in the colours the browser computed for them");
+    const pics = h.canvases.filter((c) => c._ctx && c._ctx.ops.some((o) => o[0] === "roundRect" && o[2] === -30));
+    assertEqual(pics.length, 1, "the picture has the node's frame in it");
+    assert(
+      pics[0]._ctx.ops.some((o) => o[0] === "arc"),
+      "and the slot dots are circles at the position the renderer put them, not invented geometry"
+    );
+    // A slot turning up later changes the node's *structure* and nothing else — the
+    // same text, the same box — and the picture has to follow it, or the stand-in
+    // keeps a node that no longer exists. This is the half of the signature that
+    // carries the structure.
+    const captured = api.captured;
+    struct.addDot(3);
+    draw(h, 1);
+    h.advance(600);
+    await h.flush();
+    assertGreater(snapApi(h).invalidated, 0, "a new slot drops the picture: the node is not the node that was photographed");
+    assertGreater(snapApi(h).captured, captured, "and the new picture carries it");
+  });
+
+  // A node's widgets are DOM elements in this renderer, and a stand-in hides the
+  // node's DOM while it stands in for it — so the row has to be *in the picture*:
+  // the box the browser laid out, its own colour, its border and its radius. A node
+  // whose widgets are a hole in its picture is not a stand-in, it is a broken node.
+  test("a widget's own row is in the picture, not a hole where the widget was", async () => {
+    const h = await boot();
+    const { nodes, vue } = vueGraph(h, 1);
+    const n = nodes[0];
+    stripWidgets(nodes);
+    const row = h.document.createElement("div");
+    row.className = "widget-row";
+    row.style.backgroundColor = "rgb(31, 37, 47)";
+    row.style.borderTopWidth = "1px";
+    row.style.borderTopColor = "rgb(91, 97, 117)";
+    row.style.borderTopLeftRadius = "4px";
+    vue.addMedia(n, row, { x: 12, y: 44, w: 176, h: 22 });
+    n.widgets.push({ name: "steps", type: "number", element: row, node: n });
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true, diskOn: false });
+    draw(h, 1);
+    const live = h.canvas.ctx.ops.filter((o) => o[0] === "roundRect");
+    const near = (a, b) => Math.abs(Number(a) - b) < 0.01;
+    assert(
+      live.some((o) => near(o[1], 12) && near(o[2], 44) && near(o[3], 176) && near(o[4], 22) && near(o[5], 4)),
+      "the live box draws the widget's own row, at its measured box, with the browser's radius"
+    );
+    await idle(h);
+    assertEqual(snapApi(h).captured, 1, "the node is photographed");
+    assertGreater(snapApi(h).vueWidgetInk, 0, "and the lane counts the row as part of the picture");
+    const pics = h.canvases.filter((c) => c._ctx && c._ctx.ops.some((o) => o[0] === "roundRect" && near(o[2], 44) && near(o[3], 176)));
+    assertEqual(pics.length, 1, "the picture carries the widget's row, not an empty panel");
+  });
+
+  // A node is mounted and then *filled*: the frontend writes its parts over the
+  // frames after that, and an image arrives when it arrives. A capture taken at the
+  // first opportunity is a picture of a node that is still being built — the
+  // "photographed too early" a user reported, twice. The window is the grace
+  // period that answer asks for.
+  test("a node is photographed only after it has stood still", async () => {
+    const h = await boot();
+    const { nodes, vue } = vueGraph(h, 1);
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true, diskOn: false });
+    draw(h, 1); // the frame that draws the node as a stand-in, and opens its window
+    assertGreater(snapApi(h).vueSettleArms, 0, "the node's settle window opened when it was first drawn as a stand-in");
+    assertEqual(snapApi(h).vueSettleMs, 300, "and it is the window the readout says it is");
+    h.advance(120);
+    await h.flush();
+    assertEqual(snapApi(h).captured, 0, "nothing is photographed inside the window");
+    assertGreater(snapApi(h).vueSettleHeld, 0, "and the capture lane says it waited rather than being idle");
+    h.advance(600);
+    await h.flush();
+    assertEqual(snapApi(h).captured, 1, "the picture is taken once the node has stood still");
+    assertGreater(vue.rootFor(nodes[0]).hasAttribute("data-ants-vue-standin"), 0, "and the node has been a stand-in the whole time");
+  });
+
+  // The other half of the same rule: a node that changes does not get photographed
+  // where it stands — the window re-opens, and the picture that no longer matches
+  // is replaced by one taken after the node has settled again.
+  test("a change re-opens the settle window before the picture is replaced", async () => {
+    const h = await boot();
+    const { nodes, vue } = vueGraph(h, 1);
+    const n = nodes[0];
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true, diskOn: false });
+    draw(h, 1);
+    h.advance(600);
+    await h.flush();
+    assertEqual(snapApi(h).captured, 1, "the node is pictured once it has stood still");
+    const armed = snapApi(h).vueSettleArms;
+    // The node changes: an image arrives inside it, which is what "still rendering"
+    // looks like from here.
+    const img = h.document.createElement("img");
+    Object.assign(img, { naturalWidth: 64, naturalHeight: 64, complete: true, src: "late.png" });
+    vue.addMedia(n, img, { x: 10, y: 40, w: 60, h: 60 });
+    draw(h, 1);
+    h.advance(150); // past the signature's own 100 ms window
+    await h.flush();
+    draw(h, 1); // this frame compares the signature and drops the picture
+    const mid = snapApi(h);
+    assertGreater(mid.invalidated, 0, "the picture that no longer matches the node is dropped");
+    assertGreater(mid.vueSettleArms, armed, "the change re-opened the settle window");
+    assertEqual(mid.captured, 1, "and no replacement is taken inside it");
+    h.advance(600);
+    await h.flush();
+    assertGreater(snapApi(h).captured, 1, "a fresh picture is taken once the node has stood still again");
   });
 
 });

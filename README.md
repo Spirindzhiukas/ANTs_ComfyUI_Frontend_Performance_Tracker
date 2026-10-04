@@ -6,7 +6,7 @@ for: *which extension's JavaScript is actually costing me frames while I pan
 this graph, and what is eating main-thread time that no draw hook owns?* —
 without opening DevTools and without restarting ComfyUI to bisect.
 
-Version **2.6.5**. Everything runs from page load: no node has to be placed,
+Version **2.6.6**. Everything runs from page load: no node has to be placed,
 nothing executes, and the tool never changes your graph or your workflows.
 
 - **Measure** — per-extension and per-node-type frame cost, canvas draw
@@ -198,10 +198,14 @@ call, never latched:
 
 * **canvas renderer** — a picture of the node (or its box) blitted where the
   canvas would have drawn the node;
-* **Vue-nodes renderer** — the node's own element is *blanked* with
-  `opacity: 0` (the element keeps its place, its layout, its children and its
-  pointer events) and the canvas paints the same box in the same place, with the
-  same detail ladder. The blanking is an **attribute** on the element
+* **Vue-nodes renderer** — the node's own element is *marked* so the frontend
+  stops painting it: its children are `visibility: hidden` (the one property an
+  engine honours by skipping a subtree in the paint phase — `opacity: 0`, which
+  this pathway used until v2.6.6, is still painted) and the element's own box
+  keeps its place, transparent and hit-testable, so dragging, selecting and
+  link-dragging are untouched. The elements stay in the page, in the layout and
+  in the frontend's own observers, and the canvas paints the same box in the same
+  place, with the same detail ladder. The mark is an **attribute** on the element
   (`data-ants-vue-standin`) plus an `!important` stylesheet rule, deliberately
   not a class: `LGraphNode.vue` binds `:class` on that element and rewrites it
   wholesale on every re-render, so a tool-added class is silently thrown away
@@ -222,8 +226,10 @@ call, never latched:
   `ImagePreview.vue` puts the node's pictures in `<img>` elements inside the
   node's DOM, and a custom node may render a `<canvas>` for a viewport or a curve
   editor — is found by walking the node's element and drawn at the position the
-  browser laid it out in, which is readable while the node is blanked because
-  `opacity: 0` keeps every box. **Everything the node renders as text** — its title, its
+  browser laid it out in, which is readable while the node is a stand-in because
+  the mark takes the *painting* away and never the layout: a hidden element still
+  answers `getBoundingClientRect`, still has its text metrics and is still
+  reported by every observer. **Everything the node renders as text** — its title, its
   widget labels and the values the frontend draws itself — is read out of the
   DOM, string by string, with the box the browser laid each one out in and the
   styles it computed for it, and re-painted there. Page JavaScript cannot
@@ -231,7 +237,17 @@ call, never latched:
   font, which is what a stand-in needs; a field's *value* is drawn from the value
   the field holds, as before. The content is clipped to the node's box **and its
   title bar**, so the node's own name is in the picture rather than cut off above
-  it. A pack's own drawn HTML is still blank and counted. Nothing is drawn twice, and **the page is asked for nothing while nothing
+  it. **The node's own structure** is read the same way and drawn the same way:
+  the element's box (the coloured surface), the header bar that carries the title,
+  the body panel under it and the connection dot of every slot, each at the rect
+  the browser gave it and in the background colour the browser computed for it
+  (the frontend's own `[data-testid=node-inner-wrapper]`, `node-header-<id>`,
+  `node-body-<id>` and `.slot-dot`), and every widget's own row — the element the
+  frontend mounts for it, with its background, border and radius, read in the same
+  measurement pass so a row's rect and its colour can never come from two different
+  layouts. Without that, the picture was the node's text
+  and media floating on the canvas with no surface under them — the "semi, not
+  fully there" the stand-ins were reported as. A pack's own drawn HTML is still blank and counted. Nothing is drawn twice, and **the page is asked for nothing while nothing
   changes**. The tool watches the node's element instead of interrogating it: a
   `ResizeObserver` on the element and the elements inside it, and a
   `MutationObserver` on its children and text, drop the stored measurement the
@@ -267,22 +283,33 @@ call, never latched:
   sets that number to 1 while the DOM keeps the frontend's transform) — so
   content lands where it belongs even in a capture taken mid-zoom.
 
-Nothing is hidden: the element is still there — slots, widgets, resize handles,
-the context menu — so clicking, dragging, selecting and link-dragging behave
-exactly as they do in full detail; it just stops being *visible*. **What that is
-worth on this pathway is not something this tool claims.** `opacity: 0` keeps the
-element in the render tree — only `display: none` and `visibility: hidden` take an
-element out of rendering — so the node's style, layout and paint work are still
-the browser's, and whether an engine skips rasterising a fully transparent subtree
-is not observable from page JavaScript. (Those two marks are not alternatives
-here: in this renderer node dragging and selection are handled by that DOM, so an
-element that cannot be hit-tested is a node the user cannot pick up.) What *is*
-measured, and pinned by tests, is the other half — with the stand-ins on a frame
-costs the page no attribute writes, no layout reads, no DOM queries and no
-computed styles, at 40, 60 and 150 nodes alike, and a picture means the node's
-content is not re-drawn every frame. If the frame rate still drops with the
-stand-ins on, the instrument is this tool's own frame budget and Stalls tab on
-that page. Every blanked element is handed back the moment the
+**In this renderer the mark is the mechanism, and v2.6.6 is where it became one.**
+A stand-in has to make the frontend stop *painting* the node — that is the whole
+saving in a renderer whose node drawing is ordinary DOM work, and on a machine
+with hardware acceleration off it is CPU work on every frame. `opacity: 0`
+(v2.6.0–v2.6.5) does not do that: an opacity-0 subtree stays in the render tree
+and is still painted, which is exactly why the stand-ins could cost performance
+here while saving it in the canvas renderer, where the expensive drawing was
+LiteGraph's own `drawNode` and the box replaced it. What an engine actually skips
+is a *hidden* subtree, so the node's children are `visibility: hidden` — and only
+its children: the node's own box keeps its place and stays hit-testable, which is
+what keeps dragging, selecting and link-dragging working through a stand-in,
+because in this renderer those are that DOM. Nothing is removed: the elements stay
+in the page, in the layout and in the frontend's own `ResizeObserver` (upstream
+`useVueNodeResizeTracking.ts` measures the same rects), so every number the box and
+the picture are made of still comes from the DOM, and a change inside a stand-in is
+still reported and still re-makes the picture. What the mark trades away is the
+*painted* node, not the node: a widget inside a stand-in no longer receives its own
+clicks at that zoom — the pointer goes to the node, which is what the user sees
+there — and the node's accessibility-tree entry is that of a hidden subtree while
+its picture stands in. **Both halves are measured and pinned by tests:** the paint
+the frontend no longer has to do is counted (`vuePaintSkipped`), a box that changes
+inside a stand-in is still reported (and the picture re-made), and with the
+stand-ins on a frame costs the page no attribute writes, no layout reads, no DOM
+queries and no computed styles, at 40, 60 and 150 nodes alike. What page JavaScript
+cannot measure is the rasteriser's own bill; on the machine the graph runs on, that
+is what DevTools' *paint flashing* shows (boxed nodes stop flashing) next to this
+tool's frame budget and Stalls tab. Every marked element is handed back the moment the
 zoom leaves the setting, the setting or the tool is switched off, or the
 renderer changes — the per-frame plan compares one boolean in the steady state,
 so a stale mark cannot be left behind, and an element the frontend unmounted
@@ -296,10 +323,19 @@ nodes flickering between a box and the frontend's own rendering.
 **Pictures work here as well, and so do the disk files.** Below the threshold
 the idle lane builds a stand-in *picture* for each boxed node — not a
 screenshot of the element, which no browser API can make, but the same drawing
-the live box makes (the box, its title bar and state marks, the widget text the
+the live box makes (the box, its title bar and state marks, the node's structure
+read out of the DOM — surface, header, body panel, slot dots — every widget's own
+row, drawn with the box, border and radius the browser gave it, the widget text the
 frontend mounts as DOM, and the node's own `<img>`/`<canvas>` elements at the
 rows the layout gave them) drawn into the same offscreen capture surface the
-canvas renderer uses. Everything downstream is therefore identical: the capture
+canvas renderer uses. **A node is only photographed once it has stood still**: a
+settle window (300 ms) opens when a node is first drawn as a stand-in and re-opens
+on every change the page reports or the signature notices, so a burst of rendering
+costs one picture at the end of it instead of one picture per step. That is the
+answer to a node being photographed while the frontend was still filling it in —
+the frontend mounts a node and then writes its parts over the following frames,
+and an image is decoded when it is decoded, so "capture immediately" is a picture
+of a half-built node. Everything downstream is therefore identical: the capture
 resolution ladder (0.25× → 3×), the half and quarter mip copies blitted on
 screen, the RAM budget, the disk cache and its key, and the files in
 `temp/ANTs_Frontend_Optimizer_THUMBNAILS/`. **The key names the pathway** —
@@ -318,9 +354,9 @@ picture and counted, exactly as in the canvas renderer.
 
 | Setting | In the Vue-nodes frontend |
 | --- | --- |
-| Replace node previews with bitmap stand-ins at zoom levels | **Works, as boxes.** Below the setting each node's element stops painting and the canvas draws its box; above it, every element is handed back. |
+| Replace node previews with bitmap stand-ins at zoom levels | **Works, as boxes.** Below the setting each node's element stops *painting* — its contents are `visibility: hidden`, which an engine skips in the paint phase, and it stays in the layout and in every observer — and the canvas draws its box; above it, every element is handed back. |
 | Stand-in (plain / title / title + state) | **Works** — the same box ladder, same marks, same colours, and no content drawn (that is what "plain" means here too). Choosing one of these instead of *picture* changes nothing else: the elements stay handed over and the boxes keep standing, frame after frame. |
-| Stand-in: *picture of the node* | **Works, drawn rather than photographed.** No browser API can draw a DOM element into a canvas, so a screenshot of a Vue node is impossible; the picture is instead *drawn* — the box at the picture level (title bar, error ring, progress, dimming) with the node's own content: the images and canvases the node renders (the frontend's preview `<img>` elements among them) at their real laid-out position, text fields re-painted, a pack's HTML blank and counted. Until the idle lane has that picture, the box carries the same content live. |
+| Stand-in: *picture of the node* | **Works, drawn rather than photographed.** No browser API can draw a DOM element into a canvas, so a screenshot of a Vue node is impossible; the picture is instead *drawn* — the box at the picture level (title bar, error ring, progress, dimming) with the node's own structure (surface, header bar, body panel, slot dots, at their laid-out rects and computed colours) and its content: the images and canvases the node renders (the frontend's preview `<img>` elements among them) at their real laid-out position, text fields re-painted, a pack's HTML blank and counted. A node is photographed only after it has stood still (300 ms, re-opened by every change), so the picture is of a finished node, never of one still being filled in. Until the idle lane has that picture, the box carries the same content live. |
 | Capture resolution, RAM budget, disk cache | **Work.** The picture is made on the same idle lane, at the same resolution ladder, with the same mip chain, RAM budget and disk files (`temp/ANTs_Frontend_Optimizer_THUMBNAILS/`, keyed by signature + ratio + theme + pathway). Switching renderer releases the pictures the other renderer made and builds them again, because the box, the padding and the content route all differ. |
 | Keep these node types live | **Works** — a listed type is never blanked and stays in full detail at any zoom. |
 | Link shape, link thinning, Measure link thinning | **Work.** Links are still drawn by the canvas, so the 1 px/no-outline thinning and the straight-line style reach the ink exactly as in canvas mode. |
@@ -604,7 +640,7 @@ short version:
 ## Development
 
 ```bash
-node tests/run-tests.mjs              # all tests — 215 passing, zero dependencies
+node tests/run-tests.mjs              # all tests — 220 passing, zero dependencies
 node tests/run-tests.mjs <substring>  # one suite or test
 python3 tests/test_init.py            # the Python side (routes, node contract)
 node tests/demo.mjs                   # prints what every tab says, against a synthetic graph
