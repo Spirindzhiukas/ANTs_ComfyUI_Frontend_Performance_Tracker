@@ -3628,6 +3628,36 @@ suite("drawing: the Nodes 2.0 (Vue nodes) frontend", () => {
     assertGreater(paintedAt(93).length, 0, "and the new one puts the text where the element is now");
   });
 
+  test("the readout describes pictures in this renderer when snapshots are on", async () => {
+    const h = await boot();
+    const { vue } = vueGraph(h, 1);
+    void vue;
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true });
+    draw(h, 2);
+    await idle(h);
+    // The panel used to say "(no picture is taken in this renderer — the bitmap half
+    // of the engine is idle)" while the same line reported pictures being served and
+    // captured. The user read both at once. The report is the tool's own claim about
+    // itself, so the claim is held to the setting.
+    h.tracker.open();
+    const copyBtn = h.document.body.descendants().find((n) => n._cls && n._cls.has("ants-hbtn") && n.textContent.includes("Copy"));
+    assert(copyBtn, "the panel has a copy button");
+    copyBtn.click();
+    await h.flush();
+    const report = h.clipboardWrites[h.clipboardWrites.length - 1] || "";
+    assertIncludes(report, "node stand-ins are pictures", "the Vue paragraph says pictures are made");
+    assert(!report.includes("no picture is taken in this renderer"), "and does not claim the opposite");
+    // The other branch has to stay true as well: with the pictures off, that is
+    // exactly what happens, and the sentence now says which setting turned it off.
+    h.tracker.lowZoom.set({ snapshots: false });
+    h.advance(500);
+    await h.flush();
+    copyBtn.click();
+    await h.flush();
+    const off = h.clipboardWrites[h.clipboardWrites.length - 1] || "";
+    assertIncludes(off, "no picture is taken while the snapshots setting is off", "with the setting off it says so");
+  });
+
   test("a tall node's own labels are read past the first sixteen", async () => {
     const h = await boot();
     const { nodes, vue } = vueGraph(h, 1);

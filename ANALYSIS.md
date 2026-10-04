@@ -9,7 +9,7 @@ they still existed.
 ## How this was checked
 
 ```bash
-node tests/run-tests.mjs        # 222 passing (172 before the stand-in passes; fifty added)
+node tests/run-tests.mjs        # 223 passing (172 before the stand-in passes; fifty-one added)
 node tests/run-tests.mjs "Nodes 2.0"        # the thirty-seven that cover that renderer
 node tests/run-tests.mjs "cache on disk"    # the six that cover the picture store
 node tests/run-tests.mjs "stand-in picture" # the five that cover what a picture holds
@@ -602,7 +602,8 @@ moment before is *complete*; it now stays up while the replacement is made
 `LOD_SNAP_CHURN_HOLD_MS`, 2000 ms), and the node is still asked again rather than
 written off. Through the whole engine (24 nodes at the user's zoom, 30 s of frames,
 each node's values changing every 2 s): v2.6.6 painted a box in **1020 of 1800
-frames**, v2.6.7 in **17**.
+frames** (an average of 7.14 boxed nodes a frame), v2.6.7 in **17** (0.45 a frame),
+with more nodes served from their pictures (23.8 blits a frame against 20.4).
 
 *The settle window could be slid shut forever.* It was re-armed by every change, so
 a node rewritten more often than 300 ms was never photographed — and with the rule
@@ -629,7 +630,7 @@ every frame (DOM queries over the A/B window: 50562 → 14454; widget rows drawn
 budget. Two readout statements were false and are fixed: the Vue paragraph's "(no
 picture is taken in this renderer)" beside a serving count (a v2.6.0/v2.6.1
 leftover — with snapshots on it now describes what happens, off it keeps the old
-sentence), and the DOM-hiding count now names the boxed nodes it belongs to. Two
+sentence), and the DOM-hiding count now names the boxed nodes it belongs to. Three
 tests added, four rewritten from "the changed node is dropped" to the behaviour the
 report asked for, and the sixteen-mutation battery is all caught.
 
@@ -760,7 +761,7 @@ apply, not just in the docs.
   other than the Node harness was executed in this pass.
 - **The Vue-nodes stand-in has not been run against a live page *by this
   project*.** It is verified against the frontend's sources and the harness
-  (thirty-nine tests), and its failure modes are contained by construction (a box
+  (forty tests), and its failure modes are contained by construction (a box
   only ever follows a real blanking, and every blanked element is handed back on
   the frame the setting stops applying) — but the user's page is the live test, and
   it has already caught four defects this harness could not: a class that Vue

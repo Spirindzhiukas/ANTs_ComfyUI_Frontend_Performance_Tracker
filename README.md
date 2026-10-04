@@ -670,7 +670,7 @@ short version:
 ## Development
 
 ```bash
-node tests/run-tests.mjs              # all tests — 222 passing, zero dependencies
+node tests/run-tests.mjs              # all tests — 223 passing, zero dependencies
 node tests/run-tests.mjs <substring>  # one suite or test
 python3 tests/test_init.py            # the Python side (routes, node contract)
 node tests/demo.mjs                   # prints what every tab says, against a synthetic graph

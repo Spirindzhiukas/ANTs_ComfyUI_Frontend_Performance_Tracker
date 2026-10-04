@@ -13676,7 +13676,7 @@ function buildTelemetryReport() {
                       `(no picture is taken while the snapshots setting is off — the bitmap half of the engine is idle; the widget and focus settings below still act)`)
                 : `every node a rectangle below ${Math.round(LOD.flatBelow * 100)}% zoom${LOD.legacyPx ? `, carried over from "nodes under ${LOD.legacyPx}px"` : ""}`
             }, links ${lodLinksStraight() ? "straight (link setting)" : "as drawn"}, idle redraw cap ${LOD.idleCapMs ? LOD.idleCapMs + "ms" : "off"}, box detail ${LOD.boxDetail}, ` +
-            `snapshots ${LOD.snapOn ? `on (${LOD.snapDrawn} served, ${LOD.snapCaptured} captured, ${fmtBytes(LOD.snapBytes)} of ${LOD.snapMb} MiB)` : "off"}) ` +
+            `snapshots ${LOD.snapOn ? `on (${LOD.snapDrawn} served, ${LOD.snapCaptured} captured, ${fmtBytes(LOD.snapBytes)} of ${LOD.snapMb} MiB${LOD.snapStaleHeld ? `, ${LOD.snapStaleHeld} kept while a fresh one was made` : ""}${LOD.snapCooldown ? `, ${LOD.snapCooldown} slow-capture cooldown(s)` : ""}${LOD.vueSettleHeld ? `, ${LOD.vueSettleHeld} slice(s) held for the settle window` : ""})` : "off"}) ` +
             `— ${LOD.nodes} node draw(s) and ${LOD.links} link draw(s) simplified, ${LOD.capped} redraw(s) merged` +
             (LOD.linkCalls > 0 && LOD.linkMs > 0
               ? `, link strokes ${fmtMs((LOD.linkMs / Math.max(1, LOD.linkCalls)) * 1000, 0)}\u00b5s each over ${LOD.linkCalls} call(s) ` +
