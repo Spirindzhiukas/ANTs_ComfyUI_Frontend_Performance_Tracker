@@ -685,6 +685,7 @@ export function createHarness(options = {}) {
     // the browser, not mounted through a widget. `box` is in node-local units
     // (the same space the canvas draws a node in), which is what the client rect
     // is derived from below.
+    const growth = new Map(); // node id -> extra node-local height the frontend adds
     const media = []; // { el, node, box }
     const addMedia = (node, el, box) => {
       const root = roots.get(String(node.id));
@@ -718,7 +719,12 @@ export function createHarness(options = {}) {
             left: (n.pos[0] + ox) * scale + originX,
             top: (n.pos[1] - 30 + oy) * scale + originY,
             width: (Math.abs(Number(n.size && n.size[0])) || 0) * scale,
-            height: (Math.abs(Number(n.size && n.size[1])) || 0) * scale,
+            // The element LGraphNode.vue renders is the title bar *and* the body:
+            // its height is what the tool measures the real rendered box from.
+            // `growRoot` adds the frontend's own reserve below that (image nodes
+            // are rendered IMAGE_PREVIEW_HEIGHT_RESERVE = 232 px taller than their
+            // graph size).
+            height: ((Math.abs(Number(n.size && n.size[1])) || 0) + 30 + (growth.get(String(n.id)) || 0)) * scale,
           };
         }
       }
@@ -756,10 +762,21 @@ export function createHarness(options = {}) {
       rootFor: (n) => roots.get(String(n.id)) || null,
       addMedia,
       media,
+      // The frontend lays an image node out taller than its graph size. The tool
+      // has to cover the element, so the harness can say so.
+      growRoot: (n, px) => {
+        growth.set(String(n.id), Number(px) || 0);
+        place();
+      },
       // What the frontend does with a widget while its node is off screen
       // (DomWidgets.vue's `isNodeVisible`) — a test can hand it back.
       exit: () => {
         LiteGraphShim.vueNodesMode = false;
+        // GraphCanvas.vue renders the whole pane with `v-if`: switching the
+        // renderer off unmounts every node element instead of hiding it. A tool
+        // mark left on a detached element is a node that comes back invisible if
+        // the frontend reuses it, so the elements really do leave the page here.
+        if (container.parentNode) container.parentNode.removeChild(container);
       },
     };
   }

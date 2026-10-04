@@ -6,7 +6,7 @@ for: *which extension's JavaScript is actually costing me frames while I pan
 this graph, and what is eating main-thread time that no draw hook owns?* —
 without opening DevTools and without restarting ComfyUI to bisect.
 
-Version **2.6.2**. Everything runs from page load: no node has to be placed,
+Version **2.6.3**. Everything runs from page load: no node has to be placed,
 nothing executes, and the tool never changes your graph or your workflows.
 
 - **Measure** — per-extension and per-node-type frame cost, canvas draw
@@ -17,6 +17,8 @@ nothing executes, and the tool never changes your graph or your workflows.
 - **Say what it cannot see** — GPU cost per extension, Vue draws, Firefox's
   memory API and more are named as unmeasurable rather than guessed at
   (the canonical list is the LIMITS block at the bottom of `web/tracker.js`).
+  A Vue-nodes stand-in is a *drawing*, not a screenshot, and the readout says
+  which parts of a node it could not draw.
 
 This README describes the current code. Version history moved to
 [`CHANGELOG.md`](CHANGELOG.md); the rules for changing the code are in
@@ -188,17 +190,24 @@ setting asked for.
 
 ComfyUI's newer frontend can render every node as a DOM element
 (`LiteGraph.vueNodesMode`, the **Nodes 2.0** setting). The canvas then draws
-links, groups and the grid, and no node chrome. There is no picture to take
-there — a DOM node cannot be photographed into a bitmap — but there is a
-stand-in to paint, so the tool runs a second pathway behind the same settings
-and picks it from the frontend's own flag on every call, never latched:
+links, groups and the grid, and no node chrome. There is no *screenshot* to
+take there — no browser API draws a DOM element into a canvas — but there is a
+stand-in to paint and a picture to *draw*, so the tool runs a second pathway
+behind the same settings and picks it from the frontend's own flag on every
+call, never latched:
 
 * **canvas renderer** — a picture of the node (or its box) blitted where the
   canvas would have drawn the node;
-* **Vue-nodes renderer** — the node's own element is *blanked* (one class,
-  `opacity: 0`: the element keeps its place, its layout and its pointer events)
-  and the canvas paints the same box in the same place, with the same detail
-  ladder. LiteGraph still calls `drawNode` for every visible node in this
+* **Vue-nodes renderer** — the node's own element is *blanked* with
+  `opacity: 0` (the element keeps its place, its layout, its children and its
+  pointer events) and the canvas paints the same box in the same place, with the
+  same detail ladder. The blanking is an **attribute** on the element
+  (`data-ants-vue-standin`) plus an `!important` stylesheet rule, deliberately
+  not a class: `LGraphNode.vue` binds `:class` on that element and rewrites it
+  wholesale on every re-render, so a tool-added class is silently thrown away
+  and the node comes back visible behind its box. The same reasoning applies to
+  the fovea's hide mark on a node's own element and to its inert mark
+  (`data-ants-dom-hidden` / `data-ants-dom-inert`). LiteGraph still calls `drawNode` for every visible node in this
   renderer — that is how it keeps slot metrics in sync — so this tool's
   existing seam fires with the context already in node-local space, and the box
   lands exactly where a picture lands in the canvas renderer.
@@ -214,24 +223,54 @@ and picks it from the frontend's own flag on every call, never latched:
   `opacity: 0` keeps every box. Text is re-painted from the value the field holds
   (page JavaScript cannot screenshot rendered text); a pack's own HTML stays blank
   and is counted. Nothing is drawn twice, and the layout is read on a change
-  (zoom, position, size, the elements and their sources) rather than per frame.
+  (the node's own size, the elements and their sources) rather than per frame:
+  panning and zooming cost no read at all, because every number stored is
+  node-local, and the periodic refresh is rationed to a few node layouts per
+  frame so a graph with hundreds of boxes cannot turn it into a forced layout
+  per node per frame.
+  The box covers the **box the frontend rendered**, not the node's graph size:
+  `LGraphNode.vue` renders an image node `IMAGE_PREVIEW_HEIGHT_RESERVE`
+  (220 + 8 + 4 px) taller than its graph size and puts the picture in that
+  reserve, so a box built from `node.size` would clip off exactly the picture
+  being looked for. The element's own rect is measured, divided by the zoom the
+  *element* is laid out at — measured from its own width, never read from
+  `canvas.ds.scale`, which a capture sets to 1 while the DOM keeps its
+  transform — so content lands where it belongs even in a capture taken
+  mid-zoom.
 
-Nothing is hidden and nothing is captured: the element is still there — slots,
-widgets, resize handles, the context menu — so clicking, dragging, selecting
-and link-dragging behave exactly as they do in full detail; it just stops
-painting. That makes the saving different from the canvas renderer's: not
-cheaper canvas drawing, but fewer node pixels for the browser to paint, which
-is where a heavy zoomed-out graph spends its frame. Every blanked element is
-handed back the moment the zoom leaves the setting, the setting or the tool is
-switched off, or the renderer changes — the per-frame plan compares one boolean
-in the steady state, so a stale class cannot be left behind.
+Nothing is hidden: the element is still there — slots, widgets, resize handles,
+the context menu — so clicking, dragging, selecting and link-dragging behave
+exactly as they do in full detail; it just stops painting. That makes the
+saving different from the canvas renderer's: not cheaper canvas drawing, but
+fewer node pixels for the browser to paint, which is where a heavy zoomed-out
+graph spends its frame. Every blanked element is handed back the moment the
+zoom leaves the setting, the setting or the tool is switched off, or the
+renderer changes — the per-frame plan compares one boolean in the steady state,
+so a stale mark cannot be left behind, and an element the frontend unmounted
+mid-flight (it renders the whole pane with `v-if`) has the mark taken off it
+too, so a reused element does not come back invisible.
+
+**Pictures work here as well, and so do the disk files.** Below the threshold
+the idle lane builds a stand-in *picture* for each boxed node — not a
+screenshot of the element, which no browser API can make, but the same drawing
+the live box makes (the box, its title bar and state marks, the widget text the
+frontend mounts as DOM, and the node's own `<img>`/`<canvas>` elements at the
+rows the layout gave them) drawn into the same offscreen capture surface the
+canvas renderer uses. Everything downstream is therefore identical: the capture
+resolution ladder (0.25× → 3×), the half and quarter mip copies blitted on
+screen, the RAM budget, the disk cache and its `…r<ratio>t<theme>` key, and the
+files in `temp/ANTs_Frontend_Optimizer_THUMBNAILS/`. A picture made in one
+renderer is not reused in the other: switching renderers releases what was held
+and makes the pictures again. What stays impossible is a pack widget that is
+neither an image, a canvas nor plain text (its own HTML): it is blank in the
+picture and counted, exactly as in the canvas renderer.
 
 | Setting | In the Vue-nodes frontend |
 | --- | --- |
 | Replace node previews with bitmap stand-ins at zoom levels | **Works, as boxes.** Below the setting each node's element stops painting and the canvas draws its box; above it, every element is handed back. |
 | Stand-in (plain / title / title + state) | **Works** — the same box ladder, same marks, same colours, and no content drawn (that is what "plain" means here too). |
-| Stand-in: *picture of the node* | **Works, as a box that carries the node.** No browser API can draw a DOM element into a canvas, so a photograph of a Vue node is impossible; instead the box is drawn at the picture level (title bar, error ring, progress, dimming) with the node's own content drawn into it live: the images and canvases the node renders (the frontend's preview `<img>` elements among them) at their real laid-out position, text fields re-painted, a pack's HTML blank and counted. |
-| Capture resolution, RAM budget, disk cache | **Idle**, and the readout says so: a DOM node cannot be drawn into a bitmap, so nothing is captured, held, queued or written. |
+| Stand-in: *picture of the node* | **Works, drawn rather than photographed.** No browser API can draw a DOM element into a canvas, so a screenshot of a Vue node is impossible; the picture is instead *drawn* — the box at the picture level (title bar, error ring, progress, dimming) with the node's own content: the images and canvases the node renders (the frontend's preview `<img>` elements among them) at their real laid-out position, text fields re-painted, a pack's HTML blank and counted. Until the idle lane has that picture, the box carries the same content live. |
+| Capture resolution, RAM budget, disk cache | **Work.** The picture is made on the same idle lane, at the same resolution ladder, with the same mip chain, RAM budget and disk files (`temp/ANTs_Frontend_Optimizer_THUMBNAILS/`, keyed by signature + ratio + theme). Switching renderer releases the pictures the other renderer made and builds them again, because the box, the padding and the content route all differ. |
 | Keep these node types live | **Works** — a listed type is never blanked and stays in full detail at any zoom. |
 | Link shape, link thinning, Measure link thinning | **Work.** Links are still drawn by the canvas, so the 1 px/no-outline thinning and the straight-line style reach the ink exactly as in canvas mode. |
 | Idle redraw cap | **Works** — it caps the canvas redraws, nodes or not. |
@@ -239,8 +278,10 @@ in the steady state, so a stale class cannot be left behind.
 | The governor, Timing, Stalls, Nodes, Load, Memory, GPU tabs | Unaffected: they measure timers, main-thread stalls, redraw requests and resources, not node painting. In this renderer the Nodes tab's per-type table is the frontend's own per-node layout pass (it draws no chrome), and the readout names the renderer next to it. |
 
 The Status tab names the renderer and the pathway in its first line
-("Vue nodes", "blanked", "boxes"), so a setting that is quiet for a structural
-reason is not mistaken for a broken one. Switching Nodes 2.0 off in ComfyUI's
+("Vue nodes", "blanked", "boxes"), says how many pictures are held, and — when
+the stand-in setting itself is off — says that pictures are made here too
+rather than leaving the reader to guess, so a setting that is quiet for a
+structural reason is not mistaken for a broken one. Switching Nodes 2.0 off in ComfyUI's
 settings takes effect on the same page — the flag is read per call, not latched
 at load — and the elements this tool blanked are handed back in the same frame.
 
@@ -512,7 +553,7 @@ short version:
 ## Development
 
 ```bash
-node tests/run-tests.mjs              # all tests — 201 passing, zero dependencies
+node tests/run-tests.mjs              # all tests — 204 passing, zero dependencies
 node tests/run-tests.mjs <substring>  # one suite or test
 python3 tests/test_init.py            # the Python side (routes, node contract)
 node tests/demo.mjs                   # prints what every tab says, against a synthetic graph

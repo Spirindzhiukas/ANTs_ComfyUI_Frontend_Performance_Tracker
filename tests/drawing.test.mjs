@@ -510,7 +510,7 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     assertEqual(h.tracker.lowZoom.dom.hidden, 2, "both the widget and the Vue node are hidden");
     assertEqual(h.tracker.lowZoom.dom.nodes, 2, "belonging to two boxed nodes");
     assert(wrapper.classList.contains("ants-lod-box"), "the widget is hidden through its .dom-widget wrapper");
-    assert(vueRoot.classList.contains("ants-lod-box"), "and the Vue node by its own element");
+    assert(vueRoot.hasAttribute("data-ants-dom-hidden"), "and the Vue node by an attribute Vue does not rewrite");
 
     // Zoom in far enough that the node is worth drawing properly again.
     h.canvas.ds.scale = 0.5; // 200 x 0.5 = 100px > 32px
@@ -2687,7 +2687,19 @@ suite("drawing: the Nodes 2.0 (Vue nodes) frontend", () => {
     return { nodes, vue };
   }
 
-  test("the mode is detected, and the stand-in is a box where the node\'s element was blanked", async () => {
+  // The stylesheet rule the blanking keys on, read out of the page the way the
+  // browser reads it. A test asserts it, because "the attribute is set" and "the
+  // browser hides the element" are two different claims and only the pair is the
+  // feature.
+  const blankRule = (h) => {
+    const styles = h.document.querySelectorAll("style") || [];
+    return styles.some((el) => {
+      const css = String(el.textContent || "");
+      return css.includes("[data-ants-vue-standin]") && css.includes("opacity: 0 !important");
+    });
+  };
+
+  test("the mode is detected, the element is blanked, and the stand-in becomes a picture", async () => {
     const h = await boot();
     const { nodes, vue } = vueGraph(h, 3);
     assertEqual(h.LiteGraph.vueNodesMode, true, "the frontend says which renderer it is (LiteGraph.vueNodesMode)");
@@ -2695,28 +2707,35 @@ suite("drawing: the Nodes 2.0 (Vue nodes) frontend", () => {
     h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true });
     const before = fills(h).length;
     draw(h, 3);
-    await idle(h);
-    // The Vue pathway: the canvas paints the same box the canvas renderer would
-    // paint, and the node's own element stops painting while the box stands in.
+    // Before the idle lane has a picture, the box is drawn live — with the node's
+    // own content in it, which is what the picture will be a freeze of.
     assertGreater(h.tracker.lowZoom.state.nodes, 0, "boxes are painted for the nodes the frontend renders as elements");
     assertGreater(fills(h).length, before, "and each box is ink on the canvas");
     for (const n of nodes) {
       const root = vue.rootFor(n);
       assert(root, "each node is a DOM element carrying data-node-id");
-      assert(root.classList.contains("ants-vue-standin"), "the node's own element is blanked while its box stands in");
+      assert(root.hasAttribute("data-ants-vue-standin"), "the node's own element is blanked while its box stands in");
       assert(!root.classList.contains("ants-lod-box"), "blanked is not hidden: the element keeps its place and its pointer events");
     }
+    const first = snapApi(h);
+    assertEqual(first.pathway, "vue", "the pathway is named, so the panel and a script cannot disagree about it");
+    assertEqual(first.vueBlanked, 3, "and the readout knows how many elements are blanked");
+    assert(blankRule(h), "the stylesheet carries the !important rule the attribute keys on, so Vue cannot outrank it");
+    // Then the idle lane makes the picture: this tool draws the box and the
+    // node's content into an offscreen surface (no browser API can photograph a
+    // DOM element), and it is stored like the canvas renderer's pictures.
+    await idle(h);
     const api = snapApi(h);
-    assertEqual(api.pathway, "vue", "the pathway is named, so the panel and a script cannot disagree about it");
-    assertEqual(api.vueBlanked, 3, "and the readout knows how many elements are blanked");
-    // Nothing is photographed here: a DOM node cannot be drawn into a bitmap, so
-    // the whole bitmap half of the engine stays out of it.
-    assertEqual(api.bitmaps, false, "the bitmap half is off in this renderer");
-    assertEqual(api.captured, 0, "no picture is taken");
-    assertEqual(api.held, 0, "nothing is held");
-    assertEqual(api.queue, 0, "and the idle lane stays empty");
-    assertEqual(h.canvases.length, 0, "no offscreen canvas was created for a capture");
-    assertGreater(h.tracker.totals.frames, 0, "the frame clock still runs");
+    assertEqual(api.captured, 3, "each node's stand-in was captured");
+    assertGreater(api.bytes, 0, "and the memory it holds is counted");
+    assertEqual(api.blank, 0, "none of them was written off as blank: the box is always ink");
+    assertGreater(h.canvases.length, 0, "a capture surface was made");
+    // The next frame serves the stored picture instead of redrawing the content.
+    const served = snapApi(h).drawn;
+    h.canvas.ctx.ops.length = 0;
+    draw(h, 2);
+    assertGreater(snapApi(h).drawn, served, "the stored picture is blitted to the screen");
+    assertEqual(snapApi(h).vueContent, 0, "and the live content draw is skipped while a picture exists");
   });
 
   test("the settings that act on DOM and on links still work", async () => {
@@ -2786,24 +2805,154 @@ suite("drawing: the Nodes 2.0 (Vue nodes) frontend", () => {
     assert(!wrapper.classList.contains("ants-lod-inert"), "including its inert class");
   });
 
-  test("the stand-in engine does not photograph nodes this renderer cannot draw back", async () => {
+  test("the blanking survives the frontend re-rendering the node", async () => {
     const h = await boot();
-    vueGraph(h, 4);
+    const { nodes, vue } = vueGraph(h, 3);
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true });
+    draw(h, 2);
+    const root = vue.rootFor(nodes[0]);
+    assert(root.hasAttribute("data-ants-vue-standin"), "blanked to start with");
+    // A re-render, as Vue does it: the node root's class and style are written
+    // wholesale. This is the bug that made Nodes 2.0 show no stand-ins at all —
+    // the blanking was a class, Vue owned that property, and every re-render
+    // silently handed the node back while a box was painted behind it.
+    root.className = "lg-node absolute selected";
+    root.style.cssText = "transform: translate(0px, -30px); z-index: 3;";
+    assert(root.hasAttribute("data-ants-vue-standin"), "the mark is not a class, so a re-render cannot drop it");
+    assert(blankRule(h), "and the rule that hides it is !important, so a Vue class cannot outrank it");
+    draw(h, 2);
+    assert(root.hasAttribute("data-ants-vue-standin"), "still blanked a frame later");
+    assertGreater(h.tracker.lowZoom.state.nodes, 0, "and the box is still painted for it");
+    // The other half of a re-render: the frontend unmounts the element and mounts
+    // a new one for the same node. The box must follow it, not sit over a node
+    // that is now drawing itself again.
+    const fresh = h.document.createElement("div");
+    fresh.className = "lg-node absolute";
+    fresh.setAttribute("data-node-id", String(nodes[0].id));
+    root.parentNode.appendChild(fresh);
+    root.remove();
+    assert(!root.isConnected, "the old element is off the page");
+    draw(h, 2);
+    assert(fresh.hasAttribute("data-ants-vue-standin"), "the tool finds the node's new element and blanks that too");
+    // And handing back has to reach an element that is not on the page any more:
+    // if the frontend puts it back later, it must not come back invisible.
+    h.tracker.lowZoom.set({ flatBelow: 0 });
+    h.advance(1200);
+    await h.flush();
+    assert(!fresh.hasAttribute("data-ants-vue-standin"), "and hands it back when the setting is turned off");
+  });
+
+  test("a node the frontend renders taller than its graph size gets a box that covers it", async () => {
+    const h = await boot();
+    const { nodes, vue } = vueGraph(h, 1);
+    stripWidgets(nodes);
+    // `LGraphNode.vue`: an image node with an expanding widget is rendered
+    // IMAGE_PREVIEW_HEIGHT_RESERVE = 220 + 8 + 4 px taller than its graph size,
+    // and the picture lives in that reserve. A stand-in the size of `node.size`
+    // would blank the node and then clip off exactly the picture the user is
+    // looking for.
+    const GROWTH = 232;
+    const img = h.document.createElement("img");
+    Object.assign(img, { naturalWidth: 512, naturalHeight: 512, complete: true, src: "big.png", currentSrc: "big.png" });
+    vue.addMedia(nodes[0], img, { x: 10, y: 104, w: 180, h: GROWTH - 12 }); // 104 = 100 + a 4px gap
+    vue.growRoot(nodes[0], GROWTH);
+    h.tracker.lowZoom.set({ flatBelow: 0.5, boxDetail: "plain", snapshots: true });
+    draw(h, 1); // the frame that measures the element
+    h.canvas.ctx.ops.length = 0;
+    draw(h, 1);
+    const body = h.canvas.ctx.ops.filter((o) => o[0] === "fillRect" && Number(o[3]) === 200 && Number(o[4]) === 100 + GROWTH);
+    assertGreater(body.length, 0, "the stand-in is the box the frontend rendered, not the graph size");
+    assertEqual(h.canvas.ctx.ops.filter((o) => o[0] === "fillRect" && Number(o[4]) === 100).length, 0, "and not the shorter one");
+    // The picture the idle lane makes is the same box: the image sits at 104,
+    // below the node's 100-unit graph height, and is inside the capture.
+    await idle(h);
+    const capt = h.canvases.filter((c) => c._ctx && c._ctx.ops.some((o) => o[0] === "drawImage" && o[1] === img));
+    assertGreater(capt.length, 0, "the node's own picture is inside the stand-in made for it");
+    const op = capt[0]._ctx.ops.find((o) => o[0] === "drawImage" && o[1] === img);
+    assertGreater(op[3], 100, "at the row the frontend gave it, below the graph height");
+    assertGreater(capt[0].height, 100 + GROWTH, "and the capture surface is tall enough to hold it");
+  });
+
+  test("the media layout is re-read on a budget, never once per node per frame", async () => {
+    const h = await boot();
+    const { nodes, vue } = vueGraph(h, 12);
+    for (const n of nodes) {
+      const img = h.document.createElement("img");
+      Object.assign(img, { naturalWidth: 256, naturalHeight: 256, complete: true, src: "p.png", currentSrc: "p.png" });
+      vue.addMedia(n, img, { x: 10, y: 40, w: 150, h: 150 });
+    }
+    h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true });
+    draw(h, 2);
+    // Past the backstop, every boxed node would ask for its layout back at once.
+    // Reading a rect is a forced layout, and the draw loop is the frame budget
+    // this tool exists to protect, so the backstop reads are rationed: with a
+    // dozen nodes a frame may not spend one probe per node.
+    h.advance(600);
+    h.canvas.setDirty(true, true);
+    const before = h.rectReads;
+    h.canvas.draw();
+    const reads = h.rectReads - before;
+    assertGreater(reads, 0, "the backstop did re-read some of them");
+    assert(reads < nodes.length * 2, `re-reads stayed inside the frame's ration (${reads} rect reads for ${nodes.length} nodes)`);
+    // Panning and zooming move the element and everything inside it by the same
+    // transform, so every number this pass reads (a child's rect minus the node's,
+    // over the zoom) is unchanged. A key that included the pan or the zoom would
+    // mean a forced layout per boxed node per frame while the user drags — so a
+    // pan must cost nothing at all.
+    h.advance(600);
+    draw(h, 2); // let the ration work through the whole set first
+    h.canvas.ds.offset[0] = 500;
+    h.canvas.ds.offset[1] = 300;
+    h.canvas.ds.scale = 0.3;
+    vue.place();
+    h.canvas.setDirty(true, true);
+    const beforePan = h.rectReads;
+    h.canvas.draw();
+    assertEqual(h.rectReads - beforePan, 0, "a pan and a zoom cost no layout read");
+    // The node's own size is the key. Change it and that node — and only that
+    // node — is re-read at once, because its content really did move.
+    nodes[0].size = [300, 200];
+    vue.place();
+    h.canvas.setDirty(true, true);
+    const beforeSize = h.rectReads;
+    h.canvas.draw();
+    const sizeReads = h.rectReads - beforeSize;
+    assertGreater(sizeReads, 0, "the node whose size changed was re-read");
+    assert(sizeReads < nodes.length * 2 - 1, `and only it: the rest kept their measurements (${sizeReads} reads)`);
+  });
+
+  test("a picture in this renderer is the box plus the node's own content, and it reaches the disk", async () => {
+    const h = await boot();
+    const { nodes, vue } = vueGraph(h, 3);
+    const img = h.document.createElement("img");
+    Object.assign(img, { naturalWidth: 512, naturalHeight: 512, complete: true, src: "shot.png", currentSrc: "shot.png" });
+    vue.addMedia(nodes[0], img, { x: 10, y: 40, w: 180, h: 220 });
+    // The server's half, played by the test: one file per node id, written on PUT.
+    const puts = [];
+    h.fetchRoutes.set("/ants_optimizer/thumbs/sweep", { removed: 0 });
+    h.fetchRoutes.set("/ants_optimizer/thumbs/info", { dir: "/tmp", count: 0 });
+    h.fetchRoutes.set("/ants_optimizer/thumbs/*", (req) => {
+      if (req.method === "PUT") {
+        puts.push({ url: req.url, body: req.body });
+        return { ok: true, status: 204, json: async () => ({}) };
+      }
+      return { ok: false, status: 404, json: async () => ({}), blob: async () => null };
+    });
     h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true, diskOn: true });
     draw(h, 2);
     await idle(h);
-    // Run a job and finish it: the RAM lane's restore is the one path that walks
-    // the graph without going through a drawn node.
-    h.tracker.runStart();
-    draw(h, 1);
-    const before = snapApi(h).captured;
-    h.tracker.runFinish();
-    await idle(h, 1500);
-    assertEqual(snapApi(h).captured, before, "finishing a run does not start photographing every node on screen");
-    assertEqual(snapApi(h).held, 0, "no bitmap is held");
-    assertEqual(snapApi(h).blank, 0, "and no node is written off as \"draws nothing into the canvas\" for a picture that was never going to be drawn");
-    assertEqual(snapApi(h).queue, 0, "the idle lane stays empty");
-    assertEqual(h.canvases.length, 0, "not even one offscreen canvas was created for a capture");
+    const api = snapApi(h);
+    assertGreater(api.captured, 0, "the stand-ins were captured in this renderer too");
+    // The node's own picture is in the capture surface, at the row the layout gave
+    // it — the half a widget-only composite could never see.
+    const withImage = h.canvases.filter((c) => c._ctx && c._ctx.ops.some((o) => o[0] === "drawImage" && o[1] === img));
+    assertGreater(withImage.length, 0, "the node's own image is inside the picture");
+    const mediaOp = withImage[0]._ctx.ops.find((o) => o[0] === "drawImage" && o[1] === img);
+    assertEqual(Math.round(mediaOp[3]), 40, "drawn at the row the layout gave it, in the node's own units");
+    assertEqual(Math.round(mediaOp[4]), 180, "and at the size the layout gave it");
+    assertEqual(api.diskSaved, 3, "and every picture was written to the stand-in store");
+    assertEqual(puts.length, 3, "one file per node, as the canvas renderer writes them");
+    assert(puts.every((p) => /sig=[^&]*r1t[0-9a-z]+$/.test(p.url)), "keyed by the capture resolution and the theme, like every other file");
   });
 
   test("an off-screen DOM node is not hidden while it is on screen, and the fovea still culls", async () => {
@@ -2816,13 +2965,13 @@ suite("drawing: the Nodes 2.0 (Vue nodes) frontend", () => {
     h.advance(1200);
     await h.flush();
     draw(h, 2);
-    assert(vue.rootFor(nodes[2]).classList.contains("ants-lod-box"), "a far off-screen node's element is taken out of the picture");
+    assert(vue.rootFor(nodes[2]).hasAttribute("data-ants-dom-hidden"), "a far off-screen node's element is taken out of the picture");
     assert(!vue.rootFor(nodes[0]).classList.contains("ants-lod-box"), "an on-screen node's element is never hidden");
     // Bring it back: it must come back at once, because it is on screen now.
     nodes[2].pos = [0, 200];
     vue.place();
     draw(h, 2);
-    assert(!vue.rootFor(nodes[2]).classList.contains("ants-lod-box"), "and it is handed back the moment it returns to the screen");
+    assert(!vue.rootFor(nodes[2]).hasAttribute("data-ants-dom-hidden"), "and it is handed back the moment it returns to the screen");
     // Off, everything is handed back.
     h.tracker.lowZoom.off();
     assertEqual(h.tracker.lowZoom.dom.hidden, 0, "turning the settings off leaves none of somebody else's DOM hidden");
@@ -2838,18 +2987,17 @@ suite("drawing: the Nodes 2.0 (Vue nodes) frontend", () => {
     await openTweaksTab(h);
     const text = panelText(h);
     assertIncludes(text, "Vue nodes", "the readout says which renderer this is");
-    assert(!text.includes("collapsed boxes or this tool\'s own node, which are never flattened"), "and does not blame collapsed nodes for a decision this renderer made");
+    assert(!text.includes("collapsed boxes or this tool's own node, which are never flattened"), "and does not blame collapsed nodes for a decision this renderer made");
     assert(!text.includes("snapshots are on but not painting anything"), "nor the flatten setting, which is switched on and below its zoom");
     assertIncludes(text, "blanked", "it says what a stand-in is in this renderer");
-    assert(!text.includes("remembered node(s) have a picture"), "the bitmap counters are not printed for an engine that is idle here");
     // The copyable report is read by people who never open the panel, so it has
     // to be as honest as the panel is.
     const report = h.tracker.report;
-    assert(report.includes("node stand-ins are boxes"), "the report says what the stand-ins are here");
-    assert(!report.includes("every node a rectangle"), "and does not claim nodes are rectangles here");
+    assert(!report.includes("every node a rectangle"), "the report does not claim nodes are rectangles here");
+    assert(!report.includes("node stand-ins idle"), "nor that the stand-ins are idle");
   });
 
-  test("a page that switches to this renderer hands back the pictures it can no longer paint", async () => {
+  test("a picture belongs to the renderer it was drawn in: switching renderers re-makes them", async () => {
     const h = await boot();
     const nodes = [];
     for (let i = 0; i < 2; i++) nodes.push(h.node({ type: "KSampler", pos: [i * 240, 0], size: [200, 100], widgets: [] }));
@@ -2859,17 +3007,24 @@ suite("drawing: the Nodes 2.0 (Vue nodes) frontend", () => {
     h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true });
     draw(h, 2);
     await idle(h);
-    assertGreater(snapApi(h).held, 0, "the canvas renderer captured pictures for these nodes");
-    assertGreater(snapApi(h).bytes, 0, "and is holding memory for them");
-    // The flag flips on the live page (useVueFeatureFlags watches the setting),
-    // so the cache has to let go of what it can never draw again.
+    const canvasCaptured = snapApi(h).captured;
+    assertGreater(canvasCaptured, 0, "the canvas renderer captured pictures for these nodes");
+    assertGreater(snapApi(h).held, 0, "and is holding them");
+    // The flag flips on the live page (useVueFeatureFlags watches the setting).
+    // A picture is the node's box in the renderer it was made in — different pad,
+    // different title bar, different content route — so the old ones are released
+    // and made again rather than reused.
     const vue = h.enterVueNodes();
-    draw(h, 1);
+    draw(h, 2);
     await idle(h);
-    assertEqual(snapApi(h).held, 0, "switching renderer releases every bitmap");
-    assertEqual(snapApi(h).bytes, 0, "and the memory with it");
-    assertEqual(snapApi(h).queue, 0, "and the queue");
+    const inVue = snapApi(h);
+    assertEqual(inVue.pathway, "vue", "the pathway changed with the renderer");
+    assertGreater(inVue.captured, canvasCaptured, "and new pictures were made for this renderer");
+    assertGreater(inVue.clears, 0, "the switch released the pictures the other renderer had made");
     vue.exit();
+    draw(h, 2);
+    await idle(h);
+    assertGreater(snapApi(h).captured, inVue.captured, "switching back makes canvas pictures again");
   });
 
   test("switching the renderer back on the same page brings the stand-ins back, without a reload", async () => {
@@ -2880,7 +3035,7 @@ suite("drawing: the Nodes 2.0 (Vue nodes) frontend", () => {
     draw(h, 2);
     assertGreater(h.tracker.lowZoom.state.nodes, 0, "boxes are painted while the nodes are DOM elements");
     assertEqual(h.tracker.lowZoom.snapshots.pathway, "vue", "through the Vue pathway");
-    assert(vue.rootFor(nodes[0]).classList.contains("ants-vue-standin"), "and the node's element is blanked with it");
+    assert(vue.rootFor(nodes[0]).hasAttribute("data-ants-vue-standin"), "and the node's element is blanked with it");
     // The frontend watches its own setting and flips the flag on the live
     // LiteGraph object (useVueFeatureFlags.ts), so this answer has to be read per
     // frame rather than latched when the page loaded.
@@ -2888,7 +3043,7 @@ suite("drawing: the Nodes 2.0 (Vue nodes) frontend", () => {
     draw(h, 2);
     assertGreater(h.tracker.lowZoom.state.nodes, 0, "switching the renderer off brings node flattening straight back");
     assertEqual(h.tracker.lowZoom.snapshots.pathway, "canvas", "the canvas pathway takes over on the same page");
-    assert(!vue.rootFor(nodes[0]).classList.contains("ants-vue-standin"), "and every element this tool blanked is handed back");
+    assert(!vue.rootFor(nodes[0]).hasAttribute("data-ants-vue-standin"), "and every element this tool blanked is handed back");
     assertGreater(h.tracker.lowZoom.snapshots.vueRestored, 0, "the hand-back is counted");
   });
 
@@ -2897,12 +3052,12 @@ suite("drawing: the Nodes 2.0 (Vue nodes) frontend", () => {
     const { nodes, vue } = vueGraph(h, 3);
     h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true });
     draw(h, 2);
-    assert(vue.rootFor(nodes[0]).classList.contains("ants-vue-standin"), "blanked below the threshold");
+    assert(vue.rootFor(nodes[0]).hasAttribute("data-ants-vue-standin"), "blanked below the threshold");
     h.canvas.ds.scale = 0.6; // above it
     const before = fills(h).length;
     const simplified = h.tracker.lowZoom.state.nodes; // cumulative: the boxes above it are counted
     draw(h, 2);
-    for (const n of nodes) assert(!vue.rootFor(n).classList.contains("ants-vue-standin"), "the element is handed back above the threshold");
+    for (const n of nodes) assert(!vue.rootFor(n).hasAttribute("data-ants-vue-standin"), "the element is handed back above the threshold");
     assertEqual(fills(h).length, before, "and no box is painted for a node that draws itself");
     assertEqual(h.tracker.lowZoom.state.nodes, simplified, "and not one more node draw is counted as simplified");
   });
@@ -3051,11 +3206,20 @@ suite("drawing: the Nodes 2.0 (Vue nodes) frontend", () => {
     const readsAfterFirst = h.rectReads;
     draw(h, 4); // nothing about the node has changed
     assertEqual(h.rectReads, readsAfterFirst, "four more frames with an unchanged node read no layout at all");
-    // A zoom is a change: the node's box is different, so the layout is read again.
+    // A zoom is *not* a change to anything stored here: the numbers are node-local
+    // (a child's rect minus the node's own, over the zoom), so the transform
+    // cancels out. Reading layout while the user scrolls the wheel would be one
+    // forced layout per boxed node per frame, which is the cost this tool exists to
+    // remove.
     h.canvas.ds.scale = 0.35;
     vue.place();
     draw(h, 1);
-    assertGreater(h.rectReads, readsAfterFirst, "a zoom re-reads the layout, because the box it draws into has changed");
+    assertEqual(h.rectReads, readsAfterFirst, "a zoom reads nothing, because nothing node-local moved");
+    // The node's own size is the change that matters, and it is read at once.
+    nodes[0].size = [260, 140];
+    vue.place();
+    draw(h, 1);
+    assertGreater(h.rectReads, readsAfterFirst, "a node that was resized re-reads the layout");
   });
 
   test("a canvas a node renders itself is drawn too, and an unloaded image is not", async () => {
@@ -3120,14 +3284,14 @@ suite("drawing: the Nodes 2.0 (Vue nodes) frontend", () => {
     const { nodes, vue } = vueGraph(h, 3);
     h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true });
     draw(h, 2);
-    assert(vue.rootFor(nodes[0]).classList.contains("ants-vue-standin"), "blanked");
+    assert(vue.rootFor(nodes[0]).hasAttribute("data-ants-vue-standin"), "blanked");
     h.tracker.lowZoom.set({ snapshots: false });
-    for (const n of nodes) assert(!vue.rootFor(n).classList.contains("ants-vue-standin"), "switching the stand-in off hands the elements back at once, not on the next frame");
+    for (const n of nodes) assert(!vue.rootFor(n).hasAttribute("data-ants-vue-standin"), "switching the stand-in off hands the elements back at once, not on the next frame");
     h.tracker.lowZoom.set({ snapshots: true });
     draw(h, 2);
-    assert(vue.rootFor(nodes[0]).classList.contains("ants-vue-standin"), "blanked again");
+    assert(vue.rootFor(nodes[0]).hasAttribute("data-ants-vue-standin"), "blanked again");
     h.tracker.lowZoom.setEnabled(false);
-    for (const n of nodes) assert(!vue.rootFor(n).classList.contains("ants-vue-standin"), "and the master switch hands them back too");
+    for (const n of nodes) assert(!vue.rootFor(n).hasAttribute("data-ants-vue-standin"), "and the master switch hands them back too");
     assertGreater(h.tracker.lowZoom.snapshots.vueRestored, 0, "the hand-backs are counted");
   });
 

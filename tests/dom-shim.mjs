@@ -3,12 +3,28 @@
 // anything it touches that is NOT implemented here fails loudly instead of
 // silently returning undefined.
 
+// The document the current shim tree belongs to. Read by `isConnected` to answer
+// the only question the tracker asks of it: is this element still on the page?
+let documentNode = null;
+
 class Node {
   constructor(tag) {
     this.tagName = tag ? tag.toUpperCase() : undefined;
     this.nodeType = tag ? 1 : 3;
     this.children = [];
     this.parentNode = null;
+    // Real DOM state the tracker reads: an element the frontend unmounted is not
+    // the element to dress any more, however well it still answers.
+    Object.defineProperty(this, "isConnected", {
+      // In a document, not merely attached to something: the frontend detaching a
+      // whole pane takes every node element off the page, and that is the state
+      // the tracker has to notice.
+      get: () => {
+        let n = this;
+        while (n.parentNode) n = n.parentNode;
+        return n === documentNode;
+      },
+    });
     this._text = tag ? "" : "";
     this._cls = new Set();
     this._attrs = {};
@@ -89,6 +105,12 @@ class Node {
     return this.parentNode.children[i + 1] || null;
   }
 
+  removeAttribute(k) {
+    delete this._attrs[k];
+  }
+  hasAttribute(k) {
+    return Object.prototype.hasOwnProperty.call(this._attrs, k);
+  }
   setAttribute(k, v) {
     this._attrs[k] = String(v);
   }
@@ -239,6 +261,7 @@ class Node {
 
 export function createDocument(options = {}) {
   const doc = new Node("#document");
+  documentNode = doc;
   const head = new Node("head");
   const body = new Node("body");
   doc.appendChild(head);

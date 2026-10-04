@@ -28,7 +28,7 @@ this is going. Read the golden rules before the code.
 ## Commands
 
 ```bash
-node tests/run-tests.mjs              # all 201 tests — must be green before any commit
+node tests/run-tests.mjs              # all 204 tests — must be green before any commit
 node tests/run-tests.mjs <substring>  # one suite/test, e.g. ... pill
 python3 tests/test_init.py            # the Python side (route parsing, node contract)
 node tests/demo.mjs                   # prints what the panel says against a synthetic graph
@@ -179,28 +179,45 @@ Seams worth knowing:
   page. The fixture's shapes come from the upstream files listed in
   `ANALYSIS.md` — change it there first if it ever drifts.
 - In that renderer the stand-in is the **blanking pathway**: below the threshold
-  the node's own root element gets `LOD_VUE_CLASS` (`ants-vue-standin`,
-  `opacity: 0`) and `lodPaintNode` paints the same box the canvas renderer
-  paints; `lodVueFramePlan` hands every element back when the setting, the zoom,
-  the tool or the renderer changes, and a box is only painted after a
-  *successful* blanking (`lodVueBlank`). The readout/API name it:
-  `lowZoom.snapshots.pathway` / `.bitmaps` / `.vueBlanked` / `.vueBoxes` /
-  `.vueRestored`. A test in that mode asserts the class, the box ink and the
-  hand-back; the harness shim supports tag selectors and `querySelector` for the
-  nested-`<video>` and wrapper-`<img>` cases.
+  the node's own root element gets `LOD_VUE_ATTR` (`data-ants-vue-standin`, an
+  `!important` `opacity: 0` rule) and `lodPaintNode` paints the same box the canvas
+  renderer paints; `lodVueFramePlan` hands every element back when the setting,
+  the zoom, the tool or the renderer changes, and a box is only painted after a
+  *successful* blanking (`lodVueBlank`). **Never a class**: `LGraphNode.vue` binds
+  `:class` on that element and Vue rewrites it on every re-render, so a class is
+  dropped and the node comes back visible behind its box — that was the v2.6.3 bug,
+  and the harness was blind to it until `exit()` started detaching the pane and the
+  shim started reporting `isConnected` truthfully. The fovea's hide/inert marks on
+  a node's own element are attributes too (`LOD_DOM_ATTR`, `LOD_DOM_INERT_ATTR`);
+  only widget wrappers, which Vue does not own, still use classes. The readout/API
+  name it: `lowZoom.snapshots.pathway` / `.bitmaps` / `.vueBlanked` / `.vueBoxes` /
+  `.vueRestored` / `.vueUnreached`. A test in that mode asserts the attribute, the
+  box ink, the re-render survival and the hand-back; the harness shim supports tag
+  selectors and `querySelector` for the nested-`<video>` and wrapper-`<img>` cases.
 - `lodVueBoxContent` gives a Vue box the node's own content when the stand-in is
   *picture of the node*, from the two routes content takes to the page:
   `lodSnapDomInk` for widget-borne elements (textarea values re-painted, img and
-  canvas blitted) and `lodVueMediaBoxes` for what the node renders itself
+  canvas blitted) and `lodVueRootMetrics` for what the node renders itself
   (`img`/`canvas` children of the node's element, drawn at their laid-out
   position — `(childRect - rootRect)/zoom` in graph units, minus the title bar).
-  `lodPaintNode` gained optional `content` / `detailOverride` for this and clips
-  content to the node's box; the canvas renderer passes neither. Gauges:
-  `lowZoom.snapshots.vueContent` / `.vueMedia`. The layout read is cached per node
-  and keyed on zoom/pos/size (400 ms backstop), and elements the widget route drew
-  are skipped, so nothing is drawn twice. If you touch this, keep it that way:
-  a photograph of a DOM element is impossible (no browser API), and the harness
-  shim supports `el._rect` + `h.rectReads` for testing layout.
+  `lodPaintNode` takes optional `content` / `detailOverride` / `sizeOverride` and
+  clips content to the node's box; the canvas renderer passes none of them. Gauges:
+  `lowZoom.snapshots.vueContent` / `.vueMedia`.
+  Three things here are load-bearing, learned the hard way in v2.6.3:
+  (1) **the box is `lodVueBoxSize`** — the element's measured box, not `node.size`
+  (`LGraphNode.vue` renders image nodes `IMAGE_PREVIEW_HEIGHT_RESERVE` = 232 px
+  taller than their graph size and puts the picture in the overhang);
+  (2) **the zoom is measured from the element's own width**, never read from
+  `canvas.ds.scale` — a capture sets that to 1 while the DOM keeps its transform,
+  and dividing client pixels by the wrong zoom puts the content outside its box;
+  (3) **the cache key is the node's own size only** — every stored number is
+  node-local, so a pan or a zoom must cost *no* layout read (a key that included
+  them meant one forced layout per boxed node per frame while the user dragged),
+  and the 400 ms backstop refresh is rationed by `LOD_VUE_MEDIA_BUDGET` per frame.
+  Elements the widget route drew are skipped, so nothing is drawn twice. If you
+  touch this, keep it that way: a photograph of a DOM element is impossible (no
+  browser API), and the harness shim supports `el._rect`, `h.rectReads` and
+  `vue.growRoot()` for testing layout.
 
 Rules for tests:
 

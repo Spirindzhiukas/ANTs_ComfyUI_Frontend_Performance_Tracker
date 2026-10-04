@@ -290,25 +290,34 @@ resolution setting behave in both directions. Evidence and the tests are in
 
 **K8. The Vue-nodes stand-in — built (v2.6.0).** The same setting, the other
 mechanism: below the zoom threshold each node's own element is blanked (`opacity:
-0` on the `[data-node-id]` element — it keeps its layout and its pointer events,
-so interaction is unchanged) and the canvas paints the same box in the same place,
+0`, keyed on the `data-ants-vue-standin` attribute rather than a class since
+v2.6.3 — the frontend rewrites that element's `class` and `style` on every
+re-render — and it keeps its layout and its pointer events, so interaction is
+unchanged) and the canvas paints the same box in the same place,
 through the seam LiteGraph still calls in that renderer (`drawNode` with the
-context in node-local space). Pictures are not obtainable there (a DOM node cannot
-be drawn into a bitmap), so the capture, ratio, budget and disk settings report
-themselves idle. The pathway is chosen per call from `LiteGraph.vueNodesMode`, a
-box is painted only after a real blanking, and every blanked element is handed
-back on the frame the setting, the zoom, the tool or the renderer changes.
+context in node-local space). The pathway is chosen per call from
+`LiteGraph.vueNodesMode`, a box is painted only after a real blanking, and every
+blanked element is handed back on the frame the setting, the zoom, the tool or the
+renderer changes. **v2.6.3 closed two defects this plan had recorded as design:**
+the mark is an *attribute* (`data-ants-vue-standin`, `!important` rule) because
+Vue rewrites the element's `class` and `style` on every re-render, and the
+capture/ratio/budget/disk half is **not** idle in this renderer — a picture is
+*drawn* into the capture surface (`lodVueCapturePaint`), so the ratio ladder, the
+mips, the RAM budget and the disk files behave exactly as in the canvas renderer.
 
-What the boxes carry (v2.6.1, completed in v2.6.2): the node's own content,
-drawn live from the two routes it takes to the page — widget-borne elements
-(`WidgetDOM.vue` mounts `widget.element` into the node) and everything the node
-renders itself (`ImagePreview.vue`'s `<img>` elements, a custom node's
-`<canvas>`), the latter drawn at its laid-out position through `lodVueMediaBoxes`
-(rect arithmetic, cached on the node's own layout key). A *photograph* of the
-node remains impossible: no browser API draws a DOM element into a canvas, and
-the `<foreignObject>` route cannot fetch the images that matter. Recorded in
-`ANALYSIS.md` with the two rejected routes, so nobody re-opens it without new
-information.
+What the boxes carry (v2.6.1, completed in v2.6.2, made to work in v2.6.3): the
+node's own content, drawn live from the two routes it takes to the page —
+widget-borne elements (`WidgetDOM.vue` mounts `widget.element` into the node) and
+everything the node renders itself (`ImagePreview.vue`'s `<img>` elements, a
+custom node's `<canvas>`), the latter drawn at its laid-out position through
+`lodVueRootMetrics` (rect arithmetic in node-local units, cached on the node's own
+size, rationed per frame). A *photograph* of the node remains impossible: no
+browser API draws a DOM element into a canvas, and the `<foreignObject>` route
+cannot fetch the images that matter. Recorded in `ANALYSIS.md` with the two
+rejected routes, so nobody re-opens it without new information. The box is the
+*element's* box (image nodes are rendered 232 px taller than their graph size),
+and the zoom used to convert the measurements is measured from the element, never
+read from `canvas.ds.scale` — a capture sets that to 1.
 
 Remaining gap, deliberately not closed: a pack whose preview is a *canvas* widget
 (`drawWidget`) with no DOM rendering has nothing on the page for the box to
@@ -318,7 +327,13 @@ the live frame context for every blanked node, which is exactly the per-frame
 cost this pathway exists to remove.
 
 Open, and deliberately not guessed at: **how much this saves on a real heavy
-Vue-nodes graph.** The frontend composites all nodes in one transformed container
+Vue-nodes graph — and whether the v2.6.3 fixes are enough on the user's own page.**
+The four live reports so far (v2.5.6 pictures with no content; v2.6.0 "nothing in
+Nodes 2.0"; v2.6.2 "only text nodes have content"; v2.6.3 "no pictures and no disk
+files at all") each found something the harness could not, and the harness has been
+strengthened by each one — the last pass added a Vue re-render that rewrites
+`className`, an `isConnected` that tells the truth, and the element's real height.
+A stand-in picture in this renderer is drawn, not photographed. The frontend composites all nodes in one transformed container
 (O(1) pan/zoom by design — `useTransformState.ts`), so the saving is node pixels,
 not transform work, and only a live page can price it. The tool's own frame
 budget, Stalls tab and `lowZoom.snapshots` counters are the instrument. A second
