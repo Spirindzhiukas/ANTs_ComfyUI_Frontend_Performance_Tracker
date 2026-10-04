@@ -630,7 +630,7 @@ every frame (DOM queries over the A/B window: 50562 → 14454; widget rows drawn
 budget. Two readout statements were false and are fixed: the Vue paragraph's "(no
 picture is taken in this renderer)" beside a serving count (a v2.6.0/v2.6.1
 leftover — with snapshots on it now describes what happens, off it keeps the old
-sentence), and the DOM-hiding count now names the boxed nodes it belongs to. Three
+sentence), and the DOM-hiding count now names the boxed nodes it belongs to. Two
 tests added, four rewritten from "the changed node is dropped" to the behaviour the
 report asked for, and the sixteen-mutation battery is all caught.
 
@@ -724,9 +724,11 @@ gap. The shim records such selectors now (`document._qsaUnsupported`), the grid 
 read through `els[0].children`, and a test asserts the list is empty for every
 selector the reader uses after proving the guard itself records a `>` selector.
 
-Test ledger: five added (wrapping and font, colour translation with chroma and hue,
-a dimmed node, a Vue-rendered widget's values including the controls, the selector
-guard), two rewritten, and the seventeen-mutation battery is **all caught**.
+Test ledger: six added (the readout's renderer sentence — its v2.6.7 wording was
+only true with the setting off — wrapping and font, colour translation with chroma
+and hue, a dimmed node, a Vue-rendered widget's values including the controls, and
+the selector guard), two rewritten, and the seventeen-mutation battery is **all
+caught**.
 
 Two things the Nodes 2.0 pass confirmed rather than changed: the Vue node's
 **root element is never hidden or inerted** (`via: "root"` records are exempt from
