@@ -10,7 +10,7 @@ import fs from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
 import { fileURLToPath } from "node:url";
-import { computedStyle, createDocument, createStorage } from "./dom-shim.mjs";
+import { computedStyle, createDocument, createStorage, fireResize, observerClasses, withQuiet } from "./dom-shim.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const TRACKER_PATH = path.join(HERE, "..", "web", "tracker.js");
@@ -573,6 +573,22 @@ export function createHarness(options = {}) {
   sandbox.window.getComputedStyle = (el) => computedStyle(el);
   sandbox.createImageBitmap = createImageBitmapStub;
   sandbox.window.createImageBitmap = createImageBitmapStub;
+  // The two observers a real page has, so the tracker can watch the node elements
+  // instead of re-measuring them on a timer. On by default (a browser always has
+  // them); a test that wants the fallback path switches them off.
+  const observerShims = observerClasses();
+  const setDomObservers = (on) => {
+    for (const k of ["ResizeObserver", "MutationObserver"]) {
+      if (on) {
+        sandbox[k] = observerShims[k];
+        sandbox.window[k] = observerShims[k];
+      } else {
+        delete sandbox[k];
+        delete sandbox.window[k];
+      }
+    }
+  };
+  setDomObservers(true);
   vm.createContext(sandbox);
 
   // Opt-in: make the fake timer functions behave like Chrome's, which throws
@@ -708,7 +724,7 @@ export function createHarness(options = {}) {
       return el;
     };
 
-    const place = () => {
+    const place = () => withQuiet(() => {
       const scale = Number(canvas.ds.scale) || 1;
       const ox = Number(canvas.ds.offset[0]) || 0;
       const oy = Number(canvas.ds.offset[1]) || 0;
@@ -768,7 +784,7 @@ export function createHarness(options = {}) {
           wrappers.set(w.element, w.wrapper);
         }
       }
-    };
+    });
     place();
     return {
       container,
@@ -780,9 +796,31 @@ export function createHarness(options = {}) {
       media,
       // The frontend lays an image node out taller than its graph size. The tool
       // has to cover the element, so the harness can say so.
+      // What the frontend does when it re-creates a node's element: the old one
+      // leaves the page and a new one takes its place carrying the same node id (a
+      // re-render, or a remount after the pane was torn down and rebuilt). The
+      // node's own content moves with it, and the new element is not blanked yet.
+      replaceRoot: (n) => {
+        const old = roots.get(String(n.id));
+        const root = document.createElement("div");
+        root.className = "lg-node absolute";
+        root.setAttribute("data-node-id", String(n.id));
+        root.style.transform = `translate(${n.pos[0]}px, ${n.pos[1] - 30}px)`;
+        for (const m of media) if (m.node === n && old && m.el.parentNode === old) root.appendChild(m.el);
+        if (old) old.remove();
+        pane.appendChild(root);
+        roots.set(String(n.id), root);
+        place();
+        return root;
+      },
       growRoot: (n, px) => {
         growth.set(String(n.id), Number(px) || 0);
         place();
+        // The element's own box changed (the frontend reserved more room inside the
+        // node), which is what a ResizeObserver reports — and what the tool needs to
+        // hear, since no frame would otherwise ask for the new height.
+        const root = roots.get(String(n.id));
+        if (root) fireResize(root);
       },
       // What the frontend does with a widget while its node is off screen
       // (DomWidgets.vue's `isNodeVisible`) — a test can hand it back.
@@ -843,6 +881,7 @@ export function createHarness(options = {}) {
     sandbox,
     tracker,
     observers,
+    setDomObservers,
     emitPerformance,
     performanceShim,
     resourceEntries,
@@ -861,6 +900,11 @@ export function createHarness(options = {}) {
     enterVueNodes,
     get rectReads() {
       return document._rectReads || 0;
+    },
+    // The per-document operations a browser would charge for (see dom-shim.mjs):
+    // a benchmark diffs these to price a frame.
+    get ops() {
+      return document._counts;
     },
     addResource,
     panel,

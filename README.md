@@ -6,7 +6,7 @@ for: *which extension's JavaScript is actually costing me frames while I pan
 this graph, and what is eating main-thread time that no draw hook owns?* —
 without opening DevTools and without restarting ComfyUI to bisect.
 
-Version **2.6.4**. Everything runs from page load: no node has to be placed,
+Version **2.6.5**. Everything runs from page load: no node has to be placed,
 nothing executes, and the tool never changes your graph or your workflows.
 
 - **Measure** — per-extension and per-node-type frame cost, canvas draw
@@ -214,8 +214,11 @@ call, never latched:
   While the stand-in setting is **picture of the node**, each box also carries
   what the node is showing, drawn live, from the two places a node's content
   reaches the page. **Widget-borne content** (a prompt's `<textarea>`, anything a
-  pack added through `addDOMWidget`) is drawn at the row geometry the frontend
-  itself positions it by. **Everything the node renders itself** — the frontend's
+  pack added through `addDOMWidget`) is drawn in the box the browser actually
+  laid it out in when the frontend has mounted the element inside the node's own
+  element (`WidgetDOM.vue` does; that is the route a text widget's value reaches
+  the screen in this renderer) and otherwise at the row geometry the frontend
+  positions it by. **Everything the node renders itself** — the frontend's
   `ImagePreview.vue` puts the node's pictures in `<img>` elements inside the
   node's DOM, and a custom node may render a `<canvas>` for a viewport or a curve
   editor — is found by walking the node's element and drawn at the position the
@@ -228,12 +231,27 @@ call, never latched:
   font, which is what a stand-in needs; a field's *value* is drawn from the value
   the field holds, as before. The content is clipped to the node's box **and its
   title bar**, so the node's own name is in the picture rather than cut off above
-  it. A pack's own drawn HTML is still blank and counted. Nothing is drawn twice, and the layout is read on a change
-  (the node's own size, the elements and their sources) rather than per frame:
-  panning and zooming cost no read at all, because every number stored is
-  node-local, and the periodic refresh is rationed to a few node layouts per
-  frame so a graph with hundreds of boxes cannot turn it into a forced layout
-  per node per frame.
+  it. A pack's own drawn HTML is still blank and counted. Nothing is drawn twice, and **the page is asked for nothing while nothing
+  changes**. The tool watches the node's element instead of interrogating it: a
+  `ResizeObserver` on the element and the elements inside it, and a
+  `MutationObserver` on its children and text, drop the stored measurement the
+  moment the page reports a change — a widget row moving, content arriving, the
+  element growing — and the next frame re-measures it through a ration of a few
+  node layouts per frame. Everything downstream follows from that one
+  measurement: the box, the ink, the signature that decides whether a stored
+  picture is still a picture of this node, and the capture surface the picture is
+  drawn on, so a node that grew or gained content cannot be photographed at the
+  height it had a moment earlier and then clipped. Panning and zooming cost no
+  read at all, because every number stored is node-local and a transform is not a
+  box change. On a page without those observers the tool falls back to asking on
+  a timer, and the ration still bounds what a frame may ask. In the steady state
+  — pictures held, nothing changing — a frame costs the page **no** DOM write, no
+  layout read and no DOM query of any kind, at any node count: the tool's whole
+  per-frame cost is the blits it was asked to make. Measured at 40 boxed nodes in
+  the Vue-nodes renderer, 2.6.4 alongside, steady state: attribute writes per
+  frame 40 (every one of them a re-write of a mark that had not changed) → 0, DOM
+  queries per frame 82.4 → 0, layout reads per frame 2.4 → 0; at 150 nodes
+  150 / 302.1 / 4.5 → 0 / 0 / 0.
   The box covers the **box the frontend rendered**, not the node's graph size:
   `LGraphNode.vue` renders an image node `IMAGE_PREVIEW_HEIGHT_RESERVE`
   (220 + 8 + 4 px) taller than its graph size and puts the picture in that
@@ -249,10 +267,20 @@ call, never latched:
 
 Nothing is hidden: the element is still there — slots, widgets, resize handles,
 the context menu — so clicking, dragging, selecting and link-dragging behave
-exactly as they do in full detail; it just stops painting. That makes the
-saving different from the canvas renderer's: not cheaper canvas drawing, but
-fewer node pixels for the browser to paint, which is where a heavy zoomed-out
-graph spends its frame. Every blanked element is handed back the moment the
+exactly as they do in full detail; it just stops being *visible*. **What that is
+worth on this pathway is not something this tool claims.** `opacity: 0` keeps the
+element in the render tree — only `display: none` and `visibility: hidden` take an
+element out of rendering — so the node's style, layout and paint work are still
+the browser's, and whether an engine skips rasterising a fully transparent subtree
+is not observable from page JavaScript. (Those two marks are not alternatives
+here: in this renderer node dragging and selection are handled by that DOM, so an
+element that cannot be hit-tested is a node the user cannot pick up.) What *is*
+measured, and pinned by tests, is the other half — with the stand-ins on a frame
+costs the page no attribute writes, no layout reads, no DOM queries and no
+computed styles, at 40, 60 and 150 nodes alike, and a picture means the node's
+content is not re-drawn every frame. If the frame rate still drops with the
+stand-ins on, the instrument is this tool's own frame budget and Stalls tab on
+that page. Every blanked element is handed back the moment the
 zoom leaves the setting, the setting or the tool is switched off, or the
 renderer changes — the per-frame plan compares one boolean in the steady state,
 so a stale mark cannot be left behind, and an element the frontend unmounted
@@ -574,7 +602,7 @@ short version:
 ## Development
 
 ```bash
-node tests/run-tests.mjs              # all tests — 209 passing, zero dependencies
+node tests/run-tests.mjs              # all tests — 215 passing, zero dependencies
 node tests/run-tests.mjs <substring>  # one suite or test
 python3 tests/test_init.py            # the Python side (routes, node contract)
 node tests/demo.mjs                   # prints what every tab says, against a synthetic graph

@@ -28,7 +28,7 @@ this is going. Read the golden rules before the code.
 ## Commands
 
 ```bash
-node tests/run-tests.mjs              # all 209 tests — must be green before any commit
+node tests/run-tests.mjs              # all 215 tests — must be green before any commit
 node tests/run-tests.mjs <substring>  # one suite/test, e.g. ... pill
 python3 tests/test_init.py            # the Python side (route parsing, node contract)
 node tests/demo.mjs                   # prints what the panel says against a synthetic graph
@@ -226,7 +226,28 @@ Seams worth knowing:
   (3) **the cache key is the node's own size only** — every stored number is
   node-local, so a pan or a zoom must cost *no* layout read (a key that included
   them meant one forced layout per boxed node per frame while the user dragged),
-  and the 400 ms backstop refresh is rationed by `LOD_VUE_MEDIA_BUDGET` per frame.
+  and the refresh is rationed by `LOD_VUE_MEDIA_BUDGET` per frame. **The refresh
+  is not a poll** (v2.6.5): `lodVueWatch` puts a `ResizeObserver` on the node's
+  element and the elements inside it and a `MutationObserver` over its children
+  and text, and a report deletes that node's measurement
+  (`lodVueStaleNode`), so the next frame re-takes it; attributes are deliberately
+  not observed (Vue rewrites `style`/`class` on hover, selection and every pane
+  gesture), a watched node keeps a 5 s insurance read
+  (`LOD_VUE_MEDIA_MS_WATCHED`), and a page without the observers keeps the 400/
+  800 ms beat. Keep it that way: a `setAttribute` with the value the element
+  already has is not free (Blink/WebKit run the attribute-changed path), the
+  video verdict must stay cached (`LOD.snapVideo`; 30 s watched / 100 ms
+  unwatched, and a capture probes fresh), and the steady state must cost the page
+  nothing — three tests assert exactly zero writes, reads, queries and probes per
+  frame at any node count.
+  (4) **a capture takes one measurement.** `lodVueRootMetrics(node, canvas, true)`
+  → `lodSnapGeometry(node, canvas, dom.boxH)` → surface, box and ink from the same
+  number, and the signature mixes that height, the text lines and the measured
+  widget boxes (`lodVueWidgetBoxes`), so a picture is dropped and re-made when the
+  node finishes rendering instead of being kept from the first look. Widget
+  content is drawn where the browser laid the element out when the frontend has
+  mounted it inside the node's own element (`WidgetDOM.vue`), and at the canvas
+  row only when there is no such element.
   Elements the widget route drew are skipped, so nothing is drawn twice.
   **The plan and the draw loop ask one predicate** (`lodVuePathOn`): if the plan
   ever asks a *narrower* question than the draw loop — as it did while it required
@@ -241,7 +262,12 @@ Seams worth knowing:
   other's picture — RAM or file. If you touch this, keep it that way: a photograph
   of a DOM element is impossible (no browser API), and the harness shim supports
   `el._rect`, `h.rectReads`, `getComputedStyle` (display/pointer-events/transform
-  matrix/font/colour) and `vue.growRoot()` for testing layout.
+  matrix/font/colour) and `vue.growRoot()` for testing layout. v2.6.5 added the
+  two observers to the sandbox (on by default — a browser has them; a test can
+  call `h.setDomObservers(false)` to exercise the timer fallback) with
+  `withQuiet` so the fixture's own pan/zoom layout is not mistaken for a box
+  change, `fireResize` for the changes a test makes by hand, and `h.ops` carries
+  `attrWriteBy` so a test can hold the tool to "the mark is written once".
 
 Rules for tests:
 

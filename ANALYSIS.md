@@ -1,6 +1,6 @@
 # What works, what fails, and what was taken out
 
-An audit of the repository as of v2.6.4, done by reading the sources rather
+An audit of the repository as of v2.6.5, done by reading the sources rather
 than the docs, running the suites, and running the demo. Every claim below
 has a file and (where it matters) a line reference. Found defects were fixed
 in the same pass; retired ideas were removed rather than documented as if
@@ -9,8 +9,8 @@ they still existed.
 ## How this was checked
 
 ```bash
-node tests/run-tests.mjs        # 209 passing (172 before the stand-in passes; thirty-seven added)
-node tests/run-tests.mjs "Nodes 2.0"        # the twenty-six that cover that renderer
+node tests/run-tests.mjs        # 215 passing (172 before the stand-in passes; forty-three added)
+node tests/run-tests.mjs "Nodes 2.0"        # the thirty-two that cover that renderer
 node tests/run-tests.mjs "cache on disk"    # the six that cover the picture store
 node tests/run-tests.mjs "stand-in picture" # the five that cover what a picture holds
 python3 tests/test_init.py      # Ran 9 tests ... OK
@@ -217,14 +217,27 @@ and the canvas, so the stand-in is made of those:
    the box lands exactly where a picture lands in the canvas renderer — the same
    detail ladder, the same colours, the same progress bar and error ring.
 
-**Why this is the right target, not a consolation prize.** The frontend's own
-`useTransformState.ts` states its design: all nodes live in one transformed
-container, "O(1) transform updates regardless of node count", so panning and
-zooming are already compositor work. What a zoomed-out heavy graph then spends
-its frame on is *node pixels* — and that is exactly what blanking removes. The
-canvas renderer's saving (cheaper canvas drawing) does not exist here; this
-renderer's saving (fewer DOM pixels) does not exist there. Same setting, same
-threshold, same boxes, two different mechanisms.
+**Why this is the right target, not a consolation prize — and what it is *not*
+allowed to claim (corrected in v2.6.5).** The frontend's own `useTransformState.ts`
+states its design: all nodes live in one transformed container, "O(1) transform
+updates regardless of node count", so panning and zooming are already compositor
+work; what a zoomed-out heavy graph then spends its frame on is node pixels. The
+canvas renderer's saving (cheaper canvas drawing) does not exist in this renderer
+— its `drawNode` draws no node chrome at all. But this renderer's saving is **not
+established either**: `opacity: 0` keeps the element in the render tree (only
+`display: none` / `visibility: hidden` remove one, and both would take the node's
+own hit-testing with them — in this renderer dragging and selection are handled by
+that DOM), so the node's style, layout and paint work are still the page's, and
+whether an engine skips rasterising a fully transparent subtree is not observable
+from page JavaScript. Earlier revisions of this file asserted "fewer node pixels
+for the browser to paint, which is where a heavy zoomed-out graph spends its
+frame"; that claim was not supported by the evidence collected here and is
+withdrawn. What *is* supported, measured and pinned by tests is the cost: with the
+stand-ins on, a frame writes nothing, reads no layout, runs no DOM query and reads
+no computed style (at 40, 60 and 150 nodes), and a held picture means the node's
+content is not re-drawn every frame. Whether it saves frames on a given graph is
+for the frame budget and the Stalls tab to say on that page. Same setting, same
+threshold, same boxes, two different mechanisms — and one honest claim each.
 
 **Pictures too, and the disk files with them (v2.6.3).** The mistaken belief that
 a Vue-nodes stand-in cannot have a picture was never about the browser: it was
@@ -279,6 +292,87 @@ walks the graph per frame and a stale mark cannot survive a frame. An element th
 frontend unmounted mid-flight (the whole pane is `v-if`) has its mark taken off
 too — the element the tool last dressed is remembered for exactly that — so an
 element Vue puts back later cannot come back invisible.
+
+**The eighth report: stand-ins that cost frames, and pictures taken too early
+(v2.6.5).** Measured on the harness before anything was changed; each half had a
+cause, and each cause has a test.
+
+*The frame cost was the tool's own per-frame work.* Counted in the
+Vue-nodes renderer, steady state, before the fix: at 40 boxed nodes **40
+attribute writes a frame** — every one of them a re-write of a mark that had not
+changed — **82.4 DOM queries** (80 of them `el.querySelector("video")`, once per
+widget per node: subtree walks) and **2.4 layout reads**; at 150 nodes 150 /
+302.1 / 4.5. With stand-ins off all of those numbers are zero, which is what made
+the drop visible to the user in the first place.
+
+1. **An attribute write is not free, even when the value is unchanged.** Blink
+   and WebKit run the attribute-changed path — observable side effects and style
+   invalidation — for a data attribute written with the value it already has
+   (WebKit bug 115116; a client that skipped the no-op write reports 500 layouts
+   → 0 and 30.7 → 6.9 ms over 1000 elements). The blanking mark now reads
+   `hasAttribute` first and is written only on the transition
+   (`LOD.vueDomWrites` counts it). A CSSOM style *declaration* set to its current
+   value, by contrast, is collapsed and ignored — but the mark cannot be a style,
+   because Vue owns the element's `style` and rewrites it.
+2. **The video verdict was a poll.** "Does this node hold a `<video>`?" is a
+   question about elements, and elements do not change without a DOM change; it
+   is cached per node (`LOD.snapVideo`) for 100 ms on a page without the
+   observers and for 30 s on a page with them, where the change itself drops the
+   verdict, and a capture still probes fresh — a video must never be
+   photographed.
+3. **The measurement was polled too.** The element's layout was re-read on a
+   400 ms beat (800 ms while a picture was held) for every boxed node, forever.
+   The page already knows when it changes: one `ResizeObserver` over the node's
+   element and the elements inside it, one `MutationObserver` over its children
+   and text, and a report drops that node's measurement, which the next frame
+   re-takes through the same per-frame ration (`LOD_VUE_MEDIA_BUDGET`).
+   Attributes are deliberately not observed: the frontend rewrites `style` and
+   `class` on hover, on selection and on every pane gesture. A watched node keeps
+   a 5 s insurance read for the change no observer reports; a page without the
+   observers keeps the old beat. **After: 0 / 0 / 0 per frame** at 40 nodes, at 60
+   (60/122/2 → 0/0/0) and at 150 (150/302.1/4.5 → 0/0/0), leaving the blits as the
+   tool's only per-frame cost.
+   The one caveat, stated because it is measurable: a `ResizeObserver` does not
+   fire for a transform, so panning and zooming still cost nothing (the stored
+   numbers are node-local), which the harness models by laying its fixture out
+   inside `withQuiet`.
+
+*The early picture was two numbers that should have been one.* The signature
+mixed the node's fields, its media and its text, but not **the height the
+frontend actually rendered the element at** — so a node whose content arrives a
+moment after its element (every node on a real page: a title, a label, a preview)
+kept the first, bare picture for the session. And a capture sized its surface
+from the *cached* measurement while reading the ink from a *fresh* one, so
+content that arrived between the two was painted at an origin the surface did not
+cover. The signature now mixes the element's rendered height, the widget rows and
+the text lines, and a capture takes **one** measurement —
+`lodVueRootMetrics(node, canvas, true)` → `lodSnapGeometry(node, canvas, dom.boxH)`
+— so the surface, the box and the ink all come from the same number. Widget
+content is drawn in **the box the browser laid it out in** (`lodVueWidgetBoxes`,
+`w.element`/`w.inputEl` when the frontend has mounted it inside the node's own
+element, as `WidgetDOM.vue` does) with the canvas row as the fallback for the
+renderer that authors those rows itself.
+*Evidence:* `/tmp/grow4.mjs` (before: an element grown 420 units, with content in
+the new part, left the old picture standing and the old surface 110 units tall;
+after: `invalidated 1 captured 2`, surface 608 px, content drawn at y 470) and the
+two new tests, which assert the surface height and the painted row rather than
+the intent. Ten anchored mutations were run; nine are caught (listed in
+`CHANGELOG.md`), and the tenth — passing the just-measured height to the geometry
+or letting the geometry read it from the cache — is *semantically equivalent*
+because the fresh measurement is cached first, so it is recorded as such instead
+of being claimed as bound.
+
+**The element is watched, not assumed to stay put.** The frontend replaces a
+node's element while the node stays boxed (a re-render, a remount after the pane
+is rebuilt), which is the state the v2.6.3 report came from. `lodVueBlank`
+already re-looks-up the element by `data-node-id`; v2.6.5 also re-registers the
+watchers on whichever element it finds (`lodVueWatchKeep`), so a change inside
+the *new* element drops the measurement at once rather than waiting for the
+insurance read, and the measurement taken from the element that is gone goes with
+it (`hit.root !== root` re-measures). Pinned by a test that replaces the element,
+draws one frame, appends a line to the new element and asserts the picture is
+re-made. The harness grew `vue.replaceRoot(node)` for it, which moves the node's
+media into the new element exactly as the frontend does.
 
 **The seventh report: pictures that were boxes, and a canvas that flickered
 (v2.6.4).** Both defects named in it were reproduced or located in the sources
@@ -374,7 +468,7 @@ pathway token dropped from the key → three fail; the no-element refusal remove
 test fails; the text keeping the title-bar offset → the text test fails.
 
 **What is not verified.** The mechanism is verified against the frontend's
-sources and the harness (twenty-six tests now cover that renderer); it had not
+sources and the harness (thirty-two tests now cover that renderer); it had not
 been run against a live Vue-nodes page by this project when the fourth report
 arrived, and that report is exactly why the defects above were invisible from
 here — the harness put a class on an element nothing rewrote, it reported
@@ -503,7 +597,7 @@ apply, not just in the docs.
   other than the Node harness was executed in this pass.
 - **The Vue-nodes stand-in has not been run against a live page *by this
   project*.** It is verified against the frontend's sources and the harness
-  (twenty-six tests), and its failure modes are contained by construction (a box
+  (thirty-two tests), and its failure modes are contained by construction (a box
   only ever follows a real blanking, and every blanked element is handed back on
   the frame the setting stops applying) — but the user's page is the live test, and
   it has already caught four defects this harness could not: a class that Vue

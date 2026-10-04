@@ -4,7 +4,7 @@ A running record for whoever picks this up next (including me). `CLAUDE.md` is t
 rules for changing the code; `plan.md` is where it is going. This file is the past:
 what was built, what was rejected, and what the evidence was.
 
-Last updated at **v2.6.4**, 209 tests green, PR #2 on
+Last updated at **v2.6.5**, 215 tests green, PR #2 on
 `Spirindzhiukas/ANTs_ComfyUI_Frontend_Performance_Tracker`.
 
 ---
@@ -13,8 +13,8 @@ Last updated at **v2.6.4**, 209 tests green, PR #2 on
 
 | | |
 | --- | --- |
-| Version | 2.6.4 (`web/tracker.js` `VERSION`) |
-| Tests | 209 (`node tests/run-tests.mjs`), plus `tests/test_init.py` |
+| Version | 2.6.5 (`web/tracker.js` `VERSION`) |
+| Tests | 215 (`node tests/run-tests.mjs`), plus `tests/test_init.py` |
 | Frontend | `web/tracker.js`, one ES module, no dependencies. The separate window is `web/window.html`, served at `/ants_optimizer/window`, not loaded as an extension. |
 | Backend | `__init__.py` — node `ANTs_Frontend_Optimizer` (old class key kept as an alias), nine best-effort routes (GPU, five thumbnail routes, the window page, `/ants_optimizer/ui`), and thumbnail read/write under ComfyUI's temp folder |
 | Panel | 10 tabs: Node Rendering Settings, Status, Timing, Nodes, Stalls, Governor, Load, Memory, GPU / VRAM, Testing |
@@ -36,6 +36,14 @@ something has to be drawn less or hit-tested less.
 ## 2. Version log
 
 The commit log is the full record; this is the "why", newest first.
+
+**v2.6.5 — the eighth report: the stand-ins cost frames, and a picture could be taken too early.** Both halves were measured on the harness with counters before anything was changed, and both had a cause.
+
+*The performance half was the tool's own per-frame work, not the blits.* Three things ran on every frame that had no business running on every frame. **(1) The blanking mark was re-written.** `setAttribute` for a value the element already carries is not free — Blink and WebKit run the attribute-changed path (side effects, style invalidation) even for a data attribute, which is documented in the client that skipped the no-op write and went from 500 layouts to 0 — so the mark reads `hasAttribute` first and is written only on the transition. **(2) The video verdict was re-taken.** "Does this node hold a `<video>`?" was `el.querySelector("video")` per widget per node per frame: 80 subtree walks a frame at 40 nodes. It is now cached per node (`LOD.snapVideo`) — 100 ms on a page without observers, 30 s on one with them, where a video appearing *is* a reported change — and a capture still probes fresh so a video is never photographed. **(3) The measurement was refreshed on a timer.** 400/800 ms per boxed node, forever: a forced style-and-layout read per node to answer a question the page already knows. The tool now **watches** the element instead — one `ResizeObserver` over the node's element and the elements inside it, one `MutationObserver` over its children and text (`lodVueWatch`, `lodVueWatchInside`), and a report drops that node's measurement (`lodVueStaleNode`), which the next frame re-takes through the same ration. Attributes are deliberately not observed (the frontend rewrites `style`/`class` on hover, on selection and on every pane gesture), and a page without the observers keeps the old beat. Result, steady state: at 40 boxed nodes attribute writes per frame **40 (all of them no-op re-writes of a mark that had not changed) → 0**, DOM queries **82.4 → 0**, layout reads **2.4 → 0**; at 60 nodes 60/122/2 → 0/0/0; at 150 nodes 150/302.1/4.5 → 0/0/0. The only per-frame cost left is the blits the frame asked for. `vueDomWrites`, `vueLayoutReads`, `vueProbes`, `vueWatch`, `vueWatched` and `vueStale` are in the readout.
+
+*The early-capture half was two numbers that should have been one.* The signature that decides whether a stored picture is still a picture of the node mixed the node's fields, its media and its text — but not **the height the frontend rendered the element at**, so a node whose content arrived after the picture kept the first, half-rendered picture for the session; and the capture surface was sized from the *cached* measurement while the ink was read from a *fresh* one, so anything that arrived between the two was painted at an origin the surface did not cover — the "photographed too early" in the report. The signature now mixes the element's rendered height, the widget rows and the text lines, and a capture takes **one** measurement (`lodVueRootMetrics(force)` → `lodSnapGeometry(node, canvas, dom.boxH)`), so the surface, the box and the ink come from the same number. Widget content is also drawn in **the box the browser laid the element out in** (`lodVueWidgetBoxes`, over the elements the frontend mounts inside the node's own element — `WidgetDOM.vue` does that in this renderer) instead of at the canvas row the widget only has when the canvas renderer is drawing it; the tests show the difference (a field laid out at y 52 is painted at 55, the canvas row would put it at 73).
+
+*Six tests added (215 green), ten-mutation battery: nine caught.* Caught: the page's reports ignored → the observer test fails; a reported change not dropping the measurement → four fail; the measured widget boxes unused, and out of the signature → the widget test fails; the mark written every frame and the video verdict uncached → the steady-state tests fail; the node's text out of the signature → the arrival test fails; the element's height out of the signature → the height test fails. Not caught, and named rather than claimed: asking the geometry without passing the height just measured is *semantically equivalent* now (the fresh measurement is already in the cache), so no test can tell the two spellings apart. The harness gained the two observers — on by default, because every browser has them — with `withQuiet` around the pane's own layout (a pan or a zoom is a transform, and a real `ResizeObserver` does not fire for one) and `growRoot` announcing a real box change.
 
 **v2.6.4 — the seventh report: pictures that were boxes, and a canvas that flickered.** Two defects, both reproduced or located in the sources before anything was changed.
 

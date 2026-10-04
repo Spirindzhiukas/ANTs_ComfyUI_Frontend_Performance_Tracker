@@ -317,6 +317,20 @@ setting, the draw loop only the zoom, so with any other stand-in mode the plan
 handed the whole set of elements back every frame while the draw loop blanked
 them again. One predicate (`lodVuePathOn`) is asked by both now, and a box counts
 as standing in.
+**v2.6.5 answered the eighth report's two questions with measurements.** The frame
+cost of the stand-ins was the tool's own per-frame work, not the blits: 40 mark
+re-writes and 82 DOM queries a frame at 40 nodes (38 and 80 of them no-ops the
+browser charged for), plus a layout read per boxed node on a 400/800 ms timer. The
+mark is now written only on the transition, the video verdict is cached, and the
+measurement is *reported* rather than polled (`ResizeObserver` + `MutationObserver`
+over the node's element, a report dropping that node's measurement), so the steady
+state costs the page zero writes, reads, queries and probes at any node count —
+40/82.4/2 → 0/0/0 per frame at 40 nodes, 60/122/2 → 0/0/0 at 60. The early picture
+was two numbers that should have been one: the signature now mixes the height the
+frontend rendered the element at and the rows the browser laid its widgets out in,
+and a capture takes a single measurement, so surface, box and ink agree and a node
+that finishes rendering after its first look is re-pictured instead of kept
+half-drawn.
 
 What the boxes carry (v2.6.1, completed in v2.6.2, made to work in v2.6.3): the
 node's own content, drawn live from the two routes it takes to the page —
@@ -340,23 +354,33 @@ the live frame context for every blanked node, which is exactly the per-frame
 cost this pathway exists to remove.
 
 Open, and deliberately not guessed at: **how much this saves on a real heavy
-Vue-nodes graph — and whether the v2.6.3/v2.6.4 fixes are enough on the user's own
+Vue-nodes graph — and whether the v2.6.3–v2.6.5 fixes are enough on the user's own
 page.** Each report has been a state the harness could model only after the fact:
 a class Vue rewrote, a picture half that was off, a picture with no text in it, a
-plan fighting the setting once per frame. The user's page remains the live test.
-The five live reports so far (v2.5.6 "pictures with no content"; v2.6.0 "nothing in
-Nodes 2.0"; v2.6.2 "only text nodes have content"; v2.6.3 "no pictures and no disk
-files at all"; v2.6.4 "captured box previews, cached boxes in the canvas workspace,
-and a canvas that flickers when the stand-in mode is not pictures") each found
-something the harness could not, and the harness has been strengthened by each one
-— the last pass added a Vue re-render that rewrites `className`, an `isConnected`
-that tells the truth, the element's real height, the frontend's transform pane (so
-the DOM zoom is exercised the way the page writes it) and a `getComputedStyle`
-that resolves transforms the way a browser reports them.
+plan fighting the setting once per frame, a picture taken before the node had
+finished rendering, a poll the page could have answered itself. The user's page
+remains the live test. The six live reports so far (v2.5.6 "pictures with no
+content"; v2.6.0 "nothing in Nodes 2.0"; v2.6.2 "only text nodes have content";
+v2.6.3 "no pictures and no disk files at all"; v2.6.4 "captured box previews,
+cached boxes in the canvas workspace, and a canvas that flickers when the stand-in
+mode is not pictures"; v2.6.5 "photographed too early, and the stand-ins drop the
+frame rate") each found something the harness could not, and the harness has been
+strengthened by each one — the last pass added the two change observers (with
+`withQuiet` so a pan or a zoom is not mistaken for a box change), a Vue re-render
+that rewrites `className`, an `isConnected` that tells the truth, the element's
+real height, the frontend's transform pane (so the DOM zoom is exercised the way
+the page writes it) and a `getComputedStyle` that resolves transforms the way a
+browser reports them.
 A stand-in picture in this renderer is drawn, not photographed. The frontend composites all nodes in one transformed container
-(O(1) pan/zoom by design — `useTransformState.ts`), so the saving is node pixels,
-not transform work, and only a live page can price it. The tool's own frame
-budget, Stalls tab and `lowZoom.snapshots` counters are the instrument. A second
+(O(1) pan/zoom by design — `useTransformState.ts`), so panning and zooming are not
+where the cost is; v2.6.5 measured the rest and **withdrew the "fewer node pixels"
+claim**: `opacity: 0` keeps the element rendering, so the saving is not
+established, while the *cost* is now zero per frame (no attribute writes, layout
+reads, DOM queries or computed styles at 40, 60 and 150 nodes). Whether it saves
+frames on a given graph is what the tool's own frame budget and its Stalls tab
+measure on that page — and if the frame rate still drops, the honest next step is
+to price the blits and the blanked DOM's paint with those instruments rather than
+to add another mark that would cost the node its hit-testing. A second
 open question: the frontend is growing an ECS-based renderer (`arrangeForLegacyRender`,
 `hitTargetAuthority`, `canvasRedrawBudget`), which may itself introduce a
 low-quality node mode — if it does, this pathway should hand that work over rather

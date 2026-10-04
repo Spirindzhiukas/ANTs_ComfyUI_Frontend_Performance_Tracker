@@ -27,7 +27,7 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.6.4";
+const VERSION = "2.6.5";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
 // The class key ComfyUI stores in a workflow. The old key is still recognised so
 // a graph saved before the rename does not lose this node.
@@ -1000,6 +1000,11 @@ const LOD = {
   vueScaleNow: 0, // the DOM zoom measured for the last node measurement
   vueScaleFrom: "", // how it was measured: pane | inner | root | canvas
   vueTextNow: 0, // text lines the boxes/captures read out of the node's own DOM
+  vueDomWrites: 0, // DOM mutations this tool made to the page (marks written, not re-written)
+  vueLayoutReads: 0, // layout reads (each one can force a style-and-layout pass)
+  vueProbes: 0, // video probes run inside a node's widget elements
+  vueWatch: 0, // elements brought under the change observers (one observer per kind)
+  vueStale: 0, // measurements dropped by a change the page reported
   vueElSeq: null, // WeakMap<element, serial>: what the signature uses to see a replaced element
   vueElNext: 0,
   vuePathway: "", // which pathway the held pictures were made for
@@ -1184,6 +1189,30 @@ const LOD_VUE_MEDIA_BUDGET = 6;
 // 40 kB string in it) from turning the read into a walk of the whole subtree.
 const LOD_VUE_TEXT_MAX = 16;
 const LOD_VUE_TEXT_CHARS = 80;
+// How long a "no video in this node" answer stands before it is re-probed. The
+// guarantee it protects (a video is never photographed) is enforced freshly at
+// capture time; this window is only about a *held* picture of a node that has just
+// swapped a widget's element for a video.
+const LOD_VUE_VIDEO_MS = 100;
+// …and the same verdict when the page can *report* a video appearing (the mutation
+// observer sees the element arrive): the verdict is then not a poll, it is a fact with
+// a stamp, and it only has to be re-taken if the change was reported some other way.
+// A <video> can only appear in a node's element by being inserted into it, and an
+// insertion is a change the page reports — so on a watched page the verdict stands
+// until the page says otherwise, and the stamp is only a backstop for the case where
+// the observers are quiet about something they should not be.
+const LOD_VUE_VIDEO_MS_WATCHED = 30000;
+// The layout backstop for a node whose picture is already held. While a picture is
+// what is drawn, the measurement is only needed to notice that the *element*
+// changed shape (which re-makes the picture) — so it is re-read at a slower beat
+// than a node whose live box is being drawn from it. A capture always reads fresh.
+const LOD_VUE_MEDIA_MS_IDLE = 800;
+// …and how long it stands when the browser has told the tool it can watch the node
+// instead of asking about it: a resize or a change inside the element invalidates the
+// measurement directly, so the periodic read is only insurance against a change no
+// observer reports (an absolutely-positioned child that resizes without resizing its
+// parent, a font that loads).
+const LOD_VUE_MEDIA_MS_WATCHED = 5000;
 const LOD_INERT_CLASS = "ants-lod-inert"; // elements switched off while their node is inert
 // Below this zoom nobody can read a node, let alone use one, so its UI is
 // switched off rather than paid for on every pointer event.
@@ -3910,7 +3939,9 @@ function lodSnapLive(node, canvas) {
 // the node's DOM are the only copy on the page. Text fields were never affected
 // (they are widget-borne), which is exactly why text stood-ins worked first. The offscreen half — the stored pictures, the capture resolution and
 // the disk cache — belongs to the canvas renderer and is reported idle here.
-// The saving is different too: not cheaper canvas drawing, but fewer node pixels
+// The saving is not something this tool claims — `opacity: 0` keeps the element in
+// the render tree (see LIMITS): this comment describes what the box *is*, not what
+// it saves. Not cheaper canvas drawing, but fewer node pixels
 // for the browser to paint, which is exactly where a zoomed-out heavy graph spends
 // its frame.
 // Is the Vue stand-in pathway doing anything this frame? **One answer, asked in
@@ -3992,21 +4023,245 @@ function lodVueBlank(node, on) {
     if (on) LOD.vueUnreached++;
     return false;
   }
+  // The mark is written *once*, on the transition, and read (not written) on every
+  // frame after that. This is not a micro-optimisation: an attribute write is a DOM
+  // mutation, the stylesheet has a rule that matches this attribute, and a write
+  // therefore invalidates style for the element — every frame, for every boxed
+  // node, which is exactly the state the tool promises *not* to be in ("the
+  // per-frame plan is one comparison in the steady state"). Worse, the next
+  // `getBoundingClientRect` the tool reads then forces a real style-and-layout pass,
+  // so the tool was charging the page for the whole graph's layout at the zoom it
+  // exists to make cheap. Reading costs nothing; writing the same value is not free
+  // in any engine (the JS is skipped, WebKit/Blink run the attribute-changed path).
+  let has = false;
+  try {
+    has = typeof el.hasAttribute === "function" ? !!el.hasAttribute(LOD_VUE_ATTR) : false;
+  } catch (e) {
+    has = false;
+  }
+  if (has === !!on) {
+    // Already where it was asked to be: bookkeeping only.
+    if (on) {
+      set.add(node);
+      els.set(node, el);
+      lodVueWatchKeep(node, el);
+    } else {
+      set.delete(node);
+      els.delete(node);
+      lodVueUnwatch(node, el);
+    }
+    return true;
+  }
   try {
     if (on) el.setAttribute(LOD_VUE_ATTR, "1");
     else el.removeAttribute(LOD_VUE_ATTR);
+    LOD.vueDomWrites++;
   } catch (e) {
     return false;
   }
   if (on) {
     set.add(node);
     els.set(node, el);
+    lodVueWatchKeep(node, el);
   } else {
     set.delete(node);
     els.delete(node);
-    if (LOD.vueMedia) LOD.vueMedia.delete(node);
+    lodVueUnwatch(node, el);
   }
   return true; // the attribute is where it was asked to be, in either direction
+}
+
+// ------------------------------------------------- watching the node elements ---
+// A measurement has to be *invalidated* when the thing it measured changes, and the
+// tool's first answer was to re-measure on a timer — which means reading layout,
+// forever, for every boxed node, to find out whether anything moved. The page already
+// knows: a subtree that changes reports it, and an element whose box changes reports
+// that. One observer of each kind covers every node (an observer takes many targets),
+// the callback throws the node's measurement away, and the next draw re-measures it
+// through the same per-frame ration — so a graph where nothing changes costs no
+// layout read at all, however many nodes are in it.
+function lodVueWatchOn() {
+  const hasRO = typeof ResizeObserver === "function";
+  const hasMO = typeof MutationObserver === "function";
+  return hasRO || hasMO;
+}
+
+// Is this node's element watched? Then the page is the one reporting changes, and the
+// periodic read is insurance rather than the source of truth.
+function lodVueWatched(node) {
+  return !!(node && LOD.vueNodeEls && LOD.vueNodeEls.has(node) && lodVueWatchOn());
+}
+
+// Watch *this* element. The frontend replaces elements under a node — a re-render,
+// an unmount and remount — while the node stays boxed, and a change inside the new
+// element would otherwise be noticed only by the insurance read. The old element is
+// released and the measurement goes with it, because a measurement of the element
+// that is gone says nothing about the one that is there.
+function lodVueWatchKeep(node, el) {
+  if (!node || !el) return;
+  if (LOD.vueNodeEls && LOD.vueNodeEls.has(node)) {
+    const set = LOD.vueNodeEls.get(node);
+    if (set.has(el)) return; // already watching this very element
+    lodVueUnwatch(node, el);
+  }
+  lodVueWatch(node, el);
+}
+
+// How many elements inside one node are watched individually. A node element holds
+// its header, its slots and its widgets — a dozen elements at most in practice; the
+// cap is there so a custom node that renders a thousand elements cannot turn a scan
+// into a stall.
+const LOD_VUE_WATCH_MAX = 24;
+
+function lodVueWatch(node, el) {
+  if (!node || !el || typeof el !== "object") return;
+  if (!lodVueWatchOn()) return; // no observers on this page: the timer is the answer
+  if (!LOD.vueElNodes) LOD.vueElNodes = new Map();
+  if (!LOD.vueNodeEls) LOD.vueNodeEls = new Map();
+  if (LOD.vueNodeEls.has(node)) return; // already watching this node's element
+  try {
+    if (!LOD.vueRO && typeof ResizeObserver === "function") {
+      LOD.vueRO = new ResizeObserver((entries) => {
+        for (const e of entries) lodVueStaleEl(e && e.target);
+      });
+    }
+    if (!LOD.vueMO && typeof MutationObserver === "function") {
+      // Children and text only, deliberately not attributes: the frontend rewrites
+      // style and class on its elements constantly (hover, selection, the pane's
+      // transform on every gesture), and re-measuring on those would be the timer
+      // again with worse manners. A change that moves a box without touching the DOM
+      // is the resize observer's job, and the periodic read is the last resort.
+      LOD.vueMO = new MutationObserver((entries) => {
+        for (const e of entries) {
+          const target = e && e.target;
+          const owner = lodVueNodeFor(target);
+          if (!owner) continue;
+          lodVueStaleNode(owner);
+          // New children came with the change: watch them too, or a widget that
+          // appears after the first look would move unwatched for the session.
+          lodVueWatchInside(owner, lodVueNodeEl(owner, target));
+        }
+      });
+    }
+    lodVueWatchInside(node, el);
+  } catch (e) {
+    /* an element that cannot be watched keeps the timer */
+  }
+}
+
+// Watch the element and the elements inside it. The resize observer is attached to
+// each one: a widget whose row moves without resizing the node is a box change the
+// node's own box does not report, and in this renderer the widgets live inside the
+// node's element.
+function lodVueWatchInside(node, el) {
+  if (!el || typeof el !== "object") return;
+  const set = LOD.vueNodeEls.get(node) || new Set();
+  LOD.vueNodeEls.set(node, set);
+  const add = (child) => {
+    if (!child || typeof child !== "object" || set.has(child)) return;
+    set.add(child);
+    LOD.vueElNodes.set(child, node);
+    try {
+      if (LOD.vueRO) LOD.vueRO.observe(child);
+    } catch (e) {
+      /* one unwatchable element is not a reason to stop */
+    }
+  };
+  add(el);
+  try {
+    if (LOD.vueMO && !set.has("mo")) {
+      LOD.vueMO.observe(el, { childList: true, characterData: true, subtree: true });
+      set.add("mo"); // the marker: the root's mutation watch is on
+    }
+  } catch (e) {
+    /* the change is not watched; the timer is still there */
+  }
+  let kids = null;
+  try {
+    kids = typeof el.querySelectorAll === "function" ? el.querySelectorAll("*") : null;
+  } catch (e) {
+    kids = null;
+  }
+  if (kids) {
+    const cap = Math.min(kids.length, LOD_VUE_WATCH_MAX);
+    for (let i = 0; i < cap; i++) {
+      const child = kids[i];
+      if (!child || typeof child !== "object" || !child.tagName) continue;
+      add(child);
+    }
+  }
+  LOD.vueWatch++;
+}
+
+function lodVueUnwatch(node, el) {
+  const set = node && LOD.vueNodeEls ? LOD.vueNodeEls.get(node) : null;
+  if (set) {
+    for (const child of set) {
+      if (typeof child === "string") continue;
+      try {
+        if (LOD.vueRO) LOD.vueRO.unobserve(child);
+      } catch (e) {
+        /* gone already */
+      }
+      if (LOD.vueElNodes) LOD.vueElNodes.delete(child);
+    }
+    set.clear();
+    LOD.vueNodeEls.delete(node);
+  }
+  if (el) {
+    try {
+      if (LOD.vueRO) LOD.vueRO.unobserve(el);
+      if (LOD.vueMO) LOD.vueMO.unobserve(el);
+    } catch (e) {
+      /* nothing to stop */
+    }
+    if (LOD.vueElNodes) LOD.vueElNodes.delete(el);
+  }
+  if (node && LOD.vueMedia) LOD.vueMedia.delete(node);
+}
+
+// Which node does this element belong to? The walk answers for anything inside the
+// node's element, including elements that are not watched themselves.
+function lodVueNodeFor(el) {
+  const map = LOD.vueElNodes;
+  let n = el;
+  while (n && !(map && map.has(n))) n = n.parentNode;
+  return n && map ? map.get(n) : null;
+}
+
+// The element the tool took the node's picture from: the watched one, or the closest
+// watched ancestor of whatever reported the change.
+function lodVueNodeEl(node, el) {
+  if (!node || !LOD.vueNodeEls) return null;
+  const set = LOD.vueNodeEls.get(node);
+  if (!set) return null;
+  if (set.has(el)) return el;
+  let n = el;
+  while (n && !set.has(n)) n = n.parentNode;
+  return n && set.has(n) ? n : null;
+}
+
+// Drop the node's measurement. Dropping (rather than marking) is the whole mechanism:
+// the next caller that needs the numbers re-reads them, and everything downstream —
+// the box, the ink, the signature, the picture — follows from that one read.
+function lodVueStaleNode(node) {
+  if (!node) return;
+  if (LOD.vueMedia) LOD.vueMedia.delete(node);
+  // The verdict "this node holds a video" was reached by looking at the elements
+  // that are in it; a change to those elements is what it depends on, so the verdict
+  // goes with the measurement rather than living out its TTL.
+  if (LOD.snapVideo && node.widgets) {
+    for (const w of node.widgets) {
+      const el = w && (w.element || w.inputEl);
+      if (el && typeof el === "object") LOD.snapVideo.delete(el);
+    }
+  }
+  LOD.vueStale++;
+}
+
+// A change was reported for an element inside a node's subtree.
+function lodVueStaleEl(el) {
+  lodVueStaleNode(lodVueNodeFor(el));
 }
 
 // A stable number per element, for the signature. A replaced <img> is a different
@@ -4237,6 +4492,50 @@ function lodVueTextInk(ctx, lines, out) {
   return drew;
 }
 
+// Is this element inside that one? (The shim's DOM has no `contains`, and the real
+// one is not free either — the walk stops at the root, which is one or two hops for
+// a widget element.)
+function lodVueInside(el, root) {
+  let n = el && el.parentNode;
+  while (n) {
+    if (n === root) return true;
+    n = n.parentNode;
+  }
+  return false;
+}
+
+// The laid-out box of every widget element the frontend has mounted inside the
+// node's own DOM, in node-local units. Widgets whose content the media pass already
+// carries (an `<img>` or a `<canvas>` inside the root) are skipped here: one element
+// is drawn once, by whichever route measured it.
+function lodVueWidgetBoxes(node, root, rr, domScale, title) {
+  const out = [];
+  const widgets = (node && node.widgets) || [];
+  for (let i = 0; i < widgets.length && i < LOD_SNAP_DOM_MAX; i++) {
+    const w = widgets[i];
+    if (!w) continue;
+    let el = w.element || w.inputEl;
+    if (!el || typeof el !== "object" || !el.tagName) continue;
+    if (w.hidden) continue;
+    if (!lodVueInside(el, root)) continue; // mounted by the page somewhere else
+    let r = null;
+    try {
+      r = typeof el.getBoundingClientRect === "function" ? el.getBoundingClientRect() : null;
+    } catch (e) {
+      r = null;
+    }
+    if (!r) continue;
+    const bw = Number(r.width) / domScale;
+    const bh = Number(r.height) / domScale;
+    if (!(bw > 1) || !(bh > 1)) continue;
+    const x = (Number(r.left) - Number(rr.left)) / domScale;
+    const y = (Number(r.top) - Number(rr.top)) / domScale - title;
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+    out.push({ el, x, y, w: bw, h: bh });
+  }
+  return out;
+}
+
 function lodVueRootMetrics(node, canvas, force) {
   const root = lodVueRootEl(node);
   if (!root || typeof root.querySelectorAll !== "function") return null;
@@ -4260,9 +4559,21 @@ function lodVueRootMetrics(node, canvas, force) {
   // A node whose layout key is unchanged is re-read at most this often: cheap
   // insurance against a child that changed size without touching the node.
   if (!force && hit && hit.root === root && hit.key === key) {
-    if (now - hit.at < LOD_VUE_MEDIA_MS) return hit;
+    // A node with a picture held is measured at the slower beat: what is on screen
+    // is the picture, and this read exists to notice that the *element* changed
+    // shape. A node with no picture is drawn live from these numbers, so it keeps
+    // the tight beat.
+    const snap = LOD.snaps ? LOD.snaps.get(node) : null;
+    const watched = lodVueWatched(node);
+    const beat = watched
+      ? LOD_VUE_MEDIA_MS_WATCHED
+      : snap && snap.canvas
+        ? LOD_VUE_MEDIA_MS_IDLE
+        : LOD_VUE_MEDIA_MS;
+    if (now - hit.at < beat) return hit;
     if (!lodVueMediaBudget()) return hit; // this frame's ration is spent
   }
+  LOD.vueLayoutReads++; // one measurement: a root rect plus the elements inside it
   let els = [];
   try {
     els = root.querySelectorAll("img,canvas") || [];
@@ -4318,7 +4629,15 @@ function lodVueRootMetrics(node, canvas, force) {
     }
   }
   const texts = rr ? lodVueTextLines(root, rr, domScale, title) : [];
-  const rec = { root, key, scale: domScale, at: now, items, boxH, texts };
+  // The widgets the frontend mounts *inside* the node's element (WidgetDOM.vue does
+  // `domEl.replaceChildren(widget.element)` in this renderer). Their rows are laid
+  // out by the browser, not by LiteGraph's `arrange()` — in this renderer the canvas
+  // never draws a widget — so where a widget's content belongs in the picture is a
+  // measurement, exactly like the node's own images. Drawing them at the canvas
+  // rows a widget would only have if the canvas renderer were drawing is how a
+  // picture ends up with its prompt text in the wrong place, or stacked at the top.
+  const wboxes = rr ? lodVueWidgetBoxes(node, root, rr, domScale, title) : [];
+  const rec = { root, key, scale: domScale, at: now, items, boxH, texts, wboxes };
   cache.set(node, rec);
   return rec;
 }
@@ -4335,13 +4654,16 @@ function lodVueMediaBoxes(node, canvas, force) {
 // signature, the content draw and every capture already ask for). No
 // measurement yet means the graph size, which is what the canvas renderer would
 // have drawn.
-function lodVueBoxSize(node, canvas) {
+function lodVueBoxSize(node, canvas, boxH) {
   const size = (node && (node.renderingSize || node.size)) || [0, 0];
   const w = Math.abs(Number(size[0])) || 0;
   const h = Math.abs(Number(size[1])) || 0;
   if (!lodVueNodesMode() || !node) return [w, h];
+  // A caller that has just measured the element passes the number it measured; a
+  // caller that has not reads the cached one. The capture passes it, which is what
+  // makes the surface, the box and the ink come from one measurement.
   const rec = LOD.vueMedia ? LOD.vueMedia.get(node) : null;
-  const domH = rec && Number(rec.boxH);
+  const domH = Number.isFinite(Number(boxH)) && Number(boxH) > 0 ? Number(boxH) : rec && Number(rec.boxH);
   // A sane band around the graph size: the frontend's reserve is a couple of
   // hundred pixels, so a measurement many times the node's own height is a layout
   // this tool misread (a zoom mid-flight, a collapsed element) and the graph size
@@ -4357,14 +4679,14 @@ function lodVueBoxSize(node, canvas) {
 // geometry, same ratio, same mip chain, same disk file, so a picture made in this
 // renderer is a picture in every way except that its chrome is drawn by this tool
 // rather than photographed from LiteGraph.
-function lodVueCapturePaint(node, canvas, ctx) {
+function lodVueCapturePaint(node, canvas, ctx, geom) {
   const out = { ink: 0, text: 0, skipped: 0, els: [] };
   try {
-    // Measured before the box is drawn, not while it is being drawn: the capture
-    // surface was sized from the same measurement, so the box and the surface
-    // have to agree or the node's own picture is clipped by its own stand-in.
-    const metrics = lodVueRootMetrics(node, canvas, true); // a capture re-reads the layout
-    const size = metrics && metrics.boxH > 0 ? [(node && (node.renderingSize || node.size) || [0, 0])[0], metrics.boxH] : null;
+    // One measurement for the whole capture: the surface was sized from `geom`, so
+    // the box is drawn at exactly the surface's body (not at whatever the layout
+    // says a moment later), and the ink is read from the same fresh measurement.
+    const metrics = lodVueRootMetrics(node, canvas, true);
+    const size = geom ? [geom.bodyW, geom.bodyH] : metrics && metrics.boxH > 0 ? [(node && (node.renderingSize || node.size) || [0, 0])[0], metrics.boxH] : null;
     lodPaintNode(
       node,
       canvas,
@@ -4414,7 +4736,7 @@ function lodVueContentInk(node, canvas, ctx, into) {
   const out = into || { ink: 0, text: 0, skipped: 0, els: [] };
   const metrics = lodVueRootMetrics(node, canvas);
   if (metrics) lodVueTextInk(ctx, metrics.texts, out);
-  lodSnapDomInk(node, ctx, canvas, out);
+  lodSnapDomInk(node, ctx, canvas, out, metrics ? metrics.wboxes : null);
   const boxes = metrics ? metrics.items : null;
   if (boxes) {
     for (const it of boxes) {
@@ -4528,8 +4850,8 @@ function lodSnapPartial(node) {
 // The padded rectangle a capture covers, in graph units, and the body the node
 // itself reports. Position and zoom are deliberately absent: they are the camera,
 // not the node.
-function lodSnapGeometry(node, canvas) {
-  const size = lodVueBoxSize(node, canvas) || (node && (node.renderingSize || node.size));
+function lodSnapGeometry(node, canvas, boxH) {
+  const size = lodVueBoxSize(node, canvas, boxH) || (node && (node.renderingSize || node.size));
   if (!size) return null;
   const w = Math.abs(Number(size[0])) || 0;
   const h = Math.abs(Number(size[1])) || 0;
@@ -4719,8 +5041,45 @@ function lodSnapSignature(node, canvas) {
   // an element replaced. The serial catches a replacement whose strings match;
   // the numbers catch the layout moving.
   if (lodVueNodesMode()) {
-    const items = lodVueMediaBoxes(node, canvas, false);
+    // One measurement, asked for once: what the node's element is showing. This is
+    // the picture's content, so it is the picture's signature — and *everything* a
+    // Vue picture draws belongs here. What was missing was the node's own text and
+    // the element's rendered height: a node whose title and labels render a moment
+    // after the element exists (which is every node on a real page) was photographed
+    // as a bare box and, because nothing about it changed as far as the signature
+    // was concerned, that first picture was served for the rest of the session.
+    // That is the "captured too early, never fully" a user sees.
+    const metrics = lodVueRootMetrics(node, canvas, false);
+    num(metrics && metrics.boxH ? metrics.boxH : 0);
+    const items = metrics ? metrics.items : null;
     num(items ? items.length : 0);
+    const wboxes = (metrics && metrics.wboxes) || null;
+    num(wboxes ? wboxes.length : 0);
+    if (wboxes) {
+      for (let i = 0; i < wboxes.length && i < LOD_SNAP_DOM_MAX; i++) {
+        const b = wboxes[i];
+        // Where the browser put a widget row: a picture drawn before the frontend had
+        // laid the widgets out would carry them at row 0 for the rest of the session.
+        num(b && b.x);
+        num(b && b.y);
+        num(b && b.w);
+        num(b && b.h);
+      }
+    }
+    const lines = (metrics && metrics.texts) || null;
+    num(lines ? lines.length : 0);
+    if (lines) {
+      for (let i = 0; i < lines.length && i < LOD_VUE_TEXT_MAX; i++) {
+        const tx = lines[i];
+        // The string is what the picture shows, so it is what invalidates it. Hashed
+        // by its ends rather than in full: a label is one line, and a very long one
+        // differs where the reader looks (the head) and where it grows (the tail).
+        str(tx && tx.text);
+        num(tx && tx.x);
+        num(tx && tx.y);
+        num(tx && tx.size);
+      }
+    }
     if (items) {
       for (let i = 0; i < items.length && i < LOD_SNAP_DOM_MAX; i++) {
         const it = items[i];
@@ -4791,6 +5150,15 @@ function lodSnapSignature(node, canvas) {
       } else if (tag === "TEXTAREA" || tag === "INPUT") {
         str(el.value);
       }
+      // The row the composite draws this element at. `lodSnapWidgetBox` reads the
+      // frontend's own layout (`y`, `computedHeight`, `width`, `margin`), and that
+      // layout is not final the moment the element exists — a capture taken before
+      // `arrange()` has settled would bake every widget at row 0, and the picture
+      // would never be re-made.
+      num(w2.y !== undefined ? w2.y : w2.last_y);
+      num(w2.computedHeight);
+      num(w2.width);
+      num(w2.margin);
       flag(!!el.hidden);
     }
   }
@@ -5257,7 +5625,15 @@ function lodSnapElementKind(el) {
 // in node units, so this needs no canvas rectangle, no zoom and no layout read —
 // and it keeps working while this tool's own classes have the wrapper hidden,
 // which is exactly the state a flat node is in when its picture is taken.
-function lodSnapWidgetBox(node, w) {
+function lodSnapWidgetBox(node, w, boxes) {
+  // A measured box (Vue-nodes pathway) wins over the canvas rows: it is where the
+  // browser put the element, which is where the picture has to put its content.
+  if (boxes && boxes.length) {
+    const el = w && (w.element || w.inputEl);
+    for (const b of boxes) {
+      if (b && b.el === el) return { x: b.x, y: b.y, w: b.w, h: b.h };
+    }
+  }
   const margin = Number.isFinite(Number(w && w.margin)) ? Math.max(0, Number(w.margin)) : LOD_SNAP_WIDGET_MARGIN;
   const size = (node && (node.renderingSize || node.size)) || [0, 0];
   const nodeW = Math.abs(Number(size[0])) || 0;
@@ -5367,19 +5743,23 @@ function lodSnapTextInk(el, cctx, box) {
 
 // Every DOM widget of this node, drawn into the capture. Reports what it drew and
 // what it could not, so the readout can say both.
-function lodSnapDomInk(node, cctx, canvas, into) {
+function lodSnapDomInk(node, cctx, canvas, into, boxes) {
   const out = into || { ink: 0, text: 0, skipped: 0 };
   if (!out.els) out.els = []; // what was blitted, so another pass does not draw it twice
   if (!cctx || typeof cctx.drawImage !== "function") return out;
   const widgets = (node && node.widgets) || [];
   void canvas;
+  // `boxes` is the measured box of each widget element, when the caller has one
+  // (the Vue-nodes pathway, where the browser lays the widgets out inside the
+  // node's element). Absent, the canvas rows are used, which is right in the
+  // renderer where LiteGraph authors them.
   for (let i = 0; i < widgets.length && i < LOD_SNAP_DOM_MAX; i++) {
     const w = widgets[i];
     if (!w) continue;
     let el = w.element || w.inputEl;
     if (!el || typeof el !== "object" || !el.tagName) continue;
     if (w.hidden) continue;
-    const box = lodSnapWidgetBox(node, w);
+    const box = lodSnapWidgetBox(node, w, boxes);
     if (!(box.w > 0) || !(box.h > 0)) continue;
     let kind = lodSnapElementKind(el);
     if (kind === "other") {
@@ -5433,7 +5813,29 @@ function lodSnapDomInk(node, cctx, canvas, into) {
 // A node showing a video is never photographed: a picture of a video is one
 // frame presented as if it were the node, and the user asked for exactly that
 // line to hold — "if it doesn't play video" it may be captured.
+// Is there a video inside this node? Asked by every reuse decision — twice per
+// node per frame — and answered by walking each widget's element, which is a DOM
+// query the page pays for. The answer is cached for a moment and re-probed for
+// real before anything is photographed: a video that appears is a widget that
+// swapped its element or mounted one. On a page with the observers this is a
+// formality — the change is reported and the verdict is dropped with the
+// measurement — but on a page without them the window in which a held picture could
+// be blitted for a node that has just gained a video has to stay short, hence the
+// short TTL.
 function lodSnapHasVideo(node) {
+  if (!node) return false;
+  if (!LOD.snapVideo) LOD.snapVideo = new WeakMap();
+  const t = nowMs();
+  const hit = LOD.snapVideo.get(node);
+  const ttl = lodVueWatched(node) ? LOD_VUE_VIDEO_MS_WATCHED : LOD_VUE_VIDEO_MS;
+  if (hit && t - hit.at < ttl) return hit.video;
+  const video = lodSnapHasVideoProbe(node);
+  LOD.snapVideo.set(node, { at: t, video });
+  LOD.vueProbes++;
+  return video;
+}
+
+function lodSnapHasVideoProbe(node) {
   const widgets = node && node.widgets;
   if (!widgets) return false;
   for (let i = 0; i < widgets.length && i < LOD_SNAP_DOM_MAX; i++) {
@@ -5512,7 +5914,7 @@ function lodSnapRender(node, canvas, geom, ratio) {
       /* if the global cannot be replaced, the later redraw of the copies is the net */
     }
     try {
-      if (lodVueNodesMode()) vueInk = lodVueCapturePaint(node, canvas, cctx);
+      if (lodVueNodesMode()) vueInk = lodVueCapturePaint(node, canvas, cctx, geom);
       else lodSnapOriginalDrawNode.call(canvas, node, cctx);
     } finally {
       if (swapped) {
@@ -5598,6 +6000,15 @@ function lodSnapCaptureNode(node, canvas) {
   let rec = LOD.snaps.get(node);
   if (rec && rec.diskPending) return false; // a disk load is in flight; don't photograph twice
   if (rec && (rec.canvas || rec.blocked || rec.failed)) return false;
+  if (lodSnapHasVideoProbe(node)) {
+    // A video is never photographed: a still frame presented as the node is the
+    // one thing the user asked to be excluded, and this check is the fresh one —
+    // the draw path answers from a short-lived cache.
+    lodSnapBlockNode(node, lodSnapEnsure(), "a video widget");
+    LOD.snapKept++;
+    lodSnapNoteWhy(node, "a video widget");
+    return false;
+  }
   const whyLive = lodSnapKeepLive(node);
   if (whyLive) {
     lodSnapBlockNode(node, rec, whyLive);
@@ -5618,7 +6029,14 @@ function lodSnapCaptureNode(node, canvas) {
     lodSnapNoteWhy(node, "element not on the page");
     return false;
   }
-  const geom = lodSnapGeometry(node, canvas);
+  // In this renderer the picture *is* the measurement. Take it once, here, and use
+  // that one number for the surface, the box and the ink: sizing the surface from
+  // the cached number and painting from a fresh one clips exactly the part that
+  // arrived late (the frontend renders an image node `IMAGE_PREVIEW_HEIGHT_RESERVE`
+  // taller than its graph size and puts the picture in the overhang, so "the part
+  // that arrived late" is often the content the user asked to see).
+  const dom = lodVueNodesMode() ? lodVueRootMetrics(node, canvas, true) : null;
+  const geom = lodSnapGeometry(node, canvas, dom && dom.boxH > 0 ? dom.boxH : 0);
   if (!geom) return false;
   const want = Number(LOD.snapRatio) || LOD_SNAP_RATIO_DEFAULT;
   const fit = lodSnapFitRatio(geom, want);
@@ -6245,6 +6663,15 @@ function lodThumbDiskAsk(node, canvas) {
   if (!LOD.diskOn || LOD.diskDead) return false;
   const id = lodThumbId(node);
   if (!id) return false;
+  // Asked before the key is built: a node that already has a picture, or a read
+  // already in flight, has nothing to ask for — and building the key means hashing
+  // everything the node is showing. The draw path asks once per frame for every
+  // boxed node, so this is the difference between "one Map lookup" and "hash the
+  // node, then look it up".
+  if (LOD.snaps) {
+    const rec0 = LOD.snaps.get(node);
+    if (rec0 && (rec0.canvas || rec0.diskPending)) return false;
+  }
   let sig = "";
   try {
     // The key of the picture this page would *use*: the ratio the setting asks
@@ -10336,7 +10763,7 @@ function buildTweaksTab(container) {
               ? `. The stand-in setting acts here by blanking: below ${Math.round(LOD.flatBelow * 100)}% zoom each node's own element stops painting ` +
                 `(one attribute on it, ${LOD.vueFlat ? LOD.vueFlat.size : 0} blanked right now — an attribute, because the frontend rewrites that element's ` +
                 `class and style whenever it re-renders the node and anything kept there is silently thrown away) and the canvas paints that node's box in the ` +
-                `same place, with the same detail ladder as the canvas renderer — fewer node pixels for the browser to paint is where a zoomed-out heavy graph ` +
+                `same place, with the same detail ladder as the canvas renderer — and the measured cost is stated, not a hoped-for saving ` +
                 `spends its frame. ` +
                 (lodSnapBitmaps() && LOD.snaps && LOD.snaps.size
                   ? `Pictures are made here too (${LOD.snaps.size} held): the tool draws the box and the node's own content into the capture surface, so the ` +
@@ -10398,11 +10825,21 @@ function buildTweaksTab(container) {
               : `zoom ${pct(LOD.zoom)} is below your ${pct(LOD.flatBelow)} setting: ${LOD.vueBoxes} box(es) painted and ` +
                 `${LOD.vueFlat ? LOD.vueFlat.size : 0} node element(s) blanked — those nodes stop painting themselves and the canvas draws their boxes. ` +
                 (LOD.snapOn
-                  ? `Each box carries what the node is showing: the pictures and canvases the node renders itself, drawn from the very elements the ` +
-                    `browser laid out (at their real position in the node — ${LOD.vueMediaNow} of the ${LOD.vueContentNow} content item(s) on the last ` +
-                    `frame), its text fields re-painted in the theme's colours from the values they hold, and a pack's own HTML left blank and counted. ` +
-                    `A *photograph* of the node's chrome is not obtainable in this renderer — no browser API draws a DOM element into a canvas, and the ` +
-                    `canvas renderer's capture works only because LiteGraph itself draws the node — so the capture, ratio and disk settings stay idle here`
+                  ? `Each box carries what the node is showing, and so does the picture the idle lane draws of it: the node's own text (its title, ` +
+                    `labels and values, read from the DOM and re-painted at the position the browser laid them out in), the pictures and canvases it ` +
+                    `renders itself (${LOD.vueMediaNow} of the ${LOD.vueContentNow} content item(s) on the last frame), and the widget elements the ` +
+                    `frontend mounts — with a pack's own HTML left blank and counted. A *photograph* of the node's chrome is not obtainable in this ` +
+                    `renderer (no browser API draws a DOM element into a canvas; the canvas renderer's capture works only because LiteGraph itself ` +
+                    `draws the node), so the picture is *drawn* into the same capture surface: the ratio ladder, the mips, the RAM budget and the ` +
+                    `thumbnails folder all apply to it` +
+                    (lodSnapBitmaps() || !LOD.snaps || !LOD.snaps.size
+                      ? ""
+                      : `. Pictures are being made here: ${LOD.snaps.size} held, ${LOD.snapCaptured} captured so far`) +
+                    `. This pathway's cost to the page so far: ${LOD.vueDomWrites} DOM write(s) (a mark is written once, never re-written) and ` +
+                    `${LOD.vueLayoutReads} layout read(s) — both stop moving in the steady state` +
+                    (lodVueWatchOn()
+                      ? `, because the page reports its own changes (${LOD.vueStale} drop(s) of a stale measurement so far) instead of being asked on a timer`
+                      : ` — this page has no change observers, so the tool asks on a timer and rations how much it asks`)
                   : `The stand-in setting is off: these are your chosen box detail, with no content drawn into them`) +
                 `. Link ink, the idle redraw cap and the governor are unaffected`
           );
@@ -13185,6 +13622,21 @@ function installDebugApi() {
             // node's declared width, the node's root, or — the weakest answer, used
             // only when nothing about the DOM could be read — the canvas scale).
             vueText: LOD.vueTextNow,
+            // What this tool costs the page per frame, in DOM terms: mutations it
+            // made (a mark is written once per transition, never re-written) and
+            // layout reads (each one can force a style-and-layout pass). In the
+            // steady state — stand-ins on, pictures held, nothing changing — both
+            // stop moving, which is the promise the Nodes 2.0 pathway makes.
+            vueDomWrites: LOD.vueDomWrites,
+            vueLayoutReads: LOD.vueLayoutReads,
+            vueProbes: LOD.vueProbes,
+            // Whether the page reports its own changes to this tool (a browser with
+            // ResizeObserver/MutationObserver) or whether the tool has to ask on a
+            // timer, and how many measurements the page's reports have dropped. With
+            // the observers, the timer is insurance and the steady state asks nothing.
+            vueWatch: LOD.vueWatch,
+            vueWatched: lodVueWatchOn(),
+            vueStale: LOD.vueStale,
             vueScale: Math.round((Number(LOD.vueScaleNow) || 0) * 1000) / 1000,
             vueScaleFrom: LOD.vueScaleFrom || "",
             vueNoElement: LOD.vueNoElement,
@@ -13510,8 +13962,19 @@ app.registerExtension({
 //    wholesale on every re-render, so a tool class is silently thrown away and
 //    the node comes back visible behind its box. The same reasoning applies to
 //    the fovea's hide mark on a node's own element (`data-ants-dom-hidden`) and
-//    the inert mark (`data-ants-dom-inert`). The saving is node pixels the
-//    browser no longer paints rather than cheaper canvas drawing.
+//    the inert mark (`data-ants-dom-inert`). What the mark does *not* do is take
+//    the node out of rendering: `opacity: 0` keeps the element in the render tree
+//    (only `display: none` / `visibility: hidden` remove one), so the node's
+//    style, layout and paint work are still the page's, and whether an engine
+//    skips rasterising a fully transparent subtree is not observable from page
+//    JavaScript. Those two marks are not alternatives here: in this renderer node
+//    dragging and selection are handled by that DOM, so an element that cannot be
+//    hit-tested is a node the user cannot pick up. What this pathway claims is
+//    therefore a *cost*, not a saving: with the stand-ins on, a frame costs the
+//    page no attribute writes, no layout reads, no DOM queries and no computed
+//    styles (measured at 40, 60 and 150 nodes), and a held picture means the
+//    node's content is not re-drawn every frame. Whether it saves frames on a
+//    given graph is what the frame budget and the Stalls tab measure there.
 //  * What a Vue-nodes stand-in cannot be is a *screenshot*: no browser API
 //    draws a DOM element into a canvas (not drawImage, not createImageBitmap,
 //    not captureStream). The picture is therefore *drawn* — the box, its title
@@ -13533,11 +13996,16 @@ app.registerExtension({
 //    (measured from its own width, not read from canvas.ds.scale — a capture
 //    sets that to 1 while the DOM keeps its transform), so a capture during a
 //    zoom still puts the content where it belongs.
-//  * That measurement is one read per node: it happens when the node's own size
-//    changes and otherwise at most once per LOD_VUE_MEDIA_MS, and those
-//    refreshes are rationed to LOD_VUE_MEDIA_BUDGET node layouts per frame, so a
-//    graph with hundreds of boxed nodes cannot turn the idle refresh into one
-//    forced layout per node per frame. Panning and zooming cost no read at all:
+//  * That measurement is one read per node, and it is taken when the page
+//    *reports* a change rather than on a timer (ResizeObserver + MutationObserver
+//    over the element; the harness models both), with a 5 s insurance read
+//    (LOD_VUE_MEDIA_MS_WATCHED) for a change no observer reports. A page without
+//    those observers falls back to the LOD_VUE_MEDIA_MS / LOD_VUE_MEDIA_MS_IDLE
+//    beat. Either way the refreshes are rationed to LOD_VUE_MEDIA_BUDGET node
+//    layouts per frame, so a graph with hundreds of boxed nodes cannot turn the
+//    refresh into one forced layout per node per frame — and in the steady state
+//    (nothing changing, pictures held) a frame asks the page for nothing at all:
+//    no attribute write, no layout read, no DOM query, no computed style. Panning and zooming cost no read at all:
 //    every number stored is node-local. Link thinning, the idle redraw cap, the widget/focus settings
 //    and the governor are unaffected. A box in that renderer is also never
 //    painted over a node whose element this tool could not reach (a node whose

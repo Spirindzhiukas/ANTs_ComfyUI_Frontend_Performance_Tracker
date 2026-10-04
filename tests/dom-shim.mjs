@@ -25,6 +25,7 @@ class Node {
         return n === documentNode;
       },
     });
+    if (tag && documentNode && documentNode._counts) documentNode._counts.elements++;
     this._text = tag ? "" : "";
     this._cls = new Set();
     this._attrs = {};
@@ -68,12 +69,14 @@ class Node {
     this._text = String(v);
     for (const c of this.children) c.parentNode = null;
     this.children = [];
+    fireMutation(this);
   }
 
   appendChild(child) {
     if (child.parentNode) child.parentNode.removeChild(child);
     child.parentNode = this;
     this.children.push(child);
+    fireMutation(this);
     return child;
   }
   insertBefore(child, ref) {
@@ -83,6 +86,7 @@ class Node {
     if (child.parentNode) child.parentNode.removeChild(child);
     child.parentNode = this;
     this.children.splice(i, 0, child);
+    fireMutation(this);
     return child;
   }
   removeChild(child) {
@@ -90,6 +94,7 @@ class Node {
     if (i >= 0) {
       this.children.splice(i, 1);
       child.parentNode = null;
+      fireMutation(this);
     }
     return child;
   }
@@ -106,12 +111,27 @@ class Node {
   }
 
   removeAttribute(k) {
+    if (this._doc && this._doc._counts) {
+      this._doc._counts.attrWrites++;
+      const by = this._doc._counts.attrWriteBy || (this._doc._counts.attrWriteBy = {});
+      by[k] = (by[k] || 0) + 1;
+    }
     delete this._attrs[k];
   }
   hasAttribute(k) {
+    if (this._doc && this._doc._counts) this._doc._counts.attrReads++;
     return Object.prototype.hasOwnProperty.call(this._attrs, k);
   }
   setAttribute(k, v) {
+    // What a browser charges for: writing the attribute the element already has
+    // is still an attribute change to Blink (it invalidates style for the
+    // element), so it is counted here even though the value does not move.
+    if (this._doc && this._doc._counts) {
+      this._doc._counts.attrWrites++;
+      if (this._attrs[k] === String(v)) this._doc._counts.attrRewrites++;
+      const by = this._doc._counts.attrWriteBy || (this._doc._counts.attrWriteBy = {});
+      by[k] = (by[k] || 0) + 1;
+    }
     this._attrs[k] = String(v);
   }
   getAttribute(k) {
@@ -188,13 +208,27 @@ class Node {
     return null;
   }
 
+  // The box, and — when a test has switched the observers on — a real signal that
+  // the box changed. In the browser this is what ResizeObserver is for; here it is
+  // the assignment itself, which is the only way a box changes without a real layout
+  // engine. The tracker is not told *what* changed, only that its measurement of
+  // this element is no longer good.
+  get _rect() {
+    return this.__rect;
+  }
+  set _rect(v) {
+    this.__rect = v;
+    fireResize(this);
+  }
+
   // A test can lay an element out (`el._rect = {left, top, width, height}`, what
   // the harness's Vue-nodes fixture does from real node geometry) and anything
   // that reads layout sees it. Without one, the element has no box — which is
   // also what the real DOM says about a detached or hidden element.
   getBoundingClientRect() {
+    if (this._doc && this._doc._counts) this._doc._counts.rects++;
     if (this._doc && this._doc._rectReads !== undefined) this._doc._rectReads++;
-    const r = this._rect;
+    const r = this.__rect;
     if (!r) return { top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 };
     return {
       left: Number(r.left) || 0,
@@ -209,6 +243,12 @@ class Node {
   // What the tracker asks for: an attribute (with or without a value), a class,
   // and the two chained. Anything else returns nothing rather than guessing.
   querySelectorAll(selector) {
+    if (this._doc && this._doc._counts) {
+      this._doc._counts.qsa++;
+      const key = `${String(this.tagName || this.nodeType)}:${String(selector)}`;
+      const by = this._doc._counts.qsaBy || (this._doc._counts.qsaBy = {});
+      by[key] = (by[key] || 0) + 1;
+    }
     const sel = String(selector || "").trim();
     const parts = sel.split(/(?=\[|\.)/).filter(Boolean);
     if (!parts.length) return [];
@@ -324,6 +364,19 @@ export function createDocument(options = {}) {
   const ctxFactory = options.ctxFactory || null;
   doc._canvases = [];
   doc._rectReads = 0; // how much layout the page read, so a test can hold the cache to it
+  // Everything a browser charges the main thread for, in one place: a benchmark
+  // reads these per frame to find where a stand-in costs more than it saves.
+  doc._counts = {
+    elements: 0,
+    attrWrites: 0,
+    attrRewrites: 0,
+    attrReads: 0,
+    attrWriteBy: {},
+    rects: 0,
+    qsa: 0,
+    qsaBy: {},
+    gcs: 0,
+  };
   doc.createElement = (tag) => {
     const node = new Node(tag);
     node._doc = doc;
@@ -368,6 +421,117 @@ export function createDocument(options = {}) {
     return baseQsa.call(this, selector);
   };
   return doc;
+}
+
+// ---------------------------------------------------------------- observers ---
+// The two browser observers the tracker uses to learn that a node element changed,
+// so it does not have to read layout on a timer to find out. Tests opt in: with no
+// observers on the page the tracker falls back to the periodic read, which is what
+// most of the suite exercises. With them, a mutation inside an observed subtree or
+// a new box on an observed element reports itself, exactly as in the browser.
+const mutationObservers = new Set();
+const resizeObservers = new Set();
+
+// A pane transform (a pan, a zoom) moves and scales every element inside it by the
+// same factor, and a real ResizeObserver does not fire for that: it watches the
+// element's own box, which a transform does not change. So the harness lays out its
+// fixture inside `withQuiet`, and an element whose box really changed announces it.
+let quiet = 0;
+export function withQuiet(fn) {
+  quiet++;
+  try {
+    return fn();
+  } finally {
+    quiet--;
+  }
+}
+
+function observedBy(obs, target, subtree) {
+  for (const t of obs._targets) {
+    if (t === target) return true;
+    if (!subtree && !obs._subtree) continue;
+    let n = target;
+    while (n) {
+      if (n === t) return true;
+      n = n.parentNode;
+    }
+  }
+  return false;
+}
+
+export function fireMutation(target) {
+  if (quiet || !mutationObservers.size || !target) return;
+  for (const o of [...mutationObservers]) {
+    if (observedBy(o, target, true)) o._deliver([{ target, type: "childList" }]);
+  }
+}
+
+export function fireResize(target) {
+  if (quiet || !resizeObservers.size || !target) return;
+  for (const o of [...resizeObservers]) {
+    if (observedBy(o, target, false)) o._deliver([{ target, type: "resize", contentRect: target.getBoundingClientRect() }]);
+  }
+}
+
+class MutationObserverShim {
+  constructor(cb) {
+    this._cb = cb;
+    this._targets = [];
+    this._subtree = false;
+  }
+  observe(target, options) {
+    if (options && options.subtree) this._subtree = true;
+    if (!this._targets.includes(target)) this._targets.push(target);
+    mutationObservers.add(this);
+  }
+  unobserve(target) {
+    this._targets = this._targets.filter((t) => t !== target);
+    if (!this._targets.length) mutationObservers.delete(this);
+  }
+  disconnect() {
+    this._targets = [];
+    mutationObservers.delete(this);
+  }
+  takeRecords() {
+    return [];
+  }
+  _deliver(entries) {
+    try {
+      this._cb(entries, this);
+    } catch (e) {
+      /* a page observer that throws does not break the DOM op that reported */
+    }
+  }
+}
+
+class ResizeObserverShim {
+  constructor(cb) {
+    this._cb = cb;
+    this._targets = [];
+  }
+  observe(target) {
+    if (!this._targets.includes(target)) this._targets.push(target);
+    resizeObservers.add(this);
+  }
+  unobserve(target) {
+    this._targets = this._targets.filter((t) => t !== target);
+    if (!this._targets.length) resizeObservers.delete(this);
+  }
+  disconnect() {
+    this._targets = [];
+    resizeObservers.delete(this);
+  }
+  _deliver(entries) {
+    try {
+      this._cb(entries, this);
+    } catch (e) {
+      /* ditto */
+    }
+  }
+}
+
+export function observerClasses() {
+  return { MutationObserver: MutationObserverShim, ResizeObserver: ResizeObserverShim };
 }
 
 export function createStorage() {
