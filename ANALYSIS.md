@@ -742,6 +742,57 @@ client-pixel `left`/`top` with `transform: scale()`, and `drawNode()`
 returning early. It is a model of the contract, not a browser: no real
 Vue-nodes page was executed in this pass (see *Still open*).
 
+**The twelfth pass (v2.6.9): the two things the eleventh report left open, traced to
+their sources.** The report's phrase "16 hidden element(s) of 75 boxed node(s)" and the
+question of whether a box may honestly draw a node's state in the Vue renderer were the
+last two items traced but unanswered. Both are answered from the code, and one of them
+produced a small fix.
+
+*Where the hidden-element number comes from.* `LOD.domHidden` is set from the owner
+sweep (`viewDress`), not from a DOM scan: `boxed++` counts owner records whose hide mark
+is on — one element each. For a record that is not a Vue node's own root the mark is the
+class `ants-lod-box` (`LOD_DOM_CLASS`); for a node's own element it is the attribute
+`data-ants-dom-hidden` (`LOD_DOM_ATTR`), which the sweep uses because `LGraphNode.vue`
+rewrites `:class` wholesale on every re-render. A walk of the page for those two marks
+finds exactly the number the panel reports — verified with a probe at 10 % zoom
+(`domHidden` 1, classed elements 1) and now pinned by a test that walks the document and
+holds the readout to the walk. Two clauses of the panel can print that number from
+different settings (the stand-in's "N DOM element(s) of M boxed node(s) hidden" and the
+widget switch-off's "N element(s) hidden outright and inert"), which is deliberate: the
+number is the page's, whichever mechanism asked for the hiding. What is *not* claimed is
+that the count is per node — it is per element, and the panel's `domNodes` counts the
+nodes those elements belong to.
+
+*Whether a Vue box may draw `node.progress` and `node.has_errors`.* It never has to, and
+that is the honest answer: `lodVueFlatNode` refuses the same nodes `lodSnapLive` refuses,
+so a node that is running, has errors, is being dragged or is playing a video **keeps its
+own element** and the frontend draws its own progress bar (`LGraphNode.vue`, `h-2
+bg-primary-500` centred on the header/body boundary), its own error ring
+(`ring-destructive-background` / `ring-warning-background` on `node-inner-wrapper`) and
+its own executing outline (`outline-node-stroke-executing` on the root, and
+`data-testid="node-state-outline-overlay"` at `-inset-0.75` otherwise) — no box is
+painted in the place of that state, so nothing about it can be missing or stale. In the
+canvas renderer, where a box *does* stand for such a node, the marks come from the node's
+own fields: `node.progress`, which the frontend itself mirrors onto every node
+(`src/components/graph/nodeProgressCanvasSync.ts` — `setNodeProgress` from the execution
+store's `nodeLocationProgressStates`, in both renderers) and `node.has_errors`
+(`useNodeErrorFlagSync.ts`, reconciled in a single pass and announced via
+`node:property:changed`). Both are read per frame — never baked into a picture, because
+`lodSnapLive` refuses to photograph *and* to blit a node with either set, so a bar of the
+instant of a capture cannot outlive the run it belonged to. The two marks are drawn by one
+function now (`lodSnapStateMarks`), each in its own `try`: a context that refuses one call
+leaves the box painted instead of aborting the node's whole draw, which in the Vue
+pathway meant handing the element back for that frame.
+
+*One fix this tracing produced.* The selection ring drawn on top of a stored picture asked
+for the node's graph `size`, while the box painter and the capture ask `lodVueBoxSize` —
+the element's own measured body in the Vue renderer, which is taller than the graph size
+whenever the node carries a preview (the image reserve) or a pack renders its own content.
+So selecting such a node drew the ring *inside* the node, and it changed size on the frame
+the picture replaced the live box. It asks the same function now, which a test pins on a
+node the frontend renders 420 units taller than its graph size (the ring is more than 300
+units tall and is not the graph size; mutation-checked).
+
 ## The stand-in pictures: what a capture actually contains, and where the cache went wrong
 
 The user's report was specific: image loaders and mask editors show a stand-in

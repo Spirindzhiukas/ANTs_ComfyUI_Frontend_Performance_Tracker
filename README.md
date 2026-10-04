@@ -6,7 +6,7 @@ for: *which extension's JavaScript is actually costing me frames while I pan
 this graph, and what is eating main-thread time that no draw hook owns?* —
 without opening DevTools and without restarting ComfyUI to bisect.
 
-Version **2.6.8**. Everything runs from page load: no node has to be placed,
+Version **2.6.9**. Everything runs from page load: no node has to be placed,
 nothing executes, and the tool never changes your graph or your workflows.
 
 - **Measure** — per-extension and per-node-type frame cost, canvas draw
@@ -185,6 +185,24 @@ of *live* state (a running progress bar, an error, a link drag and a video
 keep the node live, as the table above says), and it never writes a picture it
 could not fully make to disk when the budget forced it coarser than your
 setting asked for.
+
+The first of those two is checked on both renderers rather than asserted. In
+the canvas renderer a box *can* stand for a running or erroring node, and its
+progress bar and error stroke are read from the node's own fields
+(`node.progress` is what the frontend itself puts on the node object in either
+renderer — `nodeProgressCanvasSync.ts` — and `node.has_errors` comes from
+`useNodeErrorFlagSync.ts`), drawn per frame, with the node refused both for
+photographing and for blitting while either is set: a bar frozen at the instant
+of a capture cannot outlive the run it belonged to. In the Nodes 2.0 renderer
+such a node is never boxed at all — it keeps its own element, with the
+frontend's own bar, its own error ring and its own outline around the node that
+is executing — so a stand-in never stands in for a state. A selected node's
+ring is drawn at the box the node was *pictured* in, so it does not jump or sit
+inside the node when a picture replaces the live box. And the number the panel
+reports as "N element(s) hidden" is the page's own number: a walk of the
+document for the two marks this feature uses (`.ants-lod-box` on the DOM a
+node's widgets are built from, `data-ants-dom-hidden` on a Vue node's root)
+finds exactly what the panel says.
 
 ### What these settings do in the Nodes 2.0 (Vue) frontend
 

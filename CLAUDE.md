@@ -252,7 +252,24 @@ Seams worth knowing:
   the record, baked into the picture and the live box through `lodPaintNode`'s
   `alphaOverride` (**`min` with the box alpha, never a multiply; never
   `globalAlpha` around the painter — it sets its own from `lodBoxAlpha`**), and
-  mixed into the signature so a node muted later is re-photographed. `lodVueContentInk` is the one place
+  mixed into the signature so a node muted later is re-photographed. **A stand-in
+  never carries execution state** (v2.6.9): in the Vue pathway a node whose state
+  is live — a progress value, errors, a drag, a video — is never boxed at all,
+  because `lodVueFlatNode` asks the same predicate the capture lane does
+  (`lodSnapLive`), so the element stays and the frontend draws its own bar, its
+  own error ring and its own executing outline; in the canvas pathway a box does
+  stand for such a node and draws the two marks through `lodSnapStateMarks` from
+  `node.progress`/`node.has_errors` (fields the frontend mirrors onto the node
+  object itself: `nodeProgressCanvasSync.ts`, `useNodeErrorFlagSync.ts`) — each
+  mark in its own `try`, so a context that refuses one call cannot take the
+  node's whole draw down with it — and neither state is ever *photographed* or
+  *blitted* (`lodSnapLive` refuses both), so a bar frozen at the instant of a
+  capture cannot outlive its run. The selection ring on a picture asks
+  `lodVueBoxSize` for its size, i.e. the box the node was pictured in, not the
+  node's graph size: in the Vue pathway the frontend renders a node taller than
+  its `size` when it carries a preview, and a ring at the graph size would sit
+  inside the node the user selected and jump at the moment the picture replaced
+  the live box. `lodVueContentInk` is the one place
   the live box and the capture both draw from, so they cannot drift apart.
   `lodPaintNode` takes optional `content` / `detailOverride` / `sizeOverride` and
   clips content to the node's box **and its title bar** (a DOM node's title is
@@ -380,6 +397,12 @@ Rules for tests:
 - Prefer a real seam (`getWidgetOnPos`, `_fire("click")`, `canvas.draw()`) over
   calling internals by name.
 - Time-dependent tests advance the clock; never `setTimeout` in a test.
+- **A number the panel shows about the user's page must be a number a test can
+  find on that page** (v2.6.9): "N element(s) hidden" is asserted by walking the
+  document for the two marks the feature uses (`.ants-lod-box`, the attribute
+  `data-ants-dom-hidden`) and holding the readout to the walk, not to the counter
+  the sweep keeps beside itself. The same rule generalises: a counter that can
+  drift from the page is a claim, not a measurement.
 
 ## Gotchas that have already cost time
 

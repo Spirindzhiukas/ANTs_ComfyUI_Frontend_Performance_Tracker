@@ -511,6 +511,23 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     assertEqual(h.tracker.lowZoom.dom.nodes, 2, "belonging to two boxed nodes");
     assert(wrapper.classList.contains("ants-lod-box"), "the widget is hidden through its .dom-widget wrapper");
     assert(vueRoot.hasAttribute("data-ants-dom-hidden"), "and the Vue node by an attribute Vue does not rewrite");
+    // And the number the panel reports is a number the page can be scanned for: the
+    // elements carrying one of the two marks this feature uses. A count kept beside
+    // the sweep is a count that can drift from what the user's page is really doing,
+    // and "N elements hidden" is exactly the kind of claim that has to be true.
+    const markedNow = () => {
+      let n = 0;
+      const walk = (el) => {
+        if (!el) return;
+        if (el.classList && el.classList.contains("ants-lod-box")) n++;
+        else if (el.hasAttribute && el.hasAttribute("data-ants-dom-hidden")) n++;
+        for (const child of el.children || []) walk(child);
+      };
+      walk(h.document.body);
+      return n;
+    };
+    assertEqual(markedNow(), 2, "the widget wears the class, the Vue node the attribute");
+    assertEqual(h.tracker.lowZoom.dom.hidden, markedNow(), "and the readout's count is what a scan of the page finds");
 
     // Zoom in far enough that the node is worth drawing properly again.
     h.canvas.ds.scale = 0.5; // 200 x 0.5 = 100px > 32px
@@ -3497,6 +3514,16 @@ suite("drawing: the Nodes 2.0 (Vue nodes) frontend", () => {
     h.canvas.ctx.ops.length = 0;
     draw(h, 1);
     assertEqual(fills(h).length, 0, "and the tall picture is what the frame draws — no box, no clipped content");
+    // The selection ring is drawn around the *picture's* box, not the node's graph
+    // size: this element is five times its graph height, and a ring at the graph
+    // size would sit in the middle of the node the user just selected.
+    n.selected = true;
+    h.canvas.ctx.ops.length = 0;
+    draw(h, 1);
+    const ring = h.canvas.ctx.ops.filter((o) => o[0] === "strokeRect" && o[1] === 0 && o[2] === 0);
+    assertEqual(ring.length, 1, "the selected node's picture carries the selection ring");
+    assertGreater(ring[0][4], 300, `and it is the picture's height (${ring[0][4]}), not the node's graph size (100)`);
+    assert(Math.abs(ring[0][4] - 100) > 1, "a ring at the graph size would be inside the node it outlines");
   });
 
   test("the page is asked for nothing while nothing changes, and reports it when something does", async () => {

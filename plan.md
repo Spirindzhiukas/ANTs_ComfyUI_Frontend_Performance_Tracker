@@ -393,7 +393,22 @@ the frontend has no zoom-based level of detail (verified against `LGraphNode.vue
 and what made a stand-in look unlike the node was the picture itself — Tailwind 4
 `oklch()`/`oklab()` colours a canvas silently ignores, text drawn as one Arial line,
 a muted node drawn at full strength, and the frontend's own widget rows never read
-(now read, with the control's value drawn as the control it is). What is still not measurable from here is the rasteriser's bill on
+(now read, with the control's value drawn as the control it is). v2.6.9 closed the
+two items that were still open between reports, both by tracing rather than
+guessing: the panel's "N element(s) hidden" is the page's own count (the class
+`ants-lod-box` for a node's DOM widgets, the attribute `data-ants-dom-hidden` for a
+Vue node's own element, one mark per element dressed, and a walk of the page finds
+exactly that number — pinned by a test), and a Vue stand-in never has to say
+anything about a run at all, because a node whose state is live is never boxed
+there: it keeps its element and the frontend draws its own bar, its error ring and
+its executing outline, while the canvas renderer's boxes read the marks from the
+node's own fields (`node.progress`, `node.has_errors`), per frame, from nodes the
+capture lane and the blit both refuse while either is set. The tracing also turned
+up one visible defect and fixed it: the selection ring on a picture was drawn at
+the node's graph size rather than at the box the node was pictured in (in the Vue
+renderer the element's own body), so a node the frontend renders taller than its
+`size` was ringed inside itself, and the ring changed size the moment its picture
+replaced the live box. What is still not measurable from here is the rasteriser's bill on
 the user's machine (Electron, GPU/hardware acceleration off) — DevTools' paint
 flashing is the direct way to see it, and the frame budget plus the Stalls tab are
 the tool's own instruments. Each report has been a state the harness could model only after the fact:
@@ -410,7 +425,9 @@ half-rendered"; v2.6.7 "still not there yet: flat rectangles at 42 % and the
 performance hit unchanged"; v2.6.8 "we are still half-way there — and does the
 frontend have its own zoom-based LOD?") each found something the harness could not, and the harness has been
 strengthened by each one — the last pass added the two change observers (with
-`withQuiet` so a pan or a zoom is not mistaken for a box change), a Vue re-render
+`withQuiet` so a pan or a zoom is not mistaken for a box change), a walk of the page
+for the two hide marks (so a count the panel prints can be held to the page it is
+about), a Vue re-render
 that rewrites `className`, an `isConnected` that tells the truth, the element's
 real height, the frontend's transform pane (so the DOM zoom is exercised the way
 the page writes it), a `getComputedStyle` that resolves transforms the way a

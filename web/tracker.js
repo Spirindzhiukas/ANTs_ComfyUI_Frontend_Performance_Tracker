@@ -27,7 +27,7 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.6.8";
+const VERSION = "2.6.9";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
 // The class key ComfyUI stores in a workflow. The old key is still recognised so
 // a graph saved before the rename does not lose this node.
@@ -1711,6 +1711,58 @@ function lodBoxAlpha(node) {
 // to the node's origin, which is why this paints at 0,0. What it may paint is the
 // box-detail ladder above: the fill and the selection ring always, the title bar
 // and the state marks only when the user has asked for them.
+// The two marks a flat box can carry that say something *about* the node rather than
+// showing a piece of it: the progress bar it is running with and the stroke it wears
+// when it has errors. Both come from the node's own fields — `node.progress`, which
+// the frontend's own bridge keeps current for the node object (`nodeProgressCanvasSync.ts`
+// copies the execution store's progress state onto every node it adds, in both
+// renderers), and `node.has_errors`, kept by `useNodeErrorFlagSync.ts`. Neither is a
+// DOM read, and neither can go stale: `lodSnapLive` refuses to photograph *and*
+// refuses to blit a node whose `progress` is set or which has errors, so those nodes
+// are drawn as a box, every frame, from the live value. (A picture of a running node
+// would carry the bar of the instant it was taken, still there after the run.)
+//
+// In the Vue-nodes renderer neither mark is ever needed: `lodVueFlatNode` refuses the
+// same nodes `lodSnapLive` does, so a running or erroring node keeps its own element
+// and the frontend draws the mark itself (its own bar, its own error ring). These are
+// the canvas renderer's marks, where the box does stand for such a node.
+function lodSnapStateMarks(ctx, node, spec) {
+  const out = { bars: 0, errors: 0 };
+  if (!ctx || !node || typeof ctx.fillRect !== "function") return out;
+  const x = Number(spec && spec.x) || 0;
+  const y = Number(spec && spec.y) || 0;
+  const w = Number(spec && spec.w) || 0;
+  const h = Number(spec && spec.h) || 0;
+  if (!(w > 0) || !(h > 0)) return out;
+  const scale = Math.max(0.0001, Number(spec && spec.scale) || 1);
+  // A node that is running: a bar from the top-left corner, `progress` of the width
+  // wide, with a CSS-pixel floor so it is still there at 10% zoom.
+  const progress = Number(node.progress);
+  if (Number.isFinite(progress) && progress > 0) {
+    const barH = Math.min(Math.max(6, LOD_BOX_PROGRESS_PX / scale), h * LOD_BOX_TITLE_MAX);
+    try {
+      ctx.fillStyle = LOD_BOX_PROGRESS_COLOR;
+      ctx.fillRect(x, y, w * Math.min(1, progress), barH);
+      out.bars++;
+    } catch (e) {
+      /* a bar that cannot be filled is not a reason to drop the box */
+    }
+  }
+  // A node with validation errors: the frontend's own stroke, at its own width and
+  // padding, so the mark looks the same here as it does in full detail.
+  if (node.has_errors && typeof ctx.strokeRect === "function") {
+    try {
+      ctx.strokeStyle = LOD_BOX_ERROR_COLOR;
+      ctx.lineWidth = LOD_BOX_ERROR_WIDTH;
+      ctx.strokeRect(x - LOD_BOX_ERROR_PAD, y - LOD_BOX_ERROR_PAD, w + LOD_BOX_ERROR_PAD * 2, h + LOD_BOX_ERROR_PAD * 2);
+      out.errors++;
+    } catch (e) {
+      /* same */
+    }
+  }
+  return out;
+}
+
 function lodPaintNode(node, canvas, ctx, content, detailOverride, sizeOverride, alphaOverride) {
   const size = sizeOverride || lodVueBoxSize(node, canvas) || (node && (node.renderingSize || node.size)) || [0, 0];
   const w = Math.abs(Number(size[0])) || 0;
@@ -1775,24 +1827,9 @@ function lodPaintNode(node, canvas, ctx, content, detailOverride, sizeOverride, 
     }
   }
   if (drawable && detail === LOD_BOX_DETAIL[2]) {
-    // A node that is running: the frontend draws a green bar from the top-left
-    // corner, `progress` of the width wide (drawProgressBar). Same bar, with a
-    // CSS-pixel floor so it is still there at 10% zoom.
-    const progress = Number(node.progress) || 0;
-    if (progress > 0) {
-      const barH = Math.min(Math.max(6, LOD_BOX_PROGRESS_PX / scale), h * LOD_BOX_TITLE_MAX);
-      ctx.fillStyle = LOD_BOX_PROGRESS_COLOR;
-      ctx.fillRect(0, 0, w * Math.min(1, progress), barH);
-      LOD.boxBars++;
-    }
-    // A node with validation errors: the frontend's own stroke, at its own width
-    // and padding, so the mark looks the same here as it does in full detail.
-    if (node.has_errors) {
-      ctx.strokeStyle = LOD_BOX_ERROR_COLOR;
-      ctx.lineWidth = LOD_BOX_ERROR_WIDTH;
-      ctx.strokeRect(-LOD_BOX_ERROR_PAD, -LOD_BOX_ERROR_PAD, w + LOD_BOX_ERROR_PAD * 2, h + LOD_BOX_ERROR_PAD * 2);
-      LOD.boxErrors++;
-    }
+    const marks = lodSnapStateMarks(ctx, node, { x: 0, y: 0, w, h, scale });
+    LOD.boxBars += marks.bars;
+    LOD.boxErrors += marks.errors;
   }
   if (node.selected) {
     ctx.globalAlpha = alpha;
@@ -4032,6 +4069,10 @@ function lodVueFlatNode(node, canvas) {
   if (!node) return false;
   if (node.flags && node.flags.collapsed) return false; // already a small box
   if (lodOwnNode(node)) return false; // the panel has to stay reachable
+  // A node whose state is live keeps its own element, and with it every mark the
+  // frontend draws about that state: its progress bar, its error stroke and the
+  // outline it puts around the node that is executing. That is why a Vue stand-in
+  // never has to say anything about a run — it is never used while one is on.
   if (lodSnapLive(node, canvas)) return false; // running, erroring, dragging, video
   return true;
 }
@@ -7856,12 +7897,14 @@ function lodSnapEnqueue(node, canvas, restale) {
   lodSnapPump();
 }
 
-// The ring the box path draws when a node is selected, drawn on top of a picture
-// so selection does not have to throw the picture away. Same colour and width as
-// the box, in the node's own coordinates (the blit context is already there).
+// The ring the box path draws when a node is selected, drawn on top of a picture so
+// selection does not have to throw the picture away. Same colour and width as the
+// box, in the node's own coordinates (the blit context is already there), and the
+// same *size* as the box — `lodVueBoxSize`, so a node the frontend renders taller
+// than its graph size is ringed where the user sees it.
 function lodSnapSelectionRing(node, canvas, ctx) {
   try {
-    const size = (node && (node.renderingSize || node.size)) || [0, 0];
+    const size = lodVueBoxSize(node, canvas) || (node && (node.renderingSize || node.size)) || [0, 0];
     const w = Math.abs(Number(size[0])) || 0;
     const h = Math.abs(Number(size[1])) || 0;
     if (!(w > 0) || !(h > 0) || !ctx || typeof ctx.strokeRect !== "function") return;
@@ -7948,6 +7991,13 @@ function lodSnapPaint(node, canvas, ctx) {
   ctx.globalAlpha = 1; // and its own alpha (a muted node was captured dimmed)
   const src = lodSnapPick(rec, canvas);
   ctx.drawImage(src || rec.canvas, rec.x, rec.y, rec.w, rec.h);
+  // The selection ring, around the box the node was pictured in — the same size the
+  // live box had (`lodVueBoxSize`), which in the Vue renderer is the element's own
+  // measured body rather than the node's graph size. Without that the ring would
+  // jump, and sit inside the node the user just selected, on the frame the picture
+  // replaced the live box. Nothing else belongs on a blit: a picture is only ever
+  // served for a node with no progress and no errors (`lodSnapLive`), so there is no
+  // state mark for a picture to be missing.
   if (node.selected) lodSnapSelectionRing(node, canvas, ctx);
   if (src && src !== rec.canvas) LOD.snapMipDrawn++;
   rec.usedFrame = LOD.snapFrame; // this frame is looking at it
@@ -15175,6 +15225,23 @@ app.registerExtension({
 //    computed styles at 40, 60 and 150 nodes. What page JavaScript cannot measure
 //    is the rasteriser's own bill; that is what the frame budget, the Stalls tab
 //    and DevTools' paint flashing show on the machine the graph runs on.
+//  * A stand-in never carries a node's execution state, in either renderer, and
+//    the panel's "N element(s) hidden" is the page's own count. In the Vue
+//    renderer a node whose state is live (a progress value, errors, a drag, a
+//    video) is never boxed at all — `lodVueFlatNode` refuses the same nodes
+//    `lodSnapLive` refuses, so the element stays and the frontend draws its own
+//    bar, its own error stroke and its own outline around the node that is
+//    executing. In the canvas renderer a box does stand for such a node, and the
+//    two marks are read from `node.progress`/`node.has_errors` — fields the
+//    frontend itself mirrors onto the node object in both renderers
+//    (`nodeProgressCanvasSync.ts`, `useNodeErrorFlagSync.ts`) — on every frame:
+//    neither is ever photographed nor blitted (see `lodSnapLive`), so a bar of the
+//    instant of a capture cannot be served after the run it belonged to. The
+//    hidden count is per *element* dressed, one class (`.ants-lod-box`) or one
+//    attribute (`data-ants-dom-hidden`) each, and equals what a walk of the page
+//    for those two marks finds. (The Vue-nodes pathway's stand-in mark is a third
+//    one — the attribute `data-ants-vue-standin` on the node's root, counted as
+//    `vueBlanked` — and the panel names the renderer it is reporting on.)
 //  * A picture is only taken once its node has stopped changing: a settle window
 //    (LOD_SNAP_SETTLE_MS, 300ms) opened when a node is first drawn as a stand-in
 //    and re-opened by every change the page reports — or by a signature that no
