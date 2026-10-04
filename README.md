@@ -202,8 +202,10 @@ call, never latched:
   stops painting it: its children are `visibility: hidden` (the one property an
   engine honours by skipping a subtree in the paint phase — `opacity: 0`, which
   this pathway used until v2.6.6, is still painted) and the element's own box
-  keeps its place, transparent and hit-testable, so dragging, selecting and
-  link-dragging are untouched. The elements stay in the page, in the layout and
+  keeps its place, transparent and hit-testable — selecting and dragging a node
+  are bound on the root and never look at `event.target` — and the one thing
+  inside left live is a slot's dot, because that is where a link drag starts. The
+  elements stay in the page, in the layout and
   in the frontend's own observers, and the canvas paints the same box in the same
   place, with the same detail ladder. The mark is an **attribute** on the element
   (`data-ants-vue-standin`) plus an `!important` stylesheet rule, deliberately
@@ -292,9 +294,11 @@ and is still painted, which is exactly why the stand-ins could cost performance
 here while saving it in the canvas renderer, where the expensive drawing was
 LiteGraph's own `drawNode` and the box replaced it. What an engine actually skips
 is a *hidden* subtree, so the node's children are `visibility: hidden` — and only
-its children: the node's own box keeps its place and stays hit-testable, which is
-what keeps dragging, selecting and link-dragging working through a stand-in,
-because in this renderer those are that DOM. Nothing is removed: the elements stay
+its children: the node's own box keeps its place and stays hit-testable (which is
+what keeps selecting and dragging a node working through a stand-in — both are
+bound on the root), and the slot dots are re-shown inside the hidden subtree, since
+a link drag starts on the dot and the canvas renderer keeps linking working through
+its own canvas hit test. Nothing is removed: the elements stay
 in the page, in the layout and in the frontend's own `ResizeObserver` (upstream
 `useVueNodeResizeTracking.ts` measures the same rects), so every number the box and
 the picture are made of still comes from the DOM, and a change inside a stand-in is

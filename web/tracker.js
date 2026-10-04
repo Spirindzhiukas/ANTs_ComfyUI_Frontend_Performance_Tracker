@@ -3929,8 +3929,10 @@ function lodSnapLive(node, canvas) {
 //      so the browser stops painting that node's DOM. The node's *children* are
 //      `visibility: hidden`, which is the one property an engine honours by
 //      skipping a subtree in the paint phase; the node's own box keeps its place
-//      (and is transparent), so it is still hit-testable and dragging, selecting
-//      and link-dragging keep working while a node is a stand-in. The element
+//      (and is transparent), so it is still hit-testable — selecting and dragging
+//      a node are bound on the root and never look at `event.target` — and the
+//      slot dots are the one thing inside left live, because that is where a link
+//      drag starts. The element
 //      itself stays in the page, in the layout and in the frontend's own
 //      observers: only the painting is taken away. (v2.6.0–v2.6.5 used
 //      `opacity: 0` alone, which takes nothing away — the subtree is still
@@ -9230,6 +9232,15 @@ tr.ants-details table.ants-sub td { color: #bbb; }
    are all *in* the stand-in. */
 [data-ants-vue-standin] { opacity: 0 !important; }
 [data-ants-vue-standin] > * { visibility: hidden !important; }
+/* One exception, and only one: a slot's dot. SlotConnectionDot.vue is the
+   element that carries the pointerdown/click that *starts a link drag*, and
+   linking a node has to keep working at low zoom exactly as it does in the canvas
+   renderer — where LiteGraph hit-tests the slot on the canvas. The dot is a few
+   pixels square, it is drawn into the picture at the same rect in the same colour,
+   and hiding it would take a connection away from the user to save a circle. A
+   visible descendant of a hidden ancestor is painted and hit-tested, which is
+   exactly what is wanted here. */
+[data-ants-vue-standin] .slot-dot { visibility: visible !important; }
 /* Same reason as the stand-in attribute: a Vue-rendered node's root has its
    class rewritten by Vue on every re-render, so what hides it for the fovea and
    what makes it stop answering live on attributes the frontend never touches. */
@@ -14303,12 +14314,15 @@ app.registerExtension({
 //    saving, and with hardware acceleration off it is CPU work on every frame
 //    that a stand-in must not leave behind. The element's own box keeps
 //    `opacity: 0`: it paints nothing anyway, and it must stay hit-testable,
-//    because in this renderer dragging, selecting, the resize handles and
-//    link-dragging are all that DOM. So what a stand-in trades away is the
-//    *painted* node, not the node: a widget inside a boxed node no longer receives
-//    its own clicks at that zoom (the pointer goes to the node, which is what the
-//    user sees there), and the accessibility tree entry for the node is that of a
-//    hidden subtree while the picture stands in.
+//    because in this renderer selecting and dragging a node are that DOM. A third
+//    rule re-shows the slot dots: a link drag starts on the dot
+//    (`SlotConnectionDot.vue` carries the pointerdown), and the canvas renderer
+//    keeps linking working through its own canvas hit test, so the two pathways
+//    have to agree. So what a stand-in trades away is the *painted* node, not the
+//    node: a widget, a collapse button, an editable label or a resize handle inside
+//    a boxed node does not receive its own clicks at that zoom (the pointer goes to
+//    the node, which is what the user sees there), and the accessibility tree entry
+//    for the node is that of a hidden subtree while the picture stands in.
 //    Measured, and pinned by tests: the frontend's paint for those nodes stops
 //    (the count is `vuePaintSkipped`), the layout is untouched — rects, text
 //    metrics and every observer keep answering, so a change inside a stand-in is
@@ -14410,8 +14424,9 @@ app.registerExtension({
 //  * In the Vue-nodes renderer a stand-in is a marked element plus a box: the
 //    element keeps its layout, its observers and its pointer events (its
 //    children do not paint, the node's own box is transparent and still
-//    hit-testable), so dragging, selecting and link-dragging are unchanged while
-//    a widget *inside* a stand-in no longer receives its own clicks at that zoom,
+//    hit-testable, and the slot dots stay live because that is where a link drag
+//    starts), so selecting, dragging and linking a node are unchanged while a
+//    widget *inside* a stand-in no longer receives its own clicks at that zoom,
 //    and the node's accessibility tree entry is that of a hidden subtree. Not
 //    exercised in this pass against a live Vue-nodes page — verified against the
 //    frontend's sources (`LGraphNode.vue`, `NodeHeader.vue`, `NodeSlots.vue`,

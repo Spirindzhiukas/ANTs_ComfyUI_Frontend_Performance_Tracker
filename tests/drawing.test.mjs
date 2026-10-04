@@ -3794,6 +3794,14 @@ suite("drawing: the Nodes 2.0 (Vue nodes) frontend", () => {
     // hit-testable, and selecting or dragging a node at that zoom would stop
     // working — a stand-in may replace the pixels, not the node.
     assert(!/\[data-ants-vue-standin\]\s*\{[^}]*visibility/.test(css), "the node's own box is not hidden, only its contents");
+    // One exception has to survive, and it is a functional one: a link drag starts
+    // on the slot dot (`SlotConnectionDot.vue` carries the pointerdown), so the dot
+    // is re-shown inside the hidden subtree — a few pixels that the picture draws
+    // anyway, kept alive so linking a stand-in still works.
+    assert(
+      /\[data-ants-vue-standin\] \.slot-dot\s*\{[^}]*visibility: visible/.test(css),
+      "and the slot dots — the one pointer target a link drag needs — stay live"
+    );
     assertEqual(struct.surface.parentNode, vue.rootFor(nodes[0]), "the node's own structure is still in the DOM");
     const stale0 = api.vueStale;
     vue.growRoot(nodes[0], 232); // the frontend reserves room inside the node

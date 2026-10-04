@@ -221,8 +221,10 @@ and the canvas, so the stand-in is made of those:
    not own, keep their classes. The mechanism was chosen for what it does *not*
    do: the element keeps its layout box, keeps its children (slots, widgets,
    resize handles — *kept* means kept in the DOM and in layout), and its own box
-   keeps its pointer events, so dragging, selecting and link-dragging behave
-   exactly as they do in full detail. What it *does* is take the paint away: an
+   keeps its pointer events, so selecting and dragging a node behave as they do in
+   full detail; a slot's dot is the one child re-shown inside the hidden subtree,
+   because that is where a link drag starts (`SlotConnectionDot.vue` carries the
+   pointerdown) and the canvas renderer keeps linking through its canvas hit test. What it *does* is take the paint away: an
    engine skips a hidden subtree in the paint phase, so a stand-in costs the
    frontend nothing to draw while everything the tool measures still answers. The
    trade is stated rather than hidden — a widget *inside* a stand-in no longer
@@ -566,18 +568,20 @@ takes the frontend's own paint away while the picture stands in. That is
 the live node can no longer disagree, because the live node is not painted.
 
 *Five tests, and the mutations that bind them.* The new tests: the paint-skip rule
-is in the stylesheet and the element's layout is untouched (a box that changes
-inside a stand-in is still reported); the picture carries the node's structure
+is in the stylesheet — the children hidden, the node's own box not, the slot dots
+re-shown — and the element's layout is untouched (a box that changes inside a
+stand-in is still reported); the picture carries the node's structure
 (frame at the element's own rect, dots as arcs) both live and in the capture; a
 widget's own row is in the picture at its measured box with the browser's radius,
 in the live box and in the picture; a node is photographed only after the window
 (nothing captured inside it, the lane reports the wait, the picture lands after
 it); and a change re-opens the window (the picture is dropped, no replacement
-inside the window, a fresh one after it). A nine-mutation battery was run over the
+inside the window, a fresh one after it). A ten-mutation battery was run over the
 tracker — the gate bypassed, the re-arming removed, the structure not drawn, the
 stylesheet rule removed, the slot dots not drawn, the first-time window never
 opened, the structure reader reduced to the frame, the widget row's surface not
-read, the widget rows not drawn — and **all nine are caught**.
+read, the widget rows not drawn, the slot-dot pointer exception removed — and
+**all ten are caught**.
 
 Two things the Nodes 2.0 pass confirmed rather than changed: the Vue node's
 **root element is never hidden or inerted** (`via: "root"` records are exempt from

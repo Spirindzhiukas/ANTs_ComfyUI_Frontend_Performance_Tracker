@@ -191,7 +191,7 @@ Seams worth knowing:
   renderer whose node drawing is the browser's own DOM painting; an opacity-0
   subtree is still painted (that is what v2.6.0–v2.6.5 shipped, and why the
   stand-ins could cost performance here). The element's own box stays visible and
-  therefore hit-testable — dragging, selecting and link-dragging are that DOM — so
+  therefore hit-testable — selecting and dragging a node are bound on the root — so
   the *children* are hidden, never the root, and the layout is untouched: rects,
   text metrics and both observers still answer, which is where every number the
   box and the picture are made of comes from. Trade, stated in README/`LIMITS`:
