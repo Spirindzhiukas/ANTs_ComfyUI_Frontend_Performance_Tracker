@@ -2,7 +2,7 @@
 
 The initial audit was written against v2.6.8 by reading the sources rather
 than the docs, running the suites, and running the demo. Follow-up pass notes
-below extend that evidence through v2.7.4. Every claim has a file and (where it
+below extend that evidence through v2.7.5. Every claim has a file and (where it
 matters) a line reference; defects found in each pass were fixed or recorded as
 open rather than documented as if they no longer existed.
 
