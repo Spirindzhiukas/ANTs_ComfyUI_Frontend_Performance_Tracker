@@ -650,14 +650,11 @@ suite("scripted pan benchmark", () => {
     assertEqual(bench.B.muted.length, 1, "the mute state is captured with the run");
     assertEqual(bench.A.muted.length, 0, "and A recorded that it was unmuted");
 
-    // The Testing tab states the comparison in plain terms.
-    h.tracker.open();
-    const body = h.document.getElementById("ants-tracker-body");
-    const tabs = h.document.getElementById("ants-tracker-tabs");
-    for (const btn of tabs.children) if (btn.textContent === "Testing") btn.click();
-    h.advance(60);
-    const text = body.textContent;
-    assertIncludes(text, "fps", "delta line shows the fps change");
-    assertIncludes(text, "different mutes", "and warns that the two runs differ on purpose");
+    // The detached Testing tab reads this same structured result; the headless
+    // page keeps only the snapshot/report surface.
+    assertGreater(bench.B.fps, 0, "the second run has a comparable frame rate");
+    assertEqual(bench.A.muted.join(","), "", "A records its original mute state");
+    assertEqual(bench.B.muted.join(","), "BenchPack", "B records that the test changed its mutes");
+    assertIncludes(h.tracker.report, "-- BENCHMARK (scripted pan) --", "the report retains both detached benchmark slots");
   });
 });

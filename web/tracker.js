@@ -27,7 +27,7 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.7.5";
+const VERSION = "2.7.6";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
 // The class key ComfyUI stores in a workflow. The old key is still recognised so
 // a graph saved before the rename does not lose this node.
@@ -1971,7 +1971,7 @@ let lodDomSweepTimer = null;
 // execution result). One pass a second keeps the hidden set honest without
 // touching anything when the mode is off.
 function lodInstallDomSweep() {
-  if (lodDomSweepTimer) return;
+  if (!S.enabled || lodDomSweepTimer !== null) return;
   try {
     lodDomSweepTimer = govOwn(() =>
       setInterval(() => {
@@ -1989,8 +1989,16 @@ function lodInstallDomSweep() {
       }, VIEW_SWEEP_MS)
     );
   } catch (e) {
+    lodDomSweepTimer = null;
     /* no timers: the sweep still runs whenever the zoom or the setting changes */
   }
+}
+
+function lodStopDomSweep() {
+  if (lodDomSweepTimer !== null) {
+    try { clearInterval(lodDomSweepTimer); } catch (e) { /* best effort */ }
+  }
+  lodDomSweepTimer = null;
 }
 // The frontend has its own low-quality rendering: `_isLowQuality` is what
 // `low_quality` reads, and below its own threshold (Settings -> LiteGraph,
@@ -2578,6 +2586,20 @@ function viewVerifyMarked(limit) {
 const ANTS_ACCENT = "#AE7719";
 const ANTS_SWITCH_FILL = "#0D2A2A"; // the checked interior
 const ANTS_GLYPH_LINE = 1.5; // one line weight for the gear, the ring and the check
+const ANTS_GEAR_BUTTONS = new Set();
+
+function antsSetGearStatus(gear) {
+  if (!gear) return;
+  ANTS_GEAR_BUTTONS.add(gear);
+  const blocked = !!LOD.popoutNote;
+  if (blocked) gear.classList.add("ants-window-blocked");
+  else gear.classList.remove("ants-window-blocked");
+  const title = blocked
+    ? String(LOD.popoutNote)
+    : "Open the detached ANTs Frontend Optimizer window. Press and hold to move this control.";
+  gear.title = title;
+  try { gear.setAttribute("aria-label", title); } catch (e) { /* optional */ }
+}
 
 const ANTS_WIDGETS = new Set(); // sync functions, one per live node
 
@@ -2691,6 +2713,7 @@ function buildAntsNodeWidget() {
 
   const tick = antsBuildTick(pill);
   const gear = el("button", { class: "ants-node-btn ants-node-btn-gear", type: "button" });
+  antsSetGearStatus(gear);
 
   // The switch first, the gear after — the order the frame draws them in.
   pill.appendChild(tick);
@@ -2723,10 +2746,8 @@ function buildAntsNodeWidget() {
   return pill;
 }
 
-// The graph node was sized to the pill and, on some frontends, only allowed to
-// grow on one axis. A free minimum and a computeSize that does not shrink a
-// size the user already set is what both axes need. Vue node mode may ignore a
-// LiteGraph `resizable` flag; the floating panel's own grip does not depend on it.
+// Keep the workflow node resizable, but deliberately headless: settings and
+// metrics live in the detached window, never in a hidden or docked page panel.
 function antsUnlockNode(node) {
   try {
     node.resizable = true;
@@ -2751,85 +2772,30 @@ function antsUnlockNode(node) {
       }
       return [w, h];
     };
-    if (typeof node.addDOMWidget === "function" && !node._antsHost) {
-      const host = document.createElement("div");
-      host.className = "ants-own ants-node-host";
-      host.style.width = "100%";
-      host.style.minHeight = "0";
-      const widget = node.addDOMWidget("ants_host", "ants-ui", host, {
-        serialize: false,
-        hideOnZoom: false,
-      });
-      if (widget) {
-        widget.computeLayoutSize = () => ({ minWidth: 180, minHeight: 0, maxWidth: 4096, maxHeight: 4096 });
-      }
-      node._antsHost = host;
-    }
-    const prevResize = node.onResize;
-    node.onResize = function (size) {
-      let ret;
-      try {
-        if (typeof prevResize === "function") ret = prevResize.apply(this, arguments);
-      } catch (e) {
-        /* the reflow still runs */
-      }
-      antsReflowNode(this, size);
-      return ret;
-    };
   } catch (e) {
-    /* the floating panel still resizes on its own grip */
-  }
-}
-
-function antsReflowNode(node, size) {
-  try {
-    buildPanel();
-    const host = node && node._antsHost;
-    if (!host || !ui.panel) return;
-    const w = (size && Number(size[0])) || (node.size && Number(node.size[0])) || 0;
-    const h = (size && Number(size[1])) || (node.size && Number(node.size[1])) || 0;
-    if (w >= 280 && h >= 160) {
-      host.appendChild(ui.panel);
-      ui.panel.classList.add("open");
-      ui.panel.classList.add("ants-docked");
-      ui.panel.classList.remove("ants-popped");
-      ui.panel.style.width = "100%";
-      ui.panel.style.height = `${Math.max(160, Math.round(h - 28))}px`;
-      ui.docked = node;
-      return;
-    }
-    if (ui.docked === node) {
-      ui.docked = null;
-      ui.panel.classList.remove("ants-docked");
-      ui.panel.style.width = "";
-      ui.panel.style.height = "";
-      document.body.appendChild(ui.panel);
-    }
-  } catch (e) {
-    /* docking is optional; the grip on the floating panel still works */
+    /* the detached window does not depend on node resizing */
   }
 }
 
 // Attaching the pill to a node, through whichever API this frontend version has.
 function antsAttachNodeWidget(node) {
+  // The floating pill is always available. If this frontend cannot host the
+  // compact DOM widget, keep the workflow node headless instead of adding a
+  // second, text-only fallback control.
+  if (!node || typeof node.addDOMWidget !== "function") return null;
   const pill = buildAntsNodeWidget();
   try {
-    if (typeof node.addDOMWidget === "function") {
-      const widget = node.addDOMWidget("ants_controls", "ants-ui", pill, {
-        serialize: false,
-        hideOnZoom: false, // the frontend's own LOD must not take the switch away
-        selectOn: [], // clicking the switch is not "select this node"
-      });
-      if (widget) return pill;
-    }
+    node.addDOMWidget("ants_controls", "ants-ui", pill, {
+      serialize: false,
+      hideOnZoom: false, // the frontend's own LOD must not take the switch away
+      selectOn: [], // clicking the switch is not "select this node"
+    });
+    return pill;
   } catch (e) {
-    /* the fallback below is a canvas button, which is worse but not nothing */
+    /* the floating pill remains the only control if DOM widgets are unavailable */
   }
-  try {
-    node.addWidget("button", "Open Tracker", null, () => antsOpenFromGear());
-  } catch (e) {
-    /* a node with no widget API at all: the corner button is the only UI left */
-  }
+  // Do not add a text-button or hidden settings widget as a fallback: the
+  // workflow node stays headless when this frontend cannot host the compact pill.
   return null;
 }
 
@@ -2891,23 +2857,48 @@ function antsSyncWidgets() {
 function antsSetEnabled(on) {
   const next = !!on;
   if (next === !!S.enabled) return antsEnabled();
+  if (!next && !antsUiFrozenSnapshot) {
+    try { antsUiFrozenSnapshot = buildSnapshot(); } catch (e) { antsUiFrozenSnapshot = null; }
+  }
   S.enabled = next;
   if (!next) {
+    // Freeze sampling and background work before returning page elements. Keep
+    // the user's selected testing values, but cancel their active timers.
+    stopStaleSweep();
+    lodStopDomSweep();
+    lodSnapCancel();
+    stopRafMonitor();
+    stopMemorySampler();
+    stopStallObserver();
+    lodStopRamTimer();
+    govStopAutoPilot();
+    govRemoveInputGuard();
+    if (capTrailingTimer !== null) {
+      try { clearTimeout(capTrailingTimer); } catch (e) { /* best effort */ }
+      capTrailingTimer = null;
+    }
+    stopSyntheticTickTimer();
+    stopScriptedPan("optimizer off");
+    if (LOD.ab && !LOD.ab.done) lodAbStop("measurement stopped because the optimizer was switched off");
+    govResumeDeferrals();
     antsReleasePage();
-    // The page gets the drawing back, and the browser gets the memory back: a
-    // stored bitmap is only useful to a tool that is running, and switching on
-    // again recaptures on the next idle lane.
+    // The page gets the drawing back, and the browser gets the memory back: the
+    // selected snapshot setting stays, but its pictures and pending work do not.
     if (LOD.snapOn) lodSnapClear("master switch");
     lodVueUnblankAll("tool off");
-    // Nothing of this tool's own UI goes away: the floating pill carries the
-    // switch that turns it back on, and closing the panel under someone who is
-    // reading it would be its own small bug. The page is what gets handed back.
-    console.info(
-      "[ANTs Tracker] Switched off: no hooks wrapped, nothing sampled, no scheduler deferrals, no redraw cap, no low-zoom drawing, no DOM " +
-        "touched. The switch on the floating button (and the panel's own On button) switches it back on with the settings you had."
-    );
+    console.info("[ANTs Tracker] Switched off: optimization effects and sampling are suspended; the page is handed back to ComfyUI.");
   } else {
+    antsUiFrozenSnapshot = null;
     try {
+      installStallObserver();
+      installRafMonitor();
+      installMemorySampler();
+      startStaleSweep();
+      govInstallInputGuard();
+      if (GOV.controls.autoLimit) govStartAutoPilot();
+      if (LOD.ramRunning) lodStartRamTimer();
+      if (syntheticTickMs > 0) setSyntheticTick(syntheticTickMs);
+      if (LOD.snapOn) lodSnapPump();
       if (lodDomWanted()) {
         lodInstallDomSweep();
         lodSweepDom(app.canvas);
@@ -2917,19 +2908,9 @@ function antsSetEnabled(on) {
     } catch (e) {
       /* never fatal */
     }
-    console.info("[ANTs Tracker] Switched back on: the settings that were in force are in force again.");
+    console.info("[ANTs Tracker] Switched on: sampling and the saved optimization settings have resumed.");
   }
   antsSyncWidgets();
-  // The banner and the header button have to say what happened before anyone
-  // looks at them again — and an open panel is left open, showing them.
-  try {
-    if (ui.built) {
-      renderSummary();
-      if (ui.panel && ui.panel.classList.contains("open")) updateActiveTab();
-    }
-  } catch (e) {
-    /* never fatal */
-  }
   if (!antsUiSilent) antsUiPublishSettings();
   return antsEnabled();
 }
@@ -3384,6 +3365,7 @@ const LOD_AB_PHASE_MS = 1200;
 const LOD_AB_MIN_FRAMES = 3; // below this the comparison is not worth printing
 
 function lodAbStart() {
+  if (!S.enabled) return null;
   LOD.ab = {
     phase: 0, // 0 = thinning on, 1 = thinning off
     rounds: LOD_AB_ROUNDS,
@@ -3417,6 +3399,7 @@ function lodAbStop(text) {
 // One call per drawn frame, with that frame's own connections time: the two
 // phases are measured from the same code path, on the same page, seconds apart.
 function lodAbFrame(connMs) {
+  if (!S.enabled) return;
   const ab = LOD.ab;
   if (!ab || ab.done) return;
   const t = nowMs();
@@ -3574,8 +3557,8 @@ function lodSet(opts) {
       if (o.autoLinkCarried === undefined) LOD.autoLinkCarried = false;
     }
   }
-  if (LOD.flatBelow > 0 || LOD.inertBelow > 0 || LOD.fovea || LOD.snapOn) lodInstallDomSweep();
-  if (LOD.inertBelow > 0 || LOD.fovea || LOD.flatBelow > 0) {
+  if (S.enabled && (LOD.flatBelow > 0 || LOD.inertBelow > 0 || LOD.fovea || LOD.snapOn)) lodInstallDomSweep();
+  if (S.enabled && (LOD.inertBelow > 0 || LOD.fovea || LOD.flatBelow > 0)) {
     // The canvas-side gate and the event gate are both inert until something is
     // switched on, and both are needed the moment it is.
     viewInstallWidgetGate();
@@ -3587,16 +3570,16 @@ function lodSet(opts) {
   // was already on (stand-in pictures are on by default).
   if (now && !LOD.baseline) lodCaptureBaseline();
   if (!now && was) LOD.baseline = null;
-  if (LOD.idleCapMs > 0 || LOD.snapOn) govInstallInputGuard();
+  if (S.enabled && (LOD.idleCapMs > 0 || LOD.snapOn)) govInstallInputGuard();
   // A threshold change has to take effect now, not on the next frame the canvas
   // happens to draw: the marks follow the setting, whatever the zoom is.
   try {
-    lodSweepDom(app.canvas);
+    if (S.enabled) lodSweepDom(app.canvas);
     lodVueUnblankAll("setting");
     // ... and the hover half immediately, not on the next drawn frame: a redraw
     // can be merged by the idle cap, and until one is drawn a 3D viewport whose
     // node has just been switched off would keep its "pointer is over me" flag.
-    viewSuppressHover(app.canvas);
+    if (S.enabled) viewSuppressHover(app.canvas);
   } catch (e) {
     /* the sweep never throws, but setup is not worth a broken toggle */
   }
@@ -3986,11 +3969,11 @@ function patchCanvasDraw() {
     const originalSetDirty = proto.setDirty;
     const wrappedSetDirty = function (...args) {
       const t0 = performance.now();
-      if (!S.paused) {
+      if (S.enabled && !S.paused) {
         S.invalidations.push(t0, 1);
         maybeSampleCaller(t0);
       }
-      if (GOV.controls.coalesce) return govCoalesceRedraw(originalSetDirty, this, args);
+      if (S.enabled && GOV.controls.coalesce) return govCoalesceRedraw(originalSetDirty, this, args);
       return originalSetDirty.apply(this, args);
     };
     wrappedSetDirty.__antsWrapped = true;
@@ -7235,6 +7218,7 @@ function lodThumbDiskForget(node) {
 
 // System RAM from ComfyUI's own /system_stats. No reading, no release.
 async function lodRamSample() {
+  if (!S.enabled) return null;
   try {
     if (typeof fetch !== "function") {
       LOD.ramUsed = null;
@@ -7242,12 +7226,14 @@ async function lodRamSample() {
       return null;
     }
     const res = await fetch("/system_stats");
+    if (!S.enabled) return null;
     if (!res || !res.ok || typeof res.json !== "function") {
       LOD.ramUsed = null;
       LOD.ramNote = "system RAM unknown — /system_stats did not answer, so nothing was released";
       return null;
     }
     const body = await res.json();
+    if (!S.enabled) return null;
     const sys = body && body.system;
     const total = Number(sys && sys.ram_total) || 0;
     const free = Number(sys && (sys.ram_free != null ? sys.ram_free : sys.ram_available));
@@ -7261,6 +7247,7 @@ async function lodRamSample() {
     LOD.ramNote = "";
     return used;
   } catch (e) {
+    if (!S.enabled) return null;
     LOD.ramUsed = null;
     LOD.ramNote = "system RAM unknown — the stats request failed, so nothing was released";
     return null;
@@ -7289,16 +7276,19 @@ function lodSnapPurgeRam(all) {
 }
 
 async function lodRamCheck() {
+  if (!S.enabled) return { used: null, purged: 0 };
   const used = await lodRamSample();
-  if (used == null) return { used: null, purged: 0 };
+  if (!S.enabled || used == null) return { used: null, purged: 0 };
   if (used >= LOD_RAM_FULL) return { used, purged: lodSnapPurgeRam(true) };
   if (used >= LOD_RAM_OFF) return { used, purged: lodSnapPurgeRam(false) };
   return { used, purged: 0 };
 }
 
 async function lodRamFinish() {
+  if (!S.enabled) return 0;
   LOD.ramRunning = false;
   const used = await lodRamSample();
+  if (!S.enabled) return 0;
   const canvas = typeof app !== "undefined" && app ? app.canvas : null;
   if (!canvas || !lodSnapBitmaps(canvas)) return 0;
   const nodes = lodGraphNodes(canvas);
@@ -7319,22 +7309,35 @@ async function lodRamFinish() {
   return n;
 }
 
+function lodStopRamTimer() {
+  if (LOD.ramTimer != null) {
+    try { clearInterval(LOD.ramTimer); } catch (e) { /* best effort */ }
+  }
+  LOD.ramTimer = null;
+}
+
+function lodStartRamTimer() {
+  if (!S.enabled || LOD.ramTimer != null) return;
+  try {
+    LOD.ramTimer = govOwn(() => setInterval(() => {
+      if (S.enabled && LOD.ramRunning) lodRamCheck();
+    }, 2000));
+  } catch (e) {
+    LOD.ramTimer = null;
+    /* one check on start is still the policy */
+  }
+}
+
 function lodRamRun(starting) {
+  if (!S.enabled) return { used: null, purged: 0 };
   if (!starting) return lodRamFinish();
   LOD.ramRunning = true;
-  if (!LOD.ramTimer) {
-    try {
-      LOD.ramTimer = govOwn(() => setInterval(() => {
-        if (LOD.ramRunning) lodRamCheck();
-      }, 2000));
-    } catch (e) {
-      /* one check on start is still the policy */
-    }
-  }
+  lodStartRamTimer();
   return lodRamCheck();
 }
 
 function lodInstallRamWatch() {
+  if (!S.enabled) return false;
   try {
     const api = app && app.api;
     if (!api || typeof api.addEventListener !== "function" || LOD.ramWatch) {
@@ -7359,6 +7362,7 @@ function lodInstallRamWatch() {
 
 // Everything, because the stored bitmaps describe a theme that no longer exists.
 function lodSnapClear(reason) {
+  lodSnapCancel();
   lodSnapEnsure();
   for (const [, rec] of LOD.snaps) lodSnapRelease(rec);
   LOD.snaps.clear();
@@ -8282,7 +8286,7 @@ function lodSnapCaptureNode(node, canvas) {
 // Redraw the half and quarter copies from the capture, then write the file.
 // Safe to run late: if this picture was dropped or replaced, it does nothing.
 function lodSnapSettleImages(node, rec, canvas) {
-  if (!rec || rec.canvas !== canvas) return;
+  if (!S.enabled || !LOD.snapOn || !rec || rec.canvas !== canvas) return;
   lodSnapRefreshMips(rec);
   // A node that keeps changing gets a new picture every LOD_SNAP_PHOTO_MS; writing
   // each of them to disk is the most expensive part of the capture and the least
@@ -8327,11 +8331,19 @@ function lodSnapRefreshMips(rec) {
 // survives the record being dropped (it is reset by a successful reuse, which is
 // what "the lane is keeping up" looks like).
 function lodSnapSchedule(delay) {
+  if (!S.enabled || !LOD.snapOn) {
+    lodSnapCancel();
+    return;
+  }
   if (LOD.snapTimer != null) return;
   try {
     LOD.snapTimer = govOwn(() =>
       setTimeout(() => {
         LOD.snapTimer = null;
+        if (!S.enabled || !LOD.snapOn) {
+          LOD.snapPumping = false;
+          return;
+        }
         lodSnapSlice();
       }, Math.max(0, Math.round(delay) || 0))
     );
@@ -8342,6 +8354,10 @@ function lodSnapSchedule(delay) {
 }
 
 function lodSnapPump() {
+  if (!S.enabled || !LOD.snapOn) {
+    lodSnapCancel();
+    return;
+  }
   if (LOD.snapPumping) return;
   LOD.snapPumping = true;
   lodSnapSchedule(0);
@@ -8352,6 +8368,10 @@ function lodSnapPump() {
 // between slices so a big graph is captured over a second or two rather than in
 // one visible pause. No second scheduler, no second idle clock.
 function lodSnapSlice() {
+  if (!S.enabled || !LOD.snapOn) {
+    lodSnapCancel();
+    return;
+  }
   const canvas = typeof app !== "undefined" && app ? app.canvas : null;
   if (!lodSnapBitmaps(canvas)) {
     LOD.snapPumping = false;
@@ -8607,7 +8627,7 @@ function lodThumbDiskNoteFail() {
 }
 
 function lodThumbDiskSweep() {
-  if (!LOD.diskOn || LOD.diskSwept) return;
+  if (!S.enabled || !LOD.diskOn || LOD.diskSwept) return;
   LOD.diskSwept = true;
   try {
     if (typeof fetch !== "function") return;
@@ -8615,7 +8635,7 @@ function lodThumbDiskSweep() {
     fetch(THUMB_DISK_PREFIX + "/info")
       .then((res) => (res && res.ok && typeof res.json === "function" ? res.json() : null))
       .then((body) => {
-        if (body && body.dir) LOD.diskDir = String(body.dir);
+        if (S.enabled && LOD.diskOn && body && body.dir) LOD.diskDir = String(body.dir);
       })
       .catch(() => {});
   } catch (e) {
@@ -8636,7 +8656,7 @@ function lodThumbDiskDelete(node) {
 }
 
 function lodThumbDiskSave(node, rec) {
-  if (!LOD.diskOn || LOD.diskDead || !rec || !rec.canvas || !rec.sig || rec.fromDisk) return;
+  if (!S.enabled || !LOD.snapOn || !LOD.diskOn || LOD.diskDead || !rec || !rec.canvas || !rec.sig || rec.fromDisk) return;
   const id = lodThumbId(node);
   if (!id) return;
   const canvas = rec.canvas;
@@ -8649,7 +8669,7 @@ function lodThumbDiskSave(node, rec) {
   if (lodSnapPixelRatio(rec.ratio) !== want) return;
   const sig = lodSnapDiskSig(node, null, want);
   const send = (blob) => {
-    if (!blob) return;
+    if (!S.enabled || !LOD.snapOn || !LOD.diskOn || !blob) return;
     try {
       fetch(THUMB_DISK_PREFIX + "/" + encodeURIComponent(id) + "?sig=" + encodeURIComponent(sig), {
         method: "PUT",
@@ -8657,10 +8677,13 @@ function lodThumbDiskSave(node, rec) {
         headers: { "Content-Type": blob.type || "image/png" },
       })
         .then((res) => {
+          if (!S.enabled || !LOD.snapOn) return;
           if (res && res.ok) LOD.diskSaved++;
           else lodThumbDiskNoteFail();
         })
-        .catch(() => lodThumbDiskNoteFail());
+        .catch(() => {
+          if (S.enabled && LOD.snapOn) lodThumbDiskNoteFail();
+        });
     } catch (e) {
       lodThumbDiskNoteFail();
     }
@@ -8675,7 +8698,12 @@ function lodThumbDiskSave(node, rec) {
 }
 
 function lodThumbDiskInstall(node, canvas, sig, blob) {
+  if (!S.enabled || !LOD.snapOn) return false;
   const paint = (bmp) => {
+    if (!S.enabled || !LOD.snapOn) {
+      try { if (bmp && typeof bmp.close === "function") bmp.close(); } catch (e) { /* best effort */ }
+      return;
+    }
     try {
       let live = "";
       // The file's own key is the check: node state *and* the ratio and theme the
@@ -8761,7 +8789,7 @@ function lodThumbDiskInstall(node, canvas, sig, blob) {
 }
 
 function lodThumbDiskAsk(node, canvas) {
-  if (!LOD.diskOn || LOD.diskDead) return false;
+  if (!S.enabled || !LOD.snapOn || !LOD.diskOn || LOD.diskDead) return false;
   const id = lodThumbId(node);
   if (!id) return false;
   // Asked before the key is built: a node that already has a picture, or a read
@@ -8811,11 +8839,12 @@ function lodThumbDiskAsk(node, canvas) {
   }
   Promise.resolve(pending)
     .then((res) => {
-      if (!res || !res.ok || typeof res.blob !== "function") return null;
+      if (!S.enabled || !LOD.snapOn || !res || !res.ok || typeof res.blob !== "function") return null;
       return res.blob();
     })
     .then((blob) => {
       rec.diskPending = false;
+      if (!S.enabled || !LOD.snapOn) return;
       if (!blob) {
         if (LOD.snapQueue) LOD.snapQueue.add(node);
         lodSnapPump();
@@ -8825,6 +8854,7 @@ function lodThumbDiskAsk(node, canvas) {
     })
     .catch(() => {
       rec.diskPending = false;
+      if (!S.enabled || !LOD.snapOn) return;
       lodThumbDiskNoteFail();
       if (LOD.snapQueue) LOD.snapQueue.add(node);
       lodSnapPump();
@@ -9131,7 +9161,15 @@ function maybeSampleCaller(t) {
 
 let stallObserver = null;
 
+function stopStallObserver() {
+  if (stallObserver) {
+    try { stallObserver.disconnect(); } catch (e) { /* best effort */ }
+  }
+  stallObserver = null;
+}
+
 function installStallObserver() {
+  if (!S.enabled || stallObserver) return;
   try {
     stallObserver = new PerformanceObserver((list) => {
       for (const entry of list.getEntries()) recordStall(entry);
@@ -9158,7 +9196,7 @@ function installStallObserver() {
 }
 
 function recordStall(entry, kind) {
-  if (S.paused) return;
+  if (!S.enabled || S.paused) return;
   const duration = entry.duration || 0;
   if (Number.isFinite(entry.blockingDuration)) {
     GOV.lastBlockMs = entry.blockingDuration;
@@ -9299,34 +9337,61 @@ function stallMetrics() {
 
 // --- 6. rAF cadence monitor + memory sampler --------------------------------
 
+let rafMonitorHandle = null;
+let rafMonitorRunning = false;
+let rafMonitorGeneration = 0;
+let memorySampleTimer = null;
+let resourceBufferTimer = null;
+
+function stopRafMonitor() {
+  rafMonitorRunning = false;
+  rafMonitorGeneration++;
+  if (rafMonitorHandle !== null) {
+    try { if (typeof cancelAnimationFrame === "function") cancelAnimationFrame(rafMonitorHandle); } catch (e) { /* best effort */ }
+  }
+  rafMonitorHandle = null;
+}
+
 function installRafMonitor() {
-  if (typeof requestAnimationFrame !== "function") return;
+  if (!S.enabled || rafMonitorRunning || typeof requestAnimationFrame !== "function") return;
+  rafMonitorRunning = true;
+  const generation = ++rafMonitorGeneration;
   let prev = NaN;
-  const tick = (ts) => {
+  const tick = () => {
+    rafMonitorHandle = null;
+    if (!rafMonitorRunning || !S.enabled || generation !== rafMonitorGeneration) return;
     const t = performance.now();
     if (!Number.isNaN(prev)) {
       GOV.lastFrameGap = t - prev;
-      if (!S.paused && S.enabled) S.raf.push(t, t - prev);
+      if (!S.paused) S.raf.push(t, t - prev);
     }
     prev = t;
-    if (!S.enabled) {
-      govOwn(() => requestAnimationFrame(tick));
-      return;
-    }
     S.renderTicks++;
-    govOwn(() => requestAnimationFrame(tick));
+    rafMonitorHandle = govOwn(() => requestAnimationFrame(tick));
   };
-    govOwn(() => requestAnimationFrame(tick));
+  rafMonitorHandle = govOwn(() => requestAnimationFrame(tick));
+}
+
+function stopMemorySampler() {
+  if (memorySampleTimer !== null) {
+    try { clearInterval(memorySampleTimer); } catch (e) { /* best effort */ }
+  }
+  if (resourceBufferTimer !== null) {
+    try { clearInterval(resourceBufferTimer); } catch (e) { /* best effort */ }
+  }
+  memorySampleTimer = null;
+  resourceBufferTimer = null;
 }
 
 function installMemorySampler() {
-  if (!performance.memory) return;
+  if (!S.enabled || !performance.memory || memorySampleTimer !== null) return;
   const sample = () => {
     if (S.enabled && !S.paused && performance.memory) S.mem.push(nowMs(), performance.memory.usedJSHeapSize);
   };
   sample();
-  govOwn(() => setInterval(sample, 1000));
-  govOwn(() => setInterval(() => {
+  memorySampleTimer = govOwn(() => setInterval(sample, 1000));
+  resourceBufferTimer = govOwn(() => setInterval(() => {
+    if (!S.enabled) return;
     try {
       performance.setResourceTimingBufferSize && performance.setResourceTimingBufferSize(2000);
     } catch (e) {
@@ -9743,6 +9808,7 @@ function govFailOpen(where, err) {
 function govUninstall(reason) {
   if (GOV.disabled) return false;
   GOV.disabled = true;
+  govStopAutoPilot();
   GOV.offReason = reason || "turned off";
   try {
     const g = typeof globalThis !== "undefined" && globalThis ? globalThis : null;
@@ -9831,10 +9897,8 @@ function govInstall() {
     govInstallInputGuard();
     govProbeWorker();
     govLoad();
-    // The autopilot runs on its own exempt timer: it has to work with the panel
-    // closed, and it must never be slowed by the thing it is tuning.
-    govOwn(() => setInterval(() => govAutoPilot(), GOV_AUTO_INTERVAL_MS));
     GOV.installed = true;
+    govStartAutoPilot();
   } catch (e) {
     GOV.installError = e && e.message ? e.message : String(e);
     warnOnce("gov-install", `Scheduler layer not installed: ${GOV.installError}`);
@@ -10110,7 +10174,7 @@ function govDefer(reg, src, fn, thisArg, args, delayMs, registrationId) {
   reg.pendingFn = fn;
   if (registrationId !== undefined && registrationId !== null) {
     if (!GOV.pendingByRegistration) GOV.pendingByRegistration = new Map();
-    GOV.pendingByRegistration.set(registrationId, { handle, reg, src });
+    GOV.pendingByRegistration.set(registrationId, { handle, reg, src, fn, thisArg, args });
   }
 }
 
@@ -10135,6 +10199,30 @@ function govCancelDeferral(id) {
   return true;
 }
 
+function govResumeDeferrals() {
+  if (!GOV.pendingByRegistration || !GOV.pendingByRegistration.size) return 0;
+  const pending = [...GOV.pendingByRegistration.entries()];
+  let resumed = 0;
+  for (const [id, rec] of pending) {
+    GOV.pendingByRegistration.delete(id);
+    try { if (GOV.orig && GOV.orig.clearTimeout) GOV.orig.clearTimeout(rec.handle); } catch (e) { /* it may have fired */ }
+    if (rec.reg && rec.reg.pending === rec.handle) {
+      rec.reg.pending = null;
+      rec.reg.pendingId = null;
+      rec.reg.pendingFn = null;
+    }
+    // Master-off makes the wrappers pass through; deliver held callbacks once,
+    // now, without recording or imposing another scheduler decision.
+    try {
+      if (typeof rec.fn === "function") rec.fn.apply(rec.thisArg, rec.args || []);
+      resumed++;
+    } catch (e) {
+      warnOnce("gov-resume-deferral", `A deferred callback threw while the optimizer switched off: ${(e && e.message) || e}`);
+    }
+  }
+  return resumed;
+}
+
 // ---------------------------------------------------------- input guard ----
 // Adaptive mode may only slow things down when nobody is typing, dragging or
 // wheeling: input latency is the one cost a smoother graph may not pay for.
@@ -10150,24 +10238,37 @@ function govCancelDeferral(id) {
 const GOV_DISPLAY_FLOOR_MS = 33;
 
 let govInputGuardInstalled = false;
+let govInputNoteHandler = null;
+const GOV_INPUT_EVENTS = ["pointerdown", "pointermove", "mousedown", "mousemove", "keydown", "wheel", "touchstart"];
 
 function govInstallInputGuard() {
-  if (govInputGuardInstalled) return;
+  if (!S.enabled || govInputGuardInstalled) return;
   try {
     if (typeof window === "undefined" || !window || typeof window.addEventListener !== "function") return;
     const note = () => {
+      if (!S.enabled) return;
       GOV.lastInputAt = nowMs();
       GOV.inputSeen = true;
     };
+    govInputNoteHandler = note;
     // Pointer events cover modern browsers; mouse events still arrive on their
     // own in older/embedded ones, and either is proof that somebody is there.
-    for (const type of ["pointerdown", "pointermove", "mousedown", "mousemove", "keydown", "wheel", "touchstart"]) {
-      window.addEventListener(type, note, { passive: true });
-    }
+    for (const type of GOV_INPUT_EVENTS) window.addEventListener(type, note, { passive: true });
     govInputGuardInstalled = true;
   } catch (e) {
     /* an embedder without window events just means the guard stays off */
   }
+}
+
+function govRemoveInputGuard() {
+  if (!govInputGuardInstalled || !govInputNoteHandler) return;
+  try {
+    for (const type of GOV_INPUT_EVENTS) window.removeEventListener(type, govInputNoteHandler, { passive: true });
+  } catch (e) {
+    /* the next install will attach a fresh handler */
+  }
+  govInputGuardInstalled = false;
+  govInputNoteHandler = null;
 }
 
 function govInputRecently(t, windowMs) {
@@ -10227,9 +10328,17 @@ function govSetPolicy(displayKey, policyId) {
 
 function govSetControl(key, value) {
   if (!(key in GOV.controls)) return false;
+  if (key === "autoLimit") value = !!value;
+  if (Object.is(GOV.controls[key], value)) return true;
   GOV.controls[key] = value;
   if (key === "rafMode" || key === "rafMinHz" || key === "adaptiveSkipMax") GOV.rafSkippedInARow = 0;
   govSave();
+  if (key === "autoLimit") {
+    if (value) {
+      govStartAutoPilot();
+      if (S.enabled) govAutoPilot();
+    } else govStopAutoPilot();
+  }
   return true;
 }
 
@@ -10243,6 +10352,7 @@ function govSetControl(key, value) {
 // the policy has to be one that can bite: for a source whose runs are 300ms
 // apart, "half speed" (33ms) is a no-op, so the ladder skips to a real cap.
 function govSuggest() {
+  if (!S.enabled || GOV.disabled) return [];
   const rows = govRows();
   const applied = [];
   for (const r of rows) {
@@ -10302,9 +10412,28 @@ function govHeaviestSource(row) {
 // round, never re-tightening a row it already moved, and it says what it did in
 // the panel and in the copied report. "Reset to untouched" turns it off.
 const GOV_AUTO_INTERVAL_MS = 5000;
+let govAutoPilotTimer = null;
+
+function govStopAutoPilot() {
+  if (govAutoPilotTimer !== null) {
+    try { clearInterval(govAutoPilotTimer); } catch (e) { /* best effort */ }
+  }
+  govAutoPilotTimer = null;
+}
+
+function govStartAutoPilot() {
+  if (!S.enabled || !GOV.installed || GOV.disabled || !GOV.controls.autoLimit || govAutoPilotTimer !== null) return;
+  try {
+    govAutoPilotTimer = govOwn(() => setInterval(() => {
+      if (S.enabled && GOV.controls.autoLimit) govAutoPilot();
+    }, GOV_AUTO_INTERVAL_MS));
+  } catch (e) {
+    govAutoPilotTimer = null;
+  }
+}
 
 function govAutoPilot() {
-  if (GOV.disabled || !GOV.controls.autoLimit || S.paused) return GOV.auto.note;
+  if (!S.enabled || GOV.disabled || !GOV.controls.autoLimit || S.paused) return GOV.auto.note;
   GOV.auto.lastAt = nowMs();
   const rows = govRows();
   const candidates = [];
@@ -10388,6 +10517,7 @@ function govAutoPilot() {
 }
 
 function govReset() {
+  govStopAutoPilot();
   for (const src of GOV.sources.values()) {
     src.policy = "full";
     src.policySetAt = 0;
@@ -10881,6 +11011,7 @@ function govWorkerReady() {
 // A missing worker is not an error: the lane falls back to the main thread and
 // says so, so a caller cannot silently get a different answer.
 function govOffload(job, arg) {
+  if (!S.enabled) return Promise.resolve({ fellBack: true, value: null, reason: "optimizer is off; worker work was not started" });
   const isFn = typeof job === "function";
   if (!govWorkerReady()) {
     if (isFn) return Promise.resolve({ fellBack: true, value: job(arg), reason: GOV.worker.why });
@@ -10917,6 +11048,18 @@ function govOffload(job, arg) {
 // The same deterministic workload on both threads, answers compared, so "the
 // off-thread lane works" is a measurement rather than a claim.
 async function govRunSelfTest() {
+  if (!S.enabled) {
+    GOV.selfTest = {
+      at: new Date().toISOString(),
+      mainMs: NaN,
+      workerMs: NaN,
+      match: false,
+      error: "optimizer is off; worker sanity check was not started",
+      available: GOV.worker.available,
+      n: 0,
+    };
+    return GOV.selfTest;
+  }
   const t0 = performance.now();
   const main = govSelfTestMainThread(GOV_SELFTEST_ARGS);
   const mainMs = performance.now() - t0;
@@ -10928,6 +11071,18 @@ async function govRunSelfTest() {
     else off = res.value;
   } catch (e) {
     error = (e && e.message) || String(e);
+  }
+  if (!S.enabled) {
+    GOV.selfTest = {
+      at: new Date().toISOString(),
+      mainMs,
+      workerMs: off ? GOV.worker.offThreadMs : NaN,
+      match: false,
+      error: "optimizer switched off while the worker sanity check was running",
+      available: GOV.worker.available,
+      n: main.n,
+    };
+    return GOV.selfTest;
   }
   const match = !!(off && off.sum === main.sum && off.n === main.n && off.first === main.first && off.last === main.last);
   GOV.selfTest = {
@@ -11153,8 +11308,14 @@ tr.ants-details table.ants-sub td { color: #bbb; }
   font: inherit;
   -webkit-appearance: none; appearance: none;
 }
-.ants-node-btn-gear { border: none; }
+.ants-node-btn-gear { border: none; position: relative; }
 .ants-node-btn-gear svg { stroke: #AE7719; }
+.ants-node-btn-gear.ants-window-blocked { outline: 2px solid #f04444; outline-offset: 1px; }
+.ants-node-btn-gear.ants-window-blocked::after {
+  content: "!"; position: absolute; right: -6px; top: -7px; width: 13px; height: 13px;
+  border-radius: 50%; background: #b42323; color: #fff; font: bold 10px/13px sans-serif;
+  text-align: center; box-shadow: 0 0 0 1px #1a1a1e;
+}
 .ants-node-btn-tick {
   /* The ring is the same line as the gear's silhouette, in the same colour. */
   border: 1.5px solid #AE7719 !important;
@@ -11500,20 +11661,24 @@ const ui = {
 // route and syncs with the node through a small API (a revision and an origin,
 // so neither side is the master). This is that pattern: /ants_optimizer/window
 // is the page, /ants_optimizer/ui is the link. The page is not moved into the
-// popup, and the popup does not run on the canvas. A blocked popup is the only
-// reason the in-page panel opens.
+// popup, and the popup does not run on the canvas. A blocked open is shown on
+// the gear; there is no in-page panel fallback.
 const ANTS_WINDOW_URL = "/ants_optimizer/window";
 const ANTS_WINDOW_NAME = "ants-optimizer";
 const ANTS_WINDOW_W = 980;
 const ANTS_WINDOW_H = 840;
-const ANTS_WINDOW_BLOCKED = "The browser blocked the separate window. This panel is the fallback. Allow pop-ups for this site, then use Window.";
+const ANTS_WINDOW_BLOCKED = "The detached optimizer window was blocked. There is no in-page fallback; allow this window in the Electron shell and try again.";
 let antsUiSilent = false;
 let antsUiRev = 0;
 let antsUiCommandRev = 0;
 let antsUiTimer = null;
+let uiBridgeScanTimer = null;
 let antsUiHot = false;
 let antsUiOpened = false;
 let antsUiReport = "";
+let antsUiActionResult = "";
+let antsUiFrozenSnapshot = null;
+let antsUiWasHot = false;
 
 function antsUiLimits() {
   return {
@@ -11534,6 +11699,10 @@ function antsUiLimits() {
 }
 
 function antsUiSettings() {
+  const policies = Object.assign({}, GOV.savedPolicies || {});
+  for (const src of GOV.sources.values()) {
+    if (src.policy !== "full") policies[govDisplayKey(src)] = src.policy;
+  }
   return {
     flatBelow: LOD.flatBelow,
     boxDetail: LOD.boxDetail,
@@ -11552,20 +11721,97 @@ function antsUiSettings() {
     foveaMargin: LOD.foveaMargin,
     foveaRestore: LOD.foveaRestore,
     displayScale: LOD.displayScale,
+    drawThrottleMs,
+    syntheticTickMs,
+    governor: { controls: Object.assign({}, GOV.controls), policies },
     enabled: antsEnabled(),
     paused: !!S.paused,
   };
 }
 
+function antsUiDrawingDiagnostics(snapshot) {
+  const canvas = app && app.canvas;
+  const snaps = LOD.snaps;
+  return {
+    renderer: lodVueNodesMode() ? "Vue nodes" : "Canvas/LiteGraph",
+    nodes: {
+      active: lodFlatOn(canvas),
+      threshold: LOD.flatBelow,
+      detail: LOD.boxDetail,
+      flat: LOD.plan.flat,
+      total: LOD.plan.total,
+      simplifiedDraws: LOD.nodes,
+      titles: LOD.boxTitles,
+      errors: LOD.boxErrors,
+      progress: LOD.boxBars,
+      muted: LOD.boxMuted,
+    },
+    links: {
+      style: LOD.linkStyle,
+      thinBelow: LOD.detailZoom,
+      thinned: LOD.thinLinks,
+      calls: LOD.linkCalls,
+      inkMs: LOD.linkMs,
+      connectionsMsPerFrame: snapshot && snapshot.frame ? snapshot.frame.connMsPerFrame : NaN,
+      measurement: LOD.ab && LOD.ab.text ? String(LOD.ab.text) : "",
+    },
+    widgets: {
+      mode: LOD.focusDom,
+      inertBelow: LOD.inertBelow,
+      blocked: LOD.canvasWidgetsBlocked,
+      hoverBlocked: LOD.hoverBlocked,
+      fovea: !!LOD.fovea,
+      foveaElements: LOD.foveaEls,
+      queued: LOD.foveaQueue,
+      restored: LOD.foveaCameBack,
+      display: LOD.display,
+    },
+    snapshots: {
+      wanted: !!LOD.snapOn,
+      active: lodSnapOn(canvas),
+      pathway: lodSnapPathway(canvas),
+      ratio: LOD.snapRatio,
+      budgetMiB: LOD.snapMb,
+      heldRecords: snaps ? snaps.size : 0,
+      served: LOD.snapDrawn,
+      captured: LOD.snapCaptured,
+      misses: LOD.snapMisses,
+      failures: LOD.snapFailed,
+      tooLarge: LOD.snapLarge,
+      fitted: LOD.snapFit,
+      keptLive: LOD.snapKept,
+      bytes: LOD.snapBytes,
+      queued: LOD.snapQueue ? LOD.snapQueue.size : 0,
+      vueBlanked: LOD.vueFlat ? LOD.vueFlat.size : 0,
+      vueIcons: LOD.vueIcons,
+      vueIconSkip: LOD.vueIconSkip,
+      vueSettleHeld: LOD.vueSettleHeld,
+      reasons: (LOD.snapWhy || []).slice(0, 12).map((entry) => ({
+        type: entry.type,
+        title: entry.title,
+        why: entry.why,
+      })),
+    },
+    migrations: {
+      legacyPixels: LOD.legacyPx,
+      automaticLinkStyle: !!LOD.autoLinkCarried,
+    },
+  };
+}
+
 function antsUiTelemetry() {
-  let snapshot = null;
-  try {
-    snapshot = buildSnapshot();
-  } catch (e) {
-    snapshot = null;
+  let snapshot = antsUiFrozenSnapshot;
+  if (antsEnabled() || !snapshot) {
+    try {
+      snapshot = buildSnapshot();
+      antsUiFrozenSnapshot = snapshot;
+    } catch (e) {
+      snapshot = null;
+    }
   }
   const tel = {
     snapshot,
+    actionResult: antsUiActionResult,
     drawing: {
       version: VERSION,
       enabled: antsEnabled(),
@@ -11583,6 +11829,7 @@ function antsUiTelemetry() {
       diskSaved: LOD.diskSaved,
       diskDir: LOD.diskDir || "",
       ab: LOD.ab && LOD.ab.text ? String(LOD.ab.text) : "",
+      diagnostics: antsUiDrawingDiagnostics(snapshot),
     },
   };
   if (antsUiReport) {
@@ -11624,6 +11871,18 @@ function antsUiPublishTelemetry() {
   }
 }
 
+function antsUiApplyGovernor(settings) {
+  if (!settings || typeof settings !== "object") return;
+  const controls = settings.controls && typeof settings.controls === "object" ? settings.controls : {};
+  for (const key of Object.keys(GOV.controls)) {
+    if (key in controls && controls[key] !== GOV.controls[key]) govSetControl(key, controls[key]);
+  }
+  const policies = settings.policies && typeof settings.policies === "object" ? settings.policies : {};
+  for (const [key, policy] of Object.entries(policies)) {
+    if (GOV_POLICY_BY_ID.has(policy)) govSetPolicy(key, policy);
+  }
+}
+
 function antsUiApplySettings(settings) {
   if (!settings || typeof settings !== "object") return;
   const o = {};
@@ -11638,6 +11897,9 @@ function antsUiApplySettings(settings) {
   try {
     if ("enabled" in settings && !!settings.enabled !== antsEnabled()) antsSetEnabled(!!settings.enabled);
     if (Object.keys(o).length) lodSet(o);
+    if ("drawThrottleMs" in settings) setCap(Number(settings.drawThrottleMs) || 0);
+    if ("syntheticTickMs" in settings) setSyntheticTick(Number(settings.syntheticTickMs) || 0);
+    if (settings.governor) antsUiApplyGovernor(settings.governor);
     if ("paused" in settings && !!settings.paused !== !!S.paused) togglePause();
   } catch (e) {
     /* a bad payload must not break the page that is drawing */
@@ -11658,21 +11920,89 @@ function antsUiApplyRemote(body) {
   const cr = Number(body.commandRev) || 0;
   if (cr === antsUiCommandRev || body.origin === "page" || !body.command) return;
   antsUiCommandRev = cr;
-  const label = String(body.commandLabel || "");
+  const command = String(body.command || "");
+  const label = String(body.commandLabel || body.label || "");
+  const data = body.commandData && typeof body.commandData === "object" ? body.commandData :
+    body.data && typeof body.data === "object" ? body.data : {};
+  antsUiActionResult = "";
+  const requiresEnabled = new Set(["measure-links", "governor-suggest", "worker-self-test", "benchmark"]);
+  if (!S.enabled && requiresEnabled.has(command)) {
+    const names = {
+      "measure-links": "link-thinning measurement",
+      "governor-suggest": "limit suggestions",
+      "worker-self-test": "worker sanity check",
+      benchmark: "scripted pan benchmark",
+    };
+    antsUiActionResult = `Optimizer is off; ${names[command]} was not started.`;
+    return;
+  }
   try {
-    if (body.command === "measure-links") lodAbStart();
-    else if (body.command === "reset") resetAllStats();
-    else if (body.command === "report") antsUiReport = buildTelemetryReport();
-    else if (body.command === "mute" && label && !S.muted.has(label)) toggleMute(label);
-    else if (body.command === "unmute" && label && S.muted.has(label)) toggleMute(label);
+    if (command === "measure-links") {
+      lodAbStart();
+      antsUiActionResult = "Link-thinning measurement started on the ComfyUI page.";
+    } else if (command === "reset") {
+      resetAllStats();
+      antsUiActionResult = "Samples cleared.";
+    } else if (command === "report") {
+      // An explicit report request intentionally takes a fresh snapshot even
+      // while ordinary telemetry is frozen by the master-off switch.
+      antsUiReport = buildTelemetryReport();
+      antsUiActionResult = "Fresh report ready to copy.";
+    } else if (command === "mute" && label && !S.muted.has(label)) {
+      toggleMute(label);
+      antsUiActionResult = `Muted ${label}.`;
+    } else if (command === "unmute" && label && S.muted.has(label)) {
+      toggleMute(label);
+      antsUiActionResult = `Unmuted ${label}.`;
+    } else if (command === "unmute-all") {
+      clearMutes();
+      antsUiActionResult = "All hook limits are unmuted.";
+    } else if (command === "governor-reset") {
+      govReset();
+      antsUiActionResult = "Governor policies and controls reset to normal.";
+    } else if (command === "governor-suggest") {
+      const suggested = govSuggest();
+      antsUiActionResult = suggested.length ? suggested.join("; ") : "No measured source needs a suggested limit.";
+    } else if (command === "governor-off") {
+      govUninstall("turned off from the detached window");
+      antsUiActionResult = "Governor scheduling is off until this page reloads.";
+    } else if (command === "worker-self-test") {
+      Promise.resolve(govRunSelfTest()).then((result) => {
+        antsUiActionResult = result && result.match
+          ? `Worker answers match; main ${fmtMs(result.mainMs, 1)} ms, worker ${fmtMs(result.workerMs, 1)} ms.`
+          : `Worker sanity check unavailable: ${(result && result.error) || "answers did not match"}.`;
+      }).catch((e) => {
+        antsUiActionResult = `Worker sanity check failed: ${(e && e.message) || String(e)}.`;
+      });
+      antsUiActionResult = "Worker sanity check running…";
+    } else if (command === "governor-clear-traces") {
+      GOV.traces.length = 0;
+      GOV.traceVersion++;
+      antsUiActionResult = "Long-frame traces cleared.";
+    } else if (command === "benchmark") {
+      const slot = data.slot === "B" ? "B" : "A";
+      const duration = Math.max(100, Number(data.durationMs) || 6000);
+      antsUiActionResult = runScriptedPan(duration, slot)
+        ? `Scripted pan ${slot} started.`
+        : "Scripted pan was not started; check the active page and benchmark state.";
+    } else if (command === "memory-baseline") {
+      if (performance.memory) {
+        memBaseline = performance.memory.usedJSHeapSize;
+        memBaselineAt = nowMs();
+        antsUiActionResult = "Memory baseline set.";
+      } else antsUiActionResult = "Memory baseline unavailable in this renderer.";
+    } else if (command === "memory-clear-baseline") {
+      memBaseline = null;
+      memBaselineAt = 0;
+      antsUiActionResult = "Memory baseline cleared.";
+    }
   } catch (e) {
-    /* the command can be sent again */
+    antsUiActionResult = `Action failed: ${(e && e.message) || String(e)}.`;
   }
 }
 
 function antsWindowLive() {
-  const child = ui.popout;
-  if (child && child.closed) ui.popout = null;
+  antsHandleClosedWindow();
   if (ui.popout && !ui.popout.closed) return true;
   return antsUiOpened || antsUiHot;
 }
@@ -11698,16 +12028,15 @@ async function antsUiPump() {
     if (res && res.ok && typeof res.json === "function") {
       const body = await res.json();
       antsUiApplyRemote(body);
+      const wasHot = antsUiHot;
       const age = body && body.heardAge;
       antsUiHot = typeof age === "number" && age >= 0 && age < 3;
-      if (ui.popout && ui.popout.closed) {
-        ui.popout = null;
-        antsUiOpened = false;
-      }
+      antsHandleClosedWindow();
+      if (wasHot && !antsUiHot && !ui.popout) antsStopTemporaryTesting();
       if (antsWindowLive()) await antsUiPublishTelemetry();
     }
   } catch (e) {
-    /* no route, no bus — the in-page panel still works */
+    /* no route or detached window: there is deliberately no in-page fallback */
   }
 }
 
@@ -11717,10 +12046,8 @@ function antsUiStart() {
 
 function antsSayBlocked(text) {
   LOD.popoutNote = text || "";
-  if (ui.popNote) {
-    ui.popNote.style.display = text ? "" : "none";
-    ui.popNote.textContent = text || "";
-  }
+  for (const gear of [...ANTS_GEAR_BUTTONS]) antsSetGearStatus(gear);
+  if (text) console.warn(`[ANTs Tracker] ${text}`);
 }
 
 function antsWindowBox() {
@@ -11781,39 +12108,60 @@ function antsTryOpenWindow() {
     /* the window polls; a missed first post is not a failed open */
   }
   antsUiStart();
-  if (ui.panel && ui.panel.classList.contains("open") && !ui.panel.classList.contains("ants-docked")) {
-    togglePanel(false);
-  }
   return true;
 }
 
 function antsOpenFromGear() {
-  if (antsFocusWindow()) return;
-  if (typeof window.open === "function") {
-    if (antsTryOpenWindow()) return;
-    togglePanel(true);
-    antsSayBlocked(ANTS_WINDOW_BLOCKED);
-    return;
-  }
-  togglePanel();
+  if (antsTryOpenWindow()) return true;
+  antsSayBlocked(ANTS_WINDOW_BLOCKED);
+  return false;
 }
 
 function antsOpenFromApi() {
-  if (antsFocusWindow()) return;
-  if (typeof window.open === "function") {
-    if (antsTryOpenWindow()) return;
-    togglePanel(true);
-    antsSayBlocked(ANTS_WINDOW_BLOCKED);
-    return;
-  }
-  togglePanel(true);
+  if (antsTryOpenWindow()) return true;
+  antsSayBlocked(ANTS_WINDOW_BLOCKED);
+  return false;
 }
 
 function antsPopout() {
   if (antsTryOpenWindow()) return true;
-  togglePanel(true);
   antsSayBlocked(ANTS_WINDOW_BLOCKED);
   return false;
+}
+
+function antsStopTemporaryTesting() {
+  try { stopScriptedPan("detached window closed"); } catch (e) { /* best effort */ }
+  try { if (LOD.ab && !LOD.ab.done) lodAbStop("measurement stopped because the detached window closed"); } catch (e) { /* best effort */ }
+  try { setCap(0); } catch (e) { /* best effort */ }
+  try { setSyntheticTick(0); } catch (e) { /* best effort */ }
+}
+
+function antsWindowClose() {
+  const child = ui.popout;
+  if (!child) return false;
+  try {
+    if (!child.closed && typeof child.close === "function") child.close();
+  } catch (e) {
+    /* a shell may disallow closing; the window can still close itself */
+  }
+  if (child.closed || typeof child.close === "function") {
+    ui.popout = null;
+    antsUiOpened = false;
+    antsUiHot = false;
+    antsStopTemporaryTesting();
+    return true;
+  }
+  return false;
+}
+
+function antsHandleClosedWindow() {
+  const child = ui.popout;
+  if (!child || !child.closed) return false;
+  ui.popout = null;
+  antsUiOpened = false;
+  antsUiHot = false;
+  antsStopTemporaryTesting();
+  return true;
 }
 
 // A right-anchored panel grows to the left when its width changes, which is the
@@ -14117,14 +14465,20 @@ const BENCH_PRESETS = [
   { label: "10 seconds", ms: 10000, picked: false },
 ];
 
-function setSyntheticTick(ms) {
-  syntheticTickMs = ms;
-  if (syntheticTickTimer) {
-    clearInterval(syntheticTickTimer);
-    syntheticTickTimer = null;
+function stopSyntheticTickTimer() {
+  if (syntheticTickTimer !== null) {
+    try { clearInterval(syntheticTickTimer); } catch (e) { /* best effort */ }
   }
-  if (ms > 0) {
+  syntheticTickTimer = null;
+}
+
+function setSyntheticTick(ms) {
+  syntheticTickMs = Math.max(0, Number(ms) || 0);
+  stopSyntheticTickTimer();
+  if (!S.enabled || syntheticTickMs <= 0) return syntheticTickMs;
+  try {
     syntheticTickTimer = govOwn(() => setInterval(() => {
+      if (!S.enabled) return;
       try {
         if (app.canvas && typeof app.canvas.setDirty === "function") app.canvas.setDirty(true, true);
         else if (app.canvas && typeof app.canvas.draw === "function") app.canvas.draw(true, true);
@@ -14132,8 +14486,24 @@ function setSyntheticTick(ms) {
       } catch (e) {
         warnOnce("synthetic-tick-error", `Forced redraw failed: ${e && e.message}`);
       }
-    }, ms));
+    }, syntheticTickMs));
+  } catch (e) {
+    syntheticTickTimer = null;
   }
+  return syntheticTickMs;
+}
+
+function setCap(ms) {
+  drawThrottleMs = Math.max(0, Number(ms) || 0);
+  if (drawThrottleMs === 0 && capTrailingTimer !== null) {
+    try { clearTimeout(capTrailingTimer); } catch (e) { /* best effort */ }
+    capTrailingTimer = null;
+  }
+  if (!S.enabled && capTrailingTimer !== null) {
+    try { clearTimeout(capTrailingTimer); } catch (e) { /* best effort */ }
+    capTrailingTimer = null;
+  }
+  return drawThrottleMs;
 }
 
 function benchLine(r) {
@@ -14175,11 +14545,7 @@ function buildTestingTab(container) {
   }
   capSelect.value = String(drawThrottleMs);
   capSelect.addEventListener("change", () => {
-    drawThrottleMs = Number(capSelect.value);
-    if (drawThrottleMs === 0 && capTrailingTimer) {
-      clearTimeout(capTrailingTimer);
-      capTrailingTimer = null;
-    }
+    setCap(Number(capSelect.value));
     update();
   });
   capWrap.appendChild(capSelect);
@@ -14356,23 +14722,53 @@ function buildTestingTab(container) {
   ui.state.testing = { update };
 }
 
+let scriptedPanRun = null;
+
+function stopScriptedPan(reason) {
+  const run = scriptedPanRun;
+  if (!run) return false;
+  run.stopped = true;
+  if (run.handle !== null) {
+    try { if (typeof cancelAnimationFrame === "function") cancelAnimationFrame(run.handle); } catch (e) { /* best effort */ }
+  }
+  run.handle = null;
+  if (run.ds && run.ds.offset) {
+    run.ds.offset[0] = run.x0;
+    run.ds.offset[1] = run.y0;
+  }
+  scriptedPanRun = null;
+  S.benchActive = null;
+  try {
+    if (run.canvas && typeof run.canvas.setDirty === "function") run.canvas.setDirty(true, true);
+  } catch (e) { /* the original viewport is already restored */ }
+  if (ui.state.testing) ui.state.testing.update();
+  if (reason) antsUiActionResult = `Benchmark stopped: ${reason}.`;
+  return true;
+}
+
 function runScriptedPan(durationMs, slot) {
+  if (!S.enabled) return false;
   const canvas = app.canvas;
   if (!canvas || !canvas.ds || typeof requestAnimationFrame !== "function") {
     warnOnce("no-bench", "Scripted pan benchmark unavailable: app.canvas.ds was not found in this frontend version.");
-    return;
+    return false;
   }
-  if (S.benchActive) return;
+  if (S.benchActive || scriptedPanRun) return false;
   const ds = canvas.ds;
   const t0 = nowMs();
   const x0 = ds.offset ? ds.offset[0] : 0;
   const y0 = ds.offset ? ds.offset[1] : 0;
+  const duration = Math.max(100, Number(durationMs) || 6000);
+  const benchSlot = slot === "B" ? "B" : "A";
   const span = benchSpan(canvas);
   let foveaPeak = 0;
-  S.benchActive = { t0, durationMs };
+  const run = { canvas, ds, x0, y0, t0, durationMs: duration, handle: null, stopped: false };
+  scriptedPanRun = run;
+  S.benchActive = { t0, durationMs: duration };
   if (ui.state.testing) ui.state.testing.update();
 
   const finish = () => {
+    if (run.stopped || scriptedPanRun !== run) return;
     if (ds.offset) {
       ds.offset[0] = x0;
       ds.offset[1] = y0;
@@ -14399,29 +14795,34 @@ function runScriptedPan(durationMs, slot) {
       nodes: graphNodeCount(),
     };
     if (!S.bench) S.bench = { A: null, B: null };
-    S.bench[slot] = result;
+    S.bench[benchSlot] = result;
+    run.handle = null;
+    scriptedPanRun = null;
     S.benchActive = null;
-    if (typeof canvas.setDirty === "function") canvas.setDirty(true, true);
+    if (S.enabled && typeof canvas.setDirty === "function") canvas.setDirty(true, true);
     if (ui.state.testing) ui.state.testing.update();
   };
 
   const step = () => {
+    run.handle = null;
+    if (run.stopped || scriptedPanRun !== run || !S.enabled) return;
     const elapsed = nowMs() - t0;
     if (ds.offset) {
-      const phase = (elapsed / durationMs) * Math.PI * 2;
+      const phase = (elapsed / duration) * Math.PI * 2;
       ds.offset[0] = x0 + Math.sin(phase) * span.x;
       ds.offset[1] = y0 + Math.sin(phase * 2) * span.y;
     }
     if (LOD.foveaEls > foveaPeak) foveaPeak = LOD.foveaEls;
     if (typeof canvas.setDirty === "function") canvas.setDirty(true, true);
     else if (typeof canvas.draw === "function") canvas.draw(true, true);
-    if (elapsed >= durationMs) {
+    if (elapsed >= duration) {
       finish();
       return;
     }
-    govOwn(() => requestAnimationFrame(step));
+    run.handle = govOwn(() => requestAnimationFrame(step));
   };
-    govOwn(() => requestAnimationFrame(step));
+  run.handle = govOwn(() => requestAnimationFrame(step));
+  return true;
 }
 
 function graphNodeCount() {
@@ -15062,11 +15463,27 @@ function buildTabContents() {
 // Periodic sweep. Two jobs, both about keeping the window honest:
 //   * trim bucketed rings by wall-clock time even when their owner stopped
 //     being called (v1 could not age out an idle extension at all);
-//   * roll the tracker's own cost counters over so the panel can show them.
+//   * roll the tracker's own cost counters over so the report can show them.
 // It never deletes a hook bucket: a wrapped hook holds that object, and v1's
 // delete-after-4-seconds-of-quiet is precisely why an extension could vanish
 // from the Timing tab for the rest of the session while still drawing.
+let staleSweepTimer = null;
+
+function startStaleSweep() {
+  if (!S.enabled || staleSweepTimer !== null) return;
+  try { staleSweepTimer = govOwn(() => setInterval(sweepStaleData, SWEEP_MS)); }
+  catch (e) { staleSweepTimer = null; }
+}
+
+function stopStaleSweep() {
+  if (staleSweepTimer !== null) {
+    try { clearInterval(staleSweepTimer); } catch (e) { /* best effort */ }
+  }
+  staleSweepTimer = null;
+}
+
 function sweepStaleData() {
+  if (!S.enabled) return;
   const t0 = performance.now();
   const now = nowMs();
   if (!S.paused) {
@@ -15150,22 +15567,11 @@ function stopRefresh() {
 }
 
 function togglePanel(force) {
-  buildPanel();
-  buildTabContents();
-  const shouldOpen = force !== undefined ? force : !ui.panel.classList.contains("open");
-  ui.panel.classList.toggle("open", shouldOpen);
-  if (shouldOpen) {
-    // Opening the panel, from the node or the floating gear, lands on the
-    // rendering settings. A tab picked while it is open stays until it closes.
-    ui.active = "";
-    setTab("tweaks");
-    renderSummary();
-    updateActiveTab();
-    startRefresh();
-    if (ui.active === "gpu") refreshGpu();
-  } else {
-    stopRefresh();
-  }
+  // Retired: the ComfyUI document is headless apart from its power switch and
+  // detached-window gear. A blocked window must remain a visible error, never a
+  // reason to reconstruct this page's old settings panel.
+  if (ui.refreshTimer != null) stopRefresh();
+  return false;
 }
 
 function togglePause() {
@@ -15335,8 +15741,8 @@ function buildCornerPill() {
     id: "ants-corner-btn",
     class: "ants-node-btn ants-node-btn-gear",
     type: "button",
-    title: "ANTs Frontend Optimizer — click to open the separate window, press and hold to move this button. If the browser blocks the window, the panel on this page opens instead.",
   });
+  antsSetGearStatus(gear);
   const glyph = antsGearSvg();
   if (glyph) gear.appendChild(glyph);
   gear.addEventListener("click", (ev) => {
@@ -15406,6 +15812,7 @@ function buildSnapshot() {
     settings: {
       windowMs: WINDOW_MS,
       frameWindowMs: fm.windowMs,
+      enabled: S.enabled,
       paused: S.paused,
       capMs: drawThrottleMs,
       synthTickMs: syntheticTickMs,
@@ -15418,6 +15825,16 @@ function buildSnapshot() {
     invalidation: { perSec: inv.perSec, perRaf: inv.perRaf, sources: inv.sources.slice(0, 12) },
     stalls: { perSec: stalls.perSec, blockingMsPerSec: stalls.blockingMsPerSec, worst: stalls.worst, total: stalls.total, sources: stalls.rows.slice(0, 12) },
     load: load.slice(0, 30),
+    testing: {
+      draws: S.counters.framesTotal,
+      capped: S.counters.capped,
+      deferred: S.counters.deferred,
+      mutedCalls: S.counters.skippedWhileMuted,
+      wrappedHooks: S.counters.wrappedHooks,
+      preTrackedHooks: S.counters.preTrackedHooks,
+      instanceHooks: S.counters.instanceHooks,
+      benchActive: S.benchActive ? { durationMs: S.benchActive.durationMs, elapsedMs: nowMs() - S.benchActive.t0 } : null,
+    },
     memory: mem
       ? {
           used: mem.usedJSHeapSize,
@@ -15621,7 +16038,7 @@ function buildTelemetryReport() {
     }
     if (gv.inert && gv.inert.count) {
       lines.push(
-        `  ${gv.inert.count} limited source(s) are not affected by their own limit: it is narrower than how far apart their runs already are ` +
+        `  ${gv.inert.count} limited source(s) are unaffected by their own limit: it is narrower than how far apart their runs already are ` +
           `(${Math.round(gv.inert.msPerSec)} ms/s still on the main thread). Use 2/s or 1/s for a chain that slow.`
       );
     }
@@ -15733,13 +16150,14 @@ function installDebugApi() {
         };
       },
       open: () => antsOpenFromApi(),
-      close: () => togglePanel(false),
+      close: () => antsWindowClose(),
       popout: () => antsPopout(),
       // The separate window's control link, so a test can apply a payload the
       // window would have posted without standing up the route.
       link: {
         settings: () => antsUiSettings(),
         limits: () => antsUiLimits(),
+        telemetry: () => antsUiTelemetry(),
         apply: (body) => antsUiApplyRemote(body),
       },
       ramCheck: () => lodRamCheck(),
@@ -15760,9 +16178,7 @@ function installDebugApi() {
       },
       clearMutes,
       reset: () => resetAllStats(),
-      setCap: (ms) => {
-        drawThrottleMs = Number(ms) || 0;
-      },
+      setCap: (ms) => setCap(ms),
       // Low-zoom drawing: the opt-in that makes the canvas cheaper per frame
       // instead of less frequent. Also driven from the Nodes tab.
       lowZoom: {
@@ -16145,35 +16561,37 @@ app.registerExtension({
       /* the check is a report, not a dependency */
     }
     buildCornerButton();
-    installStallObserver();
-    installRafMonitor();
-    installMemorySampler();
-    govOwn(() => setInterval(sweepStaleData, SWEEP_MS));
-    // Node types keep arriving as packs register, so re-scan for hooks that
-    // never went through this tool's beforeRegisterNodeDef wrapper.
-    // The same interval that scans for late node types also asks whether the
-    // separate window is open. No extra timer: a timer registered at startup
-    // spends one of the attribution tokens the governor has for other packs.
-    govOwn(() => setInterval(() => {
-      scanRegisteredTypes();
-      if (!antsUiTimer) antsUiPump();
-    }, 2000));
-    govOwn(() => setInterval(() => {
-      if (ui.built && ui.panel.classList.contains("open") && ui.active === "gpu") refreshGpu();
-    }, 2500));
-    try {
-      lodThumbDiskSweep();
-    } catch (e) {
-      /* the disk cache is optional; a missing route leaves the memory cache */
+    if (S.enabled) {
+      installStallObserver();
+      installRafMonitor();
+      installMemorySampler();
+      startStaleSweep();
+      govStartAutoPilot();
     }
-    try {
-      lodInstallRamWatch();
-    } catch (e) {
-      /* a run with no execution events simply does not release stand-ins */
+    // Keep the small bridge alive while the detached window is open, even when
+    // optimizer work is suspended, so its power control can turn work back on.
+    // Node-type scanning itself pauses with the master switch.
+    if (uiBridgeScanTimer === null) {
+      uiBridgeScanTimer = govOwn(() => setInterval(() => {
+        if (S.enabled) scanRegisteredTypes();
+        if (!antsUiTimer) antsUiPump();
+      }, 2000));
+    }
+    if (S.enabled) {
+      try {
+        lodThumbDiskSweep();
+      } catch (e) {
+        /* the disk cache is optional; a missing route leaves the memory cache */
+      }
+      try {
+        lodInstallRamWatch();
+      } catch (e) {
+        /* a run with no execution events simply does not release stand-ins */
+      }
     }
     console.info(
-      `[ANTs Tracker] v${VERSION} running. The gear opens the separate window; if the browser blocks it, the panel on this page opens instead. ` +
-        "window.__antsTracker.snapshot / .report give the same data from the console."
+      `[ANTs Tracker] v${VERSION} running. The gear opens the detached optimizer window; a blocked open has no in-page fallback. ` +
+        "window.__antsTracker.snapshot / .report remain available for diagnostics."
     );
   },
 
@@ -16186,10 +16604,10 @@ app.registerExtension({
     const onNodeCreated = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function () {
       const ret = onNodeCreated ? onNodeCreated.apply(this, arguments) : undefined;
-      // The pill: a master switch and the gear that opens the panel, side by side
-      // in one rounded frame. Marked .ants-own, so no low-zoom sweep can hide it —
-      // it is the control that switches the tool off, so it has to be there when
-      // everything else has been switched off.
+      // The pill: a master switch and the gear that opens the detached window,
+      // side by side in one rounded frame. Marked .ants-own, so no low-zoom sweep
+      // can hide it — it is the control that switches the tool off, so it has to
+      // be there when everything else has been switched off.
       antsAttachNodeWidget(this);
       antsUnlockNode(this);
       try {
@@ -16409,7 +16827,7 @@ app.registerExtension({
 //    (a revision and an origin, so neither side is the master), which means it
 //    shows the live numbers only while the ComfyUI page is open and answering;
 //    with that page gone the window says so instead of pretending. A blocked
-//    popup leaves the in-page panel as the fallback and says why.
+//    popup is shown on the gear and never opens an in-page fallback.
 //  * Worker functions cannot capture closures, which is why the lane takes a
 //    job name (or a self-contained function source) plus structured-cloneable
 //    arguments and nothing else.

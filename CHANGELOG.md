@@ -4,6 +4,37 @@ Version history for ANTs_ComfyUI_Frontend_Performance_Tracker. Newest first.
 The current behaviour is in `README.md`; the reasoning behind each release is in
 `memory.md`; the rules for changing the code are in `CLAUDE.md`.
 
+## What changed in v2.7.6
+
+- **The detached window is now the only settings and metrics UI.** The ComfyUI
+  page and the workflow node retain only the compact power switch and gear that
+  opens `/ants_optimizer/window`. The retired in-page panel is not constructed
+  and is never a fallback when the shell blocks a detached-window launch; the
+  gear marks a blocked open visibly. Governor, Load, Memory, GPU / VRAM and
+  Testing now live in the detached window alongside the rendering controls.
+- **Master-off suspends optimizer work.** It freezes the last telemetry snapshot,
+  stops sampling/optimizer timers and temporary benchmarks, releases deferred
+  callbacks and page changes, and retains selected settings for re-enable. The
+  detached GPU tab checks the same enabled state before polling. Governor worker
+  offloads and their self-test now return without starting work while disabled.
+- **The detached Status tab carries rendering diagnostics.** Renderer, node-box
+  marks, link-ink versus connection-stage timings, widget focus, snapshot status,
+  migration notes and bounded “not pictured” reasons are carried over the page / window
+  bridge. The bridge now carries command data only for the benchmark fields that
+  consume it; unrelated command payloads are discarded.
+- **The headless workflow node has no text-button fallback.** Where a frontend
+  cannot host the compact DOM widget, the node remains headless and the floating
+  pill remains the only control.
+- **Not claimed as resolved:** the user reports the warning badge still appears
+  incorrectly in Nodes 2.0 in their custom Electron shell; the badge regression
+  only verifies the harness, not that shell's pixels. The user also reports that
+  Timing is empty after active panning / zooming; metric-window tests do not prove
+  live Timing rows. Neither symptom was checked or fixed in this pass.
+- **Verification:** `node tests/run-tests.mjs` — **229 passed**;
+  `python -m unittest discover -s tests -p 'test_*.py'` — **9 passed**.
+  Pytest is not installed in this environment. No live Electron shell or pixel
+  comparison was run.
+
 ## What changed in v2.7.5
 
 - **The warning badge is a live-fallback indicator only.** A flat box shown while a

@@ -122,6 +122,7 @@ export function createHarness(options = {}) {
       },
     },
   };
+  const openedWindows = [];
   const windowShim = {
     innerWidth: 1920,
     innerHeight: 1080,
@@ -143,6 +144,24 @@ export function createHarness(options = {}) {
       }
     },
   };
+  if (opts.openWindow) {
+    windowShim.open = (url, name, features) => {
+      if (opts.blockWindowOpen) return null;
+      const child = {
+        url,
+        name,
+        features,
+        closed: false,
+        focused: false,
+        focus() { this.focused = true; },
+        moveTo(x, y) { this.position = [x, y]; },
+        resizeTo(w, h) { this.size = [w, h]; },
+        close() { this.closed = true; },
+      };
+      openedWindows.push(child);
+      return child;
+    };
+  }
 
   // ---------------------------------------------------------- fake ComfyUI --
   const consoleCalls = [];
@@ -995,6 +1014,7 @@ export function createHarness(options = {}) {
     LiteGraph: LiteGraphShim,
     document,
     window: windowShim,
+    openedWindows,
     localStorage,
     sandbox,
     tracker,

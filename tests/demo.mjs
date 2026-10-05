@@ -1,12 +1,13 @@
-// Prints what the v2 panel actually says, without ComfyUI, a browser, or a GPU.
+// Prints the same copyable telemetry report served to the detached optimizer,
+// without ComfyUI, a browser, or a GPU.
 //
 //   node tests/demo.mjs
 //
 // The graph is synthetic (four node types, two extension packs, a status
-// heartbeat and a long animation frame per second), but every number below is
-// produced by web/tracker.js going through its real code paths: real hook
-// wrapping, real per-frame accounting, real sampled stacks, real panel DOM.
-// Use it to see what the panel reports and to eyeball changes to the UI.
+// heartbeat and a long animation frame per second), but every number is
+// produced by web/tracker.js through its real hook wrapping, per-frame
+// accounting, sampled stacks, and report builder. The detached page's controls
+// and tab layout live in web/window.html; the ComfyUI page has no settings panel.
 //
 // Nothing here is a benchmark of ComfyUI itself — the costs are simulated with
 // the harness clock (`h.busy`), so treat the magnitudes as illustrative and the
@@ -63,7 +64,7 @@ niceNode.onDrawBackground = function (...args) {
   return NiceThing.prototype.onDrawBackground.apply(this, args);
 };
 h.canvas.nodes = nodes;
-h.app.graph._nodes = nodes; // what the panel counts and the Nodes tab walks
+h.app.graph._nodes = nodes; // the graph source the report and detached Nodes tab read
 
 h.canvas.costs = { background: 0.35, connections: 1.2, chrome: 0.4 };
 
@@ -89,7 +90,7 @@ h.fetchRoutes.set("/ants_tracker/gpu", {
 
 // --------------------------------------------------------- the bad citizen ---
 // A page script that asks for a redraw on its own clock. Its real URL is what
-// the panel attributes the requests to, via the sampled setDirty stack.
+// the report attributes the requests to, via the sampled setDirty stack.
 vm.runInContext(
   `globalThis.__nastyTick = function () { __ants.app.canvas.setDirty(true, true); };`,
   h.sandbox,
@@ -110,7 +111,6 @@ vm.runInContext(
 // ------------------------------------------------------------------- drive ---
 for (const ext of h.app.extensions) if (ext.setup) await ext.setup();
 await h.flush();
-h.document.getElementById("ants-corner-btn").click(); // open the panel
 
 let nextStallAt = 0;
 function run(wallMs) {
@@ -203,60 +203,6 @@ const rule = (ch = "-") => ch.repeat(WIDTH);
 function bullets(title) {
   console.log(`\n${rule("=")}\n${title}\n${rule("=")}`);
 }
-
-// The shim has no layout engine, so "render" here means: walk the subtree and
-// emit one line per block, joining inline children into their parent's line.
-const INLINE = new Set(["SPAN", "B", "CODE", "EM", "I", "SMALL", "A", "BR"]);
-const pad = (d) => "  ".repeat(d);
-
-function textWithoutTables(node) {
-  if (node.tagName === "TABLE") return "";
-  if (node.tagName === "SELECT") return node.value || "(unset)";
-  return [node._text, ...node.children.map(textWithoutTables)].join(" ").replace(/\s+/g, " ").trim();
-}
-
-function linesOf(node, depth = 0) {
-  const tag = node.tagName;
-  // The shim has no layout, so hidden blocks are skipped by hand: the printer
-  // should show what the user sees, not what is merely in the DOM.
-  if (node.style && node.style.display === "none") return [];
-  if (node._cls && node._cls.has("ants-more") && node.style && node.style.display === "none") return [];
-  if (tag === "TABLE" || tag === "THEAD" || tag === "TBODY") {
-    return node.children.flatMap((c) => linesOf(c, depth));
-  }
-  if (tag === "TR") {
-    const out = [`${pad(depth)}| ${node.children.map((c) => textWithoutTables(c)).join(" | ")} |`];
-    for (const cell of node.children) {
-      for (const nested of cell.children) if (nested.tagName === "TABLE") out.push(...linesOf(nested, depth + 1));
-    }
-    return out;
-  }
-  if (tag === "SELECT") return [`${pad(depth)}[ select: ${node.value || "(unset)"} ]`];
-  const inline = node.children.filter((c) => INLINE.has(c.tagName));
-  const blocks = node.children.filter((c) => !INLINE.has(c.tagName));
-  const out = [];
-  const own = [node._text, ...inline.map((c) => c.textContent)].join(" ").replace(/\s+/g, " ").trim();
-  if (own) out.push(`${pad(depth)}${own}`);
-  for (const b of blocks) out.push(...linesOf(b, depth + 1));
-  return out;
-}
-
-function dump(container) {
-  if (!container) return;
-  for (const line of linesOf(container)) if (line.trim()) console.log(line);
-}
-
-// Expand the two heaviest owners, plus anything tagged nested, so the per-hook
-// breakdown (including the nested-call accounting) is in the output.
-const rowsToOpen = h.document.body
-  .descendants()
-  .filter((n) => n.tagName === "TR")
-  .filter((tr, i) => i < 2 || tr.textContent.includes("nested"));
-for (const tr of rowsToOpen) {
-  const caret = tr.descendants().find((n) => n._cls && n._cls.has("ants-caret"));
-  if (caret) caret.click();
-}
-await pump();
 
 // ------------------------------------------------------- low-zoom drawing ---
 // The other half of the answer for a big graph: at zoom 0.10 every node is on
@@ -499,7 +445,7 @@ const floatPill = h.document.getElementById("ants-corner-pill");
 const floatButtons = floatPill ? floatPill.children.filter((c) => c.tagName === "BUTTON") : [];
 console.log(
   `  the floating pill: ${floatButtons.length} button(s) (${floatButtons.map((b) => b.tagName + "." + [...b._cls].join(".")).join(", ")}), ` +
-    `marked own: ${floatPill ? floatPill._cls.has("ants-own") : "no pill"}, the panel's own button: ` +
+    `marked own: ${floatPill ? floatPill._cls.has("ants-own") : "no pill"}, the detached-window gear: ` +
     `${h.document.getElementById("ants-corner-btn") === floatButtons[1] ? "the gear" : "MISSING"}`
 );
 
@@ -525,7 +471,6 @@ console.log(
 // recorded, nothing drawn differently, every element handed back.
 const framesBefore = h.tracker.totals.frames;
 h.tracker.lowZoom.setEnabled(false);
-const panelWasOpen = !!(h.panel() && h.panel()._cls.has("open"));
 h.canvas.ds.scale = 0.1;
 const wrapperAfter = [...demoWidget._cls].join("+");
 for (let i = 0; i < 5; i++) {
@@ -539,10 +484,9 @@ console.log(
     `${h.tracker.lowZoom.state.inertBelow}, fovea ${h.tracker.lowZoom.state.fovea}`
 );
 console.log(
-  `  and the UI is still there: float pill ${floatPill ? "present" : "GONE"}, ` +
+  `  and the in-page controls remain available: float pill ${floatPill ? "present" : "GONE"}, ` +
     `hidden or inert ${floatPill ? floatPill._cls.has("ants-lod-box") || floatPill._cls.has("ants-lod-inert") : "n/a"}, ` +
-    `switch reads ${floatButtons[0] ? floatButtons[0].getAttribute("aria-checked") : "n/a"}, ` +
-    `panel open before/after: ${panelWasOpen}/${!!(h.panel() && h.panel()._cls.has("open"))}`
+    `power reads ${floatButtons[0] ? floatButtons[0].getAttribute("aria-checked") : "n/a"}; no settings panel is constructed`
 );
 h.tracker.lowZoom.setEnabled(true);
 console.log(`  switched on again: ${h.tracker.lowZoom.on ? "the same settings are in force" : "NOTHING is in force (a bug)"}`);
@@ -626,8 +570,8 @@ h.canvas.nodes[2].pos = [shown[0] + shown[2] * 0.6, shown[1] + 40];
 placeViewport();
 h.tracker.lowZoom.set({ fovea: false });
 
-// The measured answer to "does thinning do anything on this page": the panel
-// button runs exactly this, alternating the setting and comparing.
+// The measured answer to "does thinning do anything on this page": the detached
+// window exposes this comparison through its controls, backed by the same API.
 h.canvas.costs.link = 1.5; // make the ink expensive enough to measure in a demo
 h.tracker.lowZoom.set({ detailZoom: 1 });
 h.canvas.ds.scale = 0.1;
@@ -675,63 +619,18 @@ frame(2);
 run(500);
 await pump();
 
-bullets("SUMMARY BAR (always visible)");
-dump(h.document.getElementById("ants-tracker-summary"));
-
-// Every tab the panel builds, in the panel's own order. The labels come from the
-// buttons themselves, so a renamed tab cannot print under its old name.
-const TABS = ["tweaks", "status", "timing", "nodes", "stalls", "governor", "load", "memory", "gpu", "testing"];
-const tabBar = h.document.getElementById("ants-tracker-tabs");
-const body = h.document.getElementById("ants-tracker-body");
-for (let i = 0; i < TABS.length; i++) {
-  tabBar.children[i].click();
-  run(TABS[i] === "gpu" ? 2600 : 700); // the GPU tab polls /system_stats every 2.5s while open
-  await pump();
-  if (TABS[i] === "governor") {
-    // Collapsed detail rows are skipped by the printer, and the trace detail
-    // ("this frame's scripts, the ticks inside it, who asked for the redraw") is
-    // the point of the card, so open the first few here.
-    const carets = body.children[i].descendants().filter((n) => n._cls && n._cls.has("ants-caret"));
-    for (const caret of carets.slice(0, 3)) caret.click();
-    await pump();
-  }
-  // The label the panel gave the tab, not the markup around it: a badge ("!")
-  // can be appended to a button and is not part of its name.
-  const tabLabel = tabBar.children[i]._text || tabBar.children[i].textContent || TABS[i];
-  bullets(`${String(tabLabel).toUpperCase()} TAB`);
-  dump(body.children[i]);
-}
-
-// The one-click text report, exactly as the Copy button produces it.
-const copyBtn = h.document.body.descendants().find((n) => n._cls && n._cls.has("ants-hbtn") && n.textContent.includes("Copy"));
-copyBtn.click();
-await pump();
-bullets("TEXT REPORT (Copy button)");
-console.log(h.clipboardWrites[h.clipboardWrites.length - 1] || "(clipboard empty)");
+bullets("DETACHED-WINDOW COPY REPORT");
+console.log(h.tracker.report || "(report empty)");
 
 console.log(
-  "\nnote: the tail of the run above has limits applied — the extension's `clamp` heartbeat capped by" +
-    "\n      hand at quarter speed, and the repaint timer capped by the AUTOPILOT (target 150 ms/s, one" +
-    "\n      round every 5s) — so the GOVERNOR TAB above shows both: a source limited by hand, and the" +
-    "\n      autopilot's own line saying which source it capped, at what gap, and what it was costing." +
-    "\nnote: the LOW-ZOOM DRAWING section of the Node Rendering Settings tab and the report line above are the other" +
-    "\n      answer for this kind of page: every node is inside the viewport at zoom 0.10, so culling has" +
-    "\n      nothing to remove and the cost is drawing a thousand nodes properly several times a second." +
-    "\n      The mode paints every node as one rectangle below the zoom you pick, and caps redraws while" +
-    "\n      nobody is touching the page — opt-in, and off the moment you say so." +
-    "\n      Its stand-in setting is the other half: below the zoom you pick, a node whose picture has been captured" +
-    "\n      is drawn as one drawImage of that picture instead of a live draw, and the picture is taken once while the" +
-    "\n      page is idle. An image or preview node is not a second system — the picture is the preview, and it" +
-    "\n      replaces the node itself, not a box inside it." +
-    "\nnote: the three settings are independent, and each one only changes its own subject. The node setting decides what a" +
-    "\n      NODE costs; the link setting decides a LINK's shape (curves, or straight lines if you ask for them — nothing else" +
-    "\n      can turn a link straight); the thinning setting decides how much INK a curve uses (1px instead of 3, without the" +
-    "\n      dark outline ComfyUI draws under every link) and touches nothing else — no frame-level low-quality flag, no node" +
-    "\n      paint, no widget. The DOM content of a node that is currently a rectangle — previews, curve editors, Vue and" +
-    "\n      custom node UIs — is hidden with the .ants-lod-box class until that node is drawn properly again." +
-    "\nnote: in this simulation the clock only advances with h.advance(), so the tracker's own" +
-    "\n      per-render cost reads 0 — a real browser spends real time rendering the panel." +
-    "\n      Everything else above is what web/tracker.js computes from the synthetic traffic."
+  "\nnote: the tail of the synthetic run has Governor limits applied — the extension's `clamp` heartbeat is capped" +
+    "\n      by hand at quarter speed, while the repaint timer is limited by autopilot (150 ms/s target). The report" +
+    "\n      contains both the source measurements and the autopilot actions." +
+    "\nnote: the low-zoom drawing section demonstrates the other answer for a large graph: below the chosen zoom, node" +
+    "\n      stand-ins reduce drawing work while the settings for link shape, link ink, and DOM widget focus remain separate." +
+    "\n      The DOM content of a node currently represented by a rectangle is hidden until that node is drawn properly again." +
+    "\nnote: this harness advances a synthetic clock, not wall time. The report covers ComfyUI-page instrumentation; the" +
+    "\n      detached window renders separately and its UI cost is not attributed to the graph page."
 );
 
 if (h.errors().length) {

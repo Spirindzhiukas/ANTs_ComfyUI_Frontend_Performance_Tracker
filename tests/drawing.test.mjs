@@ -9,6 +9,9 @@
 //      original draw path, because a rendering change this tool cannot explain
 //      must never be left half-applied on somebody's canvas.
 
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { createHarness, FRAME_MS } from "./harness.mjs";
 import { suite, test, assert, assertEqual, assertClose, assertGreater, assertLess, assertIncludes } from "./framework.mjs";
 
@@ -51,34 +54,21 @@ function bigGraph(h, count = 40, scale = 0.1) {
   for (let i = 0; i < count; i++) h.canvas.links.push({ color: "#888888", from: [0, 0], to: [10, 10] });
 }
 
-function panelText(h) {
-  const panel = h.panel();
-  if (!panel) return "";
-  return panel
-    .descendants()
-    .map((n) => (n.children.length ? "" : n.textContent))
-    .join(" ");
+const DETACHED_HTML = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "web", "window.html"), "utf8");
+
+// A readout test consumes the control bridge used by web/window.html plus its
+// labels/help. The detached page is not mounted in the ComfyUI document.
+function detachedText(h) {
+  const link = h.tracker.link;
+  const payload = { settings: link.settings(), limits: link.limits(), telemetry: link.telemetry() };
+  return `${h.tracker.report}\n${JSON.stringify(payload)}\n${DETACHED_HTML}`;
 }
 
-// The panel is built lazily: open it from the corner button, then the tab that
-// owns the drawing settings (v2.1.8 moved them out of the Nodes tab and to the
-// front of the tab row).
-async function openTweaksTab(h) {
-  const corner = h.document.getElementById("ants-corner-btn");
-  if (corner) corner.click();
+async function openDetached(h) {
+  h.tracker.open(); // attempts only the detached route; no in-page fallback
   await h.flush();
-  const bar = h.document.getElementById("ants-tracker-tabs");
-  if (bar) {
-    const buttons = bar.children.filter((c) => c.tagName === "BUTTON");
-    const tweaks = buttons.find((b) => {
-      const t = String(b.textContent).toLowerCase();
-      return t.includes("rendering") || t.includes("tweaks");
-    });
-    if (tweaks) tweaks.click();
-    else if (buttons[0]) buttons[0].click();
-  }
-  await h.flush();
-  return h.panel();
+  assertEqual(h.panel(), null, "no in-page panel is constructed");
+  return null;
 }
 
 // One redraw, exactly, for the preview tests: a frame boundary and a paint.
@@ -254,10 +244,10 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     h.advance(FRAME_MS);
     h.canvas.setDirty(true, true);
     h.canvas.draw();
-    await openTweaksTab(h);
-    assertIncludes(panelText(h), "is below your 20% setting", "the panel names the zoom and the setting");
-    assertIncludes(panelText(h), "Replace node previews with bitmap stand-ins at zoom levels", "and the control is named for what it does");
-    assertIncludes(panelText(h), "below 20%", "and it reads as a zoom");
+    await openDetached(h);
+    assertEqual(h.tracker.link.settings().flatBelow, 0.2, "the detached settings bridge reports the selected zoom threshold");
+    assertIncludes(DETACHED_HTML, "Replace node previews with bitmap stand-ins at zoom levels", "the detached control is named for what it does");
+    assertIncludes(DETACHED_HTML, 'return "below " + Math.round(z * 100) + "%"', "the selector labels the threshold as zoom, not node size");
   });
 
   test("a node that changes its own size cannot flicker in and out of the flat state", async () => {
@@ -295,7 +285,7 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     assertEqual(h.tracker.lowZoom.state.nodes, flatCount, "and zooming back in restores every node");
   });
 
-  test("a v2.1.8 pixel setting is carried over once, and the panel says why", async () => {
+  test("a v2.1.8 pixel setting is carried over once, and the detached status explains the conversion", async () => {
     const h = await boot();
     // A record in the shape v2.1.8 wrote: minPx, no flatBelow.
     h.localStorage.setItem("ants.lowZoom.v1", JSON.stringify({ minPx: 64, detailZoom: 0.6, thumbZoom: 0.6, idleCapMs: 500, linkStyle: "auto" }));
@@ -307,20 +297,18 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
 
     bigGraph(h2, 4, 0.1);
     drawLoop(h2, 0.2);
-    await openTweaksTab(h2);
-    const text = panelText(h2);
-    assertIncludes(text, "carried over from v2.1.8", "the panel explains itself rather than silently changing a setting");
-    assertIncludes(text, "nodes under 64px", "quoting the old setting");
-    assertIncludes(text, "dynamic UIs", "and why the rule changed");
+    await openDetached(h2);
+    const telemetry = h2.tracker.link.telemetry();
+    const migrations = telemetry.drawing.diagnostics.migrations;
+    assertEqual(migrations.legacyPixels, 64, "the detached telemetry retains the old value for explanation");
+    assertIncludes(DETACHED_HTML, "migrations.legacyPixels", "the detached Status tab renders the migration note");
+    assertIncludes(DETACHED_HTML, "the rule now follows zoom, not node size", "the note explains why the setting is now zoom-based");
 
     // Choosing a value is what dismisses the note.
     h2.tracker.lowZoom.set({ flatBelow: 0.15 });
     assertEqual(h2.tracker.lowZoom.state.flatBelow, 0.15, "a setting off the ladder is snapped to the nearest zoom");
     assertEqual(h2.tracker.lowZoom.flat.carriedOverFromPx, 0, "and the note is gone");
-    h2.advance(600); // the open panel refreshes on its own timer
-    await h2.flush();
-    await openTweaksTab(h2);
-    assert(!panelText(h2).includes("carried over from v2.1.8"), "the panel no longer mentions it");
+    assertEqual(h2.tracker.link.telemetry().drawing.diagnostics.migrations.legacyPixels, 0, "the detached telemetry stops reporting the migration");
   });
 
   test("an image preview is not given a second thumbnail path", async () => {
@@ -381,13 +369,14 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     h.tracker.lowZoom.set({ flatBelow: 0.2 });
     drawLoop(h, 0.1);
     drawLoop(h, 0.1);
-    await openTweaksTab(h);
-    const text = panelText(h);
-    assertIncludes(text, "changes link ink and nothing else", "the panel describes the thinning by what it changes");
-    assert(!text.includes("straight-line path"), "and never mentions a path the node setting used to be able to switch on");
+    await openDetached(h);
+    const settings = h.tracker.link.settings();
+    assertEqual(settings.detailZoom, 0.6, "the detached settings bridge exposes link thinning independently");
+    assertEqual(settings.linkStyle, "spline", "curves remain selected while nodes are flattened");
+    assertIncludes(DETACHED_HTML, "Link ink and nothing else", "the detached control help describes the thinning by what it changes");
   });
 
-  test("the panel separates link ink from the frontend's own per-link bookkeeping", async () => {
+  test("detached telemetry keeps link ink timing separate from the connections stage", async () => {
     const h = await boot();
     h.window.devicePixelRatio = 1;
     // A connections stage that costs far more than the strokes inside it: this
@@ -400,17 +389,13 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     assertGreater(h.tracker.lowZoom.state.linkCalls, 0, "links were drawn");
     assertGreater(h.tracker.lowZoom.state.linkMs, 0, "and the ink was timed");
 
-    await openTweaksTab(h);
+    await openDetached(h);
     h.advance(600);
     await h.flush();
-    const text = panelText(h);
-    assertIncludes(text, "the strokes themselves are", "the panel splits the connections stage");
-    assertIncludes(
-      text,
-      "walking every input slot of every node",
-      "and names what the rest of it is, so no ink setting is credited with it"
-    );
-    assertIncludes(text, "a link ink setting can only reach the first part", "stated as a limit, not a promise");
+    const telemetry = h.tracker.link.telemetry();
+    assertGreater(telemetry.drawing.diagnostics.links.inkMs, 0, "the detached telemetry includes time inside link strokes");
+    assertGreater(telemetry.drawing.diagnostics.links.connectionsMsPerFrame, 0, "and the full connections stage separately");
+    assertIncludes(DETACHED_HTML, "connectionsMsPerFrame", "the Status tab labels the frontend stage separately from link ink");
   });
 
   test("the measure button compares the link setting against itself, on this page", async () => {
@@ -438,11 +423,11 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     assertGreater(h.tracker.lowZoom.state.ab.on.frames, 0, "thinned frames were counted");
     assertGreater(h.tracker.lowZoom.state.ab.off.frames, 0, "and full-ink frames too");
     assertEqual(h.tracker.lowZoom.state.detailZoom, 1, "the setting is put back exactly as it was");
-    await openTweaksTab(h);
+    await openDetached(h);
     h.advance(600);
     await h.flush();
-    assertIncludes(panelText(h), "thinning measured on this page", "and the panel reports the verdict");
-    assertIncludes(panelText(h), "ms/frame", "with numbers");
+    assertIncludes(detachedText(h), "thinning measured on this page", "and the panel reports the verdict");
+    assertIncludes(detachedText(h), "ms/frame", "with numbers");
     const done = h.tracker.lowZoom.state.ab;
     assert(
       done.on.ms / Math.max(1, done.on.frames) < done.off.ms / Math.max(1, done.off.frames),
@@ -476,14 +461,16 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     assertGreater(h.canvas.nodeDraws, 0, "LiteGraph's own node path ran for every node");
     assertGreater(h.canvas.ctx.ops.filter((o) => o[0] === "bezierCurveTo").length, 0, "and the curves are still curves");
 
-    // And the readout says so, in those words.
+    // The detached settings identify the link-only scope; telemetry confirms the
+    // node path and DOM content stayed untouched.
     h.advance(FRAME_MS);
     h.canvas.setDirty(true, true);
     h.canvas.draw();
-    await openTweaksTab(h);
-    const text = panelText(h);
-    assertIncludes(text, "changes link ink and nothing else", "the panel makes the promise explicit");
-    assertIncludes(text, "exactly as ComfyUI left them", "and spells out what it does not touch");
+    await openDetached(h);
+    assertIncludes(DETACHED_HTML, "Link ink and nothing else", "the detached help makes the promise explicit");
+    assertIncludes(DETACHED_HTML, "It never paints a node", "the detached help spells out what it does not touch");
+    assertEqual(h.tracker.link.settings().detailZoom, 1);
+    assertEqual(h.tracker.link.telemetry().drawing.diagnostics.nodes.active, false);
   });
 
   test("the DOM content of a boxed node is hidden, and comes back when it is not a box", async () => {
@@ -609,19 +596,22 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     assert(!wrapper._cls.has("ants-lod-inert"));
   });
 
-  test("the panel says what focus mode is doing, in the same terms the test uses", async () => {
+  test("the detached settings and telemetry expose focus mode and its scope", async () => {
     const h = await boot();
     h.window.devicePixelRatio = 1;
     bigGraph(h, 4, 0.1);
     h.tracker.lowZoom.set({ inertBelow: 0.4, fovea: true });
     drawLoop(h, 0.2);
-    await openTweaksTab(h);
-    const text = panelText(h);
-    assertIncludes(text, "node widgets switched off below 40% zoom", "the panel names the mode and the zoom");
-    assertIncludes(text, "stay selectable", "and promises what it does not take away");
-    assertIncludes(text, "foveated:", "and reports the off-screen half");
-    assertIncludes(text, "display scale:", "with the display-scale check it ran at startup");
-    assertIncludes(text, "the viewport maths agree", "saying whether the two agree");
+    await openDetached(h);
+    const settings = h.tracker.link.settings();
+    const diagnostics = h.tracker.link.telemetry().drawing.diagnostics.widgets;
+    assertEqual(settings.inertBelow, 0.4, "the detached settings bridge carries the widget threshold");
+    assertEqual(settings.fovea, true, "and the off-screen mode");
+    assertEqual(diagnostics.inertBelow, 0.4, "the status telemetry reports the active threshold");
+    assertEqual(diagnostics.fovea, true, "and reports the off-screen mode");
+    assertIncludes(DETACHED_HTML, "Widgets stop answering", "the detached UI names the focus control");
+    assertIncludes(DETACHED_HTML, "Off-screen nodes", "the detached UI exposes its foveated setting");
+    assertIncludes(DETACHED_HTML, "Display scale", "the detached UI exposes the scale override");
   });
 
   test("focus mode reaches a 3D viewport, which has no element for a node to point at", async () => {
@@ -826,11 +816,12 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     assert(buttons[1]._cls.has("ants-node-btn-gear"), "the gear after");
     assertEqual(h.document.getElementById("ants-corner-btn"), buttons[1], "the button that always opened the panel is the gear");
 
-    // The gear opens the panel; it is not the switch.
+    // A failed detached launch marks the gear; it is not a fallback panel or a switch.
     buttons[1]._fire("click");
     await h.flush();
-    assert(h.panel() && h.panel()._cls.has("open"), "clicking the gear opens the panel");
-    assertEqual(h.tracker.lowZoom.enabled, true, "and does not switch anything off");
+    assert(buttons[1]._cls.has("ants-window-blocked"), "a blocked detached window is visibly marked");
+    assertEqual(h.tracker.lowZoom.enabled, true, "the gear does not switch anything off");
+    assertEqual(h.panel(), null, "there is no in-page fallback");
 
     // The switch switches, and nothing of this tool's UI goes anywhere.
     buttons[0]._fire("click");
@@ -838,7 +829,7 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     assert(!pill._cls.has("ants-lod-box") && !pill._cls.has("ants-lod-inert"), "neither control is hidden or made inert");
     assert(!pill._cls.has("ants-hidden-by-switch"), "and the pill is not taken off the screen");
     assertEqual(buttons[0].getAttribute("aria-checked"), "false", "the switch reads off");
-    assert(h.panel() && h.panel()._cls.has("open"), "the panel that was open stays open");
+    assertEqual(h.panel(), null, "the retired panel is still absent after switching off");
 
     buttons[0]._fire("click");
     assertEqual(h.tracker.lowZoom.enabled, true, "and the same switch turns it back on");
@@ -879,11 +870,8 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     const kept = node.computeSize();
     assertGreater(kept[0], 400, "a width the user set is not snapped back");
     assertGreater(kept[1], 280, "nor is the height — both axes");
-    node.onResize([480, 360]);
-    assert(h.panel() && h.panel().parentNode === node._antsHost, "a large node holds the settings, so they can reflow with it");
-    assert(h.panel()._cls.has("ants-docked"), "and the panel is docked, not a second copy");
-    node.onResize([200, 40]);
-    assert(h.panel().parentNode === h.document.body, "shrinking the node floats the panel again");
+    assert(!node._antsHost, "no settings host is docked into the headless node");
+    assertEqual(h.panel(), null, "resizing never creates an in-page panel");
     // A normal node next to it, with a DOM widget of its own: the sweep needs
     // something it *is* allowed to switch off, or "it left ours alone" proves
     // nothing.
@@ -998,25 +986,22 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     h.tracker.lowZoom.off();
   });
 
-  test("the panel says what the switch means, and its own button drives it", async () => {
+  test("master-off is visible on the retained switch and suspends drawing changes", async () => {
     const h = await boot();
     h.window.devicePixelRatio = 1;
     bigGraph(h, 4, 0.1);
-    await openTweaksTab(h); // built while the tool is still on
+    h.tracker.lowZoom.set({ flatBelow: 0.2, detailZoom: 0.6 });
+    const tick = h.document.getElementById("ants-corner-pill").children.find((n) => n._cls && n._cls.has("ants-node-btn-tick"));
+    assert(tick, "the retained in-page switch exists");
     h.tracker.lowZoom.setEnabled(false);
-    await h.flush();
-    const text = panelText(h);
-    assertIncludes(text, "The hooks and the optimisations are switched off.", "the panel says so plainly");
-    assertIncludes(text, "turns them back on with exactly the settings you had", "and says how to get back");
-    assertIncludes(text, "⏻ On", "with the header button offering it");
-    assertEqual(h.tracker.lowZoom.enabled, false, "and the API agrees");
-
-    // The header button is the same switch.
-    const power = h.panel().descendants().find((n) => n.textContent === "⏻ On");
-    assert(power, "the button is on screen");
-    power._fire("click");
-    assertEqual(h.tracker.lowZoom.enabled, true, "clicking it switches the tracker back on");
-    assertIncludes(panelText(h), "⏻ Off", "and the button offers the other direction again");
+    assertEqual(h.tracker.lowZoom.enabled, false, "the API reflects master-off");
+    assertEqual(tick.getAttribute("aria-checked"), "false", "the on/off widget visibly reads off");
+    assertEqual(h.tracker.link.telemetry().drawing.enabled, false, "the detached telemetry states that drawing changes are suspended");
+    assertIncludes(DETACHED_HTML, "OPTIMIZER OFF", "the detached live readout visibly marks master-off");
+    assertEqual(h.panel(), null, "there is no header control or in-page panel");
+    tick._fire("click");
+    assertEqual(h.tracker.lowZoom.enabled, true, "the retained switch turns the optimizer back on");
+    assertEqual(tick.getAttribute("aria-checked"), "true", "the widget visibly reads on again");
   });
 
   test("canvas widgets stop answering the pointer below the zoom, while the node still selects", async () => {
@@ -1294,7 +1279,7 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
   });
 
 
-  test("link style is its own setting: curves can be kept while the graph is flattened", async () => {
+  test("link style is independent of node flattening and the detached UI labels its own setting", async () => {
     const h = await boot();
     h.window.devicePixelRatio = 1;
     bigGraph(h, 6, 0.1); // 20px nodes at zoom 0.1: everything is a rectangle
@@ -1328,21 +1313,15 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     h.tracker.lowZoom.set({ linkStyle: "auto" });
     assertEqual(h.tracker.lowZoom.state.linkStyle, "spline", "an \"auto\" link setting becomes \"keep every curve\"");
     assertEqual(h.tracker.lowZoom.flat.autoLinkCarried, true, "and it is flagged for the panel");
-    await openTweaksTab(h); // opens the panel and builds the tab
-    h.advance(600);
-    await h.flush();
-    h.canvas.setDirty(true, true);
-    h.canvas.draw();
-    assertIncludes(panelText(h), "waiting to be picked", "the panel explains it");
+    await openDetached(h);
+    const migrations = h.tracker.link.telemetry().drawing.diagnostics.migrations;
+    assertEqual(migrations.automaticLinkStyle, true, "the detached telemetry records the migrated automatic setting");
+    assertIncludes(DETACHED_HTML, "migrations.automaticLinkStyle", "the detached Status tab renders the note");
+    assertIncludes(DETACHED_HTML, "keeping every curve", "the migration is explained in the detached UI");
     // Picking a value is what dismisses it.
     h.tracker.lowZoom.set({ linkStyle: "spline" });
     assertEqual(h.tracker.lowZoom.flat.autoLinkCarried, false, "choosing dismisses it");
-    // The panel refreshes its own readout on a timer; let it run once.
-    h.advance(600);
-    await h.flush();
-    h.canvas.setDirty(true, true);
-    h.canvas.draw();
-    assert(!panelText(h).includes("waiting to be picked"), "and the note is gone");
+    assertEqual(h.tracker.link.telemetry().drawing.diagnostics.migrations.automaticLinkStyle, false, "and the detached telemetry clears the note after the user chooses");
 
     // With flattening off, curves are what you get, and nothing about that
     // changes because the node setting moved.
@@ -1424,8 +1403,8 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     assertEqual(h2.tracker.lowZoom.state.thumbZoom, 0, "the separate preview setting is retired and not restored");
     assertEqual(h2.tracker.lowZoom.state.idleCapMs, 500, "and the idle cap");
     assertEqual(h2.tracker.lowZoom.state.linkStyle, "spline", "and the link style");
-    await openTweaksTab(h2);
-    assertIncludes(panelText(h2), "links: keep every curve", "the control reflects it, so the panel is not lying about the state");
+    await openDetached(h2);
+    assertIncludes(detachedText(h2), "links: keep every curve", "the control reflects it, so the panel is not lying about the state");
 
     // "Back to full drawing" is the way back to an untouched page.
     h2.tracker.lowZoom.off();
@@ -1434,7 +1413,7 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     assertEqual(h3.tracker.lowZoom.state.thumbZoom, 0, "including the previews");
   });
 
-  test("the panel says whether culling could help at this zoom, and what the mode is doing", async () => {
+  test("visibility metrics and detached status show when node simplification is active", async () => {
     const h = await boot();
     h.window.devicePixelRatio = 1;
     bigGraph(h, 30, 0.1);
@@ -1454,12 +1433,13 @@ suite("drawing: low-zoom mode paints less, and only when asked", () => {
     drawLoop(h, 0.2);
     h.canvas.min_font_size_for_lod = 0; // the frontend's own LOD is switched off
     h.canvas.low_quality = false;
-    await openTweaksTab(h); // the tab is built when it is opened, so this reads the current state
-    const text = panelText(h);
-    assertIncludes(text, "culling cannot save anything here", "the panel draws the conclusion, not just the number");
-    assertIncludes(text, "frontend LOD is switched off", "and names the frontend's own LOD switch instead of leaving it hidden");
-    assertIncludes(text, "below 20%", "and shows what the mode is set to");
-    assertIncludes(text, "node draw", "with the saving measured by the tracker itself");
+    await openDetached(h);
+    const telemetry = h.tracker.link.telemetry();
+    assertEqual(h.tracker.lowZoom.frontendLod.lowQuality, false, "the frontend's own LOD remains switched off");
+    assertEqual(telemetry.drawing.diagnostics.nodes.active, true, "the detached status reports the tracker stand-in mode as active");
+    assertEqual(telemetry.drawing.diagnostics.nodes.threshold, 0.2, "and names the zoom threshold in the same payload as the controls");
+    assertGreater(telemetry.drawing.diagnostics.nodes.simplifiedDraws, 0, "the detached status reports the simplified node draws");
+    assertIncludes(DETACHED_HTML, "node stand-ins", "the detached Status tab reports what the node mode is doing");
   });
 });
 
@@ -1624,33 +1604,30 @@ suite("drawing: a flat box can say what it stands for, and only when asked", () 
     assertEqual(h.canvas.nodeDraws > 0, true, "and LiteGraph's own drawing is back");
   });
 
-  test("the panel and the API report the ladder, and the readout prices the marks", async () => {
+  test("the detached controls expose box-detail choices and status telemetry prices the marks", async () => {
     const h = await boot();
     markedGraph(h);
     h.tracker.lowZoom.set({ flatBelow: 0.2, snapshots: false });
     drawLoop(h, 0.2);
-    await openTweaksTab(h);
-    const text = panelText(h);
-    assertIncludes(text, "plain fill", "the control offers the levels");
-    assertIncludes(text, "title bar colour", "including the title bar");
-    assertIncludes(text, "title, error ring, progress, muted", "and the state marks");
-    assertIncludes(text, "the boxes are plain", "and the readout says what the boxes could show");
+    await openDetached(h);
+    assertIncludes(DETACHED_HTML, "plain fill", "the detached control offers the plain level");
+    assertIncludes(DETACHED_HTML, "title bar colour", "including the title bar");
+    assertIncludes(DETACHED_HTML, "title, error ring, progress, muted", "and the state marks");
 
     h.tracker.lowZoom.set({ boxDetail: "state" });
     drawLoop(h, 0.2);
-    h.advance(600); // the panel refreshes on its own tick, not on the canvas's
+    h.advance(600);
     await h.flush();
-    const after = panelText(h);
-    assertIncludes(after, 'box detail "state"', "the readout names the level in force");
-    // The counters are per paint and cumulative, like every other counter here, so
-    // the readout has to be compared with what the API reports, not with a number
-    // this test guessed.
+    const nodeStatus = h.tracker.link.telemetry().drawing.diagnostics.nodes;
+    assertEqual(nodeStatus.detail, "state", "the detached status names the level in force");
+    // The counters are per paint and cumulative, so compare them with the API.
     const marks = h.tracker.lowZoom.flat;
     assertGreater(marks.boxTitles, 6, `the marks are counted over every painted frame (${marks.boxTitles} title bars)`);
-    assertIncludes(after, `${marks.boxTitles} title bar(s)`, "and the readout prices them");
-    assertIncludes(after, `${marks.boxErrors} error ring(s)`, "ring by ring");
-    assertIncludes(after, `${marks.boxBars} progress bar(s)`, "bar by bar");
-    assertIncludes(after, `${marks.boxMuted} dimmed`, "and the dimming");
+    assertEqual(nodeStatus.titles, marks.boxTitles, "and the status reports that count");
+    assertEqual(nodeStatus.errors, marks.boxErrors, "ring by ring");
+    assertEqual(nodeStatus.progress, marks.boxBars, "bar by bar");
+    assertEqual(nodeStatus.muted, marks.boxMuted, "and the dimming");
+    assertIncludes(DETACHED_HTML, "nodeDiag.titles", "the Status tab renders the per-mark counts");
 
     // The API is the seam tests and scripts use: state, limits, and the marks.
     const api = h.tracker.lowZoom;
@@ -2224,8 +2201,8 @@ suite("drawing: node snapshots — a box that is a picture of the node", () => {
     assert(api.why.some((e) => /2100 units tall/.test(e.why)), "with its size in the readout's reasons");
     h.advance(600); // the panel refresh
     await h.flush();
-    await openTweaksTab(h);
-    const text = panelText(h);
+    await openDetached(h);
+    const text = detachedText(h);
     assertIncludes(text, "not pictured:", "the readout names what will not get a picture");
     assertIncludes(text, "2100 units tall", "with the reason, and the node's own size");
     // Time and drawing do not turn it into an attempt-per-slice: it is blocked, so
@@ -2527,23 +2504,26 @@ suite("drawing: node snapshots — a box that is a picture of the node", () => {
     assertEqual(api.bytes, 0, "and every bitmap released");
   });
 
-  test("the panel and the API report what the engine did", async () => {
+  test("the detached controls and telemetry report snapshot-engine state", async () => {
     const h = await boot();
     snapGraph(h, 3);
     h.tracker.lowZoom.set({ flatBelow: 0.2, snapshots: true });
     draw(h, 1);
     await idle(h);
-    h.advance(600); // the panel refreshes on its own tick
+    h.advance(600);
     await h.flush();
-    await openTweaksTab(h);
-    const text = panelText(h);
-    assertIncludes(text, "picture of the node", "the control offers it");
-    assertIncludes(text, "capture 1x per graph unit", "with the ratio it will capture at");
-    assertIncludes(text, "Stand-in memory (ram) budget", "the budget is named for what it holds");
-    assertIncludes(text, "4096 MiB", "and the default step");
-    assertIncludes(text, "Stand-in capture resolution", "the capture setting is named");
-    assertIncludes(text, "Keep stand-in previews on disk", "and the disk setting");
-    assertIncludes(text, "remembered node(s) have a picture", "the readout leads with how much of the graph is pictured");
+    await openDetached(h);
+    const link = h.tracker.link;
+    const status = link.telemetry().drawing.diagnostics.snapshots;
+    assertIncludes(DETACHED_HTML, "picture of the node", "the detached control offers it");
+    assertIncludes(DETACHED_HTML, 'text: "capture " + r + "x per graph unit"', "the selector labels capture resolution");
+    assertIncludes(DETACHED_HTML, "Stand-in memory (ram) budget", "the budget is named for what it holds");
+    assert(link.limits().snapBudgets.includes(4096), "the detached bridge offers the 4096 MiB default step");
+    assertIncludes(DETACHED_HTML, "Stand-in capture resolution", "the capture setting is named");
+    assertIncludes(DETACHED_HTML, "Keep stand-in previews on disk", "and the disk setting");
+    assertEqual(status.wanted, true, "the status reports the selected picture mode");
+    assertEqual(status.captured, 3, "the status reports completed captures");
+    assertIncludes(DETACHED_HTML, "snapDiag.served", "the Status tab reports pictures served from the cache");
     const api = h.tracker.lowZoom;
     assertEqual(api.snapshots.wanted, true, "the API says it is wanted");
     assertEqual(api.limits.snapRatios.join(","), "0.25,0.5,1,2,3", "and exposes the ladders");
@@ -2569,18 +2549,13 @@ suite("drawing: node snapshots — a box that is a picture of the node", () => {
     await idle(h);
     h.advance(600); // the panel refreshes on its own tick
     await h.flush();
-    await openTweaksTab(h);
-    assertIncludes(panelText(h), "Keep these node types live", "the setting is in the panel");
-    const field = h
-      .panel()
-      .descendants()
-      .find((n) => n.tagName === "INPUT" && String(n.type).toLowerCase() === "text");
-    assert(field, "and it is a text field, not a dropdown of types the tool guessed");
-    field.value = " SnapThing , , OtherThing ";
-    field._fire("change");
-    await h.flush();
-    assertEqual(h.tracker.lowZoom.state.snapExclude.join(","), "SnapThing,OtherThing", "typing a list applies it, trimmed and without blanks");
-    assertEqual(field.value, "SnapThing, OtherThing", "and the field shows what was accepted");
+    await openDetached(h);
+    assertIncludes(DETACHED_HTML, "Keep these node types live", "the setting is in the detached UI");
+    assertIncludes(DETACHED_HTML, 'id: "keep"', "the list is a text field, not a dropdown of guessed types");
+    assertIncludes(DETACHED_HTML, "String(keep.value || \"\").split(\",\").map(function (t) { return t.trim(); })", "the detached field trims and drops empty entries");
+    const nextSettings = Object.assign({}, h.tracker.link.settings(), { snapExclude: ["SnapThing", "OtherThing"] });
+    h.tracker.link.apply({ ok: true, rev: 1, origin: "window", settings: nextSettings });
+    assertEqual(h.tracker.lowZoom.state.snapExclude.join(","), "SnapThing,OtherThing", "the detached settings message applies the trimmed list");
     // A type on the list is kept live *on purpose* and says so, rather than
     // being counted as a capture that failed. The capture path is what counts
     // it, so a box has to be painted for the node to reach that path — and a
@@ -2593,10 +2568,9 @@ suite("drawing: node snapshots — a box that is a picture of the node", () => {
     await h.flush();
     assertGreater(h.tracker.lowZoom.snapshots.keptLive, 0, "the engine counts it as kept live on purpose, not as a failed capture");
     assertEqual(h.tracker.lowZoom.snapshots.captured, capturedBefore, "and no new picture is taken for a type on the list");
-    // And an empty box clears it again.
-    field.value = "";
-    field._fire("change");
-    assertEqual(h.tracker.lowZoom.state.snapExclude.length, 0, "clearing the field clears the list");
+    // And an empty list clears it again.
+    h.tracker.link.apply({ ok: true, rev: 2, origin: "window", settings: Object.assign({}, h.tracker.link.settings(), { snapExclude: [] }) });
+    assertEqual(h.tracker.lowZoom.state.snapExclude.length, 0, "clearing the detached field clears the list");
   });
 });
 
@@ -3019,22 +2993,21 @@ suite("drawing: the Nodes 2.0 (Vue nodes) frontend", () => {
     assertEqual(h.tracker.lowZoom.dom.hidden, 0, "turning the settings off leaves none of somebody else's DOM hidden");
   });
 
-  test("the panel names the renderer instead of blaming the flatten setting", async () => {
+  test("detached telemetry names the renderer without blaming the flatten setting", async () => {
     const h = await boot();
     vueGraph(h, 3);
     h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true });
     draw(h, 1);
     h.advance(1200);
     await h.flush();
-    await openTweaksTab(h);
-    const text = panelText(h);
-    assertIncludes(text, "Vue nodes", "the readout says which renderer this is");
-    assert(!text.includes("collapsed boxes or this tool's own node, which are never flattened"), "and does not blame collapsed nodes for a decision this renderer made");
-    assert(!text.includes("snapshots are on but not painting anything"), "nor the flatten setting, which is switched on and below its zoom");
-    assertIncludes(text, "node element(s) marked", "it says what a stand-in is in this renderer");
-    assertIncludes(text, "the browser skips the paint of those subtrees", "and says what the mark costs the frontend: the paint, not the layout, so the numbers still come from the DOM");
-    // The copyable report is read by people who never open the panel, so it has
-    // to be as honest as the panel is.
+    await openDetached(h);
+    const diagnostics = h.tracker.link.telemetry().drawing.diagnostics;
+    assertEqual(diagnostics.renderer, "Vue nodes", "the detached telemetry identifies the active renderer");
+    assertGreater(diagnostics.snapshots.vueBlanked, 0, "and reports Vue node elements currently blanked for stand-ins");
+    assertIncludes(DETACHED_HTML, "Vue stand-ins:", "the detached Status tab reports this renderer's stand-in counters");
+    assertIncludes(DETACHED_HTML, "snapDiag.vueBlanked", "and reads the count from telemetry");
+    // The copyable report is read by people who never open the settings; it also
+    // has to be honest about which renderer is active.
     const report = h.tracker.report;
     assert(!report.includes("every node a rectangle"), "the report does not claim nodes are rectangles here");
     assert(!report.includes("node stand-ins idle"), "nor that the stand-ins are idle");
@@ -4340,27 +4313,15 @@ suite("drawing: the Nodes 2.0 (Vue nodes) frontend", () => {
     h.tracker.lowZoom.set({ flatBelow: 0.5, snapshots: true });
     draw(h, 2);
     await idle(h);
-    // The panel used to say "(no picture is taken in this renderer — the bitmap half
-    // of the engine is idle)" while the same line reported pictures being served and
-    // captured. The user read both at once. The report is the tool's own claim about
-    // itself, so the claim is held to the setting.
-    h.tracker.open();
-    const copyBtn = h.document.body.descendants().find((n) => n._cls && n._cls.has("ants-hbtn") && n.textContent.includes("Copy"));
-    assert(copyBtn, "the panel has a copy button");
-    copyBtn.click();
-    await h.flush();
-    const report = h.clipboardWrites[h.clipboardWrites.length - 1] || "";
-    assertIncludes(report, "node stand-ins are pictures", "the Vue paragraph says pictures are made");
+    // The detached Copy action uses this same report, without constructing an
+    // in-page panel or clipboard control.
+    const report = h.tracker.report;
+    assertIncludes(report, "node stand-ins are pictures", "the report says pictures are made in this renderer");
     assert(!report.includes("no picture is taken in this renderer"), "and does not claim the opposite");
-    // The other branch has to stay true as well: with the pictures off, that is
-    // exactly what happens, and the sentence now says which setting turned it off.
     h.tracker.lowZoom.set({ snapshots: false });
     h.advance(500);
-    await h.flush();
-    copyBtn.click();
-    await h.flush();
-    const off = h.clipboardWrites[h.clipboardWrites.length - 1] || "";
-    assertIncludes(off, "no picture is taken while the snapshots setting is off", "with the setting off it says so");
+    const off = h.tracker.report;
+    assertIncludes(off, "no picture is taken while the snapshots setting is off", "with the setting off the report says so");
   });
 
   test("a tall node's own labels are read past the first sixteen", async () => {
@@ -4856,11 +4817,11 @@ suite("drawing: the Nodes 2.0 (Vue nodes) frontend", () => {
     assertEqual(`${before[0][0]}:${Math.round(before[0][1])},${Math.round(before[0][2])}`, "translate:58,70", "drawn at the element's own box inside the node");
     assertEqual(`${before[1][0]}:${Number(before[1][1]).toFixed(2)}`, "scale:0.50", "scaled from the icon's 24-unit viewBox into its 12-unit box");
     assertEqual(pic._ctx.paintLog[at].fill, "rgba(200, 210, 220, 1)", "in the colour the mask clips out of the element's background");
-    // The panel says it in the same terms, and the number it shows is the one the
-    // reader counted — a claim about the user's page has to be readable on it.
-    await openTweaksTab(h);
-    assertIncludes(panelText(h), "icon(s) drawn so far", "the panel names the icons it drew");
-    assertIncludes(panelText(h), `${api.vueIcons} icon(s)`, "and shows the same count the readout holds");
+    // The detached status carries the same count the renderer measured.
+    await openDetached(h);
+    const status = h.tracker.link.telemetry().drawing.diagnostics.snapshots;
+    assertEqual(status.vueIcons, api.vueIcons, "the detached telemetry reports the icons it drew");
+    assertIncludes(DETACHED_HTML, "snapDiag.vueIcons", "the Status tab renders the renderer's icon count");
   });
 
   test("a picture carries the icon the page shows, and is remade with it when the page changes it", async () => {

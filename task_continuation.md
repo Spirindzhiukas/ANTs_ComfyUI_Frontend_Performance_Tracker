@@ -1,111 +1,69 @@
-# Task handover — current state (v2.7.5)
+# Task handover — current state (v2.7.6)
 
-This is a status summary, not a script to follow blindly. Verify the workspace and
-separate harness evidence from live-browser validation.
+Status summary, not a script to follow blindly. Keep harness evidence separate
+from behavior in the user's custom-built Electron shell. The user has no browser
+console; do not suggest console commands or blame browser compatibility.
 
-## User's active acceptance criteria
+## Active acceptance criteria
 
-1. **Warning badge placement:** draw the amber/black high-voltage badge only on a
-   live fallback box. Never include it in, or draw it over, a successfully captured
-   or cached picture. The signature token changed so old badge-bearing RAM/disk
-   entries miss and are rebuilt.
-2. **Nodes 2.0 visuals:** investigate the reported clipped/odd CLIP Text Encode
-   prompt and other UI appearing in stand-ins. The screenshot's apparent truncation
-   despite remaining space is not explained yet. Do not claim these reconstructed
-   canvas drawings are browser screenshots.
-3. **Metrics row stability:** Timing and per-node-type rows use a 4-second rolling
-   window and naturally age out when there is no activity in that window. Stalls
-   headline rates use 4 seconds too, while source rows remain visible for up to
-   30 seconds after their last event and their source counters accumulate. UI notes
-   now communicate those windows. No retention behavior was changed. A Stalls row
-   disappearing before 30 seconds, or any row clearing while new samples continue,
-   is not explained by the intended window and needs before/after reports.
-4. **Governor visibility/state:** the in-page panel always registers Governor in
-   both frontend renderer modes. The separate-window page intentionally has five
-   tabs and omits Governor. Clean defaults are normal source policies, rAF governor
-   off, redraw coalescing off and autopilot off; policies and controls can persist
-   in `ants-governor-v1`. The active browser's installed version, chosen panel
-   surface and persisted state have not been inspected.
-5. **Keep the no-flicker behavior:** the user confirms there is no more flicker.
-   Progress/error marks remain live overlays on held Vue pictures; video/link-drag
-   still hand the live element back.
-6. **Preserve pathway-specific text rules:** ordinary Vue DOM text has its own
-   2,000-character prefix limit; Vue textarea/form values are not hard-sliced at
-   2,000 and are wrapped/clipped by available box lines; the separate canvas
-   DOM-widget composite retains its 2,000-character and 12-line limits.
-7. **Still unverified:** CPU-only Electron A/B, live pixel comparison, and the
-   user's renderer-switch disk-cache repopulation check. Do not present harness
-   correctness as any of those results.
+1. **Detached-only UI:** the detached optimizer window is the only settings and
+   metrics UI. The in-page workflow node stays headless except for its compact
+   power switch and gear control; the floating pill remains the control if the
+   frontend cannot host the node's DOM widget. The gear opens/focuses the detached
+   route. If the shell blocks that launch, show a visible failure and never fall
+   back to an in-page panel.
+2. **Master-off:** suspend optimizer effects and sampling, including detached GPU
+   polling and temporary tests, while preserving appropriate settings for
+   re-enable. Governor offload and self-test entry points must not start worker
+   work while disabled. A self-test already underway must not publish success if
+   master-off occurs before its result is accepted.
+3. **Custom Electron shell:** prefer telemetry inside this optimizer/node. Keep
+   shell changes separate; if one becomes unavoidable, prepare a request for the
+   user's Claude Sonnet 5.5 shell agent. Do not ask for browser-console output.
+4. **Warning badge:** intended only for live fallback boxes, never baked into or
+   painted over captured/cached pictures. The harness regression is not evidence
+   that this is fixed in Nodes 2.0: the user reports the issue persists there in
+   their custom Electron shell. Do not call the whole badge issue resolved.
+5. **Timing:** the user reports Timing is empty after active panning/zooming.
+   Metric-window notes/tests are not evidence of live Timing rows; keep this
+   symptom unresolved unless live shell evidence demonstrates otherwise.
+6. **No flicker:** the user confirms it is gone; preserve the existing behavior.
+7. **Path-specific text:** ordinary Vue DOM text has a 2,000-character prefix
+   limit, but Vue textarea/form values are not hard-sliced at 2,000 and wrap/clip
+   to available lines. The separate canvas DOM-widget route has 2,000-character
+   and 12-line caps. Do not conflate those paths.
 
-## Work completed in v2.7.5 follow-up
+## Work completed in v2.7.6
 
-- `web/tracker.js` is version **2.7.5**. The live flat-box painter keeps the badge;
-  capture no longer paints it, and cached reuse does not add it as an overlay.
-  `LOD_SNAP_BADGE_VERSION` changed to `hv-warning-fallback-only-2`, invalidating old
-  badge-bearing picture signatures.
-- Badge regression distinguishes the live fallback, the successful offscreen
-  capture and the later cached blit; a blank capture is still rejected.
-- Timing context, Nodes note and Stalls note disclose the rolling/retained windows.
-  Added a core regression showing the Stalls rate reaches zero after 4 seconds
-  without a new event while its row is still present at 5 seconds. Retention itself
-  is unchanged.
-- Panel regression verifies the in-page Governor tab is present, exposes clean
-  defaults (no limited source, rAF off, coalescing off, autopilot off), and checks
-  the window omissions are separate from panel behavior.
-- `README.md`, `CHANGELOG.md`, `memory.md`, `ANALYSIS.md`, this handover, and the
-  real-painter preview captions were updated. `preview/boxes.html` and `.svg` were
-  regenerated; the badge remains visible there because that fixture runs the live
-  fallback box painter.
+- The detached window owns Node Rendering Settings, Status, Timing, Nodes, Stalls,
+  Governor, Load, Memory, GPU/VRAM and Testing. In-page panel construction and its
+  fallback were removed from the active UI flow. A blocked open is surfaced rather
+  than replaced by an in-page panel.
+- The compact workflow-node widget has no text-button fallback; if DOM widgets
+  cannot be hosted, the node remains headless and the floating pill remains.
+- Master-off suspends optimizer sampling/effects and detached GPU polling. Governor
+  worker offload/self-test refuse new work while disabled; a completed worker
+  result is rejected if the master switch was turned off while it was in flight.
+- The detached Status surface carries renderer, box/snapshot, link-thinning and
+  connection-stage, widget/fovea, Vue icon and migration diagnostics. Bridge
+  command payloads are discarded except for normalized benchmark inputs.
+- README and changelog wording now records the Nodes 2.0 badge and live Timing
+  reports as unresolved rather than treating harness tests as proof.
 
 ## Verification
 
-- `node tests/run-tests.mjs`: **247 passed**.
-- `python3 tests/test_init.py`: **9 passed**.
-- `node tests/demo.mjs`: exit 0.
-- `node --check --input-type=module < web/tracker.js`,
-  `node --check tools/box-preview.mjs`, preview regeneration and `git diff --check`
-  passed.
-- No real Electron/browser A/B, live pixel comparison or user's cache-folder test
-  has been performed in this workspace.
+- `node --check web/tracker.js`: passed.
+- `node tests/run-tests.mjs`: **229 passed**.
+- `python -m unittest discover -s tests -p 'test_*.py'`: **9 passed**.
+- `git diff --check`: passed.
+- No live custom-Electron pixel comparison or live Timing-row validation was
+  performed. Tests do not resolve the user's reported badge or Timing symptoms.
 
-## Live evidence needed next
+## Remaining live evidence
 
-On the **ComfyUI page** (not the separate window), run in DevTools:
-
-```js
-window.__antsTracker.open();
-({
-  version: window.__antsTracker.version,
-  tabs: [...document.querySelectorAll("#ants-tracker-tabs button")].map(b => b.textContent),
-  governor: {
-    metrics: window.__antsTracker.governor.metrics,
-    controls: window.__antsTracker.governor.state.controls,
-    savedPolicies: window.__antsTracker.governor.state.savedPolicies
-  }
-})
-```
-
-That distinguishes an old/unloaded tracker or the five-tab detached window from
-an in-page UI visibility bug, and shows whether saved limits are active. Do not
-call `governor.reset()` before seeing the state; it changes persistent settings.
-
-For the metrics issue, collect `copy(window.__antsTracker.report)` once while the
-rows are populated and again after they disappear. The report has a timestamp,
-version, sampling window and per-tab metrics. If the Stalls source row disappears,
-record elapsed time since its last event and whether new stalls continued. If a
-row clears while samples keep coming, say which tab and whether the page was
-paused/reset or reloaded.
-
-For the Nodes 2.0 issue, send a same-node live-vs-stand-in image pair and the
-snapshot report without exposing private prompt contents. The relevant diagnostic
-surface is `window.__antsTracker.lowZoom.snapshots` (renderer pathway, held/drawn/
-captured counters, text/widget counters and refusal reasons); do not dump the full
-internal `lowZoom.state.vueMedia`, which can contain raw form values.
-
-## Branch / PR
-
-The v2.7.5 follow-up is committed and pushed to
-`arena/01a1089b-ants-comfyui-frontend-performa`; draft PR #3 remains open against
-`main`:
-https://github.com/Spirindzhiukas/ANTs_ComfyUI_Frontend_Performance_Tracker/pull/3.
-The PR is unmerged.
+No browser-console procedure is suitable for the user's shell. Use the detached
+Status/report surface and visible output where available. If more instrumentation
+requires changing Electron itself, keep it in a separate handoff to the user's
+Claude Sonnet 5.5 shell agent. A Nodes 2.0 badge fix or Timing diagnosis should
+not be claimed until the reported shell behavior is checked; do not expose raw
+prompt contents in telemetry.

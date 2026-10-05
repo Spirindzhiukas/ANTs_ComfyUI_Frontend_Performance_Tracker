@@ -26,19 +26,20 @@ How it works (see web/tracker.js for the real logic):
   4. It observes long animation frames (Chrome 123+) / long tasks, so the cost
      that is not canvas drawing at all — timers, layout thrash, GC — gets its
      own tab with a named script and invoker.
-  5. A floating panel shows all of it live with per-owner mute, a scripted pan
-     benchmark for comparable A/B runs, and a plain-text snapshot for bug
-     reports.
+  5. The detached optimizer window is the sole settings and metrics UI, with
+     per-owner mute, a scripted pan benchmark for comparable A/B runs, and a
+     plain-text snapshot for bug reports. In-page, only the power/gear pill and
+     its copy on the headless node remain.
 
 The Python side serves the frontend, adds one optional read-only route
 (/ants_tracker/gpu) that shells out to nvidia-smi, and — because the page cannot
-write a folder — stores node thumbnails under ComfyUI's temp directory when the
-frontend asks. That write is the one the panel's disk cache is for. Nothing else
-is written to disk. The separate window (/ants_optimizer/window) talks to the
-page through /ants_optimizer/ui, which is memory only: a revision and an origin,
-so a change made in the window and a change made on the page are the same
-settings, and neither side is the master. If nvidia-smi is missing, the GPU
-route says so and the panel falls back to ComfyUI's own /system_stats.
+write a folder — stores node pictures under ComfyUI's temp directory when the
+frontend asks. That write is the disk cache for the pictures. Nothing else is
+written to disk. The detached window (/ants_optimizer/window) talks to the page
+through /ants_optimizer/ui, which is memory only: a revision and an origin, so a
+change made in the window and a change made on the page are the same settings,
+and neither side is the master. If nvidia-smi is missing, the GPU route says so
+and the detached window falls back to ComfyUI's own /system_stats.
 
 Safe to drop into any workflow: no inputs, no outputs, no execution, no
 dependencies.
@@ -60,8 +61,8 @@ THUMB_MAX_BYTES = 8 * 1024 * 1024
 
 _thumb_root_override = None
 
-# The GPU probe is cached for this long. The panel polls it at most every 2.5s
-# while its GPU tab is open, and spawning nvidia-smi is not free.
+# The GPU probe is cached for this long. The detached GPU tab polls it only
+# while active, and spawning nvidia-smi is not free.
 GPU_CACHE_SECONDS = 2.0
 
 _NVIDIA_SMI_TIMEOUT = 5
@@ -76,7 +77,7 @@ except Exception:  # pragma: no cover
 
 def parse_nvidia_smi(gpu_csv, proc_csv=None):
     """
-    Turn nvidia-smi CSV output into the JSON shape the panel expects.
+    Turn nvidia-smi CSV output into the JSON shape the detached window expects.
 
     Kept as a pure function (no subprocess, no framework) so it can be tested
     without a GPU or a running ComfyUI.
@@ -138,7 +139,7 @@ def query_nvidia_smi():
     """
     Run nvidia-smi and return the parsed payload. Never raises: an absent binary,
     a driver hiccup or a timeout all become {'available': False, 'reason': ...},
-    which the panel renders as an explanation rather than an error.
+    which the detached GPU tab renders as an explanation rather than an error.
     """
     import shutil
     import subprocess
@@ -370,6 +371,7 @@ _UI_EMPTY = {
     "limits": None,
     "command": "",
     "command_label": "",
+    "command_data": None,
     "command_rev": 0,
     "heard": 0.0,
 }
@@ -396,6 +398,7 @@ def _ui_copy(now):
         "limits": _ui["limits"],
         "command": _ui["command"],
         "commandLabel": _ui["command_label"],
+        "commandData": _ui["command_data"],
         "commandRev": _ui["command_rev"],
         "heardAge": None if not heard else now - heard,
     }
@@ -425,8 +428,24 @@ def ui_update(body, who=""):
             _ui["limits"] = copy.deepcopy(body["limits"])
         command = body.get("command")
         if command:
-            _ui["command"] = str(command)
-            _ui["command_label"] = str(body.get("label") or "")
+            command = str(command)[:80]
+            _ui["command"] = command
+            _ui["command_label"] = str(body.get("label") or "")[:200]
+            data = body.get("data")
+            if command == "benchmark":
+                data = data if isinstance(data, dict) else {}
+                slot = "B" if data.get("slot") == "B" else "A"
+                try:
+                    duration_ms = int(float(data.get("durationMs", 6000)))
+                except (TypeError, ValueError, OverflowError):
+                    duration_ms = 6000
+                duration_ms = max(100, min(60_000, duration_ms))
+                _ui["command_data"] = {"slot": slot, "durationMs": duration_ms}
+            else:
+                # Only benchmark consumes command data. Drop any unrelated
+                # payload instead of carrying arbitrary request data across the
+                # page/window bridge.
+                _ui["command_data"] = None
             _ui["command_rev"] += 1
             if origin:
                 _ui["origin"] = origin
@@ -437,9 +456,9 @@ def ui_update(body, who=""):
 
 def register_routes():
     """
-    Register the optional GPU route. Deliberately best-effort: if this ComfyUI
+    Register the optional routes. Deliberately best-effort: if this ComfyUI
     build has no route registry (or the import failed), the tracker still works
-    and the panel simply says the side-channel is unavailable.
+    and the detached window can report that side-channel data is unavailable.
     """
     if PromptServer is None or not getattr(PromptServer, "instance", None):
         return False
@@ -522,9 +541,9 @@ register_routes()
 
 class ANTsFrontendOptimizer:
     """
-    Dummy node. Its only job is to carry the pill (added on the JS side) that
-    opens the panel. The tool itself runs from page load whether or not this
-    node is in the graph.
+    Dummy node. Its only job is to carry the compact power/gear pill (added on
+    the JS side) that opens the detached optimizer window. The tool itself runs
+    from page load whether or not this node is in the graph.
     """
 
     CATEGORY = "ANTs"

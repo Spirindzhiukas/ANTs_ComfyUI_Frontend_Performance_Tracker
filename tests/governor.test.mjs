@@ -491,6 +491,39 @@ suite("governor: off-thread lane", () => {
     assertEqual(seen[0][0], "constructed", "the worker starts on first use, not at page load");
   });
 
+  test("master-off refuses new worker jobs and worker self-tests", async () => {
+    const h = await boot();
+    let posted = 0;
+    class FakeWorker {
+      constructor() {}
+      postMessage(message) {
+        posted++;
+        this.onmessage({ data: { id: message.id, ok: true, value: 42, ms: 1 } });
+      }
+    }
+    h.sandbox.Worker = FakeWorker;
+    h.sandbox.Blob = class { constructor(parts) { this.parts = parts; } };
+    h.sandbox.URL = { createObjectURL: () => "blob:ants-governor-off-test" };
+    h.tracker.governor.probeWorker();
+    const jobsBeforeOff = h.tracker.governor.metrics.worker.jobs;
+    const postsBeforeOff = posted;
+
+    h.tracker.lowZoom.setEnabled(false);
+    const offload = await h.tracker.governor.offload("sum", [1, 2, 3]);
+    assertEqual(offload.fellBack, true, "a direct call is reported as not offloaded");
+    assertEqual(offload.value, null, "the disabled lane does not run the main-thread fallback either");
+    assertIncludes(offload.reason, "optimizer is off", "the reason is explicit");
+    assertEqual(posted, postsBeforeOff, "no worker message is sent while disabled");
+    assertEqual(h.tracker.governor.metrics.worker.jobs, jobsBeforeOff, "no disabled job is counted");
+
+    const selfTest = await h.tracker.governor.selfTest();
+    assertEqual(selfTest.match, false, "the sanity check does not run while disabled");
+    assertIncludes(selfTest.error, "not started", "the disabled state is reported rather than a false failure");
+    assert(Number.isNaN(selfTest.mainMs), "the expensive main-thread twin is not run");
+    assertEqual(posted, postsBeforeOff, "the self-test also leaves the worker idle");
+    assertEqual(h.tracker.governor.metrics.worker.jobs, jobsBeforeOff, "the self-test adds no job");
+  });
+
   test("the worker code itself computes the same answer as the main thread", async () => {
     const h = await boot();
     const src = h.tracker.governor.workerSource;
@@ -740,24 +773,16 @@ suite("governor: fail open, and the way back", () => {
     assertEqual(h.tracker.governor.metrics.registered, before, "and is not even registered as a source");
   });
 
-  test("the panel and the report both say when the layer is off", async () => {
+  test("the detached status and copied report say when the layer is off", async () => {
     const h = await boot();
-    h.tracker.governor.off("turned off from the panel");
+    h.tracker.governor.off("turned off from the detached window");
     assertEqual(h.tracker.governor.metrics.disabled, true);
+    const report = h.tracker.report;
+    assertIncludes(report, "TURNED OFF", "the report leads with the layer state");
+    assertIncludes(report, "turned off from the detached window", "and preserves the reason");
     h.tracker.open();
-    const govTab = h.document
-      .getElementById("ants-tracker-tabs")
-      .children.find((n) => n.textContent.includes("Governor"));
-    govTab.click();
-    h.advance(1200);
-    await h.flush();
-    const text = h.document.body.descendants().map((n) => n._text || "").join(" ");
-    assertIncludes(text, "turned off from the panel", "the tab names the reason");
-    const copyBtn = h.document.body.descendants().find((n) => n._cls && n._cls.has("ants-hbtn") && n.textContent.includes("Copy"));
-    copyBtn.click();
-    await h.flush();
-    const report = h.clipboardWrites[h.clipboardWrites.length - 1] || "";
-    assertIncludes(report, "TURNED OFF", "and the copied report leads with it instead of listing limits that no longer exist");
+    assertEqual(h.panel(), null, "opening from the page never constructs the retired panel");
+    assert(h.document.getElementById("ants-corner-btn")._cls.has("ants-window-blocked"), "a blocked detached launch stays visibly marked");
   });
 });
 
@@ -1031,19 +1056,8 @@ suite("governor: suggestions and the autopilot target what actually costs time",
       "the row is reported as unaffected by its own limit instead of claiming savings"
     );
     assertGreater(h.tracker.governor.metrics.inert.msPerSec, 20, "with how much it still costs per second");
-    h.tracker.open();
-    h.advance(1200);
-    await h.flush();
-    const text = h.document
-      .getElementById("ants-tracker-tabs")
-      .children.find((n) => n.textContent.includes("Governor")).click();
-    h.advance(1200);
-    await h.flush();
-    assertIncludes(
-      h.document.body.descendants().map((n) => n._text || "").join(" "),
-      "no effect",
-      "and the table marks the row's limit as having no effect"
-    );
+    assertEqual(after.policy, "half", "the selected limit remains the source's current policy");
+    assertIncludes(h.tracker.report, "unaffected by their own limit", "the headless report explains that a too-narrow limit cannot bite");
   });
 });
 

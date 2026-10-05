@@ -42,6 +42,7 @@
   .sub { margin: 3px 0 0; color: var(--muted); font-size: 12px; max-width: 62ch; }
   .live { margin: 8px 0 0; font-variant-numeric: tabular-nums; }
   .live span { color: var(--gold); }
+  .live.off { color: var(--bad); font-weight: 600; }
   .actions { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
   button, select {
     font: inherit;
@@ -65,6 +66,7 @@
   nav {
     flex: none;
     display: flex;
+    flex-wrap: wrap;
     gap: 0;
     border-bottom: 1px solid var(--line);
     padding: 0 8px;
@@ -102,6 +104,7 @@
   select, input[type="text"], .row button { width: 100%; max-width: 420px; }
   input[type="text"] { background: #202024; color: #eee; border: 1px solid #4a4a55; border-radius: 4px; padding: 5px 8px; font: inherit; }
   .note { margin: 8px 0 0; color: var(--muted); min-height: 1.2em; }
+  .note.warn { color: var(--bad); }
   table { width: 100%; border-collapse: collapse; margin-top: 8px; }
   th, td {
     text-align: left;
@@ -113,6 +116,12 @@
   td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   .empty { color: var(--muted); padding: 18px 0; }
   .muted { color: var(--muted); }
+  .limited td { background: #352814; }
+  .policy-select { width: auto; min-width: 112px; }
+  details { border-bottom: 1px solid var(--line); padding: 8px 0; }
+  summary { cursor: pointer; }
+  .gpu-card { margin: 10px 0 16px; border: 1px solid var(--line); padding: 8px; border-radius: 4px; }
+  .gpu-card table { margin: 0; }
   @media (max-width: 640px) {
     header { flex-direction: column; }
     .row { grid-template-columns: 1fr; }
@@ -124,7 +133,7 @@
 <header>
   <div>
     <h1><b>ANTs</b> Frontend Optimizer <span id="ver"></span></h1>
-    <p class="sub">This is its own page. It is not on the graph canvas. Settings go to the ComfyUI page through <span class="muted">/ants_optimizer/ui</span>, and the numbers come back the same way. Resize this window from its edges — the edge you drag is the edge that moves.</p>
+    <p class="sub">This detached window is the optimizer's only settings UI; the in-page node retains just its power switch and gear. Settings and live readings travel through <span class="muted">/ants_optimizer/ui</span>. Closing this window stops temporary testing runs, while saved optimization choices remain in force until you change them or switch the optimizer off.</p>
     <p class="live" id="live">waiting for the ComfyUI page…</p>
   </div>
   <div class="actions">
@@ -132,6 +141,7 @@
     <button id="pause" type="button" disabled>⏸ Pause</button>
     <button id="reset" type="button">⟲ Reset</button>
     <button id="copy" type="button">📋 Copy</button>
+    <button id="close" type="button" title="Close the detached optimizer window">✕ Close</button>
   </div>
 </header>
 <div id="banner"></div>
@@ -141,6 +151,11 @@
   <button type="button" data-tab="timing">Timing</button>
   <button type="button" data-tab="nodes">Nodes</button>
   <button type="button" data-tab="stalls">Stalls</button>
+  <button type="button" data-tab="governor">Governor</button>
+  <button type="button" data-tab="load">Load</button>
+  <button type="button" data-tab="memory">Memory</button>
+  <button type="button" data-tab="gpu">GPU / VRAM</button>
+  <button type="button" data-tab="testing">Testing</button>
 </nav>
 <main>
   <section class="pane on" id="pane-settings"></section>
@@ -148,6 +163,11 @@
   <section class="pane" id="pane-timing"></section>
   <section class="pane" id="pane-nodes"></section>
   <section class="pane" id="pane-stalls"></section>
+  <section class="pane" id="pane-governor"></section>
+  <section class="pane" id="pane-load"></section>
+  <section class="pane" id="pane-memory"></section>
+  <section class="pane" id="pane-gpu"></section>
+  <section class="pane" id="pane-testing"></section>
 </main>
 <script>
 (function () {
@@ -158,6 +178,14 @@
   var controls = {};
   var miss = 0;
   var copiedReport = "";
+  var commandQueue = Promise.resolve();
+  var activeTab = "settings";
+  var governorRows = new Map();
+  var renderedTraceVersion = -1;
+  var gpuLastAt = 0;
+  var gpuBusy = false;
+  var gpuPaused = false;
+  var gpuData = { system: null, nvidia: null, error: "" };
 
   function $(id) { return document.getElementById(id); }
   function say(text) {
@@ -196,12 +224,14 @@
     while (node.firstChild) node.removeChild(node.firstChild);
   }
   function showTab(name) {
+    activeTab = name;
     document.querySelectorAll("nav button").forEach(function (b) {
       b.classList.toggle("on", b.getAttribute("data-tab") === name);
     });
     document.querySelectorAll("main .pane").forEach(function (p) {
       p.classList.toggle("on", p.id === "pane-" + name);
     });
+    if (name === "gpu") refreshGpu(true);
   }
   document.querySelectorAll("nav button").forEach(function (b) {
     b.addEventListener("click", function () { showTab(b.getAttribute("data-tab")); });
@@ -217,14 +247,25 @@
       return res.json();
     });
   }
+  function postCommand(command, data, label) {
+    commandQueue = commandQueue.then(function () {
+      return post({ origin: "window", command: command, data: data || {}, label: label || "" });
+    }).catch(function (e) {
+      say("Could not send that action: " + e.message);
+    });
+    return commandQueue;
+  }
   function postSettings(change) {
     if (!last.settings) return Promise.resolve();
     var next = Object.assign({}, last.settings, change || {});
     last.settings = next;
     last.origin = "window";
-    return post({ origin: "window", settings: next }).catch(function (e) {
+    commandQueue = commandQueue.then(function () {
+      return post({ origin: "window", settings: next });
+    }).catch(function (e) {
       say("Could not send that setting: " + e.message);
     });
+    return commandQueue;
   }
 
   function zoomLabel(z, below) {
@@ -312,7 +353,7 @@
     row(host, "Link thinning", thin, "Below this zoom, links are stroked 1px wide instead of 3 and lose the dark outline. Link ink and nothing else.");
     var measure = el("button", { type: "button", id: "measure" }, "Measure link thinning");
     measure.addEventListener("click", function () {
-      post({ origin: "window", command: "measure-links" }).catch(function (e) { say(e.message); });
+      postCommand("measure-links");
     });
     row(host, "Measure link thinning", measure, "A few seconds of thinned links, then the same with full ink, on this page. The verdict shows under this row.");
     host.appendChild(el("p", { class: "note", id: "ab" }, ""));
@@ -366,8 +407,142 @@
       });
     });
     row(host, "Way back", back, "Turns the drawing changes off. The disk cache is left as you set it.");
+    buildOtherTabs(limits);
     built = true;
     writeLimits(limits);
+  }
+
+  function settingRow(host, id, label, options, key, type, help) {
+    var sel = select(id);
+    options.forEach(function (o) { sel.appendChild(el("option", { value: String(o.value) }, o.text)); });
+    sel.addEventListener("change", function () {
+      var value = type === "boolean" ? sel.value === "true" : type === "number" ? Number(sel.value) : sel.value;
+      governorSetting("controls", key, value);
+    });
+    row(host, label, sel, help || "");
+    return sel;
+  }
+  function governorSetting(group, key, value) {
+    var current = Object.assign({}, (last.settings && last.settings.governor) || {});
+    var part = Object.assign({}, current[group] || {});
+    part[key] = value;
+    current[group] = part;
+    postSettings({ governor: current });
+  }
+  function actionButton(host, text, command, data, title) {
+    var button = el("button", { type: "button", title: title || "", "data-command": command }, text);
+    button.addEventListener("click", function () { postCommand(command, data); });
+    host.appendChild(button);
+    return button;
+  }
+  function kv(host, rows) {
+    var t = el("table");
+    var body = el("tbody");
+    rows.forEach(function (item) {
+      var tr = el("tr");
+      tr.appendChild(el("td", null, item[0]));
+      tr.appendChild(el("td", { class: "num", id: item[1] }, "—"));
+      body.appendChild(tr);
+    });
+    t.appendChild(body);
+    host.appendChild(t);
+    return t;
+  }
+  function buildOtherTabs(limits) {
+    var host = $("pane-governor");
+    heading(host, "Scheduler Governor");
+    host.appendChild(el("p", { class: "note" }, "The Governor runs on the ComfyUI page. Its active limits and controls are shown here and can be changed here; source policies survive reloads. Normal means measured but not limited."));
+    var govState = el("p", { class: "note", id: "gov-state" }, "Waiting for the ComfyUI page…");
+    host.appendChild(govState);
+    var govStats = el("div", { id: "gov-stats" });
+    kv(govStats, [["Tick sources", "gov-count"], ["Limited sources", "gov-limited"], ["Skipped / deferred", "gov-skips"], ["Redraws merged", "gov-merged"], ["Estimated saved", "gov-saved"], ["Governor overhead", "gov-overhead"], ["rAF mode", "gov-raf"]]);
+    host.appendChild(govStats);
+    heading(host, "Governor controls");
+    settingRow(host, "gov-budget", "Frame budget", [8, 12, 16, 24].map(function (n) { return { value: n, text: n + " ms" }; }), "budgetMs", "number");
+    settingRow(host, "gov-raf-mode", "rAF governor", [{ value: "off", text: "off (measure only)" }, { value: "adaptive", text: "adaptive" }], "rafMode", "string");
+    settingRow(host, "gov-raf-floor", "rAF floor", [60, 30, 20, 10].map(function (n) { return { value: n, text: n + " Hz" }; }), "rafMinHz", "number");
+    settingRow(host, "gov-raf-skips", "Maximum consecutive rAF skips", [1, 2, 3, 4, 5].map(function (n) { return { value: n, text: String(n) }; }), "adaptiveSkipMax", "number");
+    settingRow(host, "gov-coalesce", "Merge redundant redraw requests", [{ value: false, text: "off" }, { value: true, text: "on" }], "coalesce", "boolean");
+    settingRow(host, "gov-input-guard", "Protect recent input", [{ value: true, text: "on" }, { value: false, text: "off" }], "inputGuard", "boolean");
+    settingRow(host, "gov-trace-threshold", "Long-frame trace threshold", [0, 30, 50, 100, 200].map(function (n) { return { value: n, text: n === 0 ? "off" : "over " + n + " ms" }; }), "traceMinMs", "number");
+    settingRow(host, "gov-trace-count", "Maximum saved traces", [10, 20, 40, 80].map(function (n) { return { value: n, text: String(n) }; }), "traceCap", "number");
+    settingRow(host, "gov-auto", "Autopilot", [{ value: false, text: "off" }, { value: true, text: "on" }], "autoLimit", "boolean");
+    settingRow(host, "gov-auto-target", "Autopilot target", [150, 250, 400, 600].map(function (n) { return { value: n, text: n + " ms/s" }; }), "autoTargetMsPerSec", "number");
+    settingRow(host, "gov-auto-floor", "Autopilot floor", [15, 30, 60].map(function (n) { return { value: n, text: n + " ms/s" }; }), "autoMinMsPerSec", "number");
+    var actions = el("div", { class: "actions" });
+    actionButton(actions, "Suggest limits", "governor-suggest", null, "Apply limits only to measured sources that are costing time.");
+    actionButton(actions, "Reset Governor to normal", "governor-reset", null, "Clear saved source limits and restore the default controls.");
+    actionButton(actions, "Turn Governor off until reload", "governor-off", null, "Restore the page's native timers and stop scheduling limits for this load.");
+    actionButton(actions, "Run worker sanity check", "worker-self-test");
+    actionButton(actions, "Clear traces", "governor-clear-traces");
+    host.appendChild(actions);
+    host.appendChild(el("p", { class: "note", id: "gov-action" }, ""));
+    heading(host, "Tick sources and active policies");
+    var policyHost = el("div", { id: "gov-table" });
+    host.appendChild(policyHost);
+    host.appendChild(el("p", { class: "note" }, "The tracker never limits its own timers. Setting a source to a slower policy changes that page's behavior; reset restores normal scheduling."));
+    heading(host, "Long-frame traces");
+    var traceHost = el("div", { id: "gov-traces" });
+    host.appendChild(traceHost);
+    host = $("pane-load");
+    heading(host, "Startup resource timing");
+    host.appendChild(el("p", { class: "note" }, "Load metrics are captured once by the ComfyUI page. Concurrent request durations overlap; the span column is wall-clock time, not a sum."));
+    var loadSummary = el("div", { id: "load-summary" });
+    host.appendChild(loadSummary);
+    var loadTable = el("div", { id: "load-table" });
+    host.appendChild(loadTable);
+    host = $("pane-memory");
+    heading(host, "JavaScript heap");
+    host.appendChild(el("p", { class: "note" }, "Heap telemetry is from Chromium's performance.memory API. It is process/page heap only, not GPU VRAM or per-extension memory."));
+    var memorySummary = el("div", { id: "memory-summary" });
+    host.appendChild(memorySummary);
+    var memoryActions = el("div", { class: "actions" });
+    actionButton(memoryActions, "Set baseline", "memory-baseline");
+    actionButton(memoryActions, "Clear baseline", "memory-clear-baseline");
+    host.appendChild(memoryActions);
+    var memorySelf = el("div", { id: "memory-self" });
+    host.appendChild(memorySelf);
+    host = $("pane-gpu");
+    heading(host, "GPU and VRAM");
+    host.appendChild(el("p", { class: "note" }, "ComfyUI /system_stats is the primary source. NVIDIA driver detail is best-effort; unavailable fields remain unknown rather than guessed."));
+    var gpuStatus = el("p", { class: "note", id: "gpu-status" }, "Not fetched yet");
+    host.appendChild(gpuStatus);
+    var gpuActions = el("div", { class: "actions" });
+    var gpuRefresh = el("button", { type: "button" }, "Refresh now");
+    gpuRefresh.addEventListener("click", function () { refreshGpu(true); });
+    gpuActions.appendChild(gpuRefresh);
+    host.appendChild(gpuActions);
+    var gpuSummary = el("div", { id: "gpu-summary" });
+    host.appendChild(gpuSummary);
+    host = $("pane-testing");
+    heading(host, "Diagnostic controls");
+    host.appendChild(el("p", { class: "note", id: "test-state" }, "These controls are session-only. A synthetic tick deliberately forces redraw requests; keep it off except while diagnosing."));
+    var cap = select("test-cap");
+    [{ ms: 0, label: "Off" }, { ms: 16, label: "60 fps (~16 ms)" }, { ms: 33, label: "30 fps (~33 ms)" }, { ms: 66, label: "15 fps (~66 ms)" }, { ms: 100, label: "10 fps (100 ms)" }, { ms: 200, label: "5 fps (200 ms)" }, { ms: 500, label: "2 fps (500 ms)" }, { ms: 1000, label: "1 fps (1 s)" }, { ms: 2000, label: "1 redraw / 2 s" }, { ms: 5000, label: "1 redraw / 5 s" }].forEach(function (p) { cap.appendChild(el("option", { value: String(p.ms) }, p.label)); });
+    cap.addEventListener("change", function () { postSettings({ drawThrottleMs: Number(cap.value) }); });
+    row(host, "Canvas redraw cap", cap, "Delays early redraws and schedules one trailing redraw. Off is the normal ComfyUI behavior.");
+    var synth = select("test-synth");
+    [{ ms: 0, label: "Off" }, { ms: 5000, label: "1 redraw / 5 s" }, { ms: 1000, label: "1 redraw / s" }, { ms: 500, label: "2 redraws / s" }, { ms: 250, label: "4 redraws / s" }, { ms: 100, label: "10 redraws / s" }, { ms: 50, label: "20 redraws / s" }, { ms: 16, label: "60 redraws / s" }].forEach(function (p) { synth.appendChild(el("option", { value: String(p.ms) }, p.label)); });
+    synth.addEventListener("change", function () { postSettings({ syntheticTickMs: Number(synth.value) }); });
+    row(host, "Synthetic redraw generator", synth, "Forces setDirty on a fixed clock. This is an explicit diagnostic, not a normal optimization.");
+    var benchDuration = select("bench-duration");
+    [{ ms: 3000, label: "3 seconds" }, { ms: 6000, label: "6 seconds" }, { ms: 10000, label: "10 seconds" }].forEach(function (p) { benchDuration.appendChild(el("option", { value: String(p.ms) }, p.label)); });
+    benchDuration.value = "6000";
+    var benchActions = el("div", { class: "actions" });
+    var runA = el("button", { type: "button", id: "bench-A" }, "Run as A");
+    var runB = el("button", { type: "button", id: "bench-B" }, "Run as B");
+    runA.addEventListener("click", function () { postCommand("benchmark", { slot: "A", durationMs: Number(benchDuration.value) }); });
+    runB.addEventListener("click", function () { postCommand("benchmark", { slot: "B", durationMs: Number(benchDuration.value) }); });
+    benchActions.appendChild(runA);
+    benchActions.appendChild(runB);
+    row(host, "Benchmark duration", benchDuration, "Runs the same scripted viewport pan; do not interact with the graph until it completes.");
+    host.appendChild(benchActions);
+    var testStats = el("div", { id: "test-stats" });
+    host.appendChild(testStats);
+    var testActions = el("div", { class: "actions" });
+    actionButton(testActions, "Unmute all hooks", "unmute-all");
+    host.appendChild(testActions);
+    host.appendChild(el("div", { id: "test-bench", class: "note" }, "No benchmark recorded."));
   }
 
   function writeLimits(limits) {
@@ -417,7 +592,7 @@
 
   function editing() {
     var a = document.activeElement;
-    return !!(a && a.closest && a.closest("#pane-settings"));
+    return !!(a && a.closest && a.closest("#pane-settings, #pane-governor, #pane-testing"));
   }
   function writeSettings(s) {
     if (!s || editing()) return;
@@ -437,6 +612,9 @@
     fill(controls.restore, optionsOf(controls.restore), s.foveaRestore);
     fill(controls.scale, optionsOf(controls.scale), s.displayScale);
     fill(controls.widgets, optionsOf(controls.widgets), s.focusDom || "hide");
+    fill(controls["test-cap"], optionsOf(controls["test-cap"]), s.drawThrottleMs || 0);
+    fill(controls["test-synth"], optionsOf(controls["test-synth"]), s.syntheticTickMs || 0);
+    writeGovernorSettings(s.governor);
     var power = $("power");
     power.disabled = false;
     power.textContent = s.enabled === false ? "⏻ On" : "⏻ Off";
@@ -444,6 +622,17 @@
     var pause = $("pause");
     pause.disabled = false;
     pause.textContent = s.paused ? "▶ Resume" : "⏸ Pause";
+  }
+  function writeGovernorSettings(governor) {
+    governor = governor || {};
+    var c = governor.controls || {};
+    var defaults = { budgetMs: 12, rafMode: "off", rafMinHz: 20, adaptiveSkipMax: 3, coalesce: false, inputGuard: true, traceMinMs: 50, traceCap: 40, autoLimit: false, autoTargetMsPerSec: 250, autoMinMsPerSec: 30 };
+    Object.keys(defaults).forEach(function (key) {
+      var sel = controls["gov-" + ({ budgetMs: "budget", rafMode: "raf-mode", rafMinHz: "raf-floor", adaptiveSkipMax: "raf-skips", coalesce: "coalesce", inputGuard: "input-guard", traceMinMs: "trace-threshold", traceCap: "trace-count", autoLimit: "auto", autoTargetMsPerSec: "auto-target", autoMinMsPerSec: "auto-floor" }[key])];
+      if (!sel) return;
+      var value = Object.prototype.hasOwnProperty.call(c, key) ? c[key] : defaults[key];
+      fill(sel, optionsOf(sel), value);
+    });
   }
   function optionsOf(sel) {
     if (!sel) return [];
@@ -453,7 +642,7 @@
   function table(host, headers, rows) {
     clear(host);
     if (!rows.length) {
-      host.appendChild(el("p", { class: "empty" }, "Nothing recorded in this window yet. Pan the graph on the ComfyUI page."));
+      host.appendChild(el("p", { class: "empty" }, "No rows are available in this snapshot. This metric may be unsupported or no matching activity has been recorded."));
       return;
     }
     var t = el("table");
@@ -472,17 +661,252 @@
   function cell(text, numeric) {
     return el("td", { class: numeric ? "num" : "" }, text);
   }
+  function setMetric(id, value) {
+    var node = $(id);
+    if (node) node.textContent = value == null ? "—" : String(value);
+  }
+  function renderGovernor(tel) {
+    var snap = (tel && tel.snapshot) || {};
+    var g = snap.governor || {};
+    var counters = g.counters || {};
+    var optimizerOn = !(tel && tel.drawing && tel.drawing.enabled === false);
+    var state = $("gov-state");
+    if (state) {
+      state.textContent = !optimizerOn ? "Optimizer off — Governor limits and autopilot are suspended." :
+        g.disabled ? "Governor OFF for this page load — " + (g.offReason || "disabled") :
+        g.installed ? (g.installError ? "Governor not installed: " + g.installError : "Governor installed; source limits are active where selected.") :
+        "Governor not installed yet. The ComfyUI page has not reported its scheduler layer.";
+      state.className = "note" + ((!optimizerOn || g.disabled || g.installError) ? " warn" : "");
+    }
+    ["worker-self-test", "governor-suggest"].forEach(function (command) {
+      var button = document.querySelector('button[data-command="' + command + '"]');
+      if (button) button.disabled = !optimizerOn;
+    });
+    setMetric("gov-count", g.sourceCount == null ? "—" : g.sourceCount + " (" + (g.registered || 0) + " registrations)");
+    setMetric("gov-limited", g.throttled || 0);
+    setMetric("gov-skips", (counters.skipped || 0) + " (" + num(g.skippedPerSec, 2) + "/s)");
+    setMetric("gov-merged", (counters.coalesced || 0) + "");
+    setMetric("gov-saved", g.throttled ? "≈ " + ms(g.savedMsPerSec) + " ms/s" : "—");
+    setMetric("gov-overhead", ms((g.overheadMsPerSec || 0) * 1000) + " µs/s");
+    setMetric("gov-raf", g.controls ? (g.controls.rafMode === "off" ? "off (measure only)" : g.controls.rafMode + ", floor " + g.controls.rafMinHz + " Hz") : "—");
+    var result = $("gov-action");
+    if (result && tel && tel.actionResult) result.textContent = tel.actionResult;
+
+    var host = $("gov-table");
+    if (host) {
+      var sources = Array.isArray(g.sources) ? g.sources.slice(0, 120) : [];
+      var seen = new Set();
+      sources.forEach(function (r) {
+        var key = String(r.key || r.label || "unknown");
+        seen.add(key);
+        var entry = governorRows.get(key);
+        if (!entry) {
+          var tr = el("tr");
+          var cells = [];
+          for (var i = 0; i < 9; i++) { cells.push(el("td", { class: i > 1 ? "num" : "" })); tr.appendChild(cells[i]); }
+          var policyCell = el("td");
+          var sel = el("select", { class: "policy-select", "aria-label": "Source policy" });
+          var policies = Array.isArray(g.policies) ? g.policies : [
+            { id: "full", label: "normal" }, { id: "half", label: "½ speed" }, { id: "quarter", label: "¼ speed" },
+            { id: "hz2", label: "2 /s" }, { id: "hz1", label: "1 /s" }, { id: "pause", label: "pause" },
+          ];
+          policies.forEach(function (p) { sel.appendChild(el("option", { value: p.id }, p.label)); });
+          sel.addEventListener("change", function () { governorSetting("policies", key, sel.value); });
+          policyCell.appendChild(sel);
+          tr.appendChild(policyCell);
+          entry = { tr: tr, cells: cells, select: sel };
+          governorRows.set(key, entry);
+        }
+        var requested = Number(r.requestedMs);
+        entry.cells[0].textContent = (r.name || r.label || key) + (r.file ? " @ " + r.file + (r.line ? ":" + r.line : "") : "");
+        entry.cells[0].title = r.ours ? "Tracker-owned source; this source is exempt from policy limits." : (r.kindLabel || r.kind || "") + (r.provisional ? "; file attribution is sampled" : "");
+        entry.cells[1].textContent = r.kindLabel || r.kind || "—";
+        entry.cells[2].textContent = Number.isFinite(requested) ? ms(requested) + " ms" : "—";
+        entry.cells[3].textContent = Number.isFinite(r.effectiveMs) ? ms(r.effectiveMs) + " ms" : "paused";
+        entry.cells[4].textContent = num(r.runsPerSec, 2);
+        entry.cells[5].textContent = ms(r.msPerSec);
+        entry.cells[6].textContent = Number.isFinite(r.perRunMs) ? ms(r.perRunMs, 3) : "—";
+        entry.cells[7].textContent = r.worst ? ms(r.worst) + " ms" : "—";
+        entry.cells[8].textContent = r.skipped ? String(r.skipped) : "—";
+        if (entry.select.value !== String(r.policy || "full")) entry.select.value = String(r.policy || "full");
+        entry.select.disabled = !!r.ours || !!g.disabled;
+        entry.select.title = r.ours ? "The tracker never limits its own timers." : "Slower policies reduce this source's scheduling rate; normal measures without limiting.";
+        entry.tr.className = r.policy && r.policy !== "full" && !r.ours ? "limited" : "";
+      });
+      governorRows.forEach(function (entry, key) {
+        if (!seen.has(key)) { if (entry.tr.parentNode) entry.tr.parentNode.removeChild(entry.tr); governorRows.delete(key); }
+      });
+      var table = host.querySelector("table");
+      if (!table) {
+        table = el("table");
+        var head = el("thead");
+        var hr = el("tr");
+        ["Source", "Kind", "Requested", "Allowed", "Runs/s", "ms/s", "ms/run", "Worst", "Skipped", "Limit"].forEach(function (x, i) { hr.appendChild(el("th", { class: i > 1 ? "num" : "" }, x)); });
+        head.appendChild(hr);
+        table.appendChild(head);
+        table.appendChild(el("tbody"));
+        host.appendChild(table);
+      }
+      var body = table.querySelector("tbody");
+      sources.forEach(function (r) { var entry = governorRows.get(String(r.key || r.label || "unknown")); if (entry && entry.tr.parentNode !== body) body.appendChild(entry.tr); });
+      var empty = host.querySelector(".empty");
+      if (!sources.length && !empty) host.appendChild(el("p", { class: "empty" }, "No timer or animation-frame sources have been observed in this snapshot."));
+      else if (sources.length && empty) empty.parentNode.removeChild(empty);
+    }
+    var traceHost = $("gov-traces");
+    var traceVersion = Number(g.traceVersion) || 0;
+    if (traceHost && traceVersion !== renderedTraceVersion) {
+      renderedTraceVersion = traceVersion;
+      clear(traceHost);
+      var traces = Array.isArray(tel && tel.governorTraces) ? tel.governorTraces.slice(0, 12) : [];
+      if (!traces.length) traceHost.appendChild(el("p", { class: "empty" }, "No long-frame traces captured. Tracing follows the Governor threshold above."));
+      traces.forEach(function (t) {
+        var details = el("details");
+        var scripts = (t.scripts || []).slice(0, 4).map(function (s) { return (s.fn || "script") + " @ " + (s.file || "") + " (" + ms(s.ms) + " ms)"; }).join("; ");
+        var summary = el("summary", null, ms(t.duration) + " ms frame · " + ms(t.blocking) + " ms blocked · " + (scripts || "no script attribution"));
+        details.appendChild(summary);
+        (t.scripts || []).forEach(function (s) { details.appendChild(el("p", { class: "note" }, (s.fn || "script") + " @ " + (s.file || "") + " — " + ms(s.ms) + " ms" + (s.layoutMs ? ", " + ms(s.layoutMs) + " ms forced layout" : "") + (s.invoker ? " · " + s.invoker : ""))); });
+        (t.ticks || []).forEach(function (x) { details.appendChild(el("p", { class: "note" }, "Tick: " + (x.label || x.key) + " — " + (x.count || 0) + " runs, " + ms(x.ms) + " ms, " + (x.policy || "normal"))); });
+        (t.callers || []).forEach(function (x) { details.appendChild(el("p", { class: "note" }, "Redraw caller: " + x.label + " ×" + x.count)); });
+        details.appendChild(el("p", { class: "note" }, (t.redraws || 0) + " redraw requests · " + (t.coalesced || 0) + " merged · forced layout " + ms(t.layoutMs) + " ms"));
+        traceHost.appendChild(details);
+      });
+    }
+  }
+  function renderLoad(snap) {
+    var totals = snap.loadTotals || null;
+    var summary = $("load-summary");
+    clear(summary);
+    if (totals) summary.appendChild(el("p", { class: "note" }, (totals.resourceCount || 0) + " browser-timed resources · " + bytes(totals.bytes || 0) + " transferred · " + ms(totals.spanMs || 0) + " ms overall wall span"));
+    var rows = Array.isArray(snap.load) ? snap.load : [];
+    var host = $("load-table");
+    clear(host);
+    if (!rows.length) { host.appendChild(el("p", { class: "empty" }, "No extension-pack resource timings were recorded for this page load.")); return; }
+    var rs = rows.map(function (r) {
+      var tr = el("tr");
+      [r.pack || "—", bytes(r.bytes || 0), String(r.files || 0), String(r.cached || 0), ms(r.spanMs || 0) + " ms", ms(r.slowest || 0) + " ms", ms(r.avgMs || 0) + " ms"].forEach(function (v, i) { tr.appendChild(el("td", { class: i ? "num" : "" }, v)); });
+      return tr;
+    });
+    table(host, [{ text: "Extension pack" }, { text: "Transferred", num: true }, { text: "Files", num: true }, { text: "Cached/unknown", num: true }, { text: "Wall span", num: true }, { text: "Slowest file", num: true }, { text: "Avg file", num: true }], rs);
+  }
+  function renderMemory(snap) {
+    var host = $("memory-summary");
+    clear(host);
+    var m = snap.memory;
+    if (!m) { host.appendChild(el("p", { class: "empty" }, "Heap data unavailable: this Chromium build did not expose performance.memory.")); }
+    else {
+      var pressure = m.limit ? m.used / m.limit : 0;
+      var baseline = m.baselineDelta == null ? "not set" : (m.baselineDelta >= 0 ? "+" : "−") + bytes(Math.abs(m.baselineDelta));
+      var trend = m.trendMbPerMin == null ? "not enough samples" : (m.trendMbPerMin >= 0 ? "+" : "−") + Math.abs(m.trendMbPerMin).toFixed(2) + " MB/min";
+      var range = m.min2m == null || m.max2m == null ? "not enough samples" : bytes(m.min2m) + " – " + bytes(m.max2m);
+      kv(host, [["JS heap used", bytes(m.used)], ["Allocated", bytes(m.total)], ["Heap limit", bytes(m.limit)], ["Pressure", (pressure * 100).toFixed(1) + "%"], ["Since baseline", baseline], ["Trend (last 60s)", trend], ["Range (last 2 min)", range]]);
+    }
+    var selfHost = $("memory-self");
+    clear(selfHost);
+    var s = snap.self || {};
+    kv(selfHost, [["Tracker buckets", String(s.buckets || 0)], ["Ring buffers", bytes(s.ringBytes || 0)], ["Wrapped hooks", String(s.wrappedHooks || 0)], ["Panel render", ms(s.renderMsPerSec) + " ms/s"], ["Bookkeeping", ms(s.sweepMsPerSec) + " ms/s"]]);
+  }
+  function benchmarkLine(r) {
+    if (!r) return "not run yet";
+    return (r.frames || 0) + " frames over " + (((r.spanMs || 0) / 1000).toFixed(1)) + " s · mean " + ms(r.meanFrameMs) + " / frame · p95 " + ms(r.p95) + " · " + num(r.fps, 1) + " fps · hook share " + (Number.isFinite(r.attrShare) ? (r.attrShare * 100).toFixed(0) + "%" : "—");
+  }
+  function renderTesting(snap) {
+    var test = snap.testing || {};
+    var settings = snap.settings || {};
+    var enabled = settings.enabled !== false;
+    ["test-cap", "test-synth", "bench-duration", "bench-A", "bench-B"].forEach(function (id) { var control = $(id); if (control) control.disabled = !enabled; });
+    var testState = $("test-state");
+    if (testState) testState.textContent = enabled
+      ? "Testing controls are session-only. A synthetic tick deliberately forces redraw requests; keep it off except while diagnosing."
+      : "Master switch is off: testing settings are retained but suspended. Turn the optimizer on to run diagnostics.";
+    var host = $("test-stats");
+    clear(host);
+    kv(host, [["Draws sampled", String(test.draws || 0)], ["Capped", String(test.capped || 0)], ["Deferred", String(test.deferred || 0)], ["Muted hook calls", String(test.mutedCalls || 0)], ["Wrapped hooks", String(test.wrappedHooks || 0)], ["Pre-existing hooks", String(test.preTrackedHooks || 0)], ["Instance hooks", String(test.instanceHooks || 0)], ["Muted sources", (settings.muted || []).join(", ") || "none"], ["Synthetic tick", settings.synthTickMs ? settings.synthTickMs + " ms" : "off"], ["Draw cap", settings.capMs ? settings.capMs + " ms" : "off"]]);
+    var benchHost = $("test-bench");
+    var bench = settings.benchmark || {};
+    if (bench.A || bench.B || test.benchActive) {
+      benchHost.textContent = (test.benchActive ? "Benchmark running · " : "") + "A: " + benchmarkLine(bench.A) + "\nB: " + benchmarkLine(bench.B);
+      benchHost.style.whiteSpace = "pre-wrap";
+    } else benchHost.textContent = "No benchmark recorded yet.";
+    var result = $("gov-action");
+    if (result && !result.textContent && last.telemetry && last.telemetry.actionResult) result.textContent = last.telemetry.actionResult;
+  }
+  function gpuMetric(value, suffix) {
+    return value == null || !Number.isFinite(Number(value)) ? "—" : Number(value).toLocaleString() + (suffix || "");
+  }
+  function refreshGpu(force) {
+    if (!last.settings || last.settings.enabled === false) {
+      gpuPaused = true;
+      var pausedStatus = $("gpu-status");
+      if (pausedStatus && pausedStatus.textContent !== "Master switch is off; live GPU polling is paused.") {
+        setMetric("gpu-status", "Master switch is off; live GPU polling is paused.");
+      }
+      return;
+    }
+    if (gpuPaused) {
+      gpuPaused = false;
+      force = true;
+    }
+    if (!force && (activeTab !== "gpu" || Date.now() - gpuLastAt < 15000)) return;
+    if (gpuBusy) return;
+    gpuBusy = true;
+    gpuLastAt = Date.now();
+    setMetric("gpu-status", "Refreshing…");
+    var systemPromise = fetch("/system_stats").then(function (res) { if (!res.ok) throw new Error("/system_stats returned " + res.status); return res.json(); }).then(function (data) { gpuData.system = data; gpuData.error = ""; }).catch(function (e) { gpuData.error = e.message; });
+    var nvidiaPromise = fetch("/ants_tracker/gpu").then(function (res) { if (!res.ok) return null; return res.json(); }).then(function (data) { gpuData.nvidia = data; }).catch(function () { gpuData.nvidia = null; });
+    Promise.all([systemPromise, nvidiaPromise]).then(function () {
+      gpuBusy = false;
+      if (!last.settings || last.settings.enabled === false) {
+        gpuPaused = true;
+        setMetric("gpu-status", "Master switch is off; live GPU polling is paused.");
+        return;
+      }
+      renderGpu();
+    });
+  }
+  function renderGpu() {
+    var host = $("gpu-summary");
+    clear(host);
+    var sys = gpuData.system;
+    var devs = sys && Array.isArray(sys.devices) ? sys.devices : [];
+    if (!devs.length && !gpuData.nvidia) host.appendChild(el("p", { class: "empty" }, gpuData.error || "No GPU telemetry is available from this server."));
+    devs.forEach(function (d) {
+      var total = Number(d.vram_total), free = Number(d.vram_free);
+      var rows = [["Device", (d.name || "GPU") + (d.type ? " (" + d.type + ")" : "")], ["VRAM total", bytes(total)], ["VRAM free", bytes(free)], ["VRAM used", Number.isFinite(total - free) ? bytes(total - free) : "—"], ["Torch reserved", d.torch_vram_total == null ? "—" : bytes(d.torch_vram_total)], ["Torch idle", d.torch_vram_free == null ? "—" : bytes(d.torch_vram_free)]];
+      var section = el("div", { class: "gpu-card" });
+      kv(section, rows);
+      host.appendChild(section);
+    });
+    var nv = gpuData.nvidia;
+    if (nv && nv.available && Array.isArray(nv.gpus)) {
+      nv.gpus.forEach(function (g) {
+        var section = el("div", { class: "gpu-card" });
+        kv(section, [["nvidia-smi device", g.name || "GPU " + g.index], ["Utilization", gpuMetric(g.utilization_gpu, "%")], ["Temperature", gpuMetric(g.temperature_gpu, " °C")], ["Power", gpuMetric(g.power_draw, " W") + " / " + gpuMetric(g.power_limit, " W")], ["Driver memory", gpuMetric(g.memory_used, " MiB") + " / " + gpuMetric(g.memory_total, " MiB")]]);
+        host.appendChild(section);
+      });
+      (nv.processes || []).forEach(function (p) { host.appendChild(el("p", { class: "note" }, "Process " + (p.pid == null ? "" : p.pid + " · ") + (p.name || "unknown") + " · " + gpuMetric(p.used_memory, " MiB"))); });
+    } else if (nv && nv.reason) host.appendChild(el("p", { class: "note" }, "nvidia-smi unavailable: " + nv.reason));
+    setMetric("gpu-status", "Updated " + new Date(gpuLastAt).toLocaleTimeString());
+  }
+
   function renderTelemetry(tel) {
     var snap = (tel && tel.snapshot) || {};
     var frame = snap.frame || {};
     var drawing = (tel && tel.drawing) || {};
     var fps = Number.isFinite(frame.fps) ? String(Math.round(frame.fps)) : "—";
     var zoom = Number.isFinite(drawing.zoom) ? Math.round(drawing.zoom * 100) + "%" : "—";
-    $("live").textContent = "fps " + fps + "  ·  frame " + ms(frame.meanFrameMs) + "  ·  zoom " + zoom +
+    var live = $("live");
+    live.classList.toggle("off", drawing.enabled === false);
+    live.textContent = (drawing.enabled === false ? "OPTIMIZER OFF  ·  " : "") + "fps " + fps + "  ·  frame " + ms(frame.meanFrameMs) + "  ·  zoom " + zoom +
       "  ·  stand-ins " + (drawing.snapDrawn || 0) + " served, " + bytes(drawing.snapBytes || 0);
     if (drawing.version) $("ver").textContent = "v" + drawing.version;
     var ab = $("ab");
     if (ab) ab.textContent = drawing.ab || "";
+    renderGovernor(tel);
+    renderLoad(snap);
+    renderMemory(snap);
+    renderTesting(snap);
+    if (activeTab === "gpu") refreshGpu(false);
 
     var status = $("pane-status");
     clear(status);
@@ -495,11 +919,65 @@
         "   " + (drawing.snapCaptured || 0) + " captured, " + (drawing.snapMisses || 0) + " misses",
       "disk " + (drawing.diskOn ? "on" : "off") + "   loaded " + (drawing.diskLoaded || 0) +
         "   saved " + (drawing.diskSaved || 0) + (drawing.diskDir ? "   " + drawing.diskDir : ""),
-      "sampling " + (drawing.paused ? "paused" : "on") + "   tool " + (drawing.enabled === false ? "off" : "on"),
+      "sampling " + (drawing.enabled === false ? "suspended" : drawing.paused ? "paused" : "on") + "   tool " + (drawing.enabled === false ? "off" : "on"),
     ];
     if (snap.env) {
       lines.push("graph " + (snap.env.nodes != null ? snap.env.nodes : "—") + " nodes / " +
         (snap.env.links != null ? snap.env.links : "—") + " links   canvas " + (snap.env.canvas || "—"));
+    }
+    var diag = drawing.diagnostics || {};
+    var nodeDiag = diag.nodes || {};
+    if (diag.renderer) {
+      var nodeMode = !drawing.enabled && nodeDiag.threshold ? "suspended below " + Math.round((nodeDiag.threshold || 0) * 100) + "%" :
+        nodeDiag.active ? "active below " + Math.round((nodeDiag.threshold || 0) * 100) + "%" : "inactive";
+      lines.push("renderer " + diag.renderer + "   node stand-ins " + nodeMode +
+        "   " + (nodeDiag.flat || 0) + " of " + (nodeDiag.total || 0) + " nodes simplified");
+      lines.push("box detail " + (nodeDiag.detail || "plain") + "   title bars " + (nodeDiag.titles || 0) + "   error marks " + (nodeDiag.errors || 0) +
+        "   progress bars " + (nodeDiag.progress || 0) + "   muted " + (nodeDiag.muted || 0));
+    }
+    var linkDiag = diag.links || {};
+    if (linkDiag.style || linkDiag.thinned || linkDiag.measurement) {
+      lines.push("link shape " + (linkDiag.style || "—") + "   thinning below " + Math.round((linkDiag.thinBelow || 0) * 100) + "%   " +
+        (linkDiag.thinned || 0) + " thin segments   ink " + (linkDiag.calls || 0) + " calls / " + ms(linkDiag.inkMs) + " total   connections stage " +
+        ms(linkDiag.connectionsMsPerFrame) + " / frame");
+      if (linkDiag.measurement) lines.push(linkDiag.measurement);
+    }
+    var widgetDiag = diag.widgets || {};
+    if (widgetDiag.inertBelow || widgetDiag.fovea || widgetDiag.blocked || widgetDiag.hoverBlocked) {
+      lines.push("widgets " + (widgetDiag.mode || "inert") + "   inert below " + Math.round((widgetDiag.inertBelow || 0) * 100) + "%   " +
+        (widgetDiag.blocked || 0) + " canvas hits blocked   " + (widgetDiag.hoverBlocked || 0) + " hover callbacks held   " +
+        (widgetDiag.fovea ? "off-screen treatment on; " + (widgetDiag.queued || 0) + " queued" : "off-screen treatment off"));
+    }
+    if (widgetDiag.display) {
+      var display = widgetDiag.display;
+      lines.push("display scale: window " + num(display.win, 2) + "×   effective " + num(display.effective, 2) + "×   frontend area " +
+        (display.unit || "unknown") + "   viewport maths " + (display.agree ? "agree" : "do not agree") + " (factor " + num(display.factor, 3) + ")");
+    }
+    var snapDiag = diag.snapshots || {};
+    if (snapDiag.wanted || snapDiag.captured || snapDiag.misses || snapDiag.heldRecords) {
+      var pictureMode = snapDiag.active ? "active" : snapDiag.wanted ? (drawing.enabled === false ? "suspended by master switch" : "selected, currently idle") : "off";
+      lines.push("pictures " + pictureMode + "   pathway " + (snapDiag.pathway || "off") +
+        "   " + (snapDiag.served || 0) + " served   " + (snapDiag.captured || 0) + " captured   " + (snapDiag.misses || 0) + " misses   " +
+        bytes(snapDiag.bytes || 0) + " held   " + (snapDiag.queued || 0) + " queued");
+      if (snapDiag.vueBlanked || snapDiag.vueIcons || snapDiag.vueIconSkip || snapDiag.vueSettleHeld) {
+        lines.push("Vue stand-ins: " + (snapDiag.vueBlanked || 0) + " node element(s) blanked   " + (snapDiag.vueIcons || 0) + " icon(s) drawn into pictures" +
+          (snapDiag.vueIconSkip ? "   " + snapDiag.vueIconSkip + " unreadable icon(s) left as holes" : "") +
+          (snapDiag.vueSettleHeld ? "   " + snapDiag.vueSettleHeld + " capture slice(s) held while nodes settled" : ""));
+      }
+      if (snapDiag.tooLarge || snapDiag.failures || snapDiag.fitted || snapDiag.keptLive) {
+        lines.push("picture outcomes: " + (snapDiag.tooLarge || 0) + " too large   " + (snapDiag.failures || 0) + " failed   " +
+          (snapDiag.fitted || 0) + " fitted to capture limit   " + (snapDiag.keptLive || 0) + " kept live on purpose");
+      }
+      if (snapDiag.reasons && snapDiag.reasons.length) {
+        lines.push("not pictured: " + snapDiag.reasons.map(function (r) { return (r.title || r.type || "node") + " (" + r.why + ")"; }).join("; "));
+      }
+    }
+    var migrations = diag.migrations || {};
+    if (migrations.legacyPixels) {
+      lines.push("Carried over from v2.1.8: the ‘nodes under " + migrations.legacyPixels + "px’ setting was mapped to a zoom threshold; the rule now follows zoom, not node size.");
+    }
+    if (migrations.automaticLinkStyle) {
+      lines.push("The old automatic link style was carried over as keeping every curve; choose a link shape to dismiss this note.");
     }
     if (snap.memory) lines.push("JS heap " + bytes(snap.memory.used) + " of " + bytes(snap.memory.limit));
     lines.forEach(function (line) { status.appendChild(el("p", null, line)); });
@@ -515,7 +993,7 @@
       var td = el("td");
       var b = el("button", { type: "button" }, r.muted ? "Unmute" : "Mute");
       b.addEventListener("click", function () {
-        post({ origin: "window", command: r.muted ? "unmute" : "mute", label: r.label }).catch(function (e) { say(e.message); });
+        postCommand(r.muted ? "unmute" : "mute", null, r.label);
       });
       td.appendChild(b);
       tr.appendChild(td);
@@ -604,11 +1082,14 @@
     postSettings({ paused: !last.settings.paused });
   });
   $("reset").addEventListener("click", function () {
-    post({ origin: "window", command: "reset" }).catch(function (e) { say(e.message); });
+    postCommand("reset");
   });
   $("copy").addEventListener("click", function () {
     copiedReport = "";
-    post({ origin: "window", command: "report" }).catch(function (e) { say(e.message); });
+    postCommand("report");
+  });
+  $("close").addEventListener("click", function () {
+    try { window.close(); } catch (e) { say("This shell did not allow closing the detached window."); }
   });
 
   poll();
