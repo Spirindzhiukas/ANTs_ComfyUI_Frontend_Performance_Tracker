@@ -398,20 +398,21 @@ two items that were still open between reports, both by tracing rather than
 guessing: the panel's "N element(s) hidden" is the page's own count (the class
 `ants-lod-box` for a node's DOM widgets, the attribute `data-ants-dom-hidden` for a
 Vue node's own element, one mark per element dressed, and a walk of the page finds
-exactly that number — pinned by a test), and a Vue stand-in never has to say
-anything about a run at all, because a node whose state is live is never boxed
-there: it keeps its element and the frontend draws its own bar, its error ring and
-its executing outline, while the canvas renderer's boxes read the marks from the
-node's own fields (`node.progress`, `node.has_errors`), per frame, from nodes the
-capture lane and the blit both refuse while either is set. The tracing also turned
-up one visible defect and fixed it: the selection ring on a picture was drawn at
-the node's graph size rather than at the box the node was pictured in (in the Vue
-renderer the element's own body), so a node the frontend renders taller than its
-`size` was ringed inside itself, and the ring changed size the moment its picture
-replaced the live box. What is still not measurable from here is the rasteriser's bill on
-the user's machine (Electron, GPU/hardware acceleration off) — DevTools' paint
-flashing is the direct way to see it, and the frame budget plus the Stalls tab are
-the tool's own instruments. Each report has been a state the harness could model only after the fact:
+exactly that number — pinned by a test). v2.6.9 initially left running/erroring
+nodes live; v2.7.4 changed the Vue path so progress/error marks overlay a held
+picture without being frozen or triggering recapture. Video and link drag still
+keep the live element; the frontend's separate executing outline is not recreated.
+The canvas renderer continues to draw running/erroring nodes live. The tracing also
+turned up one visible defect and fixed it: the selection ring on a picture was
+drawn at the node's graph size rather than at the box the node was pictured in (in
+the Vue renderer the element's own body), so a node the frontend renders taller
+than its `size` was ringed inside itself, and the ring changed size the moment its
+picture replaced the live box. What is still not measurable from here is the
+rasteriser's bill on the user's machine (Electron, GPU/hardware acceleration off)
+— DevTools' paint flashing is the direct way to see it, and the frame budget plus
+the Stalls tab are the tool's own instruments. The supplied FPS report had low-zoom
+drawing off, so the user's estimated ~15-vs-25 FPS stand-in delta still needs a
+paired on/off report with the threshold actually enabled. Each report has been a state the harness could model only after the fact:
 a class Vue rewrote, a picture half that was off, a picture with no text in it, a
 plan fighting the setting once per frame, a picture taken before the node had
 finished rendering, a poll the page could have answered itself. The user's page
@@ -670,20 +671,29 @@ worth doing, each only with evidence from the user's own page:
 - **A page-injected icon stylesheet is not noticed until the node changes** (the
   watched beat is 5 s by design). Recorded in `ANALYSIS.md` and `memory.md` §7. A
   fix would have to be *free* in the steady state — a per-frame query is not.
-- **The collapsed-node bar** (a collapsed node in this renderer is a header strip with
-  its own dots and progress line) is not read as its own shape; the reader draws the
-  header and the dots, and the bar only exists while a collapsed node is executing —
-  which is a node that keeps its own element, so nothing is lost today. Revisit only
-  if a report shows a collapsed stand-in that looks wrong.
+- **The collapsed-node progress-line geometry** (a collapsed node in this renderer
+  is a header strip with its own dots and progress line) is not reconstructed as its
+  own shape; the reader draws the header and dots. v2.7.4 overlays the current
+  progress mark on a held picture, but it is the stand-in's generic bar rather than
+  a confirmed pixel match for the frontend's collapsed-header line. Because a
+  running collapsed node can now stay blanked, verify its appearance on the live
+  page if the user reports it looking wrong.
 - **A pack's canvas-drawn widget content** is still invisible in this renderer (the
   widget has no element to walk), and a pack's own HTML stays blank and counted. That
   is a limit of the page, not of the reader.
-- **The state marks** (progress, error ring, executing outline) are the frontend's own
-  live drawing — a running, erroring or dragged node keeps its own element, so a
-  picture never has to carry them. The one case left is a node that *starts* running
-  while its picture stands in: `lodVueFlatNode` hands the element back on the next
-  draw, and the readout counts it (`vueRestored` / the stand-in counters). If a user
-  reports seeing a stale picture during a run, the answer is in the counters first.
+- **Execution/error state over held Vue pictures** was added in v2.7.4. The live
+  `node.progress` bar and `node.has_errors` stroke overlay a stand-in without entering
+  the picture signature or capture queue; clearing either mark takes effect on the
+  next draw with no recapture. Video and link drag still return the live element.
+  Regression: *progress and error marks overlay a held Vue picture without changing
+  or recapturing it*. The frontend's separate executing outline is still hidden with
+  the blanked DOM and not reconstructed; if the user expects that outline as well,
+  treat it as a distinct request. Live Electron paint/fidelity verification remains
+  open.
+- **Dark control/background differences** reported for Nodes 2.0 have not been
+  isolated to a style read, overlay, or capture ordering. The harness verifies
+  measured boxes and draw calls, not pixels; require a live screenshot pair before
+  attributing a cause or changing the palette reconstruction.
 
 **K12. After the capture floor, what else the lane costs (S, ongoing).** v2.7.2
 bounded the *rate* (600 ms between two pictures of one node, 5 s between two files

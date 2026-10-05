@@ -27,7 +27,7 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.7.3";
+const VERSION = "2.7.6";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
 // The class key ComfyUI stores in a workflow. The old key is still recognised so
 // a graph saved before the rename does not lose this node.
@@ -1097,7 +1097,8 @@ const LOD_BOX_PROGRESS_PX = 3; // a bar is at least this tall in CSS pixels
 //     no zoom this tool does not already touch can change appearance (golden
 //     rule 6). Reuse while panning is the point — panning moves the camera, not
 //     the node — so a canvas pan does not disable it, and neither does dragging a
-//     node. A link drag, a running bar and an error still draw live.
+//     node. In Vue mode progress/error are live overlays on the picture; video
+//     and link drag keep the element live. Canvas-mode state nodes still draw live.
 //   * the capture draws into its own offscreen canvas rather than the visible
 //     one. The live context is never touched, so there is no canvas state to
 //     restore (upstream had to copy sixteen properties and put them back).
@@ -1140,6 +1141,9 @@ const LOD_SNAP_HOLD_MS = 5000;
 const LOD_SNAP_PAD = 24; // graph units of margin around the node, so hooks that
 // draw outside the body (selection rings, glow) are not cut off
 const LOD_SNAP_TITLE_H = 30; // graph units above the body: LiteGraph's title bar
+const LOD_SNAP_BADGE_VERSION = "hv-warning-fallback-only-2"; // signature change rejects older RAM/disk pictures that baked the mark in
+const LOD_SNAP_BADGE_AMBER = "#FFC000";
+const LOD_SNAP_BADGE_BLACK = "#111111";
 const LOD_SNAP_MAX_DIM = 2048; // px; a capture is fitted down to this, or the node stays a box
 const LOD_SNAP_SLOW_MS = 60; // slower than this: stop, cool down, and try again later
 const LOD_SNAP_SIG_MS = 100; // a signature is re-checked at most this often
@@ -1223,19 +1227,15 @@ const LOD_VUE_MEDIA_MS = 400;
 // worse than late. Captures read unconditionally — one layout per picture is
 // part of making the picture.
 const LOD_VUE_MEDIA_BUDGET = 6;
-// How much of a node's own rendered text one measurement may carry, and how long a
-// single string may be. A node's DOM text is its widget labels and values as the
-// frontend draws them; the cap keeps a node with a hundred spans (or one with a
-// 40 kB string in it) from turning the read into a walk of the whole subtree.
-// How much of a node a reconstruction will read and draw. These were caps chosen
-// for the *cost* of a read — 16 strings and 12 widget rows per node — and on a
-// real node they are what made a picture look like a sketch: the node the user
-// photographed has ~30 widget rows with a label and a value each, so two thirds of
-// it was never read at all. A measure happens once per capture (never per frame)
-// and the read is batched, so the caps are now set where a real node ends rather
-// than where the first card felt cheap.
+// How much of a node's own rendered text one measurement may carry, and how long
+// an ordinary DOM text leaf may be. The 2,000-character bound applies to that
+// ordinary-text reconstruction only; Vue form values (including textarea prompts)
+// are wrapped and clipped by their available box lines instead of sliced here.
+// The item count was raised from fixture-sized caps after real nodes with ~30 widget
+// rows came back as sketches; measurement is batched and happens on change/capture,
+// never once per node per frame in the steady state.
 const LOD_VUE_TEXT_MAX = 256; // strings read from a node's DOM, per measurement
-const LOD_VUE_TEXT_CHARS = 400; // per string (a label is short; a caption is not)
+const LOD_VUE_TEXT_CHARS = 2000; // per ordinary DOM text string
 // The node's own icons. `icon-[lucide--info]` — the iconify Tailwind plugin this
 // frontend ships — compiles to `mask-image: url("data:image/svg+xml,…")` with
 // `background-color: currentColor` and `mask-size: 100% 100%`, so the glyph exists
@@ -1761,15 +1761,10 @@ function lodBoxAlpha(node) {
 // the frontend's own bridge keeps current for the node object (`nodeProgressCanvasSync.ts`
 // copies the execution store's progress state onto every node it adds, in both
 // renderers), and `node.has_errors`, kept by `useNodeErrorFlagSync.ts`. Neither is a
-// DOM read, and neither can go stale: `lodSnapLive` refuses to photograph *and*
-// refuses to blit a node whose `progress` is set or which has errors, so those nodes
-// are drawn as a box, every frame, from the live value. (A picture of a running node
-// would carry the bar of the instant it was taken, still there after the run.)
-//
-// In the Vue-nodes renderer neither mark is ever needed: `lodVueFlatNode` refuses the
-// same nodes `lodSnapLive` does, so a running or erroring node keeps its own element
-// and the frontend draws the mark itself (its own bar, its own error ring). These are
-// the canvas renderer's marks, where the box does stand for such a node.
+// DOM read. In the classic canvas renderer, a running/erroring node stays live and
+// its flat fallback box draws the current mark. In the Nodes 2.0 renderer, the node
+// may keep its held picture; `lodSnapPaint` calls this after the blit with current
+// fields. The marks never enter that picture, its signature, or the capture queue.
 function lodSnapStateMarks(ctx, node, spec) {
   const out = { bars: 0, errors: 0 };
   if (!ctx || !node || typeof ctx.fillRect !== "function") return out;
@@ -1805,6 +1800,80 @@ function lodSnapStateMarks(ctx, node, spec) {
     }
   }
   return out;
+}
+
+// A small, classic high-voltage mark for a live fallback box. Cached pictures
+// deliberately omit it: the badge distinguishes a placeholder from a complete
+// stored drawing and must never be baked into or painted over that drawing.
+function lodSnapWarningBadge(ctx, w, h, alpha) {
+  const width = Math.abs(Number(w)) || 0;
+  const height = Math.abs(Number(h)) || 0;
+  if (!ctx || !(width > 0) || !(height > 0) || typeof ctx.beginPath !== "function" || typeof ctx.fill !== "function") return false;
+  const titleH = Math.min(LOD_BOX_TITLE_H, height * LOD_BOX_TITLE_MAX);
+  if (!(titleH > 0)) return false;
+  const side = Math.max(10, Math.min(34, width * 0.16, titleH * 0.95 / 0.9));
+  const badgeH = side * 0.9;
+  const margin = Math.max(2, Math.min(8, width * 0.025));
+  const x = width - side - margin;
+  const y = -titleH + (titleH - badgeH) / 2;
+  const prior = {
+    globalAlpha: ctx.globalAlpha,
+    shadowColor: ctx.shadowColor,
+    fillStyle: ctx.fillStyle,
+    strokeStyle: ctx.strokeStyle,
+    lineWidth: ctx.lineWidth,
+    lineJoin: ctx.lineJoin,
+  };
+  let saved = false;
+  let painted = false;
+  try {
+    if (typeof ctx.save === "function") {
+      ctx.save();
+      saved = true;
+    }
+    const opacity = Number(alpha);
+    if (Number.isFinite(opacity)) ctx.globalAlpha = Math.max(0.05, Math.min(1, opacity));
+    ctx.shadowColor = "transparent";
+    ctx.lineJoin = "round";
+    ctx.beginPath();
+    ctx.moveTo(x + side / 2, y);
+    ctx.lineTo(x + side, y + badgeH);
+    ctx.lineTo(x, y + badgeH);
+    if (typeof ctx.closePath === "function") ctx.closePath();
+    ctx.fillStyle = LOD_SNAP_BADGE_AMBER;
+    ctx.fill();
+    if (typeof ctx.stroke === "function") {
+      ctx.strokeStyle = LOD_SNAP_BADGE_BLACK;
+      ctx.lineWidth = Math.max(1, side * 0.075);
+      ctx.stroke();
+    }
+    // The bolt sits inside the triangle, with a broad zig-zag silhouette that
+    // remains recognizable in the small on-screen copy.
+    ctx.beginPath();
+    ctx.moveTo(x + side * 0.57, y + badgeH * 0.16);
+    ctx.lineTo(x + side * 0.37, y + badgeH * 0.53);
+    ctx.lineTo(x + side * 0.51, y + badgeH * 0.53);
+    ctx.lineTo(x + side * 0.43, y + badgeH * 0.84);
+    ctx.lineTo(x + side * 0.68, y + badgeH * 0.41);
+    ctx.lineTo(x + side * 0.54, y + badgeH * 0.41);
+    if (typeof ctx.closePath === "function") ctx.closePath();
+    ctx.fillStyle = LOD_SNAP_BADGE_BLACK;
+    ctx.fill();
+    painted = true;
+  } catch (e) {
+    painted = false;
+  } finally {
+    if (saved && typeof ctx.restore === "function") {
+      try { ctx.restore(); } catch (e) { /* direct state restoration below is the fallback */ }
+    }
+    // Real canvas contexts restore these through save/restore; setting them back
+    // explicitly also keeps light test contexts and wrappers from leaking styles.
+    for (const key of Object.keys(prior)) {
+      if (prior[key] === undefined) continue;
+      try { ctx[key] = prior[key]; } catch (e) { /* state is best-effort */ }
+    }
+  }
+  return painted;
 }
 
 function lodPaintNode(node, canvas, ctx, content, detailOverride, sizeOverride, alphaOverride) {
@@ -1875,6 +1944,9 @@ function lodPaintNode(node, canvas, ctx, content, detailOverride, sizeOverride, 
     LOD.boxBars += marks.bars;
     LOD.boxErrors += marks.errors;
   }
+  // The warning mark belongs only to a live fallback box. A cached picture is
+  // complete and must not receive the placeholder mark; capture mode skips it too.
+  if (drawable && !LOD.inCapture) lodSnapWarningBadge(ctx, w, h, alpha);
   if (node.selected) {
     ctx.globalAlpha = alpha;
     ctx.strokeStyle = "#ffb300";
@@ -1899,7 +1971,7 @@ let lodDomSweepTimer = null;
 // execution result). One pass a second keeps the hidden set honest without
 // touching anything when the mode is off.
 function lodInstallDomSweep() {
-  if (lodDomSweepTimer) return;
+  if (!S.enabled || lodDomSweepTimer !== null) return;
   try {
     lodDomSweepTimer = govOwn(() =>
       setInterval(() => {
@@ -1917,8 +1989,16 @@ function lodInstallDomSweep() {
       }, VIEW_SWEEP_MS)
     );
   } catch (e) {
+    lodDomSweepTimer = null;
     /* no timers: the sweep still runs whenever the zoom or the setting changes */
   }
+}
+
+function lodStopDomSweep() {
+  if (lodDomSweepTimer !== null) {
+    try { clearInterval(lodDomSweepTimer); } catch (e) { /* best effort */ }
+  }
+  lodDomSweepTimer = null;
 }
 // The frontend has its own low-quality rendering: `_isLowQuality` is what
 // `low_quality` reads, and below its own threshold (Settings -> LiteGraph,
@@ -2506,6 +2586,20 @@ function viewVerifyMarked(limit) {
 const ANTS_ACCENT = "#AE7719";
 const ANTS_SWITCH_FILL = "#0D2A2A"; // the checked interior
 const ANTS_GLYPH_LINE = 1.5; // one line weight for the gear, the ring and the check
+const ANTS_GEAR_BUTTONS = new Set();
+
+function antsSetGearStatus(gear) {
+  if (!gear) return;
+  ANTS_GEAR_BUTTONS.add(gear);
+  const blocked = !!LOD.popoutNote;
+  if (blocked) gear.classList.add("ants-window-blocked");
+  else gear.classList.remove("ants-window-blocked");
+  const title = blocked
+    ? String(LOD.popoutNote)
+    : "Open the detached ANTs Frontend Optimizer window. Press and hold to move this control.";
+  gear.title = title;
+  try { gear.setAttribute("aria-label", title); } catch (e) { /* optional */ }
+}
 
 const ANTS_WIDGETS = new Set(); // sync functions, one per live node
 
@@ -2619,6 +2713,7 @@ function buildAntsNodeWidget() {
 
   const tick = antsBuildTick(pill);
   const gear = el("button", { class: "ants-node-btn ants-node-btn-gear", type: "button" });
+  antsSetGearStatus(gear);
 
   // The switch first, the gear after — the order the frame draws them in.
   pill.appendChild(tick);
@@ -2651,10 +2746,8 @@ function buildAntsNodeWidget() {
   return pill;
 }
 
-// The graph node was sized to the pill and, on some frontends, only allowed to
-// grow on one axis. A free minimum and a computeSize that does not shrink a
-// size the user already set is what both axes need. Vue node mode may ignore a
-// LiteGraph `resizable` flag; the floating panel's own grip does not depend on it.
+// Keep the workflow node resizable, but deliberately headless: settings and
+// metrics live in the detached window, never in a hidden or docked page panel.
 function antsUnlockNode(node) {
   try {
     node.resizable = true;
@@ -2679,85 +2772,30 @@ function antsUnlockNode(node) {
       }
       return [w, h];
     };
-    if (typeof node.addDOMWidget === "function" && !node._antsHost) {
-      const host = document.createElement("div");
-      host.className = "ants-own ants-node-host";
-      host.style.width = "100%";
-      host.style.minHeight = "0";
-      const widget = node.addDOMWidget("ants_host", "ants-ui", host, {
-        serialize: false,
-        hideOnZoom: false,
-      });
-      if (widget) {
-        widget.computeLayoutSize = () => ({ minWidth: 180, minHeight: 0, maxWidth: 4096, maxHeight: 4096 });
-      }
-      node._antsHost = host;
-    }
-    const prevResize = node.onResize;
-    node.onResize = function (size) {
-      let ret;
-      try {
-        if (typeof prevResize === "function") ret = prevResize.apply(this, arguments);
-      } catch (e) {
-        /* the reflow still runs */
-      }
-      antsReflowNode(this, size);
-      return ret;
-    };
   } catch (e) {
-    /* the floating panel still resizes on its own grip */
-  }
-}
-
-function antsReflowNode(node, size) {
-  try {
-    buildPanel();
-    const host = node && node._antsHost;
-    if (!host || !ui.panel) return;
-    const w = (size && Number(size[0])) || (node.size && Number(node.size[0])) || 0;
-    const h = (size && Number(size[1])) || (node.size && Number(node.size[1])) || 0;
-    if (w >= 280 && h >= 160) {
-      host.appendChild(ui.panel);
-      ui.panel.classList.add("open");
-      ui.panel.classList.add("ants-docked");
-      ui.panel.classList.remove("ants-popped");
-      ui.panel.style.width = "100%";
-      ui.panel.style.height = `${Math.max(160, Math.round(h - 28))}px`;
-      ui.docked = node;
-      return;
-    }
-    if (ui.docked === node) {
-      ui.docked = null;
-      ui.panel.classList.remove("ants-docked");
-      ui.panel.style.width = "";
-      ui.panel.style.height = "";
-      document.body.appendChild(ui.panel);
-    }
-  } catch (e) {
-    /* docking is optional; the grip on the floating panel still works */
+    /* the detached window does not depend on node resizing */
   }
 }
 
 // Attaching the pill to a node, through whichever API this frontend version has.
 function antsAttachNodeWidget(node) {
+  // The floating pill is always available. If this frontend cannot host the
+  // compact DOM widget, keep the workflow node headless instead of adding a
+  // second, text-only fallback control.
+  if (!node || typeof node.addDOMWidget !== "function") return null;
   const pill = buildAntsNodeWidget();
   try {
-    if (typeof node.addDOMWidget === "function") {
-      const widget = node.addDOMWidget("ants_controls", "ants-ui", pill, {
-        serialize: false,
-        hideOnZoom: false, // the frontend's own LOD must not take the switch away
-        selectOn: [], // clicking the switch is not "select this node"
-      });
-      if (widget) return pill;
-    }
+    node.addDOMWidget("ants_controls", "ants-ui", pill, {
+      serialize: false,
+      hideOnZoom: false, // the frontend's own LOD must not take the switch away
+      selectOn: [], // clicking the switch is not "select this node"
+    });
+    return pill;
   } catch (e) {
-    /* the fallback below is a canvas button, which is worse but not nothing */
+    /* the floating pill remains the only control if DOM widgets are unavailable */
   }
-  try {
-    node.addWidget("button", "Open Tracker", null, () => antsOpenFromGear());
-  } catch (e) {
-    /* a node with no widget API at all: the corner button is the only UI left */
-  }
+  // Do not add a text-button or hidden settings widget as a fallback: the
+  // workflow node stays headless when this frontend cannot host the compact pill.
   return null;
 }
 
@@ -2819,23 +2857,48 @@ function antsSyncWidgets() {
 function antsSetEnabled(on) {
   const next = !!on;
   if (next === !!S.enabled) return antsEnabled();
+  if (!next && !antsUiFrozenSnapshot) {
+    try { antsUiFrozenSnapshot = buildSnapshot(); } catch (e) { antsUiFrozenSnapshot = null; }
+  }
   S.enabled = next;
   if (!next) {
+    // Freeze sampling and background work before returning page elements. Keep
+    // the user's selected testing values, but cancel their active timers.
+    stopStaleSweep();
+    lodStopDomSweep();
+    lodSnapCancel();
+    stopRafMonitor();
+    stopMemorySampler();
+    stopStallObserver();
+    lodStopRamTimer();
+    govStopAutoPilot();
+    govRemoveInputGuard();
+    if (capTrailingTimer !== null) {
+      try { clearTimeout(capTrailingTimer); } catch (e) { /* best effort */ }
+      capTrailingTimer = null;
+    }
+    stopSyntheticTickTimer();
+    stopScriptedPan("optimizer off");
+    if (LOD.ab && !LOD.ab.done) lodAbStop("measurement stopped because the optimizer was switched off");
+    govResumeDeferrals();
     antsReleasePage();
-    // The page gets the drawing back, and the browser gets the memory back: a
-    // stored bitmap is only useful to a tool that is running, and switching on
-    // again recaptures on the next idle lane.
+    // The page gets the drawing back, and the browser gets the memory back: the
+    // selected snapshot setting stays, but its pictures and pending work do not.
     if (LOD.snapOn) lodSnapClear("master switch");
     lodVueUnblankAll("tool off");
-    // Nothing of this tool's own UI goes away: the floating pill carries the
-    // switch that turns it back on, and closing the panel under someone who is
-    // reading it would be its own small bug. The page is what gets handed back.
-    console.info(
-      "[ANTs Tracker] Switched off: no hooks wrapped, nothing sampled, no scheduler deferrals, no redraw cap, no low-zoom drawing, no DOM " +
-        "touched. The switch on the floating button (and the panel's own On button) switches it back on with the settings you had."
-    );
+    console.info("[ANTs Tracker] Switched off: optimization effects and sampling are suspended; the page is handed back to ComfyUI.");
   } else {
+    antsUiFrozenSnapshot = null;
     try {
+      installStallObserver();
+      installRafMonitor();
+      installMemorySampler();
+      startStaleSweep();
+      govInstallInputGuard();
+      if (GOV.controls.autoLimit) govStartAutoPilot();
+      if (LOD.ramRunning) lodStartRamTimer();
+      if (syntheticTickMs > 0) setSyntheticTick(syntheticTickMs);
+      if (LOD.snapOn) lodSnapPump();
       if (lodDomWanted()) {
         lodInstallDomSweep();
         lodSweepDom(app.canvas);
@@ -2845,19 +2908,9 @@ function antsSetEnabled(on) {
     } catch (e) {
       /* never fatal */
     }
-    console.info("[ANTs Tracker] Switched back on: the settings that were in force are in force again.");
+    console.info("[ANTs Tracker] Switched on: sampling and the saved optimization settings have resumed.");
   }
   antsSyncWidgets();
-  // The banner and the header button have to say what happened before anyone
-  // looks at them again — and an open panel is left open, showing them.
-  try {
-    if (ui.built) {
-      renderSummary();
-      if (ui.panel && ui.panel.classList.contains("open")) updateActiveTab();
-    }
-  } catch (e) {
-    /* never fatal */
-  }
   if (!antsUiSilent) antsUiPublishSettings();
   return antsEnabled();
 }
@@ -3312,6 +3365,7 @@ const LOD_AB_PHASE_MS = 1200;
 const LOD_AB_MIN_FRAMES = 3; // below this the comparison is not worth printing
 
 function lodAbStart() {
+  if (!S.enabled) return null;
   LOD.ab = {
     phase: 0, // 0 = thinning on, 1 = thinning off
     rounds: LOD_AB_ROUNDS,
@@ -3345,6 +3399,7 @@ function lodAbStop(text) {
 // One call per drawn frame, with that frame's own connections time: the two
 // phases are measured from the same code path, on the same page, seconds apart.
 function lodAbFrame(connMs) {
+  if (!S.enabled) return;
   const ab = LOD.ab;
   if (!ab || ab.done) return;
   const t = nowMs();
@@ -3502,8 +3557,8 @@ function lodSet(opts) {
       if (o.autoLinkCarried === undefined) LOD.autoLinkCarried = false;
     }
   }
-  if (LOD.flatBelow > 0 || LOD.inertBelow > 0 || LOD.fovea || LOD.snapOn) lodInstallDomSweep();
-  if (LOD.inertBelow > 0 || LOD.fovea || LOD.flatBelow > 0) {
+  if (S.enabled && (LOD.flatBelow > 0 || LOD.inertBelow > 0 || LOD.fovea || LOD.snapOn)) lodInstallDomSweep();
+  if (S.enabled && (LOD.inertBelow > 0 || LOD.fovea || LOD.flatBelow > 0)) {
     // The canvas-side gate and the event gate are both inert until something is
     // switched on, and both are needed the moment it is.
     viewInstallWidgetGate();
@@ -3515,16 +3570,16 @@ function lodSet(opts) {
   // was already on (stand-in pictures are on by default).
   if (now && !LOD.baseline) lodCaptureBaseline();
   if (!now && was) LOD.baseline = null;
-  if (LOD.idleCapMs > 0 || LOD.snapOn) govInstallInputGuard();
+  if (S.enabled && (LOD.idleCapMs > 0 || LOD.snapOn)) govInstallInputGuard();
   // A threshold change has to take effect now, not on the next frame the canvas
   // happens to draw: the marks follow the setting, whatever the zoom is.
   try {
-    lodSweepDom(app.canvas);
+    if (S.enabled) lodSweepDom(app.canvas);
     lodVueUnblankAll("setting");
     // ... and the hover half immediately, not on the next drawn frame: a redraw
     // can be merged by the idle cap, and until one is drawn a 3D viewport whose
     // node has just been switched off would keep its "pointer is over me" flag.
-    viewSuppressHover(app.canvas);
+    if (S.enabled) viewSuppressHover(app.canvas);
   } catch (e) {
     /* the sweep never throws, but setup is not worth a broken toggle */
   }
@@ -3755,7 +3810,13 @@ function patchCanvasDraw() {
       // drawing any chrome — so the box lands exactly where a picture lands in
       // the canvas renderer. The frontend's own draw runs first because its
       // `arrange()` is what the box's geometry reads afterwards.
-      if (ctx && lodVueFlatNode(node, this)) {
+      const vueFlat = !!(ctx && lodVueFlatNode(node, this));
+      // The per-frame plan is intentionally a no-op while Vue stand-ins are steady.
+      // If a true live exception appears meanwhile (video or link drag), hand that
+      // node's element back here, before the browser paints; state marks are not an
+      // exception because the stand-in overlays them.
+      if (ctx && lodVueNodesMode() && !vueFlat && LOD.vueFlat && LOD.vueFlat.has(node)) lodVueBlank(node, false);
+      if (vueFlat) {
         const tv = performance.now();
         const retV = originalDrawNode.call(this, node, ctx, ...rest);
         const dtv = performance.now() - tv;
@@ -3908,11 +3969,11 @@ function patchCanvasDraw() {
     const originalSetDirty = proto.setDirty;
     const wrappedSetDirty = function (...args) {
       const t0 = performance.now();
-      if (!S.paused) {
+      if (S.enabled && !S.paused) {
         S.invalidations.push(t0, 1);
         maybeSampleCaller(t0);
       }
-      if (GOV.controls.coalesce) return govCoalesceRedraw(originalSetDirty, this, args);
+      if (S.enabled && GOV.controls.coalesce) return govCoalesceRedraw(originalSetDirty, this, args);
       return originalSetDirty.apply(this, args);
     };
     wrappedSetDirty.__antsWrapped = true;
@@ -4016,16 +4077,18 @@ function lodDomWanted() {
 // Is this node one that must be drawn by ComfyUI, right now? Every answer here is
 // a field the frontend maintains itself. Anything uncertain answers "live": a
 // stale picture is a worse failure than a slow frame.
-function lodSnapLive(node, canvas) {
+function lodSnapLive(node, canvas, allowVueStateMarks) {
   try {
     if (!node) return true;
     // Hover is not live, and neither is selection or a node drag. Those used to
     // drop a pictured node back to a painted box. The picture stays, and it moves
     // with the node. A selected node gets a ring on top of it (see the blit).
-    // A link drag, a running bar and an error still draw live. The node stays
-    // clickable either way.
-    if (node.has_errors) return true; // the error stroke is live state
-    if (Number(node.progress) > 0) return true; // a running node draws a bar
+    // In the canvas renderer an error/progress node stays live. In Nodes 2.0 its
+    // stand-in stays up and these two marks are painted over the held picture;
+    // captures still use the default (false) and can never freeze either mark.
+    const vueMarks = !!(allowVueStateMarks && lodVueNodesMode());
+    if (node.has_errors && !vueMarks) return true; // error state is live outside the Vue overlay path
+    if (Number(node.progress) > 0 && !vueMarks) return true; // progress is live outside the Vue overlay path
     // A video widget is never a still picture, however idle the graph is.
     if (lodSnapHasVideo(node)) return true;
     const c = canvas || null;
@@ -4113,11 +4176,10 @@ function lodVueFlatNode(node, canvas) {
   if (!node) return false;
   if (node.flags && node.flags.collapsed) return false; // already a small box
   if (lodOwnNode(node)) return false; // the panel has to stay reachable
-  // A node whose state is live keeps its own element, and with it every mark the
-  // frontend draws about that state: its progress bar, its error stroke and the
-  // outline it puts around the node that is executing. That is why a Vue stand-in
-  // never has to say anything about a run — it is never used while one is on.
-  if (lodSnapLive(node, canvas)) return false; // running, erroring, dragging, video
+  // Progress and error are independent of the picture: the stand-in stays in
+  // place and receives their live marks on top. Video and link-drag handling still
+  // need the frontend's live element, as do canvas-renderer snapshots.
+  if (lodSnapLive(node, canvas, true)) return false; // video or a link is being dragged
   return true;
 }
 
@@ -5518,6 +5580,9 @@ function lodVueTextLines(root, rr, domScale, title, icons) {
       if (form) {
         const item = lodVueFormItem(el, tag);
         if (!item) continue;
+        // Form values are not ordinary DOM text. In particular, do not slice a
+        // Vue textarea at the shared 2,000-character canvas-widget limit: its text
+        // is wrapped here and lodVueTextInk clips it to the lines its box can hold.
         item.x = box.x;
         item.y = box.y;
         item.w = box.w;
@@ -5550,13 +5615,14 @@ function lodVueTextLines(root, rr, domScale, title, icons) {
       // paragraph into one line of text the node never showed.
       raw = raw.replace(/[^\S\n]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
       if (!raw) continue;
-      if (raw.length > LOD_VUE_TEXT_CHARS) raw = raw.slice(0, LOD_VUE_TEXT_CHARS);
+      const truncated = raw.length > LOD_VUE_TEXT_CHARS;
+      if (truncated) raw = raw.slice(0, LOD_VUE_TEXT_CHARS);
       const align = lodVueTextAlign(el);
       // Everything the ink needs to draw the string the way the browser did: the
       // size, the colour, the family, the weight, the line height and the clamp the
       // element asked for. (A picture that draws Arial at 12px where the page drew
       // Inter at 11px is a picture of a node nobody has.)
-      const item = { kind: "text", text: raw, align, x: box.x, y: box.y, w: box.w, h: box.h };
+      const item = { kind: "text", text: raw, truncated, align, x: box.x, y: box.y, w: box.w, h: box.h };
       lodVueTextStyleInto(item, style);
       out.push(item);
     }
@@ -5755,11 +5821,9 @@ function lodVueTextInk(ctx, lines, out) {
       const pad = 2;
       const room = Math.max(1, Math.min(64, Number(it.clampLines) || Math.floor((it.h - pad) / lineH) || 1));
       const wrapped = lodSnapWrapText(it.text, Math.max(4, it.w - pad * 2), room + 1, size, ctx);
-      if (wrapped.length > room) {
-        const last = wrapped[room - 1];
-        wrapped[room - 1] = last && last.length > 1 ? `${last.slice(0, last.length - 1)}\u2026` : "\u2026";
-      }
+      const clipped = wrapped.length > room || !!it.truncated;
       const drawn = wrapped.length > room ? wrapped.slice(0, room) : wrapped;
+      if (clipped && drawn.length) lodSnapEllipsizeLine(drawn, drawn.length - 1);
       // Where the browser puts the first line: its line box starts at the top of
       // the measured box and leads into the glyphs by half the leftover between the
       // line height and the font's own content height. A single line in a taller row
@@ -6708,9 +6772,9 @@ function lodSnapWhyText() {
 // Deliberately NOT in here: position, the pan, and the zoom. Those change while
 // you look at the node and change nothing about the picture — including them
 // would throw the work away on every frame of a pan, which is exactly when it is
-// worth having. `progress`, `has_errors` and the node's own flags are in, even
-// though those nodes stay live anyway, so a bitmap can never be used after one of
-// them starts.
+// worth having. The canvas pathway hashes progress/errors because those nodes
+// remain live there. The Vue pathway overlays those marks on the held picture, so
+// they are dynamic draw state and deliberately do not invalidate the bitmap.
 function lodSnapSignature(node, canvas) {
   let h = 2166136261;
   const mix = (n) => {
@@ -6722,33 +6786,43 @@ function lodSnapSignature(node, canvas) {
     if (Number.isFinite(n)) mix(Math.round(n * 100));
     else mix(0);
   };
-  // A long string is hashed by its length and its two ends: the head because that
-  // is the part a node's canvas actually draws (a text widget is clipped to its
-  // row), and the tail because that is where a growing payload changes. Walking a
-  // 40 kB data URL or a serialized link graph in full on every re-check was the
-  // real reason this tool used to refuse such nodes outright; refusing was never
-  // about the picture.
+  // Ordinary Vue DOM text and canvas DOM-widget values are reconstructed from a
+  // bounded prefix and hashed in full, so a same-length middle edit in the visible
+  // prefix cannot leave a stale bitmap. Vue form values are passed intact to the
+  // line wrapper; large serialized values and data URLs stay cheap through length
+  // plus head, middle and tail samples rather than a full walk every 100 ms.
+  const fullTextLimit = 4096;
   const str = (v) => {
     const s = v == null ? "" : String(v);
     mix(s.length);
-    if (s.length <= 512) {
-      for (let i = 0; i < s.length; i++) {
+    const put = (from, to) => {
+      for (let i = from; i < to; i++) {
         h ^= s.charCodeAt(i);
         h = Math.imul(h, 16777619);
       }
+    };
+    if (s.length <= fullTextLimit) {
+      put(0, s.length);
       return;
     }
-    for (let i = 0; i < 256; i++) {
-      h ^= s.charCodeAt(i);
-      h = Math.imul(h, 16777619);
-    }
-    for (let i = s.length - 64; i < s.length; i++) {
-      h ^= s.charCodeAt(i);
-      h = Math.imul(h, 16777619);
-    }
+    put(0, 256);
+    const middle = Math.max(256, Math.floor(s.length / 2) - 32);
+    put(middle, Math.min(s.length - 64, middle + 64));
+    put(s.length - 64, s.length);
+  };
+  // The canvas DOM-widget composite deliberately hard-slices form values at
+  // LOD_SNAP_TEXT_CHARS; hash that same visible prefix plus the original length.
+  // Vue form values take a separate route through `metrics.texts` below, where a
+  // textarea is passed intact to the box-aware wrapper and clipped by line room.
+  const strVisible = (v, limit) => {
+    const s = v == null ? "" : String(v);
+    mix(s.length);
+    str(s.slice(0, Math.max(0, Number(limit) || 0)));
   };
   const flag = (v) => mix(v ? 1 : 0);
+  const vuePath = lodVueNodesMode();
 
+  str(LOD_SNAP_BADGE_VERSION);
   str(node.title);
   const size = node.renderingSize || node.size;
   num(size && size[0]);
@@ -6763,8 +6837,13 @@ function lodSnapSignature(node, canvas) {
   str(node.renderingColor || node.color);
   str(node.renderingBgColor || node.bgcolor);
   str(node.boxcolor);
-  flag(node.has_errors);
-  num(node.progress);
+  // In Vue mode these marks are overlays on top of a stable picture, not picture
+  // content. Keeping them out of the signature lets one bitmap survive a whole run.
+  // The canvas pathway keeps its original live-node behavior and signature.
+  if (!vuePath) {
+    flag(node.has_errors);
+    num(node.progress);
+  }
   // `selected` is deliberately absent. The ring is drawn on top of the picture
   // at blit time, and the capture clears the flag so it is not baked in. In the
   // signature it would mean dropping and recapturing a bitmap every click.
@@ -6778,7 +6857,7 @@ function lodSnapSignature(node, canvas) {
   // way a widget value does: a new image in a loader, a mask editor redrawing,
   // an element replaced. The serial catches a replacement whose strings match;
   // the numbers catch the layout moving.
-  if (lodVueNodesMode()) {
+  if (vuePath) {
     // One measurement, asked for once: what the node's element is showing. This is
     // the picture's content, so it is the picture's signature — and *everything* a
     // Vue picture draws belongs here. What was missing was the node's own text and
@@ -6846,10 +6925,11 @@ function lodSnapSignature(node, canvas) {
     if (lines) {
       for (let i = 0; i < lines.length && i < LOD_VUE_TEXT_MAX; i++) {
         const tx = lines[i];
-        // The string is what the picture shows, so it is what invalidates it. Hashed
-        // by its ends rather than in full: a label is one line, and a very long one
-        // differs where the reader looks (the head) and where it grows (the tail).
+        // Ordinary Vue DOM leaves are capped at 2,000 characters when measured;
+        // form values arrive intact and their ink is bounded by the box's line room.
+        // Hash the measured string so a same-length middle edit invalidates it.
         str(tx && tx.text);
+        flag(tx && tx.truncated);
         num(tx && tx.x);
         num(tx && tx.y);
         num(tx && tx.size);
@@ -6923,7 +7003,7 @@ function lodSnapSignature(node, canvas) {
         num(el.width);
         num(el.height);
       } else if (tag === "TEXTAREA" || tag === "INPUT") {
-        str(el.value);
+        strVisible(el.value, LOD_SNAP_TEXT_CHARS);
       }
       // The row the composite draws this element at. `lodSnapWidgetBox` reads the
       // frontend's own layout (`y`, `computedHeight`, `width`, `margin`), and that
@@ -6974,7 +7054,7 @@ function lodSnapSignature(node, canvas) {
   // way that matters (box, padding, content route). Mixing the pathway in means a
   // picture made in one can never be trusted in the other, whatever order the user
   // switches renderers in.
-  str(lodVueNodesMode() ? "pathway-vue" : "pathway-canvas");
+  str(vuePath ? "pathway-vue" : "pathway-canvas");
   void canvas;
   return (h >>> 0).toString(36);
 }
@@ -7138,6 +7218,7 @@ function lodThumbDiskForget(node) {
 
 // System RAM from ComfyUI's own /system_stats. No reading, no release.
 async function lodRamSample() {
+  if (!S.enabled) return null;
   try {
     if (typeof fetch !== "function") {
       LOD.ramUsed = null;
@@ -7145,12 +7226,14 @@ async function lodRamSample() {
       return null;
     }
     const res = await fetch("/system_stats");
+    if (!S.enabled) return null;
     if (!res || !res.ok || typeof res.json !== "function") {
       LOD.ramUsed = null;
       LOD.ramNote = "system RAM unknown — /system_stats did not answer, so nothing was released";
       return null;
     }
     const body = await res.json();
+    if (!S.enabled) return null;
     const sys = body && body.system;
     const total = Number(sys && sys.ram_total) || 0;
     const free = Number(sys && (sys.ram_free != null ? sys.ram_free : sys.ram_available));
@@ -7164,6 +7247,7 @@ async function lodRamSample() {
     LOD.ramNote = "";
     return used;
   } catch (e) {
+    if (!S.enabled) return null;
     LOD.ramUsed = null;
     LOD.ramNote = "system RAM unknown — the stats request failed, so nothing was released";
     return null;
@@ -7192,16 +7276,19 @@ function lodSnapPurgeRam(all) {
 }
 
 async function lodRamCheck() {
+  if (!S.enabled) return { used: null, purged: 0 };
   const used = await lodRamSample();
-  if (used == null) return { used: null, purged: 0 };
+  if (!S.enabled || used == null) return { used: null, purged: 0 };
   if (used >= LOD_RAM_FULL) return { used, purged: lodSnapPurgeRam(true) };
   if (used >= LOD_RAM_OFF) return { used, purged: lodSnapPurgeRam(false) };
   return { used, purged: 0 };
 }
 
 async function lodRamFinish() {
+  if (!S.enabled) return 0;
   LOD.ramRunning = false;
   const used = await lodRamSample();
+  if (!S.enabled) return 0;
   const canvas = typeof app !== "undefined" && app ? app.canvas : null;
   if (!canvas || !lodSnapBitmaps(canvas)) return 0;
   const nodes = lodGraphNodes(canvas);
@@ -7222,22 +7309,35 @@ async function lodRamFinish() {
   return n;
 }
 
+function lodStopRamTimer() {
+  if (LOD.ramTimer != null) {
+    try { clearInterval(LOD.ramTimer); } catch (e) { /* best effort */ }
+  }
+  LOD.ramTimer = null;
+}
+
+function lodStartRamTimer() {
+  if (!S.enabled || LOD.ramTimer != null) return;
+  try {
+    LOD.ramTimer = govOwn(() => setInterval(() => {
+      if (S.enabled && LOD.ramRunning) lodRamCheck();
+    }, 2000));
+  } catch (e) {
+    LOD.ramTimer = null;
+    /* one check on start is still the policy */
+  }
+}
+
 function lodRamRun(starting) {
+  if (!S.enabled) return { used: null, purged: 0 };
   if (!starting) return lodRamFinish();
   LOD.ramRunning = true;
-  if (!LOD.ramTimer) {
-    try {
-      LOD.ramTimer = govOwn(() => setInterval(() => {
-        if (LOD.ramRunning) lodRamCheck();
-      }, 2000));
-    } catch (e) {
-      /* one check on start is still the policy */
-    }
-  }
+  lodStartRamTimer();
   return lodRamCheck();
 }
 
 function lodInstallRamWatch() {
+  if (!S.enabled) return false;
   try {
     const api = app && app.api;
     if (!api || typeof api.addEventListener !== "function" || LOD.ramWatch) {
@@ -7262,6 +7362,7 @@ function lodInstallRamWatch() {
 
 // Everything, because the stored bitmaps describe a theme that no longer exists.
 function lodSnapClear(reason) {
+  lodSnapCancel();
   lodSnapEnsure();
   for (const [, rec] of LOD.snaps) lodSnapRelease(rec);
   LOD.snaps.clear();
@@ -7471,9 +7572,17 @@ function lodSnapMeasureText(cctx, text, size) {
   return String(text).length * size * 0.55;
 }
 
-// Words wrapped to the row, at most `maxLines` of them, with the last line marked
-// with an ellipsis when the text does not fit — the same thing the browser does to
-// a textarea's overflow, done by hand because there is no other way to get it.
+// Wrap a string to at most `maxLines`. Callers request one extra line beyond the
+// visible room to detect clipping, then mark the last visible line themselves. This
+// helper does not impose a character cap: Vue form values are limited by line room,
+// while the separate canvas DOM-widget caller slices its input before wrapping.
+function lodSnapEllipsizeLine(lines, index) {
+  if (!lines || index < 0 || index >= lines.length) return;
+  const last = String(lines[index] == null ? "" : lines[index]);
+  if (last.endsWith("\u2026")) return;
+  lines[index] = last.length > 1 ? `${last.slice(0, last.length - 1)}\u2026` : "\u2026";
+}
+
 function lodSnapWrapText(raw, maxW, maxLines, size, cctx) {
   const text = String(raw == null ? "" : raw).replace(/\r\n?/g, "\n");
   const out = [];
@@ -7516,10 +7625,6 @@ function lodSnapWrapText(raw, maxW, maxLines, size, cctx) {
       }
     }
     if (line && out.length < maxLines) out.push(line);
-  }
-  if ((text.length > LOD_SNAP_TEXT_CHARS || out.length >= maxLines) && out.length) {
-    const last = out[out.length - 1];
-    out[out.length - 1] = last.length > 1 ? `${last.slice(0, Math.max(1, last.length - 1))}\u2026` : "\u2026";
   }
   return out;
 }
@@ -7566,12 +7671,13 @@ function lodSnapTextInk(el, cctx, box) {
     // value that plainly fit came back as "a ca…". The visible rows are what is
     // trimmed, and the trim is marked the way the wrapper marks its own.
     const room = Math.max(1, Math.min(64, Math.floor((Number(box.h) - 6) / lineH) || 1));
-    const wrapped = lodSnapWrapText(raw.slice(0, LOD_SNAP_TEXT_CHARS), Math.max(4, box.w - 6), LOD_SNAP_TEXT_LINES, size, cctx);
-    if (wrapped.length > room) {
-      const last = wrapped[room - 1];
-      wrapped[room - 1] = last && last.length > 1 ? `${last.slice(0, last.length - 1)}\u2026` : "\u2026";
-    }
-    const lines = wrapped.length > room ? wrapped.slice(0, room) : wrapped;
+    const lineLimit = Math.min(room, LOD_SNAP_TEXT_LINES);
+    const truncated = raw.length > LOD_SNAP_TEXT_CHARS;
+    const visible = raw.slice(0, LOD_SNAP_TEXT_CHARS);
+    const wrapped = lodSnapWrapText(visible, Math.max(4, box.w - 6), lineLimit + 1, size, cctx);
+    const clipped = truncated || wrapped.length > lineLimit;
+    const lines = wrapped.length > lineLimit ? wrapped.slice(0, lineLimit) : wrapped;
+    if (clipped && lines.length) lodSnapEllipsizeLine(lines, lines.length - 1);
     for (let i = 0; i < lines.length; i++) {
       if (typeof cctx.fillText === "function") cctx.fillText(lines[i], box.x + 3, box.y + 3 + i * lineH);
     }
@@ -8105,6 +8211,9 @@ function lodSnapCaptureNode(node, canvas) {
     domInk = lodSnapDomInk(node, made.ctx, canvas);
     LOD.snapMs += nowMs() - dc0;
   }
+  // Do not add the warning badge here: the capture is the complete drawing, not
+  // a fallback box. The signature token changed so older badge-bearing files miss
+  // and are rebuilt without the mark.
   if (!lodSnapMakeRoom(made.bytes)) {
     // The budget is full of bitmaps that are being looked at. Refusing is the
     // honest answer: releasing one would take a picture off the screen, and
@@ -8129,6 +8238,8 @@ function lodSnapCaptureNode(node, canvas) {
   rec.y = made.y;
   rec.w = made.w;
   rec.h = made.h;
+  rec.bodyW = geom.bodyW;
+  rec.bodyH = geom.bodyH;
   rec.bytes = made.bytes;
   rec.sig = sig;
   rec.checkedAt = nowMs();
@@ -8175,7 +8286,7 @@ function lodSnapCaptureNode(node, canvas) {
 // Redraw the half and quarter copies from the capture, then write the file.
 // Safe to run late: if this picture was dropped or replaced, it does nothing.
 function lodSnapSettleImages(node, rec, canvas) {
-  if (!rec || rec.canvas !== canvas) return;
+  if (!S.enabled || !LOD.snapOn || !rec || rec.canvas !== canvas) return;
   lodSnapRefreshMips(rec);
   // A node that keeps changing gets a new picture every LOD_SNAP_PHOTO_MS; writing
   // each of them to disk is the most expensive part of the capture and the least
@@ -8220,11 +8331,19 @@ function lodSnapRefreshMips(rec) {
 // survives the record being dropped (it is reset by a successful reuse, which is
 // what "the lane is keeping up" looks like).
 function lodSnapSchedule(delay) {
+  if (!S.enabled || !LOD.snapOn) {
+    lodSnapCancel();
+    return;
+  }
   if (LOD.snapTimer != null) return;
   try {
     LOD.snapTimer = govOwn(() =>
       setTimeout(() => {
         LOD.snapTimer = null;
+        if (!S.enabled || !LOD.snapOn) {
+          LOD.snapPumping = false;
+          return;
+        }
         lodSnapSlice();
       }, Math.max(0, Math.round(delay) || 0))
     );
@@ -8235,6 +8354,10 @@ function lodSnapSchedule(delay) {
 }
 
 function lodSnapPump() {
+  if (!S.enabled || !LOD.snapOn) {
+    lodSnapCancel();
+    return;
+  }
   if (LOD.snapPumping) return;
   LOD.snapPumping = true;
   lodSnapSchedule(0);
@@ -8245,6 +8368,10 @@ function lodSnapPump() {
 // between slices so a big graph is captured over a second or two rather than in
 // one visible pause. No second scheduler, no second idle clock.
 function lodSnapSlice() {
+  if (!S.enabled || !LOD.snapOn) {
+    lodSnapCancel();
+    return;
+  }
   const canvas = typeof app !== "undefined" && app ? app.canvas : null;
   if (!lodSnapBitmaps(canvas)) {
     LOD.snapPumping = false;
@@ -8500,7 +8627,7 @@ function lodThumbDiskNoteFail() {
 }
 
 function lodThumbDiskSweep() {
-  if (!LOD.diskOn || LOD.diskSwept) return;
+  if (!S.enabled || !LOD.diskOn || LOD.diskSwept) return;
   LOD.diskSwept = true;
   try {
     if (typeof fetch !== "function") return;
@@ -8508,7 +8635,7 @@ function lodThumbDiskSweep() {
     fetch(THUMB_DISK_PREFIX + "/info")
       .then((res) => (res && res.ok && typeof res.json === "function" ? res.json() : null))
       .then((body) => {
-        if (body && body.dir) LOD.diskDir = String(body.dir);
+        if (S.enabled && LOD.diskOn && body && body.dir) LOD.diskDir = String(body.dir);
       })
       .catch(() => {});
   } catch (e) {
@@ -8529,7 +8656,7 @@ function lodThumbDiskDelete(node) {
 }
 
 function lodThumbDiskSave(node, rec) {
-  if (!LOD.diskOn || LOD.diskDead || !rec || !rec.canvas || !rec.sig || rec.fromDisk) return;
+  if (!S.enabled || !LOD.snapOn || !LOD.diskOn || LOD.diskDead || !rec || !rec.canvas || !rec.sig || rec.fromDisk) return;
   const id = lodThumbId(node);
   if (!id) return;
   const canvas = rec.canvas;
@@ -8542,7 +8669,7 @@ function lodThumbDiskSave(node, rec) {
   if (lodSnapPixelRatio(rec.ratio) !== want) return;
   const sig = lodSnapDiskSig(node, null, want);
   const send = (blob) => {
-    if (!blob) return;
+    if (!S.enabled || !LOD.snapOn || !LOD.diskOn || !blob) return;
     try {
       fetch(THUMB_DISK_PREFIX + "/" + encodeURIComponent(id) + "?sig=" + encodeURIComponent(sig), {
         method: "PUT",
@@ -8550,10 +8677,13 @@ function lodThumbDiskSave(node, rec) {
         headers: { "Content-Type": blob.type || "image/png" },
       })
         .then((res) => {
+          if (!S.enabled || !LOD.snapOn) return;
           if (res && res.ok) LOD.diskSaved++;
           else lodThumbDiskNoteFail();
         })
-        .catch(() => lodThumbDiskNoteFail());
+        .catch(() => {
+          if (S.enabled && LOD.snapOn) lodThumbDiskNoteFail();
+        });
     } catch (e) {
       lodThumbDiskNoteFail();
     }
@@ -8568,7 +8698,12 @@ function lodThumbDiskSave(node, rec) {
 }
 
 function lodThumbDiskInstall(node, canvas, sig, blob) {
+  if (!S.enabled || !LOD.snapOn) return false;
   const paint = (bmp) => {
+    if (!S.enabled || !LOD.snapOn) {
+      try { if (bmp && typeof bmp.close === "function") bmp.close(); } catch (e) { /* best effort */ }
+      return;
+    }
     try {
       let live = "";
       // The file's own key is the check: node state *and* the ratio and theme the
@@ -8614,6 +8749,8 @@ function lodThumbDiskInstall(node, canvas, sig, blob) {
       rec.y = geom.y;
       rec.w = geom.w;
       rec.h = geom.h;
+      rec.bodyW = geom.bodyW;
+      rec.bodyH = geom.bodyH;
       rec.bytes = bytes;
       rec.sig = sig;
       rec.checkedAt = nowMs();
@@ -8652,7 +8789,7 @@ function lodThumbDiskInstall(node, canvas, sig, blob) {
 }
 
 function lodThumbDiskAsk(node, canvas) {
-  if (!LOD.diskOn || LOD.diskDead) return false;
+  if (!S.enabled || !LOD.snapOn || !LOD.diskOn || LOD.diskDead) return false;
   const id = lodThumbId(node);
   if (!id) return false;
   // Asked before the key is built: a node that already has a picture, or a read
@@ -8702,11 +8839,12 @@ function lodThumbDiskAsk(node, canvas) {
   }
   Promise.resolve(pending)
     .then((res) => {
-      if (!res || !res.ok || typeof res.blob !== "function") return null;
+      if (!S.enabled || !LOD.snapOn || !res || !res.ok || typeof res.blob !== "function") return null;
       return res.blob();
     })
     .then((blob) => {
       rec.diskPending = false;
+      if (!S.enabled || !LOD.snapOn) return;
       if (!blob) {
         if (LOD.snapQueue) LOD.snapQueue.add(node);
         lodSnapPump();
@@ -8716,6 +8854,7 @@ function lodThumbDiskAsk(node, canvas) {
     })
     .catch(() => {
       rec.diskPending = false;
+      if (!S.enabled || !LOD.snapOn) return;
       lodThumbDiskNoteFail();
       if (LOD.snapQueue) LOD.snapQueue.add(node);
       lodSnapPump();
@@ -8726,6 +8865,13 @@ function lodThumbDiskAsk(node, canvas) {
 function lodSnapEnqueue(node, canvas, restale) {
   if (!lodSnapBitmaps(canvas)) return;
   lodSnapEnsure();
+  // The Vue picture has dynamic progress/error overlays, so a transient state does
+  // not request a new frozen bitmap. If one was queued before the state arrived,
+  // remove it and resume the ordinary capture lane when the live field clears.
+  if (lodVueNodesMode() && node && (node.has_errors || Number(node.progress) > 0)) {
+    if (LOD.snapQueue) LOD.snapQueue.delete(node);
+    return;
+  }
   // A node the Vue lane has never seen starts its window now — the frame it was
   // first drawn as a stand-in is the frame it appeared. Only the *first* time: the
   // box path calls this every frame while a node has no picture, and re-arming
@@ -8785,7 +8931,7 @@ function lodSnapPaint(node, canvas, ctx) {
     LOD.snapMisses++;
     return false;
   }
-  if (lodSnapLive(node, canvas)) {
+  if (lodSnapLive(node, canvas, lodVueNodesMode())) {
     LOD.snapMisses++;
     return false;
   }
@@ -8846,13 +8992,38 @@ function lodSnapPaint(node, canvas, ctx) {
   ctx.globalAlpha = 1; // and its own alpha (a muted node was captured dimmed)
   const src = lodSnapPick(rec, canvas);
   ctx.drawImage(src || rec.canvas, rec.x, rec.y, rec.w, rec.h);
+  // Progress and errors are live Vue-node fields, not picture content. Paint their
+  // marks over the stable bitmap at reuse time; captures and disk files never carry
+  // these transient marks. The canvas pathway continues to leave these nodes live.
+  const progress = Number(node && node.progress);
+  if (lodVueNodesMode() && (node.has_errors || (Number.isFinite(progress) && progress > 0))) {
+    const size = Number(rec.bodyW) > 0 && Number(rec.bodyH) > 0
+      ? [Number(rec.bodyW), Number(rec.bodyH)]
+      : lodVueBoxSize(node, canvas) || (node && (node.renderingSize || node.size)) || [0, 0];
+    if (typeof ctx.save === "function" && typeof ctx.restore === "function") {
+      ctx.save();
+      try {
+        ctx.shadowColor = "transparent";
+        ctx.globalAlpha = 1;
+        const marks = lodSnapStateMarks(ctx, node, {
+          x: 0,
+          y: 0,
+          w: Math.abs(Number(size[0])) || 0,
+          h: Math.abs(Number(size[1])) || 0,
+          scale: (canvas && canvas.ds && Number(canvas.ds.scale)) || 1,
+        });
+        LOD.boxBars += marks.bars;
+        LOD.boxErrors += marks.errors;
+      } finally {
+        ctx.restore();
+      }
+    }
+  }
   // The selection ring, around the box the node was pictured in — the same size the
   // live box had (`lodVueBoxSize`), which in the Vue renderer is the element's own
   // measured body rather than the node's graph size. Without that the ring would
   // jump, and sit inside the node the user just selected, on the frame the picture
-  // replaced the live box. Nothing else belongs on a blit: a picture is only ever
-  // served for a node with no progress and no errors (`lodSnapLive`), so there is no
-  // state mark for a picture to be missing.
+  // replaced the live box.
   if (node.selected) lodSnapSelectionRing(node, canvas, ctx);
   if (src && src !== rec.canvas) LOD.snapMipDrawn++;
   rec.usedFrame = LOD.snapFrame; // this frame is looking at it
@@ -8990,7 +9161,15 @@ function maybeSampleCaller(t) {
 
 let stallObserver = null;
 
+function stopStallObserver() {
+  if (stallObserver) {
+    try { stallObserver.disconnect(); } catch (e) { /* best effort */ }
+  }
+  stallObserver = null;
+}
+
 function installStallObserver() {
+  if (!S.enabled || stallObserver) return;
   try {
     stallObserver = new PerformanceObserver((list) => {
       for (const entry of list.getEntries()) recordStall(entry);
@@ -9017,7 +9196,7 @@ function installStallObserver() {
 }
 
 function recordStall(entry, kind) {
-  if (S.paused) return;
+  if (!S.enabled || S.paused) return;
   const duration = entry.duration || 0;
   if (Number.isFinite(entry.blockingDuration)) {
     GOV.lastBlockMs = entry.blockingDuration;
@@ -9158,34 +9337,61 @@ function stallMetrics() {
 
 // --- 6. rAF cadence monitor + memory sampler --------------------------------
 
+let rafMonitorHandle = null;
+let rafMonitorRunning = false;
+let rafMonitorGeneration = 0;
+let memorySampleTimer = null;
+let resourceBufferTimer = null;
+
+function stopRafMonitor() {
+  rafMonitorRunning = false;
+  rafMonitorGeneration++;
+  if (rafMonitorHandle !== null) {
+    try { if (typeof cancelAnimationFrame === "function") cancelAnimationFrame(rafMonitorHandle); } catch (e) { /* best effort */ }
+  }
+  rafMonitorHandle = null;
+}
+
 function installRafMonitor() {
-  if (typeof requestAnimationFrame !== "function") return;
+  if (!S.enabled || rafMonitorRunning || typeof requestAnimationFrame !== "function") return;
+  rafMonitorRunning = true;
+  const generation = ++rafMonitorGeneration;
   let prev = NaN;
-  const tick = (ts) => {
+  const tick = () => {
+    rafMonitorHandle = null;
+    if (!rafMonitorRunning || !S.enabled || generation !== rafMonitorGeneration) return;
     const t = performance.now();
     if (!Number.isNaN(prev)) {
       GOV.lastFrameGap = t - prev;
-      if (!S.paused && S.enabled) S.raf.push(t, t - prev);
+      if (!S.paused) S.raf.push(t, t - prev);
     }
     prev = t;
-    if (!S.enabled) {
-      govOwn(() => requestAnimationFrame(tick));
-      return;
-    }
     S.renderTicks++;
-    govOwn(() => requestAnimationFrame(tick));
+    rafMonitorHandle = govOwn(() => requestAnimationFrame(tick));
   };
-    govOwn(() => requestAnimationFrame(tick));
+  rafMonitorHandle = govOwn(() => requestAnimationFrame(tick));
+}
+
+function stopMemorySampler() {
+  if (memorySampleTimer !== null) {
+    try { clearInterval(memorySampleTimer); } catch (e) { /* best effort */ }
+  }
+  if (resourceBufferTimer !== null) {
+    try { clearInterval(resourceBufferTimer); } catch (e) { /* best effort */ }
+  }
+  memorySampleTimer = null;
+  resourceBufferTimer = null;
 }
 
 function installMemorySampler() {
-  if (!performance.memory) return;
+  if (!S.enabled || !performance.memory || memorySampleTimer !== null) return;
   const sample = () => {
     if (S.enabled && !S.paused && performance.memory) S.mem.push(nowMs(), performance.memory.usedJSHeapSize);
   };
   sample();
-  govOwn(() => setInterval(sample, 1000));
-  govOwn(() => setInterval(() => {
+  memorySampleTimer = govOwn(() => setInterval(sample, 1000));
+  resourceBufferTimer = govOwn(() => setInterval(() => {
+    if (!S.enabled) return;
     try {
       performance.setResourceTimingBufferSize && performance.setResourceTimingBufferSize(2000);
     } catch (e) {
@@ -9602,6 +9808,7 @@ function govFailOpen(where, err) {
 function govUninstall(reason) {
   if (GOV.disabled) return false;
   GOV.disabled = true;
+  govStopAutoPilot();
   GOV.offReason = reason || "turned off";
   try {
     const g = typeof globalThis !== "undefined" && globalThis ? globalThis : null;
@@ -9690,10 +9897,8 @@ function govInstall() {
     govInstallInputGuard();
     govProbeWorker();
     govLoad();
-    // The autopilot runs on its own exempt timer: it has to work with the panel
-    // closed, and it must never be slowed by the thing it is tuning.
-    govOwn(() => setInterval(() => govAutoPilot(), GOV_AUTO_INTERVAL_MS));
     GOV.installed = true;
+    govStartAutoPilot();
   } catch (e) {
     GOV.installError = e && e.message ? e.message : String(e);
     warnOnce("gov-install", `Scheduler layer not installed: ${GOV.installError}`);
@@ -9969,7 +10174,7 @@ function govDefer(reg, src, fn, thisArg, args, delayMs, registrationId) {
   reg.pendingFn = fn;
   if (registrationId !== undefined && registrationId !== null) {
     if (!GOV.pendingByRegistration) GOV.pendingByRegistration = new Map();
-    GOV.pendingByRegistration.set(registrationId, { handle, reg, src });
+    GOV.pendingByRegistration.set(registrationId, { handle, reg, src, fn, thisArg, args });
   }
 }
 
@@ -9994,6 +10199,30 @@ function govCancelDeferral(id) {
   return true;
 }
 
+function govResumeDeferrals() {
+  if (!GOV.pendingByRegistration || !GOV.pendingByRegistration.size) return 0;
+  const pending = [...GOV.pendingByRegistration.entries()];
+  let resumed = 0;
+  for (const [id, rec] of pending) {
+    GOV.pendingByRegistration.delete(id);
+    try { if (GOV.orig && GOV.orig.clearTimeout) GOV.orig.clearTimeout(rec.handle); } catch (e) { /* it may have fired */ }
+    if (rec.reg && rec.reg.pending === rec.handle) {
+      rec.reg.pending = null;
+      rec.reg.pendingId = null;
+      rec.reg.pendingFn = null;
+    }
+    // Master-off makes the wrappers pass through; deliver held callbacks once,
+    // now, without recording or imposing another scheduler decision.
+    try {
+      if (typeof rec.fn === "function") rec.fn.apply(rec.thisArg, rec.args || []);
+      resumed++;
+    } catch (e) {
+      warnOnce("gov-resume-deferral", `A deferred callback threw while the optimizer switched off: ${(e && e.message) || e}`);
+    }
+  }
+  return resumed;
+}
+
 // ---------------------------------------------------------- input guard ----
 // Adaptive mode may only slow things down when nobody is typing, dragging or
 // wheeling: input latency is the one cost a smoother graph may not pay for.
@@ -10009,24 +10238,37 @@ function govCancelDeferral(id) {
 const GOV_DISPLAY_FLOOR_MS = 33;
 
 let govInputGuardInstalled = false;
+let govInputNoteHandler = null;
+const GOV_INPUT_EVENTS = ["pointerdown", "pointermove", "mousedown", "mousemove", "keydown", "wheel", "touchstart"];
 
 function govInstallInputGuard() {
-  if (govInputGuardInstalled) return;
+  if (!S.enabled || govInputGuardInstalled) return;
   try {
     if (typeof window === "undefined" || !window || typeof window.addEventListener !== "function") return;
     const note = () => {
+      if (!S.enabled) return;
       GOV.lastInputAt = nowMs();
       GOV.inputSeen = true;
     };
+    govInputNoteHandler = note;
     // Pointer events cover modern browsers; mouse events still arrive on their
     // own in older/embedded ones, and either is proof that somebody is there.
-    for (const type of ["pointerdown", "pointermove", "mousedown", "mousemove", "keydown", "wheel", "touchstart"]) {
-      window.addEventListener(type, note, { passive: true });
-    }
+    for (const type of GOV_INPUT_EVENTS) window.addEventListener(type, note, { passive: true });
     govInputGuardInstalled = true;
   } catch (e) {
     /* an embedder without window events just means the guard stays off */
   }
+}
+
+function govRemoveInputGuard() {
+  if (!govInputGuardInstalled || !govInputNoteHandler) return;
+  try {
+    for (const type of GOV_INPUT_EVENTS) window.removeEventListener(type, govInputNoteHandler, { passive: true });
+  } catch (e) {
+    /* the next install will attach a fresh handler */
+  }
+  govInputGuardInstalled = false;
+  govInputNoteHandler = null;
 }
 
 function govInputRecently(t, windowMs) {
@@ -10086,9 +10328,17 @@ function govSetPolicy(displayKey, policyId) {
 
 function govSetControl(key, value) {
   if (!(key in GOV.controls)) return false;
+  if (key === "autoLimit") value = !!value;
+  if (Object.is(GOV.controls[key], value)) return true;
   GOV.controls[key] = value;
   if (key === "rafMode" || key === "rafMinHz" || key === "adaptiveSkipMax") GOV.rafSkippedInARow = 0;
   govSave();
+  if (key === "autoLimit") {
+    if (value) {
+      govStartAutoPilot();
+      if (S.enabled) govAutoPilot();
+    } else govStopAutoPilot();
+  }
   return true;
 }
 
@@ -10102,6 +10352,7 @@ function govSetControl(key, value) {
 // the policy has to be one that can bite: for a source whose runs are 300ms
 // apart, "half speed" (33ms) is a no-op, so the ladder skips to a real cap.
 function govSuggest() {
+  if (!S.enabled || GOV.disabled) return [];
   const rows = govRows();
   const applied = [];
   for (const r of rows) {
@@ -10161,9 +10412,28 @@ function govHeaviestSource(row) {
 // round, never re-tightening a row it already moved, and it says what it did in
 // the panel and in the copied report. "Reset to untouched" turns it off.
 const GOV_AUTO_INTERVAL_MS = 5000;
+let govAutoPilotTimer = null;
+
+function govStopAutoPilot() {
+  if (govAutoPilotTimer !== null) {
+    try { clearInterval(govAutoPilotTimer); } catch (e) { /* best effort */ }
+  }
+  govAutoPilotTimer = null;
+}
+
+function govStartAutoPilot() {
+  if (!S.enabled || !GOV.installed || GOV.disabled || !GOV.controls.autoLimit || govAutoPilotTimer !== null) return;
+  try {
+    govAutoPilotTimer = govOwn(() => setInterval(() => {
+      if (S.enabled && GOV.controls.autoLimit) govAutoPilot();
+    }, GOV_AUTO_INTERVAL_MS));
+  } catch (e) {
+    govAutoPilotTimer = null;
+  }
+}
 
 function govAutoPilot() {
-  if (GOV.disabled || !GOV.controls.autoLimit || S.paused) return GOV.auto.note;
+  if (!S.enabled || GOV.disabled || !GOV.controls.autoLimit || S.paused) return GOV.auto.note;
   GOV.auto.lastAt = nowMs();
   const rows = govRows();
   const candidates = [];
@@ -10247,6 +10517,7 @@ function govAutoPilot() {
 }
 
 function govReset() {
+  govStopAutoPilot();
   for (const src of GOV.sources.values()) {
     src.policy = "full";
     src.policySetAt = 0;
@@ -10740,6 +11011,7 @@ function govWorkerReady() {
 // A missing worker is not an error: the lane falls back to the main thread and
 // says so, so a caller cannot silently get a different answer.
 function govOffload(job, arg) {
+  if (!S.enabled) return Promise.resolve({ fellBack: true, value: null, reason: "optimizer is off; worker work was not started" });
   const isFn = typeof job === "function";
   if (!govWorkerReady()) {
     if (isFn) return Promise.resolve({ fellBack: true, value: job(arg), reason: GOV.worker.why });
@@ -10776,6 +11048,18 @@ function govOffload(job, arg) {
 // The same deterministic workload on both threads, answers compared, so "the
 // off-thread lane works" is a measurement rather than a claim.
 async function govRunSelfTest() {
+  if (!S.enabled) {
+    GOV.selfTest = {
+      at: new Date().toISOString(),
+      mainMs: NaN,
+      workerMs: NaN,
+      match: false,
+      error: "optimizer is off; worker sanity check was not started",
+      available: GOV.worker.available,
+      n: 0,
+    };
+    return GOV.selfTest;
+  }
   const t0 = performance.now();
   const main = govSelfTestMainThread(GOV_SELFTEST_ARGS);
   const mainMs = performance.now() - t0;
@@ -10787,6 +11071,18 @@ async function govRunSelfTest() {
     else off = res.value;
   } catch (e) {
     error = (e && e.message) || String(e);
+  }
+  if (!S.enabled) {
+    GOV.selfTest = {
+      at: new Date().toISOString(),
+      mainMs,
+      workerMs: off ? GOV.worker.offThreadMs : NaN,
+      match: false,
+      error: "optimizer switched off while the worker sanity check was running",
+      available: GOV.worker.available,
+      n: main.n,
+    };
+    return GOV.selfTest;
   }
   const match = !!(off && off.sum === main.sum && off.n === main.n && off.first === main.first && off.last === main.last);
   GOV.selfTest = {
@@ -11012,8 +11308,14 @@ tr.ants-details table.ants-sub td { color: #bbb; }
   font: inherit;
   -webkit-appearance: none; appearance: none;
 }
-.ants-node-btn-gear { border: none; }
+.ants-node-btn-gear { border: none; position: relative; }
 .ants-node-btn-gear svg { stroke: #AE7719; }
+.ants-node-btn-gear.ants-window-blocked { outline: 2px solid #f04444; outline-offset: 1px; }
+.ants-node-btn-gear.ants-window-blocked::after {
+  content: "!"; position: absolute; right: -6px; top: -7px; width: 13px; height: 13px;
+  border-radius: 50%; background: #b42323; color: #fff; font: bold 10px/13px sans-serif;
+  text-align: center; box-shadow: 0 0 0 1px #1a1a1e;
+}
 .ants-node-btn-tick {
   /* The ring is the same line as the gear's silhouette, in the same colour. */
   border: 1.5px solid #AE7719 !important;
@@ -11359,20 +11661,24 @@ const ui = {
 // route and syncs with the node through a small API (a revision and an origin,
 // so neither side is the master). This is that pattern: /ants_optimizer/window
 // is the page, /ants_optimizer/ui is the link. The page is not moved into the
-// popup, and the popup does not run on the canvas. A blocked popup is the only
-// reason the in-page panel opens.
+// popup, and the popup does not run on the canvas. A blocked open is shown on
+// the gear; there is no in-page panel fallback.
 const ANTS_WINDOW_URL = "/ants_optimizer/window";
 const ANTS_WINDOW_NAME = "ants-optimizer";
 const ANTS_WINDOW_W = 980;
 const ANTS_WINDOW_H = 840;
-const ANTS_WINDOW_BLOCKED = "The browser blocked the separate window. This panel is the fallback. Allow pop-ups for this site, then use Window.";
+const ANTS_WINDOW_BLOCKED = "The detached optimizer window was blocked. There is no in-page fallback; allow this window in the Electron shell and try again.";
 let antsUiSilent = false;
 let antsUiRev = 0;
 let antsUiCommandRev = 0;
 let antsUiTimer = null;
+let uiBridgeScanTimer = null;
 let antsUiHot = false;
 let antsUiOpened = false;
 let antsUiReport = "";
+let antsUiActionResult = "";
+let antsUiFrozenSnapshot = null;
+let antsUiWasHot = false;
 
 function antsUiLimits() {
   return {
@@ -11393,6 +11699,10 @@ function antsUiLimits() {
 }
 
 function antsUiSettings() {
+  const policies = Object.assign({}, GOV.savedPolicies || {});
+  for (const src of GOV.sources.values()) {
+    if (src.policy !== "full") policies[govDisplayKey(src)] = src.policy;
+  }
   return {
     flatBelow: LOD.flatBelow,
     boxDetail: LOD.boxDetail,
@@ -11411,20 +11721,97 @@ function antsUiSettings() {
     foveaMargin: LOD.foveaMargin,
     foveaRestore: LOD.foveaRestore,
     displayScale: LOD.displayScale,
+    drawThrottleMs,
+    syntheticTickMs,
+    governor: { controls: Object.assign({}, GOV.controls), policies },
     enabled: antsEnabled(),
     paused: !!S.paused,
   };
 }
 
+function antsUiDrawingDiagnostics(snapshot) {
+  const canvas = app && app.canvas;
+  const snaps = LOD.snaps;
+  return {
+    renderer: lodVueNodesMode() ? "Vue nodes" : "Canvas/LiteGraph",
+    nodes: {
+      active: lodFlatOn(canvas),
+      threshold: LOD.flatBelow,
+      detail: LOD.boxDetail,
+      flat: LOD.plan.flat,
+      total: LOD.plan.total,
+      simplifiedDraws: LOD.nodes,
+      titles: LOD.boxTitles,
+      errors: LOD.boxErrors,
+      progress: LOD.boxBars,
+      muted: LOD.boxMuted,
+    },
+    links: {
+      style: LOD.linkStyle,
+      thinBelow: LOD.detailZoom,
+      thinned: LOD.thinLinks,
+      calls: LOD.linkCalls,
+      inkMs: LOD.linkMs,
+      connectionsMsPerFrame: snapshot && snapshot.frame ? snapshot.frame.connMsPerFrame : NaN,
+      measurement: LOD.ab && LOD.ab.text ? String(LOD.ab.text) : "",
+    },
+    widgets: {
+      mode: LOD.focusDom,
+      inertBelow: LOD.inertBelow,
+      blocked: LOD.canvasWidgetsBlocked,
+      hoverBlocked: LOD.hoverBlocked,
+      fovea: !!LOD.fovea,
+      foveaElements: LOD.foveaEls,
+      queued: LOD.foveaQueue,
+      restored: LOD.foveaCameBack,
+      display: LOD.display,
+    },
+    snapshots: {
+      wanted: !!LOD.snapOn,
+      active: lodSnapOn(canvas),
+      pathway: lodSnapPathway(canvas),
+      ratio: LOD.snapRatio,
+      budgetMiB: LOD.snapMb,
+      heldRecords: snaps ? snaps.size : 0,
+      served: LOD.snapDrawn,
+      captured: LOD.snapCaptured,
+      misses: LOD.snapMisses,
+      failures: LOD.snapFailed,
+      tooLarge: LOD.snapLarge,
+      fitted: LOD.snapFit,
+      keptLive: LOD.snapKept,
+      bytes: LOD.snapBytes,
+      queued: LOD.snapQueue ? LOD.snapQueue.size : 0,
+      vueBlanked: LOD.vueFlat ? LOD.vueFlat.size : 0,
+      vueIcons: LOD.vueIcons,
+      vueIconSkip: LOD.vueIconSkip,
+      vueSettleHeld: LOD.vueSettleHeld,
+      reasons: (LOD.snapWhy || []).slice(0, 12).map((entry) => ({
+        type: entry.type,
+        title: entry.title,
+        why: entry.why,
+      })),
+    },
+    migrations: {
+      legacyPixels: LOD.legacyPx,
+      automaticLinkStyle: !!LOD.autoLinkCarried,
+    },
+  };
+}
+
 function antsUiTelemetry() {
-  let snapshot = null;
-  try {
-    snapshot = buildSnapshot();
-  } catch (e) {
-    snapshot = null;
+  let snapshot = antsUiFrozenSnapshot;
+  if (antsEnabled() || !snapshot) {
+    try {
+      snapshot = buildSnapshot();
+      antsUiFrozenSnapshot = snapshot;
+    } catch (e) {
+      snapshot = null;
+    }
   }
   const tel = {
     snapshot,
+    actionResult: antsUiActionResult,
     drawing: {
       version: VERSION,
       enabled: antsEnabled(),
@@ -11442,6 +11829,7 @@ function antsUiTelemetry() {
       diskSaved: LOD.diskSaved,
       diskDir: LOD.diskDir || "",
       ab: LOD.ab && LOD.ab.text ? String(LOD.ab.text) : "",
+      diagnostics: antsUiDrawingDiagnostics(snapshot),
     },
   };
   if (antsUiReport) {
@@ -11483,6 +11871,18 @@ function antsUiPublishTelemetry() {
   }
 }
 
+function antsUiApplyGovernor(settings) {
+  if (!settings || typeof settings !== "object") return;
+  const controls = settings.controls && typeof settings.controls === "object" ? settings.controls : {};
+  for (const key of Object.keys(GOV.controls)) {
+    if (key in controls && controls[key] !== GOV.controls[key]) govSetControl(key, controls[key]);
+  }
+  const policies = settings.policies && typeof settings.policies === "object" ? settings.policies : {};
+  for (const [key, policy] of Object.entries(policies)) {
+    if (GOV_POLICY_BY_ID.has(policy)) govSetPolicy(key, policy);
+  }
+}
+
 function antsUiApplySettings(settings) {
   if (!settings || typeof settings !== "object") return;
   const o = {};
@@ -11497,6 +11897,9 @@ function antsUiApplySettings(settings) {
   try {
     if ("enabled" in settings && !!settings.enabled !== antsEnabled()) antsSetEnabled(!!settings.enabled);
     if (Object.keys(o).length) lodSet(o);
+    if ("drawThrottleMs" in settings) setCap(Number(settings.drawThrottleMs) || 0);
+    if ("syntheticTickMs" in settings) setSyntheticTick(Number(settings.syntheticTickMs) || 0);
+    if (settings.governor) antsUiApplyGovernor(settings.governor);
     if ("paused" in settings && !!settings.paused !== !!S.paused) togglePause();
   } catch (e) {
     /* a bad payload must not break the page that is drawing */
@@ -11517,21 +11920,89 @@ function antsUiApplyRemote(body) {
   const cr = Number(body.commandRev) || 0;
   if (cr === antsUiCommandRev || body.origin === "page" || !body.command) return;
   antsUiCommandRev = cr;
-  const label = String(body.commandLabel || "");
+  const command = String(body.command || "");
+  const label = String(body.commandLabel || body.label || "");
+  const data = body.commandData && typeof body.commandData === "object" ? body.commandData :
+    body.data && typeof body.data === "object" ? body.data : {};
+  antsUiActionResult = "";
+  const requiresEnabled = new Set(["measure-links", "governor-suggest", "worker-self-test", "benchmark"]);
+  if (!S.enabled && requiresEnabled.has(command)) {
+    const names = {
+      "measure-links": "link-thinning measurement",
+      "governor-suggest": "limit suggestions",
+      "worker-self-test": "worker sanity check",
+      benchmark: "scripted pan benchmark",
+    };
+    antsUiActionResult = `Optimizer is off; ${names[command]} was not started.`;
+    return;
+  }
   try {
-    if (body.command === "measure-links") lodAbStart();
-    else if (body.command === "reset") resetAllStats();
-    else if (body.command === "report") antsUiReport = buildTelemetryReport();
-    else if (body.command === "mute" && label && !S.muted.has(label)) toggleMute(label);
-    else if (body.command === "unmute" && label && S.muted.has(label)) toggleMute(label);
+    if (command === "measure-links") {
+      lodAbStart();
+      antsUiActionResult = "Link-thinning measurement started on the ComfyUI page.";
+    } else if (command === "reset") {
+      resetAllStats();
+      antsUiActionResult = "Samples cleared.";
+    } else if (command === "report") {
+      // An explicit report request intentionally takes a fresh snapshot even
+      // while ordinary telemetry is frozen by the master-off switch.
+      antsUiReport = buildTelemetryReport();
+      antsUiActionResult = "Fresh report ready to copy.";
+    } else if (command === "mute" && label && !S.muted.has(label)) {
+      toggleMute(label);
+      antsUiActionResult = `Muted ${label}.`;
+    } else if (command === "unmute" && label && S.muted.has(label)) {
+      toggleMute(label);
+      antsUiActionResult = `Unmuted ${label}.`;
+    } else if (command === "unmute-all") {
+      clearMutes();
+      antsUiActionResult = "All hook limits are unmuted.";
+    } else if (command === "governor-reset") {
+      govReset();
+      antsUiActionResult = "Governor policies and controls reset to normal.";
+    } else if (command === "governor-suggest") {
+      const suggested = govSuggest();
+      antsUiActionResult = suggested.length ? suggested.join("; ") : "No measured source needs a suggested limit.";
+    } else if (command === "governor-off") {
+      govUninstall("turned off from the detached window");
+      antsUiActionResult = "Governor scheduling is off until this page reloads.";
+    } else if (command === "worker-self-test") {
+      Promise.resolve(govRunSelfTest()).then((result) => {
+        antsUiActionResult = result && result.match
+          ? `Worker answers match; main ${fmtMs(result.mainMs, 1)} ms, worker ${fmtMs(result.workerMs, 1)} ms.`
+          : `Worker sanity check unavailable: ${(result && result.error) || "answers did not match"}.`;
+      }).catch((e) => {
+        antsUiActionResult = `Worker sanity check failed: ${(e && e.message) || String(e)}.`;
+      });
+      antsUiActionResult = "Worker sanity check running…";
+    } else if (command === "governor-clear-traces") {
+      GOV.traces.length = 0;
+      GOV.traceVersion++;
+      antsUiActionResult = "Long-frame traces cleared.";
+    } else if (command === "benchmark") {
+      const slot = data.slot === "B" ? "B" : "A";
+      const duration = Math.max(100, Number(data.durationMs) || 6000);
+      antsUiActionResult = runScriptedPan(duration, slot)
+        ? `Scripted pan ${slot} started.`
+        : "Scripted pan was not started; check the active page and benchmark state.";
+    } else if (command === "memory-baseline") {
+      if (performance.memory) {
+        memBaseline = performance.memory.usedJSHeapSize;
+        memBaselineAt = nowMs();
+        antsUiActionResult = "Memory baseline set.";
+      } else antsUiActionResult = "Memory baseline unavailable in this renderer.";
+    } else if (command === "memory-clear-baseline") {
+      memBaseline = null;
+      memBaselineAt = 0;
+      antsUiActionResult = "Memory baseline cleared.";
+    }
   } catch (e) {
-    /* the command can be sent again */
+    antsUiActionResult = `Action failed: ${(e && e.message) || String(e)}.`;
   }
 }
 
 function antsWindowLive() {
-  const child = ui.popout;
-  if (child && child.closed) ui.popout = null;
+  antsHandleClosedWindow();
   if (ui.popout && !ui.popout.closed) return true;
   return antsUiOpened || antsUiHot;
 }
@@ -11557,16 +12028,15 @@ async function antsUiPump() {
     if (res && res.ok && typeof res.json === "function") {
       const body = await res.json();
       antsUiApplyRemote(body);
+      const wasHot = antsUiHot;
       const age = body && body.heardAge;
       antsUiHot = typeof age === "number" && age >= 0 && age < 3;
-      if (ui.popout && ui.popout.closed) {
-        ui.popout = null;
-        antsUiOpened = false;
-      }
+      antsHandleClosedWindow();
+      if (wasHot && !antsUiHot && !ui.popout) antsStopTemporaryTesting();
       if (antsWindowLive()) await antsUiPublishTelemetry();
     }
   } catch (e) {
-    /* no route, no bus — the in-page panel still works */
+    /* no route or detached window: there is deliberately no in-page fallback */
   }
 }
 
@@ -11576,10 +12046,8 @@ function antsUiStart() {
 
 function antsSayBlocked(text) {
   LOD.popoutNote = text || "";
-  if (ui.popNote) {
-    ui.popNote.style.display = text ? "" : "none";
-    ui.popNote.textContent = text || "";
-  }
+  for (const gear of [...ANTS_GEAR_BUTTONS]) antsSetGearStatus(gear);
+  if (text) console.warn(`[ANTs Tracker] ${text}`);
 }
 
 function antsWindowBox() {
@@ -11640,39 +12108,60 @@ function antsTryOpenWindow() {
     /* the window polls; a missed first post is not a failed open */
   }
   antsUiStart();
-  if (ui.panel && ui.panel.classList.contains("open") && !ui.panel.classList.contains("ants-docked")) {
-    togglePanel(false);
-  }
   return true;
 }
 
 function antsOpenFromGear() {
-  if (antsFocusWindow()) return;
-  if (typeof window.open === "function") {
-    if (antsTryOpenWindow()) return;
-    togglePanel(true);
-    antsSayBlocked(ANTS_WINDOW_BLOCKED);
-    return;
-  }
-  togglePanel();
+  if (antsTryOpenWindow()) return true;
+  antsSayBlocked(ANTS_WINDOW_BLOCKED);
+  return false;
 }
 
 function antsOpenFromApi() {
-  if (antsFocusWindow()) return;
-  if (typeof window.open === "function") {
-    if (antsTryOpenWindow()) return;
-    togglePanel(true);
-    antsSayBlocked(ANTS_WINDOW_BLOCKED);
-    return;
-  }
-  togglePanel(true);
+  if (antsTryOpenWindow()) return true;
+  antsSayBlocked(ANTS_WINDOW_BLOCKED);
+  return false;
 }
 
 function antsPopout() {
   if (antsTryOpenWindow()) return true;
-  togglePanel(true);
   antsSayBlocked(ANTS_WINDOW_BLOCKED);
   return false;
+}
+
+function antsStopTemporaryTesting() {
+  try { stopScriptedPan("detached window closed"); } catch (e) { /* best effort */ }
+  try { if (LOD.ab && !LOD.ab.done) lodAbStop("measurement stopped because the detached window closed"); } catch (e) { /* best effort */ }
+  try { setCap(0); } catch (e) { /* best effort */ }
+  try { setSyntheticTick(0); } catch (e) { /* best effort */ }
+}
+
+function antsWindowClose() {
+  const child = ui.popout;
+  if (!child) return false;
+  try {
+    if (!child.closed && typeof child.close === "function") child.close();
+  } catch (e) {
+    /* a shell may disallow closing; the window can still close itself */
+  }
+  if (child.closed || typeof child.close === "function") {
+    ui.popout = null;
+    antsUiOpened = false;
+    antsUiHot = false;
+    antsStopTemporaryTesting();
+    return true;
+  }
+  return false;
+}
+
+function antsHandleClosedWindow() {
+  const child = ui.popout;
+  if (!child || !child.closed) return false;
+  ui.popout = null;
+  antsUiOpened = false;
+  antsUiHot = false;
+  antsStopTemporaryTesting();
+  return true;
 }
 
 // A right-anchored panel grows to the left when its width changes, which is the
@@ -12095,6 +12584,7 @@ function updateActiveTab() {
 function timingContextLine() {
   const bits = [];
   bits.push(`${S.counters.wrappedHooks} hook(s) wrapped`);
+  bits.push(`rolling ${Math.round(WINDOW_MS / 1000)}s activity window`);
   if (S.counters.preTrackedHooks) bits.push(`${S.counters.preTrackedHooks} pre-existing prototype hook(s) adopted`);
   if (S.counters.instanceHooks) bits.push(`${S.counters.instanceHooks} instance hook(s) adopted`);
   if (S.extSeen.size) bits.push(`${S.extSeen.size} extension(s) registered`);
@@ -12398,7 +12888,7 @@ function buildTweaksTab(container) {
   settingRow(
     "Replace node previews with bitmap stand-ins at zoom levels",
     lodFlatSel,
-    "Below this zoom a node is one picture instead of a live draw. Hover, selection and a drag keep the picture. A selected node gets a ring, not a box. A link drag, a running bar or an error still draws live.",
+    "Below this zoom a node is one picture instead of a live draw. Hover, selection and node drag keep the picture; selection gets a ring. In Nodes 2.0, progress/error marks update live over the held picture, while video or link drag keeps the element live. In the classic canvas renderer, running/erroring nodes stay live.",
     "A zoom, not a node size. Past this percentage means zoomed out below it. A node whose own UI hides or adds a widget changes size while you look at it, and a per-node pixel rule then flips that node in and out of the stand-in. A zoom classifies every node the same way, once per frame. Collapsed nodes and this tool's own node are never replaced. Nothing about the graph changes. Off, or Back to full drawing, restores ComfyUI's own draw. The node stays clickable either way. While the link below is on, this zoom and the widget-stop zoom are the same, and the higher one wins."
   );
 
@@ -13250,7 +13740,8 @@ function buildNodesTab(container) {
     "\"calls/frame\" is calls per redraw of the canvas, so for a type that is painted every frame it is close to the number of " +
     "instances on screen; a value well below 1 means most of this type is off-screen or culled on a given redraw, which is cheap " +
     "by definition. Use \"% of frame\" and \"ms/call\" to find the expensive ones: a high ms/call with a low calls/frame is one " +
-    "heavy node, a low ms/call with a high calls/frame is many cheap nodes.";
+    "heavy node, a low ms/call with a high calls/frame is many cheap nodes. Per-type rows use the last " +
+    `${(WINDOW_MS / 1000).toFixed(0)} seconds, so a type drops out after it has not been drawn in that rolling window; the whole-frame summary above uses a separate, longer frame window.`;
 
   container.appendChild(budgetCallout);
   container.appendChild(el("div", { class: "ants-section-title", text: "Who is asking for redraws" }));
@@ -13439,6 +13930,7 @@ function buildStallsTab(container) {
   const empty = el("div", { class: "ants-empty" });
   const note = el("p", { class: "ants-note" });
   note.textContent =
+    `The headline rates use the last ${(WINDOW_MS / 1000).toFixed(0)} seconds and can fall when new stalls stop. Source rows stay visible for up to 30 seconds after their last event; their counts, blocking time and worst values are lifetime totals. ` +
     "Click any column header to sort by it (again to reverse, a third time for the default: most blocking first). " +
     "This lane is deliberately not canvas drawing. It is main-thread time that no draw hook owns: a heartbeat setInterval, a " +
     "fetch/DOM polling loop, forced layout thrash, a big GC, a Vue re-render, or this panel itself (look for " +
@@ -13973,14 +14465,20 @@ const BENCH_PRESETS = [
   { label: "10 seconds", ms: 10000, picked: false },
 ];
 
-function setSyntheticTick(ms) {
-  syntheticTickMs = ms;
-  if (syntheticTickTimer) {
-    clearInterval(syntheticTickTimer);
-    syntheticTickTimer = null;
+function stopSyntheticTickTimer() {
+  if (syntheticTickTimer !== null) {
+    try { clearInterval(syntheticTickTimer); } catch (e) { /* best effort */ }
   }
-  if (ms > 0) {
+  syntheticTickTimer = null;
+}
+
+function setSyntheticTick(ms) {
+  syntheticTickMs = Math.max(0, Number(ms) || 0);
+  stopSyntheticTickTimer();
+  if (!S.enabled || syntheticTickMs <= 0) return syntheticTickMs;
+  try {
     syntheticTickTimer = govOwn(() => setInterval(() => {
+      if (!S.enabled) return;
       try {
         if (app.canvas && typeof app.canvas.setDirty === "function") app.canvas.setDirty(true, true);
         else if (app.canvas && typeof app.canvas.draw === "function") app.canvas.draw(true, true);
@@ -13988,8 +14486,24 @@ function setSyntheticTick(ms) {
       } catch (e) {
         warnOnce("synthetic-tick-error", `Forced redraw failed: ${e && e.message}`);
       }
-    }, ms));
+    }, syntheticTickMs));
+  } catch (e) {
+    syntheticTickTimer = null;
   }
+  return syntheticTickMs;
+}
+
+function setCap(ms) {
+  drawThrottleMs = Math.max(0, Number(ms) || 0);
+  if (drawThrottleMs === 0 && capTrailingTimer !== null) {
+    try { clearTimeout(capTrailingTimer); } catch (e) { /* best effort */ }
+    capTrailingTimer = null;
+  }
+  if (!S.enabled && capTrailingTimer !== null) {
+    try { clearTimeout(capTrailingTimer); } catch (e) { /* best effort */ }
+    capTrailingTimer = null;
+  }
+  return drawThrottleMs;
 }
 
 function benchLine(r) {
@@ -14031,11 +14545,7 @@ function buildTestingTab(container) {
   }
   capSelect.value = String(drawThrottleMs);
   capSelect.addEventListener("change", () => {
-    drawThrottleMs = Number(capSelect.value);
-    if (drawThrottleMs === 0 && capTrailingTimer) {
-      clearTimeout(capTrailingTimer);
-      capTrailingTimer = null;
-    }
+    setCap(Number(capSelect.value));
     update();
   });
   capWrap.appendChild(capSelect);
@@ -14212,23 +14722,53 @@ function buildTestingTab(container) {
   ui.state.testing = { update };
 }
 
+let scriptedPanRun = null;
+
+function stopScriptedPan(reason) {
+  const run = scriptedPanRun;
+  if (!run) return false;
+  run.stopped = true;
+  if (run.handle !== null) {
+    try { if (typeof cancelAnimationFrame === "function") cancelAnimationFrame(run.handle); } catch (e) { /* best effort */ }
+  }
+  run.handle = null;
+  if (run.ds && run.ds.offset) {
+    run.ds.offset[0] = run.x0;
+    run.ds.offset[1] = run.y0;
+  }
+  scriptedPanRun = null;
+  S.benchActive = null;
+  try {
+    if (run.canvas && typeof run.canvas.setDirty === "function") run.canvas.setDirty(true, true);
+  } catch (e) { /* the original viewport is already restored */ }
+  if (ui.state.testing) ui.state.testing.update();
+  if (reason) antsUiActionResult = `Benchmark stopped: ${reason}.`;
+  return true;
+}
+
 function runScriptedPan(durationMs, slot) {
+  if (!S.enabled) return false;
   const canvas = app.canvas;
   if (!canvas || !canvas.ds || typeof requestAnimationFrame !== "function") {
     warnOnce("no-bench", "Scripted pan benchmark unavailable: app.canvas.ds was not found in this frontend version.");
-    return;
+    return false;
   }
-  if (S.benchActive) return;
+  if (S.benchActive || scriptedPanRun) return false;
   const ds = canvas.ds;
   const t0 = nowMs();
   const x0 = ds.offset ? ds.offset[0] : 0;
   const y0 = ds.offset ? ds.offset[1] : 0;
+  const duration = Math.max(100, Number(durationMs) || 6000);
+  const benchSlot = slot === "B" ? "B" : "A";
   const span = benchSpan(canvas);
   let foveaPeak = 0;
-  S.benchActive = { t0, durationMs };
+  const run = { canvas, ds, x0, y0, t0, durationMs: duration, handle: null, stopped: false };
+  scriptedPanRun = run;
+  S.benchActive = { t0, durationMs: duration };
   if (ui.state.testing) ui.state.testing.update();
 
   const finish = () => {
+    if (run.stopped || scriptedPanRun !== run) return;
     if (ds.offset) {
       ds.offset[0] = x0;
       ds.offset[1] = y0;
@@ -14255,29 +14795,34 @@ function runScriptedPan(durationMs, slot) {
       nodes: graphNodeCount(),
     };
     if (!S.bench) S.bench = { A: null, B: null };
-    S.bench[slot] = result;
+    S.bench[benchSlot] = result;
+    run.handle = null;
+    scriptedPanRun = null;
     S.benchActive = null;
-    if (typeof canvas.setDirty === "function") canvas.setDirty(true, true);
+    if (S.enabled && typeof canvas.setDirty === "function") canvas.setDirty(true, true);
     if (ui.state.testing) ui.state.testing.update();
   };
 
   const step = () => {
+    run.handle = null;
+    if (run.stopped || scriptedPanRun !== run || !S.enabled) return;
     const elapsed = nowMs() - t0;
     if (ds.offset) {
-      const phase = (elapsed / durationMs) * Math.PI * 2;
+      const phase = (elapsed / duration) * Math.PI * 2;
       ds.offset[0] = x0 + Math.sin(phase) * span.x;
       ds.offset[1] = y0 + Math.sin(phase * 2) * span.y;
     }
     if (LOD.foveaEls > foveaPeak) foveaPeak = LOD.foveaEls;
     if (typeof canvas.setDirty === "function") canvas.setDirty(true, true);
     else if (typeof canvas.draw === "function") canvas.draw(true, true);
-    if (elapsed >= durationMs) {
+    if (elapsed >= duration) {
       finish();
       return;
     }
-    govOwn(() => requestAnimationFrame(step));
+    run.handle = govOwn(() => requestAnimationFrame(step));
   };
-    govOwn(() => requestAnimationFrame(step));
+  run.handle = govOwn(() => requestAnimationFrame(step));
+  return true;
 }
 
 function graphNodeCount() {
@@ -14918,11 +15463,27 @@ function buildTabContents() {
 // Periodic sweep. Two jobs, both about keeping the window honest:
 //   * trim bucketed rings by wall-clock time even when their owner stopped
 //     being called (v1 could not age out an idle extension at all);
-//   * roll the tracker's own cost counters over so the panel can show them.
+//   * roll the tracker's own cost counters over so the report can show them.
 // It never deletes a hook bucket: a wrapped hook holds that object, and v1's
 // delete-after-4-seconds-of-quiet is precisely why an extension could vanish
 // from the Timing tab for the rest of the session while still drawing.
+let staleSweepTimer = null;
+
+function startStaleSweep() {
+  if (!S.enabled || staleSweepTimer !== null) return;
+  try { staleSweepTimer = govOwn(() => setInterval(sweepStaleData, SWEEP_MS)); }
+  catch (e) { staleSweepTimer = null; }
+}
+
+function stopStaleSweep() {
+  if (staleSweepTimer !== null) {
+    try { clearInterval(staleSweepTimer); } catch (e) { /* best effort */ }
+  }
+  staleSweepTimer = null;
+}
+
 function sweepStaleData() {
+  if (!S.enabled) return;
   const t0 = performance.now();
   const now = nowMs();
   if (!S.paused) {
@@ -15006,22 +15567,11 @@ function stopRefresh() {
 }
 
 function togglePanel(force) {
-  buildPanel();
-  buildTabContents();
-  const shouldOpen = force !== undefined ? force : !ui.panel.classList.contains("open");
-  ui.panel.classList.toggle("open", shouldOpen);
-  if (shouldOpen) {
-    // Opening the panel, from the node or the floating gear, lands on the
-    // rendering settings. A tab picked while it is open stays until it closes.
-    ui.active = "";
-    setTab("tweaks");
-    renderSummary();
-    updateActiveTab();
-    startRefresh();
-    if (ui.active === "gpu") refreshGpu();
-  } else {
-    stopRefresh();
-  }
+  // Retired: the ComfyUI document is headless apart from its power switch and
+  // detached-window gear. A blocked window must remain a visible error, never a
+  // reason to reconstruct this page's old settings panel.
+  if (ui.refreshTimer != null) stopRefresh();
+  return false;
 }
 
 function togglePause() {
@@ -15191,8 +15741,8 @@ function buildCornerPill() {
     id: "ants-corner-btn",
     class: "ants-node-btn ants-node-btn-gear",
     type: "button",
-    title: "ANTs Frontend Optimizer — click to open the separate window, press and hold to move this button. If the browser blocks the window, the panel on this page opens instead.",
   });
+  antsSetGearStatus(gear);
   const glyph = antsGearSvg();
   if (glyph) gear.appendChild(glyph);
   gear.addEventListener("click", (ev) => {
@@ -15262,6 +15812,7 @@ function buildSnapshot() {
     settings: {
       windowMs: WINDOW_MS,
       frameWindowMs: fm.windowMs,
+      enabled: S.enabled,
       paused: S.paused,
       capMs: drawThrottleMs,
       synthTickMs: syntheticTickMs,
@@ -15274,6 +15825,16 @@ function buildSnapshot() {
     invalidation: { perSec: inv.perSec, perRaf: inv.perRaf, sources: inv.sources.slice(0, 12) },
     stalls: { perSec: stalls.perSec, blockingMsPerSec: stalls.blockingMsPerSec, worst: stalls.worst, total: stalls.total, sources: stalls.rows.slice(0, 12) },
     load: load.slice(0, 30),
+    testing: {
+      draws: S.counters.framesTotal,
+      capped: S.counters.capped,
+      deferred: S.counters.deferred,
+      mutedCalls: S.counters.skippedWhileMuted,
+      wrappedHooks: S.counters.wrappedHooks,
+      preTrackedHooks: S.counters.preTrackedHooks,
+      instanceHooks: S.counters.instanceHooks,
+      benchActive: S.benchActive ? { durationMs: S.benchActive.durationMs, elapsedMs: nowMs() - S.benchActive.t0 } : null,
+    },
     memory: mem
       ? {
           used: mem.usedJSHeapSize,
@@ -15477,7 +16038,7 @@ function buildTelemetryReport() {
     }
     if (gv.inert && gv.inert.count) {
       lines.push(
-        `  ${gv.inert.count} limited source(s) are not affected by their own limit: it is narrower than how far apart their runs already are ` +
+        `  ${gv.inert.count} limited source(s) are unaffected by their own limit: it is narrower than how far apart their runs already are ` +
           `(${Math.round(gv.inert.msPerSec)} ms/s still on the main thread). Use 2/s or 1/s for a chain that slow.`
       );
     }
@@ -15589,13 +16150,14 @@ function installDebugApi() {
         };
       },
       open: () => antsOpenFromApi(),
-      close: () => togglePanel(false),
+      close: () => antsWindowClose(),
       popout: () => antsPopout(),
       // The separate window's control link, so a test can apply a payload the
       // window would have posted without standing up the route.
       link: {
         settings: () => antsUiSettings(),
         limits: () => antsUiLimits(),
+        telemetry: () => antsUiTelemetry(),
         apply: (body) => antsUiApplyRemote(body),
       },
       ramCheck: () => lodRamCheck(),
@@ -15616,9 +16178,7 @@ function installDebugApi() {
       },
       clearMutes,
       reset: () => resetAllStats(),
-      setCap: (ms) => {
-        drawThrottleMs = Number(ms) || 0;
-      },
+      setCap: (ms) => setCap(ms),
       // Low-zoom drawing: the opt-in that makes the canvas cheaper per frame
       // instead of less frequent. Also driven from the Nodes tab.
       lowZoom: {
@@ -16001,35 +16561,37 @@ app.registerExtension({
       /* the check is a report, not a dependency */
     }
     buildCornerButton();
-    installStallObserver();
-    installRafMonitor();
-    installMemorySampler();
-    govOwn(() => setInterval(sweepStaleData, SWEEP_MS));
-    // Node types keep arriving as packs register, so re-scan for hooks that
-    // never went through this tool's beforeRegisterNodeDef wrapper.
-    // The same interval that scans for late node types also asks whether the
-    // separate window is open. No extra timer: a timer registered at startup
-    // spends one of the attribution tokens the governor has for other packs.
-    govOwn(() => setInterval(() => {
-      scanRegisteredTypes();
-      if (!antsUiTimer) antsUiPump();
-    }, 2000));
-    govOwn(() => setInterval(() => {
-      if (ui.built && ui.panel.classList.contains("open") && ui.active === "gpu") refreshGpu();
-    }, 2500));
-    try {
-      lodThumbDiskSweep();
-    } catch (e) {
-      /* the disk cache is optional; a missing route leaves the memory cache */
+    if (S.enabled) {
+      installStallObserver();
+      installRafMonitor();
+      installMemorySampler();
+      startStaleSweep();
+      govStartAutoPilot();
     }
-    try {
-      lodInstallRamWatch();
-    } catch (e) {
-      /* a run with no execution events simply does not release stand-ins */
+    // Keep the small bridge alive while the detached window is open, even when
+    // optimizer work is suspended, so its power control can turn work back on.
+    // Node-type scanning itself pauses with the master switch.
+    if (uiBridgeScanTimer === null) {
+      uiBridgeScanTimer = govOwn(() => setInterval(() => {
+        if (S.enabled) scanRegisteredTypes();
+        if (!antsUiTimer) antsUiPump();
+      }, 2000));
+    }
+    if (S.enabled) {
+      try {
+        lodThumbDiskSweep();
+      } catch (e) {
+        /* the disk cache is optional; a missing route leaves the memory cache */
+      }
+      try {
+        lodInstallRamWatch();
+      } catch (e) {
+        /* a run with no execution events simply does not release stand-ins */
+      }
     }
     console.info(
-      `[ANTs Tracker] v${VERSION} running. The gear opens the separate window; if the browser blocks it, the panel on this page opens instead. ` +
-        "window.__antsTracker.snapshot / .report give the same data from the console."
+      `[ANTs Tracker] v${VERSION} running. The gear opens the detached optimizer window; a blocked open has no in-page fallback. ` +
+        "window.__antsTracker.snapshot / .report remain available for diagnostics."
     );
   },
 
@@ -16042,10 +16604,10 @@ app.registerExtension({
     const onNodeCreated = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function () {
       const ret = onNodeCreated ? onNodeCreated.apply(this, arguments) : undefined;
-      // The pill: a master switch and the gear that opens the panel, side by side
-      // in one rounded frame. Marked .ants-own, so no low-zoom sweep can hide it —
-      // it is the control that switches the tool off, so it has to be there when
-      // everything else has been switched off.
+      // The pill: a master switch and the gear that opens the detached window,
+      // side by side in one rounded frame. Marked .ants-own, so no low-zoom sweep
+      // can hide it — it is the control that switches the tool off, so it has to
+      // be there when everything else has been switched off.
       antsAttachNodeWidget(this);
       antsUnlockNode(this);
       try {
@@ -16100,23 +16662,21 @@ app.registerExtension({
 //    computed styles at 40, 60 and 150 nodes. What page JavaScript cannot measure
 //    is the rasteriser's own bill; that is what the frame budget, the Stalls tab
 //    and DevTools' paint flashing show on the machine the graph runs on.
-//  * A stand-in never carries a node's execution state, in either renderer, and
-//    the panel's "N element(s) hidden" is the page's own count. In the Vue
-//    renderer a node whose state is live (a progress value, errors, a drag, a
-//    video) is never boxed at all — `lodVueFlatNode` refuses the same nodes
-//    `lodSnapLive` refuses, so the element stays and the frontend draws its own
-//    bar, its own error stroke and its own outline around the node that is
-//    executing. In the canvas renderer a box does stand for such a node, and the
-//    two marks are read from `node.progress`/`node.has_errors` — fields the
-//    frontend itself mirrors onto the node object in both renderers
-//    (`nodeProgressCanvasSync.ts`, `useNodeErrorFlagSync.ts`) — on every frame:
-//    neither is ever photographed nor blitted (see `lodSnapLive`), so a bar of the
-//    instant of a capture cannot be served after the run it belonged to. The
-//    hidden count is per *element* dressed, one class (`.ants-lod-box`) or one
-//    attribute (`data-ants-dom-hidden`) each, and equals what a walk of the page
-//    for those two marks finds. (The Vue-nodes pathway's stand-in mark is a third
-//    one — the attribute `data-ants-vue-standin` on the node's root, counted as
-//    `vueBlanked` — and the panel names the renderer it is reporting on.)
+//  * A bitmap never contains transient execution state, but the live handling is
+//    renderer-specific. In the Vue renderer a progress/erroring node stays blanked
+//    behind its held picture; `lodSnapPaint` draws current `node.progress` /
+//    `node.has_errors` marks over the bitmap. Those fields are excluded from the
+//    picture signature and any queued capture is removed while either is active,
+//    so the marks cannot freeze into a RAM or disk picture. Clearing the state
+//    removes its overlay on the next draw without recapture. Video and link drag
+//    still hand the Vue element back to ComfyUI. The Vue executing outline is not
+//    reconstructed. In the classic canvas renderer, a running/erroring node stays
+//    live and uses its flat fallback box with marks read from those same frontend-
+//    mirrored fields; the snapshot blit refuses it. The panel's "N element(s)
+//    hidden" is the page's own count: one per *element* dressed by `.ants-lod-box`
+//    or `data-ants-dom-hidden`, matching a page walk. (The Vue-nodes pathway's
+//    stand-in mark is a third one — `data-ants-vue-standin` on the node root,
+//    counted as `vueBlanked` — and the panel names the renderer.)
 //  * A picture is only taken once its node has stopped changing: a settle window
 //    (LOD_SNAP_SETTLE_MS, 300ms) opened when a node is first drawn as a stand-in
 //    and re-opened by every change the page reports — or by a signature that no
@@ -16150,9 +16710,9 @@ app.registerExtension({
 //    node's file a miss anyway.
 //  * What a Vue-nodes stand-in cannot be is a *screenshot*: no browser API
 //    draws a DOM element into a canvas (not drawImage, not createImageBitmap,
-//    not captureStream). The picture is therefore *drawn* — the box, its title
-//    bar and state marks, the node's own structure and widget rows in the
-//    colours the browser computed, the text wrapped into the box the browser
+//    not captureStream). The picture is therefore *drawn* — the box and title,
+//    the node's own structure and widget rows in the colours the browser
+//    computed, the text wrapped into the box the browser
 //    laid it out in and drawn in the element's own font, the values of its form
 //    and ARIA controls drawn as the controls they are, the node's composited
 //    opacity, the node's **icons** — parsed out of the SVG the frontend's iconify
@@ -16161,6 +16721,10 @@ app.registerExtension({
 //    the glyph — and the node's own `<img>`/`<canvas>` elements at the rows the
 //    layout gave them — into the same capture surface the canvas renderer uses,
 //    with the same capture resolution, mip chain, RAM budget and disk files.
+//    The amber warning badge marks a live fallback box only; captured/cached
+//    pictures never contain it or receive it as an overlay. The badge signature
+//    token invalidates older badge-bearing cache entries. Progress/error marks
+//    remain live overlays and never become part of a captured bitmap.
 //    Every colour goes through `lodVueColor` first: this frontend's themed
 //    surfaces are Tailwind 4 `oklch()`/`oklab()` strings, which a canvas
 //    `fillStyle` ignores *silently* (the previous colour stays, so a node wears
@@ -16263,7 +16827,7 @@ app.registerExtension({
 //    (a revision and an origin, so neither side is the master), which means it
 //    shows the live numbers only while the ComfyUI page is open and answering;
 //    with that page gone the window says so instead of pretending. A blocked
-//    popup leaves the in-page panel as the fallback and says why.
+//    popup is shown on the gear and never opens an in-page fallback.
 //  * Worker functions cannot capture closures, which is why the lane takes a
 //    job name (or a self-contained function source) plus structured-cloneable
 //    arguments and nothing else.
@@ -16286,18 +16850,18 @@ app.registerExtension({
 //    includes an image from another origin is tainted by the browser, which is
 //    allowed to blit but not to read back: such a picture works in memory and
 //    simply cannot be written to disk.
-//  * Node snapshots reuse a bitmap that was checked against the node's signature
-//    at most LOD_SNAP_SIG_MS ago (100ms), so a change that happens between two
-//    checks can be shown stale for that long. Anything the panel can see cheaply
-//    — selection, hover, an error, progress, a drag — is checked every frame
-//    instead and never uses a bitmap. A bitmap is also a *picture of the node at
-//    the moment it was captured*: while a node's own live drawing animates
-//    without changing any field in the signature (a shader-like hook with its own
-//    clock), the picture is the frame it was taken from, not a moving image.
-//  * A capture is drawn at the capture ratio (default 1 pixel per graph unit)
-//    and scaled into the node's box on screen. Zoomed in past that, a snapshot is
-//    softer than the live drawing — which is why a node that is being worked at,
-//    selected or hovered is never served from one, and why the ratio is a
-//    setting rather than a constant. The ratio is also the coverage knob on a
-//    large graph: the budget divided by the pixels per picture decides how many
-//    nodes can hold one at all.
+//  * Node snapshots reuse a bitmap whose signature is rechecked at most
+//    LOD_SNAP_SIG_MS apart (100ms), so a content change can remain in the picture
+//    until that check and its replacement. Position, pan and zoom do not enter the
+//    signature, and selection does not either: the selected-node ring is drawn on
+//    top at reuse time. Vue progress/error marks are also read live at reuse time
+//    and overlaid; a classic-canvas node carrying either mark stays live rather
+//    than using a bitmap. Video and link drag keep the Vue element live. A bitmap
+//    remains a *picture of the node at capture time*: animation with no changing
+//    signature field (for example a shader-like hook with its own clock) is frozen
+//    at that frame rather than becoming a moving image.
+//  * A capture is drawn at the selected capture ratio (default 1 pixel per graph
+//    unit) and scaled into the node's box on screen. At zooms above that ratio a
+//    snapshot can look softer than live drawing; the ratio is a setting and a
+//    coverage knob on a large graph, because the budget divided by pixels per
+//    picture decides how many nodes can hold one at all.

@@ -378,6 +378,34 @@ suite("non-canvas lanes", () => {
     assertInclude2(src.invoker, "setInterval");
   });
 
+  test("Stalls rates age out after 4s but source rows are retained for 30s", async () => {
+    const h = await boot();
+    h.advance(4000);
+    h.emitPerformance("long-animation-frame", [
+      {
+        startTime: h.clock.now - 100,
+        duration: 200,
+        blockingDuration: 160,
+        scripts: [
+          {
+            sourceURL: "http://localhost:8188/extensions/SlowPack/js/poll.js",
+            sourceFunctionName: "poll",
+            invoker: "TimerHandler:setInterval",
+            duration: 180,
+            forcedStyleAndLayoutDuration: 0,
+          },
+        ],
+      },
+    ]);
+    assertEqual(h.tracker.snapshot.stalls.sources.length, 1, "the event creates one source row");
+    h.advance(5000);
+    const quiet = h.tracker.snapshot.stalls;
+    assertEqual(quiet.blockingMsPerSec, 0, "the recent 4s headline rate falls to zero when the event ages out");
+    assertEqual(quiet.sources.length, 1, "but the source row is still retained after 5s");
+    h.advance(26000);
+    assertEqual(h.tracker.snapshot.stalls.sources.length, 0, "the row leaves only after its 30s retention window");
+  });
+
   test("load tab reports a span, not a sum of overlapping durations (v1 regression)", async () => {
     const h = await boot();
     // 10 concurrently-fetched files: sum of durations 1000ms, real span 120ms.
@@ -622,14 +650,11 @@ suite("scripted pan benchmark", () => {
     assertEqual(bench.B.muted.length, 1, "the mute state is captured with the run");
     assertEqual(bench.A.muted.length, 0, "and A recorded that it was unmuted");
 
-    // The Testing tab states the comparison in plain terms.
-    h.tracker.open();
-    const body = h.document.getElementById("ants-tracker-body");
-    const tabs = h.document.getElementById("ants-tracker-tabs");
-    for (const btn of tabs.children) if (btn.textContent === "Testing") btn.click();
-    h.advance(60);
-    const text = body.textContent;
-    assertIncludes(text, "fps", "delta line shows the fps change");
-    assertIncludes(text, "different mutes", "and warns that the two runs differ on purpose");
+    // The detached Testing tab reads this same structured result; the headless
+    // page keeps only the snapshot/report surface.
+    assertGreater(bench.B.fps, 0, "the second run has a comparable frame rate");
+    assertEqual(bench.A.muted.join(","), "", "A records its original mute state");
+    assertEqual(bench.B.muted.join(","), "BenchPack", "B records that the test changed its mutes");
+    assertIncludes(h.tracker.report, "-- BENCHMARK (scripted pan) --", "the report retains both detached benchmark slots");
   });
 });

@@ -7,13 +7,13 @@
 //   node tools/box-preview.mjs        > preview/boxes.html
 //   node tools/box-preview.mjs --svg  > preview/boxes.svg
 //
-// Why: the whole point of the box-detail ladder is what it looks like, and a test
-// can only count rectangles. This page draws them. The geometry is not a mock —
-// every rectangle below is an operation the tracker actually issued, in graph
-// units, with the fill, alpha, stroke and width it issued it with. What is *not*
-// real is the surrounding graph: LiteGraph's own node rendering (title text,
-// sockets, widgets) is not reproduced, so the picture shows the boxes and nothing
-// else, which is exactly what the flat path replaces.
+// Why: the whole point of the box-detail ladder is what it looks like. This page
+// records the tracker's real paint operations — rectangles and canvas paths — in
+// graph units, with the fill, alpha, stroke and width they were issued with. The
+// path recorder includes the live fallback box's amber triangle, dark border and bolt.
+// What is *not* real is the surrounding graph: LiteGraph's own node rendering
+// (title text, sockets, widgets) is not reproduced, so the preview shows the
+// tracker's stand-in drawing rather than the full node.
 //
 // The picture is drawn in graph units and magnified so it can be read at all:
 // at 10% zoom — the zoom this mode exists for — a 200x100 node is 20x10 pixels on
@@ -86,7 +86,7 @@ function buildNodes() {
 function recordNode(canvas, node) {
   const ctx = canvas.ctx;
   const ops = [];
-  const names = ["fillRect", "strokeRect", "beginPath", "moveTo", "lineTo", "stroke", "fill", "bezierCurveTo", "arc", "drawImage"];
+  const names = ["fillRect", "strokeRect", "beginPath", "moveTo", "lineTo", "closePath", "stroke", "fill", "bezierCurveTo", "arc", "drawImage"];
   const real = {};
   for (const name of names) {
     real[name] = ctx[name];
@@ -97,6 +97,7 @@ function recordNode(canvas, node) {
         fillStyle: this.fillStyle,
         strokeStyle: this.strokeStyle,
         lineWidth: this.lineWidth,
+        lineJoin: this.lineJoin,
         globalAlpha: this.globalAlpha,
       });
       return real[name].apply(this, args);
@@ -112,12 +113,36 @@ const num = (v) => Math.round(Number(v) * 1000) / 1000;
 const alphaAttr = (a) => (Number(a) >= 1 ? "" : ` opacity="${num(a)}"`);
 
 // One node's ops -> SVG, translated to where the node sits (the flat path draws
-// in node-local coordinates, exactly as LiteGraph's own drawNode does).
+// in node-local coordinates, exactly as LiteGraph's own drawNode does). Rectangles
+// stay rectangles; path operations preserve the warning badge's actual triangle,
+// dark outline and lightning bolt.
 function opsToSvg(ops, x, y, scale, notes) {
   const parts = [`<g transform="translate(${num(x * scale)} ${num(y * scale)})">`];
+  let path = [];
+  const emitPath = (mode, op) => {
+    if (!path.length) return;
+    const d = path.join(" ");
+    const fill = mode === "fill" ? esc(op.fillStyle || "none") : "none";
+    const stroke = mode === "stroke" ? esc(op.strokeStyle || "none") : "none";
+    const strokeWidth = mode === "stroke" ? num(op.lineWidth * scale) : 0;
+    const join = mode === "stroke" && op.lineJoin ? ` stroke-linejoin="${esc(op.lineJoin)}"` : "";
+    parts.push(
+      `<path d="${d}" fill="${fill}" stroke="${stroke}" stroke-width="${strokeWidth}"${join}${alphaAttr(op.globalAlpha)}/>`
+    );
+    notes.push(`${mode} path (${mode === "fill" ? op.fillStyle : op.strokeStyle})`);
+  };
   for (const op of ops) {
     const a = op.args.map(Number);
-    if (op.name === "fillRect") {
+    if (op.name === "beginPath") {
+      path = [];
+    } else if (op.name === "moveTo" || op.name === "lineTo") {
+      const cmd = op.name === "moveTo" ? "M" : "L";
+      path.push(`${cmd} ${num(a[0] * scale)} ${num(a[1] * scale)}`);
+    } else if (op.name === "closePath") {
+      path.push("Z");
+    } else if (op.name === "fill" || op.name === "stroke") {
+      emitPath(op.name, op);
+    } else if (op.name === "fillRect") {
       parts.push(
         `<rect x="${num(a[0] * scale)}" y="${num(a[1] * scale)}" width="${num(a[2] * scale)}" height="${num(a[3] * scale)}" ` +
           `fill="${esc(op.fillStyle)}"${alphaAttr(op.globalAlpha)}/>`
@@ -193,7 +218,7 @@ const SANS = "DejaVu Sans, Verdana, Geneva, ui-sans-serif, system-ui, sans-serif
 const MONO = "DejaVu Sans Mono, Menlo, Consolas, ui-monospace, monospace";
 
 const legend = {
-  plain: "plain — one rectangle per node, plus the selection ring: exactly what v2.1.16 painted",
+  plain: "plain — one fill rectangle per node, plus the selection ring and live-fallback warning badge",
   title: "title — + the node's own title-bar colour, above the body, at LiteGraph's 30-unit title height",
   state:
     "state — + the frontend's own marks: error stroke (#E00, 10 units wide, 12 units out), the green progress bar, " +
@@ -291,10 +316,11 @@ if (process.argv.includes("--svg")) {
 </style>
 <h2 style="margin:16px">Flat boxes, by box-detail level</h2>
 <p class="note">The setting is <code>box detail</code> in the Tweaks tab, or
-<code>window.__antsTracker.lowZoom.set({ boxDetail: "title" })</code>. Every rectangle below is an
+<code>window.__antsTracker.lowZoom.set({ boxDetail: "title" })</code>. Every rectangle and canvas path below is an
 operation the real paint path (<code>lodPaintNode</code>) issued, recorded from the harness canvas and
-replayed as SVG, in graph units, at the same numbers the code uses. LiteGraph's own node drawing
-(title text, sockets, widgets) is not reproduced — that is the drawing the flat path replaces. At
+replayed as SVG, in graph units, at the same numbers the code uses. That includes each live fallback box's
+warning badge (amber triangle, dark outline and bolt); the badge is not part of stored pictures. LiteGraph's
+own node drawing (title text, sockets, widgets) is not reproduced — that is the drawing the flat path replaces. At
 ${Math.round(ZOOM * 100)}% zoom each box is ${num(SIZE[0] * ZOOM)}&times;${num(SIZE[1] * ZOOM)} css pixels on screen, so the picture is magnified ${MAG}&times;.</p>
 ${svg}
 `);
