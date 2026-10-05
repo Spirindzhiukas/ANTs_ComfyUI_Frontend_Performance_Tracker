@@ -1,106 +1,111 @@
-# Task handover — current state (v2.7.4)
+# Task handover — current state (v2.7.5)
 
-This file supersedes the v2.7.3 handover below it in Git history. It is a current
-status summary, not a script to follow blindly: verify the workspace if continuing
-later, and keep harness evidence separate from live-page validation.
+This is a status summary, not a script to follow blindly. Verify the workspace and
+separate harness evidence from live-browser validation.
 
 ## User's active acceptance criteria
 
-1. **Establish stand-in performance on the user's CPU-only Electron with Nodes 2.0.**
-   The user's estimate is about 15 FPS with stand-ins enabled versus 25 FPS without.
-   The supplied telemetry had low-zoom drawing off, so it does not establish that
-   difference. A same-page paired test is still required; do not cite the current
-   harness suite as an FPS measurement.
-2. **Improve and diagnose poor Nodes 2.0 stand-ins.** Legacy thumbnails reportedly
-   look correct; Nodes 2.0 pictures were clipped/truncated and repopulated badly
-   after switching back. Code-level text regressions now distinguish the three
-   routes below, and the renderer-switch/cache path has tests, but neither live
-   Electron pixel equality nor the user's disk-folder repopulation check is confirmed.
-   Dark control/background differences remain undiagnosed.
-3. **Keep stand-ins visible and draw live execution/error state marks over them.**
-   The user's report says flicker is already gone: do not reintroduce the old live/
-   picture handoff. Progress and error marks now overlay held Vue pictures and are
-   not frozen into them. Video and link-drag handling still hands the live element
-   back. The separate Vue executing outline is not reconstructed; do not claim it is.
-4. **Draw the classic amber/black high-voltage warning badge** on a new stand-in and
-   include it in the stored picture.
-5. **Add a Vue textarea regression** for line layout/clipping from available box
-   lines, not an assumed 2,000-character value cap.
+1. **Warning badge placement:** draw the amber/black high-voltage badge only on a
+   live fallback box. Never include it in, or draw it over, a successfully captured
+   or cached picture. The signature token changed so old badge-bearing RAM/disk
+   entries miss and are rebuilt.
+2. **Nodes 2.0 visuals:** investigate the reported clipped/odd CLIP Text Encode
+   prompt and other UI appearing in stand-ins. The screenshot's apparent truncation
+   despite remaining space is not explained yet. Do not claim these reconstructed
+   canvas drawings are browser screenshots.
+3. **Metrics row stability:** Timing and per-node-type rows use a 4-second rolling
+   window and naturally age out when there is no activity in that window. Stalls
+   headline rates use 4 seconds too, while source rows remain visible for up to
+   30 seconds after their last event and their source counters accumulate. UI notes
+   now communicate those windows. No retention behavior was changed. A Stalls row
+   disappearing before 30 seconds, or any row clearing while new samples continue,
+   is not explained by the intended window and needs before/after reports.
+4. **Governor visibility/state:** the in-page panel always registers Governor in
+   both frontend renderer modes. The separate-window page intentionally has five
+   tabs and omits Governor. Clean defaults are normal source policies, rAF governor
+   off, redraw coalescing off and autopilot off; policies and controls can persist
+   in `ants-governor-v1`. The active browser's installed version, chosen panel
+   surface and persisted state have not been inspected.
+5. **Keep the no-flicker behavior:** the user confirms there is no more flicker.
+   Progress/error marks remain live overlays on held Vue pictures; video/link-drag
+   still hand the live element back.
+6. **Preserve pathway-specific text rules:** ordinary Vue DOM text has its own
+   2,000-character prefix limit; Vue textarea/form values are not hard-sliced at
+   2,000 and are wrapped/clipped by available box lines; the separate canvas
+   DOM-widget composite retains its 2,000-character and 12-line limits.
+7. **Still unverified:** CPU-only Electron A/B, live pixel comparison, and the
+   user's renderer-switch disk-cache repopulation check. Do not present harness
+   correctness as any of those results.
 
-## Work completed in this pass
+## Work completed in v2.7.5 follow-up
 
-- `web/tracker.js` is version **2.7.4**. Vue progress/error fields are excluded from
-  the bitmap signature and queued captures; `lodSnapPaint` overlays current marks
-  after the held picture. State clear removes marks on the next draw without a
-  recapture. Canvas-renderer running/erroring nodes remain live as before.
-- The amber triangle / dark outline / lightning bolt badge paints on live fallback
-  boxes. Captures add it after the capture ink check and before mipmaps/disk; its
-  version token invalidates older pictures. The helper explicitly restores changed
-  canvas styles so test wrappers cannot leak its black `strokeStyle`.
-- Text bounds are intentionally path-specific:
-  - ordinary Vue DOM text: 2,000-character per-string cap;
-  - Vue textarea/form values: no hard 2,000-character slice; wrapping and clipping
-    are bounded by the box's available lines;
-  - canvas DOM-widget text composite: 2,000-character slice and 12-line cap.
-  Same-length middle edits to ordinary Vue text invalidate the picture.
-- Regressions cover held-picture state overlays/no recapture, video/link drag, live
-  badge and capture ordering/blank-ink rejection, ordinary Vue text cap, textarea
-  line clipping and >2,000-character tail, canvas widget cap, and a middle edit.
-- The earlier complete-suite failure (badge `strokeStyle` left as `#111111` in the
-  fake context) was fixed with explicit context-property restoration. No temporary
-  debug log remains.
-- Documentation has been updated in `README.md`, `CHANGELOG.md`, `memory.md`,
-  `ANALYSIS.md`, `plan.md`, and `docs/nodes-2.0-contract.md` to distinguish verified
-  behavior from unverified Electron performance/pixel claims.
+- `web/tracker.js` is version **2.7.5**. The live flat-box painter keeps the badge;
+  capture no longer paints it, and cached reuse does not add it as an overlay.
+  `LOD_SNAP_BADGE_VERSION` changed to `hv-warning-fallback-only-2`, invalidating old
+  badge-bearing picture signatures.
+- Badge regression distinguishes the live fallback, the successful offscreen
+  capture and the later cached blit; a blank capture is still rejected.
+- Timing context, Nodes note and Stalls note disclose the rolling/retained windows.
+  Added a core regression showing the Stalls rate reaches zero after 4 seconds
+  without a new event while its row is still present at 5 seconds. Retention itself
+  is unchanged.
+- Panel regression verifies the in-page Governor tab is present, exposes clean
+  defaults (no limited source, rAF off, coalescing off, autopilot off), and checks
+  the window omissions are separate from panel behavior.
+- `README.md`, `CHANGELOG.md`, `memory.md`, `ANALYSIS.md`, this handover, and the
+  real-painter preview captions were updated. `preview/boxes.html` and `.svg` were
+  regenerated; the badge remains visible there because that fixture runs the live
+  fallback box painter.
 
-## Verification status at handover
+## Verification
 
-- `node tests/run-tests.mjs`: **246 passed**, exit 0, after the source, UI copy,
-  canvas harness, and preview generator changes.
-- Targeted regressions for Vue ordinary text, textarea layout/tail, canvas DOM-widget
-  text cap, long text/middle edit, state overlay, and badge passed individually.
-- `python3 tests/test_init.py`: **9 passed**. `node tests/demo.mjs`: exit 0; its
-  rendering-settings copy was checked for the new Nodes 2.0 overlay/live-element
-  behavior.
-- ES-module syntax checks for `web/tracker.js` and `tools/box-preview.mjs` passed;
-  duplicate top-level-function scan was empty; `git diff --check` passed.
-- Regenerated `preview/boxes.html` and `preview/boxes.svg`. The preview serializer
-  now preserves canvas paths as well as rectangles and shows the warning badge
-  (54 path operations across the six fixtures and three detail levels).
-- No real CPU-only Electron/browser A/B was available in this workspace. Do not
-  interpret the synthetic harness or a report with low-zoom drawing off as proof of
-  the 15-versus-25 FPS estimate.
+- `node tests/run-tests.mjs`: **247 passed**.
+- `python3 tests/test_init.py`: **9 passed**.
+- `node tests/demo.mjs`: exit 0.
+- `node --check --input-type=module < web/tracker.js`,
+  `node --check tools/box-preview.mjs`, preview regeneration and `git diff --check`
+  passed.
+- No real Electron/browser A/B, live pixel comparison or user's cache-folder test
+  has been performed in this workspace.
 
-## Remaining user-side evidence
+## Live evidence needed next
 
-For the performance question, collect two reports from the same Electron page and
-same workflow, zoom, display scale, camera action and time window:
+On the **ComfyUI page** (not the separate window), run in DevTools:
 
-1. stand-in threshold active (for example 50% while viewing at 10% zoom); confirm the
-   Status/report says Nodes 2.0, picture/boxes active, and `vueBlanked` is nonzero;
-2. stand-ins off, with all other settings unchanged.
+```js
+window.__antsTracker.open();
+({
+  version: window.__antsTracker.version,
+  tabs: [...document.querySelectorAll("#ants-tracker-tabs button")].map(b => b.textContent),
+  governor: {
+    metrics: window.__antsTracker.governor.metrics,
+    controls: window.__antsTracker.governor.state.controls,
+    savedPolicies: window.__antsTracker.governor.state.savedPolicies
+  }
+})
+```
 
-Compare FPS plus p50/p95/p99/max frame time, stalls/sec and `bound renderFrame` /
-forced layout, and the stand-in counters (`vuePaintSkipped`, `vueBoxes`, pictures
-served/captured, DOM writes/layout reads). An on/off pair with the threshold off in
-both conditions is not a valid result. For appearance, a live-node/stand-in
-screenshot pair of the same dark control/background is needed; for the disk claim,
-repeat the user's empty-thumbnail-folder renderer-switch test.
+That distinguishes an old/unloaded tracker or the five-tab detached window from
+an in-page UI visibility bug, and shows whether saved limits are active. Do not
+call `governor.reset()` before seeing the state; it changes persistent settings.
 
-## Relevant workspace files
+For the metrics issue, collect `copy(window.__antsTracker.report)` once while the
+rows are populated and again after they disappear. The report has a timestamp,
+version, sampling window and per-tab metrics. If the Stalls source row disappears,
+record elapsed time since its last event and whether new stalls continued. If a
+row clears while samples keep coming, say which tab and whether the page was
+paused/reset or reloaded.
 
-- `web/tracker.js` — implementation; state overlay, warning badge, text caps/signatures.
-- `tests/drawing.test.mjs` — renderer and text regressions.
-- `tests/harness.mjs` — fake canvas `save/restore` does not restore style properties; it now records `closePath` for the badge geometry.
-- `tools/box-preview.mjs` — records rectangles and serializes the badge's real canvas paths into SVG.
-- `preview/boxes.html`, `preview/boxes.svg` — regenerated with badge paths visible.
-- `README.md`, `CHANGELOG.md`, `memory.md`, `ANALYSIS.md`, `plan.md` — updated docs.
-- `docs/nodes-2.0-contract.md` — upstream renderer contract and live-validation limits.
-- `preview/boxes.html`, `preview/boxes.svg` — generated real-painter box previews; regenerate after badge changes.
+For the Nodes 2.0 issue, send a same-node live-vs-stand-in image pair and the
+snapshot report without exposing private prompt contents. The relevant diagnostic
+surface is `window.__antsTracker.lowZoom.snapshots` (renderer pathway, held/drawn/
+captured counters, text/widget counters and refusal reasons); do not dump the full
+internal `lowZoom.state.vueMedia`, which can contain raw form values.
 
-## Branch
+## Branch / PR
 
-This session stays on `arena/01a1089b-ants-comfyui-frontend-performa`. Do not switch
-branches. Commit `1e1253c` has been pushed there; draft PR #3 is open at
+The v2.7.5 follow-up is committed and pushed to
+`arena/01a1089b-ants-comfyui-frontend-performa`; draft PR #3 remains open against
+`main`:
 https://github.com/Spirindzhiukas/ANTs_ComfyUI_Frontend_Performance_Tracker/pull/3.
-The PR is not merged. Keep any follow-up commit and push on this same branch.
+The PR is unmerged.

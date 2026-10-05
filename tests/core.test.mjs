@@ -378,6 +378,34 @@ suite("non-canvas lanes", () => {
     assertInclude2(src.invoker, "setInterval");
   });
 
+  test("Stalls rates age out after 4s but source rows are retained for 30s", async () => {
+    const h = await boot();
+    h.advance(4000);
+    h.emitPerformance("long-animation-frame", [
+      {
+        startTime: h.clock.now - 100,
+        duration: 200,
+        blockingDuration: 160,
+        scripts: [
+          {
+            sourceURL: "http://localhost:8188/extensions/SlowPack/js/poll.js",
+            sourceFunctionName: "poll",
+            invoker: "TimerHandler:setInterval",
+            duration: 180,
+            forcedStyleAndLayoutDuration: 0,
+          },
+        ],
+      },
+    ]);
+    assertEqual(h.tracker.snapshot.stalls.sources.length, 1, "the event creates one source row");
+    h.advance(5000);
+    const quiet = h.tracker.snapshot.stalls;
+    assertEqual(quiet.blockingMsPerSec, 0, "the recent 4s headline rate falls to zero when the event ages out");
+    assertEqual(quiet.sources.length, 1, "but the source row is still retained after 5s");
+    h.advance(26000);
+    assertEqual(h.tracker.snapshot.stalls.sources.length, 0, "the row leaves only after its 30s retention window");
+  });
+
   test("load tab reports a span, not a sum of overlapping durations (v1 regression)", async () => {
     const h = await boot();
     // 10 concurrently-fetched files: sum of durations 1000ms, real span 120ms.

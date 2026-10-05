@@ -10,7 +10,7 @@
 // Why: the whole point of the box-detail ladder is what it looks like. This page
 // records the tracker's real paint operations — rectangles and canvas paths — in
 // graph units, with the fill, alpha, stroke and width they were issued with. The
-// path recorder includes the warning badge's amber triangle, dark border and bolt.
+// path recorder includes the live fallback box's amber triangle, dark border and bolt.
 // What is *not* real is the surrounding graph: LiteGraph's own node rendering
 // (title text, sockets, widgets) is not reproduced, so the preview shows the
 // tracker's stand-in drawing rather than the full node.
@@ -218,7 +218,7 @@ const SANS = "DejaVu Sans, Verdana, Geneva, ui-sans-serif, system-ui, sans-serif
 const MONO = "DejaVu Sans Mono, Menlo, Consolas, ui-monospace, monospace";
 
 const legend = {
-  plain: "plain — one fill rectangle per node, plus the selection ring and amber warning badge",
+  plain: "plain — one fill rectangle per node, plus the selection ring and live-fallback warning badge",
   title: "title — + the node's own title-bar colour, above the body, at LiteGraph's 30-unit title height",
   state:
     "state — + the frontend's own marks: error stroke (#E00, 10 units wide, 12 units out), the green progress bar, " +
@@ -318,9 +318,9 @@ if (process.argv.includes("--svg")) {
 <p class="note">The setting is <code>box detail</code> in the Tweaks tab, or
 <code>window.__antsTracker.lowZoom.set({ boxDetail: "title" })</code>. Every rectangle and canvas path below is an
 operation the real paint path (<code>lodPaintNode</code>) issued, recorded from the harness canvas and
-replayed as SVG, in graph units, at the same numbers the code uses. That includes each warning badge's
-amber triangle, dark outline and bolt. LiteGraph's own node drawing (title text, sockets, widgets) is
-not reproduced — that is the drawing the flat path replaces. At
+replayed as SVG, in graph units, at the same numbers the code uses. That includes each live fallback box's
+warning badge (amber triangle, dark outline and bolt); the badge is not part of stored pictures. LiteGraph's
+own node drawing (title text, sockets, widgets) is not reproduced — that is the drawing the flat path replaces. At
 ${Math.round(ZOOM * 100)}% zoom each box is ${num(SIZE[0] * ZOOM)}&times;${num(SIZE[1] * ZOOM)} css pixels on screen, so the picture is magnified ${MAG}&times;.</p>
 ${svg}
 `);

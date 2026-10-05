@@ -6,7 +6,7 @@ for: *which extension's JavaScript is actually costing me frames while I pan
 this graph, and what is eating main-thread time that no draw hook owns?* —
 without opening DevTools and without restarting ComfyUI to bisect.
 
-Version **2.7.4**. Everything runs from page load: no node has to be placed,
+Version **2.7.5**. Everything runs from page load: no node has to be placed,
 nothing executes, and the tool never changes your graph or your workflows.
 
 - **Measure** — per-extension and per-node-type frame cost, canvas draw
@@ -91,10 +91,12 @@ The two surfaces are one tool. Both read the same settings through
 `/ants_optimizer/ui`, a change carries a revision and an origin so neither
 side applies its own echo, and a live number is not a settings change. The
 window shows five tabs — Node Rendering Settings, Status, Timing, Nodes and
-Stalls — which is the reading half of the panel; the panel itself adds the
-Governor, Load, Memory, GPU and Testing tabs. The window shows live telemetry
-only while the ComfyUI page is open and answering; when that page is gone it
-says so instead of pretending.
+Stalls — which is the reading half of the panel; the in-page panel adds the
+Governor, Load, Memory, GPU and Testing tabs. **Governor is intentionally not in
+the separate window.** The in-page Governor tab is renderer-independent, but is
+only visible on that panel surface. The window shows live telemetry only while
+the ComfyUI page is open and answering; when that page is gone it says so instead
+of pretending.
 
 ### The ten tabs
 
@@ -128,7 +130,7 @@ drawing**, and "off" is a real restoration, not a memory of one.
 | Setting | Choices | Default | What it does |
 | --- | --- | --- | --- |
 | Replace node previews with bitmap stand-ins at zoom levels | off — draw every node · below 5 · 10 · 15 · 20 · 25 · 30 · 40 · 50 % | **below 50 %** | Below this zoom a node is a flat box instead of a live draw. The decision is the zoom, never a node's pixel size. In Nodes 2.0 the node's DOM is blanked and the canvas paints the box. Hover, selection and node drag keep the picture; selection gets a ring. Progress and error marks update live over a held Vue stand-in (they are not baked into it); in the classic canvas renderer those states keep the node live. A link drag or video still hands the Vue element back to the frontend. |
-| Stand-in | plain fill · title bar colour · title + error ring + progress + muted · picture of the node | **picture of the node** | What the box is made of. *plain* is a fill, *title* adds each node's own title bar, *state* adds error rings, progress bars and muted dimming, and *picture* stores and blits a bitmap. Every stand-in also carries the amber-and-black high-voltage badge. In Nodes 2.0, *picture* is drawn rather than photographed; progress/error marks are overlaid live instead of stored. Changing this choice never hands an element back and forth, so it does not reintroduce the old flicker. |
+| Stand-in | plain fill · title bar colour · title + error ring + progress + muted · picture of the node | **picture of the node** | What the box is made of. *plain* is a fill, *title* adds each node's own title bar, *state* adds error rings, progress bars and muted dimming, and *picture* stores and blits a bitmap. The amber-and-black high-voltage badge appears only on a live fallback box, never on a fully cached picture. In Nodes 2.0, *picture* is drawn rather than photographed; progress/error marks are overlaid live instead of stored. Changing this choice never hands an element back and forth, so it does not reintroduce the old flicker. |
 | Keep these node types live | comma-separated node types | empty | Types never served from a picture, however far you zoom out. They keep the painted fill or draw live, and the readout counts them as "kept live on purpose", not as failures. |
 | Stand-in capture resolution | 0.25× · 0.5× · 1× · 2× · 3× | **1×** | Pixels per graph unit in the picture. Below 1× the picture is a quarter (0.25×) or a half (0.5×) of the node's size — that is what makes it cheap to hold a thousand of them, and it is drawn at that size, not at 1× with a smaller name. Half and quarter copies are still made for the screen. Zoomed in past the ratio a picture can be softer than live drawing. Hover, selection and node drag keep the picture (selection gets a ring); use a higher capture ratio or **Back to full drawing** when you need more detail. Changing this value re-captures and re-keys the disk files (see below). |
 | Stand-in memory (RAM) budget | 256 · 512 · 1024 · 2048 · 4096 · 8192 MiB | **4096 MiB** | How much RAM the pictures may hold. A full budget refuses a new capture rather than evicting a picture that is on screen (that is what flicker looks like). On Execute or Run-to-node, at 85 % system RAM the off-screen pictures leave memory; at 95 % all of them do. Disk files stay and are loaded back after the run. |
@@ -408,8 +410,8 @@ as holes rather than paint a blob for (`vueIconSkip`).
 **Pictures work here as well, and so do the disk files.** Below the threshold
 the idle lane builds a stand-in *picture* for each boxed node — not a
 screenshot of the element, which no browser API can make, but the same drawing
-the live box makes (the box, its title bar and warning badge, the node's structure
-read out of the DOM — surface, header, body panel, slot dots, the badge pills the
+the live fallback box makes (the box and its title bar, the node's structure
+read out of the DOM — surface, header, body panel, slot dots, the frontend badge pills the
 frontend renders beside its own badge anchors and the footer band under its tab
 buttons — every widget's own row, drawn with the box, border and radius the
 browser gave it, every icon the node shows — read out of the SVG *mask* the
@@ -495,8 +497,8 @@ picture and counted, exactly as in the canvas renderer.
 | Setting | In the Vue-nodes frontend |
 | --- | --- |
 | Replace node previews with bitmap stand-ins at zoom levels | **Works, as boxes.** Below the setting each node's element stops *painting* — its contents are `visibility: hidden`, which an engine skips in the paint phase, and it stays in layout and every observer — and the canvas draws its box; above it, every element is handed back. Hover, selection and node drag keep the picture; progress/error marks overlay it live. Video and link drag still return the live element. |
-| Stand-in (plain / title / title + state) | **Works** — the same box ladder and marks, with the amber/black high-voltage badge on each stand-in. *Plain* carries no reconstructed node content. Progress and errors in the state-level box are read live. |
-| Stand-in: *picture of the node* | **Works, drawn rather than photographed.** No browser API draws a DOM element into a canvas, so the picture is reconstructed from the box, node structure, laid-out widget rows, text, images and canvases. The amber/black warning badge is added after the capture's ink check and is stored with the picture; live progress/error marks are overlaid at reuse time, never baked in. Text values follow the separate limits described above. A picture is captured only after the node has stood still (300 ms, re-opened by every change) and its element, media and fonts are ready; until then the same content is drawn live. This is a reconstruction, not a pixel screenshot, and dark control/background differences are still unverified against Electron. |
+| Stand-in (plain / title / title + state) | **Works** — the same box ladder and marks. The amber/black high-voltage badge appears only on a live fallback box; it is absent from cached pictures. *Plain* carries no reconstructed node content. Progress and errors in the state-level box are read live. |
+| Stand-in: *picture of the node* | **Works, drawn rather than photographed.** No browser API draws a DOM element into a canvas, so the picture is reconstructed from the box, node structure, laid-out widget rows, text, images and canvases. The amber/black warning badge is only drawn on a live fallback box; it is never baked into or painted over a cached picture. A signature-version change makes old badge-bearing RAM/disk entries miss and rebuild. Live progress/error marks are overlaid at reuse time, never baked in. Text values follow the separate limits described above. A picture is captured only after the node has stood still (300 ms, re-opened by every change) and its element, media and fonts are ready; until then the same content is drawn live. This is a reconstruction, not a pixel screenshot, and dark control/background differences are still unverified against Electron. |
 | Capture resolution, RAM budget, disk cache | **Work.** The picture is made on the same idle lane, at the same resolution ladder, with the same mip chain, RAM budget and disk files (`temp/ANTs_Frontend_Optimizer_THUMBNAILS/`, keyed by signature + ratio + theme + pathway). Switching renderer releases the pictures the other renderer made and builds them again, because the box, the padding and the content route all differ. |
 | Keep these node types live | **Works** — a listed type is never blanked and stays in full detail at any zoom. |
 | Link shape, link thinning, Measure link thinning | **Work.** Links are still drawn by the canvas, so the 1 px/no-outline thinning and the straight-line style reach the ink exactly as in canvas mode. |
@@ -535,11 +537,16 @@ a 60 fps frame, to another graph, or to the same graph a minute ago. They do
 not change if you pan faster; v1's window sums did. Rates (`fps`,
 `requests/s`, stalls/s) are wall-clock and say so.
 
-**Windows.** Hook and node-type costs cover the last 4 seconds. Frame
-statistics cover 10 seconds, and widen to 30 seconds when a redraw cap
+**Windows.** Hook and node-type costs cover a rolling last 4 seconds; their
+rows naturally disappear when that type or hook has no activity in the window.
+Frame statistics cover 10 seconds, and widen to 30 seconds when a redraw cap
 leaves fewer than 4 frames in the window, so a 1 fps cap still produces
 meaningful `fps` and p95 numbers instead of `0`. The panel prints which
-window it used.
+window it used. Stalls headline rates also use the rolling 4-second window,
+but source rows remain visible for up to 30 seconds after their last event;
+their displayed counts and costs are cumulative, not 4-second totals. If all
+Stalls rows vanish in only a few seconds, that is not explained by the normal
+source-row retention and needs a before/after report.
 
 **Sorting and long lists.** Every column header in the Timing, Nodes and
 Stalls tables is a sort button: click to sort, click again to reverse, a
@@ -648,6 +655,14 @@ the trace threshold. Limits and controls live in `localStorage`
 untouched** clears them, and **Suggest limits from this session** proposes a
 limit per source from its measured cost — nothing is applied until you pick
 it. **Turn the layer off** restores the browser's own functions immediately.
+
+The Governor tab is present in the in-page panel in both renderer modes; it is
+not a Nodes 2.0-only or legacy-only control. Defaults are measure-only: all
+source policies are `normal`, the rAF governor is off, redraw merging is off,
+and autopilot is off. Settings can persist under `ants-governor-v1`, so inspect
+the live controls/policies before concluding that no saved limit is active.
+The scheduler layer cannot draw or reconstruct node UI; an active saved policy
+can only affect the page's timer/rAF callbacks.
 
 **Autopilot** (off by default) caps the worst source it is allowed to touch
 every five seconds until the limitable sources are under the target you set
@@ -813,7 +828,13 @@ works/fails audit with the fixed defects and the retired ideas;
 `memory.md` is the decision history. `preview/` is generated and never
 hand-edited. Reusable pieces you can call from a console are on
 `window.__antsTracker` — `snapshot`, `report`, `open`/`close`, `lowZoom.*`,
-`link.*`, `governor.*`, `runStart`/`runFinish`, `ramCheck`, `rowCaps`.
+`link.*`, `governor.*`, `runStart`/`runFinish`, `ramCheck`, `rowCaps`. For a
+live diagnosis, run `window.__antsTracker.version` and
+`[...document.querySelectorAll("#ants-tracker-tabs button")].map(b => b.textContent)`
+on the ComfyUI page (not the separate window). `window.__antsTracker.report`
+is a getter containing the current snapshot text; the Governor state is available
+at `window.__antsTracker.governor.metrics` and
+`window.__antsTracker.governor.state.controls` / `.savedPolicies`.
 
 ## Credits
 

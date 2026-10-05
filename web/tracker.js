@@ -27,7 +27,7 @@
 
 import { app } from "/scripts/app.js";
 
-const VERSION = "2.7.4";
+const VERSION = "2.7.5";
 const EXT_NAME = "ANTs.NastyBastardsTracker.Core";
 // The class key ComfyUI stores in a workflow. The old key is still recognised so
 // a graph saved before the rename does not lose this node.
@@ -1141,7 +1141,7 @@ const LOD_SNAP_HOLD_MS = 5000;
 const LOD_SNAP_PAD = 24; // graph units of margin around the node, so hooks that
 // draw outside the body (selection rings, glow) are not cut off
 const LOD_SNAP_TITLE_H = 30; // graph units above the body: LiteGraph's title bar
-const LOD_SNAP_BADGE_VERSION = "hv-warning-1"; // changing the baked warning mark invalidates RAM and disk pictures
+const LOD_SNAP_BADGE_VERSION = "hv-warning-fallback-only-2"; // signature change rejects older RAM/disk pictures that baked the mark in
 const LOD_SNAP_BADGE_AMBER = "#FFC000";
 const LOD_SNAP_BADGE_BLACK = "#111111";
 const LOD_SNAP_MAX_DIM = 2048; // px; a capture is fitted down to this, or the node stays a box
@@ -1802,9 +1802,9 @@ function lodSnapStateMarks(ctx, node, spec) {
   return out;
 }
 
-// A small, classic high-voltage mark that makes the flat picture legible as a
-// stand-in. Live boxes paint it here; captures add the same mark after the ink
-// probe, so the badge can never make an otherwise blank node pass that probe.
+// A small, classic high-voltage mark for a live fallback box. Cached pictures
+// deliberately omit it: the badge distinguishes a placeholder from a complete
+// stored drawing and must never be baked into or painted over that drawing.
 function lodSnapWarningBadge(ctx, w, h, alpha) {
   const width = Math.abs(Number(w)) || 0;
   const height = Math.abs(Number(h)) || 0;
@@ -1944,9 +1944,8 @@ function lodPaintNode(node, canvas, ctx, content, detailOverride, sizeOverride, 
     LOD.boxBars += marks.bars;
     LOD.boxErrors += marks.errors;
   }
-  // The live fallback box is still a stand-in, so it gets the mark before the
-  // idle capture arrives. Captures skip this call and add the badge after the
-  // ink probe instead.
+  // The warning mark belongs only to a live fallback box. A cached picture is
+  // complete and must not receive the placeholder mark; capture mode skips it too.
   if (drawable && !LOD.inCapture) lodSnapWarningBadge(ctx, w, h, alpha);
   if (node.selected) {
     ctx.globalAlpha = alpha;
@@ -8208,15 +8207,9 @@ function lodSnapCaptureNode(node, canvas) {
     domInk = lodSnapDomInk(node, made.ctx, canvas);
     LOD.snapMs += nowMs() - dc0;
   }
-  // This persistent badge is part of the stand-in, not evidence that the node
-  // itself drew ink. Add it only after the probe and the content composite, but
-  // before mipmaps and disk persistence, so every stored resolution carries it.
-  const badgeAt = nowMs();
-  const badgeAlpha = lodVueNodesMode()
-    ? dom && Number.isFinite(Number(dom.opacity)) ? Number(dom.opacity) : 1
-    : lodBoxAlpha(node);
-  lodSnapWarningBadge(made.ctx, geom.bodyW, geom.bodyH, badgeAlpha);
-  LOD.snapMs += nowMs() - badgeAt;
+  // Do not add the warning badge here: the capture is the complete drawing, not
+  // a fallback box. The signature token changed so older badge-bearing files miss
+  // and are rebuilt without the mark.
   if (!lodSnapMakeRoom(made.bytes)) {
     // The budget is full of bitmaps that are being looked at. Refusing is the
     // honest answer: releasing one would take a picture off the screen, and
@@ -12243,6 +12236,7 @@ function updateActiveTab() {
 function timingContextLine() {
   const bits = [];
   bits.push(`${S.counters.wrappedHooks} hook(s) wrapped`);
+  bits.push(`rolling ${Math.round(WINDOW_MS / 1000)}s activity window`);
   if (S.counters.preTrackedHooks) bits.push(`${S.counters.preTrackedHooks} pre-existing prototype hook(s) adopted`);
   if (S.counters.instanceHooks) bits.push(`${S.counters.instanceHooks} instance hook(s) adopted`);
   if (S.extSeen.size) bits.push(`${S.extSeen.size} extension(s) registered`);
@@ -13398,7 +13392,8 @@ function buildNodesTab(container) {
     "\"calls/frame\" is calls per redraw of the canvas, so for a type that is painted every frame it is close to the number of " +
     "instances on screen; a value well below 1 means most of this type is off-screen or culled on a given redraw, which is cheap " +
     "by definition. Use \"% of frame\" and \"ms/call\" to find the expensive ones: a high ms/call with a low calls/frame is one " +
-    "heavy node, a low ms/call with a high calls/frame is many cheap nodes.";
+    "heavy node, a low ms/call with a high calls/frame is many cheap nodes. Per-type rows use the last " +
+    `${(WINDOW_MS / 1000).toFixed(0)} seconds, so a type drops out after it has not been drawn in that rolling window; the whole-frame summary above uses a separate, longer frame window.`;
 
   container.appendChild(budgetCallout);
   container.appendChild(el("div", { class: "ants-section-title", text: "Who is asking for redraws" }));
@@ -13587,6 +13582,7 @@ function buildStallsTab(container) {
   const empty = el("div", { class: "ants-empty" });
   const note = el("p", { class: "ants-note" });
   note.textContent =
+    `The headline rates use the last ${(WINDOW_MS / 1000).toFixed(0)} seconds and can fall when new stalls stop. Source rows stay visible for up to 30 seconds after their last event; their counts, blocking time and worst values are lifetime totals. ` +
     "Click any column header to sort by it (again to reverse, a third time for the default: most blocking first). " +
     "This lane is deliberately not canvas drawing. It is main-thread time that no draw hook owns: a heartbeat setInterval, a " +
     "fetch/DOM polling loop, forced layout thrash, a big GC, a Vue re-render, or this panel itself (look for " +
@@ -16307,8 +16303,10 @@ app.registerExtension({
 //    the glyph — and the node's own `<img>`/`<canvas>` elements at the rows the
 //    layout gave them — into the same capture surface the canvas renderer uses,
 //    with the same capture resolution, mip chain, RAM budget and disk files.
-//    The warning badge is baked into the stable picture after the ink check;
-//    progress/error marks are live overlays and never part of a captured bitmap.
+//    The amber warning badge marks a live fallback box only; captured/cached
+//    pictures never contain it or receive it as an overlay. The badge signature
+//    token invalidates older badge-bearing cache entries. Progress/error marks
+//    remain live overlays and never become part of a captured bitmap.
 //    Every colour goes through `lodVueColor` first: this frontend's themed
 //    surfaces are Tailwind 4 `oklch()`/`oklab()` strings, which a canvas
 //    `fillStyle` ignores *silently* (the previous colour stays, so a node wears

@@ -901,15 +901,28 @@ reader instead of treating the phrase "2,000-character cap" as one behaviour.
 | # | What was required | Implementation / test evidence |
 | --- | --- | --- |
 | 1 | Keep a Vue stand-in visible while progress/error state changes; do not freeze those marks into the held picture. | `lodSnapLive` allows progress/error for the Vue reuse path; `lodSnapPaint` blits the held picture and draws marks from current `node.progress` / `node.has_errors`. Those fields are excluded from the Vue signature and active-state enqueue, so the picture is neither invalidated nor recaptured. Tests hold a captured picture through both state changes and their clearing, and assert one blit, live marks, unchanged capture/invalidation counts. Canvas-renderer nodes with progress/errors remain live. Video and link drag still hand the Vue element back. The Vue executing outline is not recreated; only progress/error marks are overlaid. |
-| 2 | Put the requested amber/black high-voltage symbol on a stand-in at first use and in stored pictures. | `lodSnapWarningBadge` paints on the live fallback box and on the capture only after the ink check, before mips/disk write. Its version is mixed into the signature so older RAM/disk pictures miss. Test observes the live badge before capture, its order after `getImageData`, and that a badge alone cannot validate a blank capture. |
+| 2 | Show the amber/black high-voltage symbol only on a live fallback box, never in or over a completed picture. | The initial v2.7.4 implementation also baked the mark into captures; after the user's explicit reversal, v2.7.5 removes it from the capture path. `LOD_SNAP_BADGE_VERSION` changes the signature so old badge-bearing RAM/disk entries miss and rebuild. The regression now observes the live fallback, checks the offscreen capture has no amber mark, and checks a cached blit is not painted over with one. |
 | 3 | Preserve pathway-specific text behavior. | Ordinary Vue DOM leaves cap at 2,000 characters and mark the cut; the test places sentinels on both sides. Vue textarea values are passed without that hard cut and wrap/clip by available line room (tested with a >2,000-character value that fits its enlarged box). The canvas DOM-widget route remains a hard 2,000-character / 12-line slice, separately tested. The previous wrapper ellipsized solely because a string exceeded 2,000; it now reports clipping from line overflow, leaving the canvas caller to apply its own explicit cap. |
 
-The suite is **246**. These are harness correctness claims, not a live Electron
-performance or pixel-fidelity result. The user's report with low-zoom drawing off
-does not establish the estimated ~15 fps with stand-ins versus ~25 fps without;
-that needs paired reports with the setting actually enabled/disabled and all other
-conditions held constant. The reported dark control/background mismatch is still
-undiagnosed, and no screenshot-level A/B was available here.
+The suite is **246** at the original v2.7.4 pass. These are harness correctness
+claims, not a live Electron performance or pixel-fidelity result. The user's report
+with low-zoom drawing off does not establish the estimated ~15 fps with stand-ins
+versus ~25 fps without; that needs paired reports with the setting actually
+enabled/disabled and all other conditions held constant. The reported dark
+control/background mismatch is still undiagnosed, and no screenshot-level A/B was
+available here.
+
+### The eighteenth pass (v2.7.5): live-fallback badge and windowed metrics
+
+| # | Report / question | Finding and action |
+| --- | --- | --- |
+| 1 | Warning badges appear on cached stand-ins. | The badge now exists only on live fallback boxes. Captures skip it, cache reuse does not overlay it, and the signature token changes so old badge-bearing cache entries miss. Regression covers the live box, captured surface, and subsequent bitmap reuse. |
+| 2 | Timing, Nodes and Stalls rows appear to clear. | Hook and node-type rows and Stalls headline rates use the 4-second rolling window. Stalls source rows are filtered at 30 seconds after last event; their displayed counters accumulate. Retention was not widened without evidence. UI notes now name these different clocks, and a regression proves a Stalls rate can be zero while its source row is still retained at 5 seconds. If rows vanish while events continue, or Stalls rows vanish before 30 seconds, that is not explained by the intended windows. |
+| 3 | Governor tab/settings cannot be found; could it still act? | The in-page panel registers a Governor tab in either renderer mode. The separate-window page intentionally has only five tabs and omits Governor. Clean defaults are all source policies `normal`, rAF off, redraw coalescing off and autopilot off; the `ants-governor-v1` localStorage key can restore prior policies/controls. A live version, actual tab surface and stored state were not inspected. |
+| 4 | Nodes 2.0 prompt text is clipped/odd and other UI appears in pictures. | No new visual conclusion: the renderer reconstructs DOM data into canvas rather than taking a browser screenshot. Vue textarea/form values are not hard-sliced at 2,000 characters; box/line limits apply. The classic canvas DOM-widget composite remains 2,000 characters / 12 lines. Exact live cause still requires before/after reports and a same-node image pair. |
+
+No retention behavior changed, and no CPU-only Electron A/B, live pixel comparison,
+or browser-state/cache-repopulation check was run in this pass.
 
 ## The stand-in pictures: what a capture actually contains, and where the cache went wrong
 

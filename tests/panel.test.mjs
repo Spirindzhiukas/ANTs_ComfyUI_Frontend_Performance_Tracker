@@ -154,6 +154,9 @@ suite("panel", () => {
     drawLoop(h, 1);
     h.advance(600); // let a refresh tick land
 
+    const labels = tabButtons(h).map((b) => b.textContent);
+    assert(labels.some((label) => label.includes("Governor")), "Governor is a visible tab in the in-page panel");
+    assert(labels.some((label) => label.includes("Node Rendering Settings")), "the rendering controls remain in the same panel");
     for (const name of ["status", "timing", "nodes", "stalls", "governor", "load", "memory", "gpu", "testing"]) {
       clickTab(h, name);
       h.advance(600);
@@ -177,6 +180,7 @@ suite("panel", () => {
     assertIncludes(text, "ms/frame", "column header explains the unit");
     assertIncludes(text, "Mute", "mute control present");
     assertIncludes(text, "hook(s) wrapped", "context line states what is instrumented");
+    assertIncludes(text, "rolling 4s activity window", "the rows' short rolling window is visible");
   });
 
   test("nags about redundant redraws when drawing more than once per frame", async () => {
@@ -422,6 +426,10 @@ suite("panel", () => {
     h.advance(600);
     await h.flush();
 
+    const stallsText = byId(h, "ants-tracker-body").textContent;
+    assertIncludes(stallsText, "last 4 seconds", "rates disclose their short rolling window");
+    assertIncludes(stallsText, "30 seconds", "source-row retention is documented");
+    assertIncludes(stallsText, "lifetime totals", "the table distinguishes retained rows from rate aggregates");
     const rows = () => tableRows(h, "stalls");
     assertGreater(rows().length, 1, "both scripts are listed");
     assert(rows()[0][0].includes("often"), "default order is by total blocking time");
@@ -472,6 +480,9 @@ suite("panel", () => {
     ]);
     drawLoop(h, 3);
     await openTab(h, "nodes");
+    const nodeTabText = byId(h, "ants-tracker-body").textContent;
+    assertIncludes(nodeTabText, "last 4 seconds", "per-type rows disclose their rolling window");
+    assertIncludes(nodeTabText, "drops out", "the panel explains why an idle type disappears");
 
     const types = () => tableRows(h, "nodes", 1);
     assert(types()[0][0].includes("HeavyThing"), "default order is most expensive per frame first");
@@ -527,6 +538,11 @@ suite("panel: the Governor tab", () => {
     }, 20);
     h.advance(600);
     await openTab(h, "governor");
+    const defaults = h.tracker.governor.metrics;
+    assertEqual(defaults.controls.rafMode, "off", "the rAF governor is measure-only by default");
+    assertEqual(defaults.controls.coalesce, false, "redraw merging is off by default");
+    assertEqual(defaults.controls.autoLimit, false, "autopilot is off by default");
+    assertEqual(defaults.throttled, 0, "no source is limited in a clean default profile");
     const rows = tableRows(h, "governor");
     const poll = rows.find((r) => r[0].includes("panelPoll"));
     assert(poll, `the heartbeat is listed (${JSON.stringify(rows.map((r) => r[0]))})`);
@@ -652,6 +668,9 @@ suite("panel: the Governor tab", () => {
     assert(html.includes("/ants_optimizer/ui"), "it talks to the page through the route");
     assert(!html.includes("window.opener"), "it does not hold the canvas document");
     assert(!html.includes("tracker.js"), "and it does not load the canvas script");
+    const windowTabs = [...html.matchAll(/<button type="button" data-tab="([^"]+)"/g)].map((m) => m[1]);
+    assertEqual(windowTabs.length, 5, "the separate-window surface intentionally has five tabs");
+    assert(!windowTabs.includes("governor"), "Governor is only in the in-page panel, not this detached page");
 
     const h = await boot();
     const calls = [];

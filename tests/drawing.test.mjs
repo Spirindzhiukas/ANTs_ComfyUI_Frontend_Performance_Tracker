@@ -4182,7 +4182,7 @@ suite("drawing: the Nodes 2.0 (Vue nodes) frontend", () => {
     assert(longLines.some((o) => String(o[1]).includes("TEXTAREA_TAIL")), "text after the first 2,000 characters is still paintable when the box has room");
   });
 
-  test("the high-voltage badge is visible immediately and baked only after a capture passes its ink check", async () => {
+  test("the high-voltage badge is live-fallback-only and never enters a cached picture", async () => {
     const h = await boot();
     const { nodes } = vueGraph(h, 1);
     stripWidgets(nodes);
@@ -4215,12 +4215,20 @@ suite("drawing: the Nodes 2.0 (Vue nodes) frontend", () => {
     assertEqual(snapApi(h).captured, 1, "the node still gets its picture");
     const cap = h.canvases.find((c) => c.width > 0 && c._ctx && c._ctx.paintLog.some((p) => p.op === "getImageData"));
     assert(cap, "the capture's ink probe is observable");
-    const probeAt = cap._ctx.paintLog.findIndex((p) => p.op === "getImageData");
-    const amberAt = cap._ctx.paintLog.findIndex((p) => p.op === "fill" && p.fill === "#FFC000");
-    const blackAt = cap._ctx.paintLog.findIndex((p, i) => i > amberAt && p.op === "fill" && p.fill === "#111111");
-    assertGreater(amberAt, probeAt, "the amber triangle is baked after the original ink test");
-    assertGreater(blackAt, amberAt, "the black lightning bolt is drawn over the amber triangle");
-    assert(cap._ctx.ops.some((o) => o[0] === "stroke"), "the triangle has the classic dark outline");
+    assert(
+      !cap._ctx.paintLog.some((p) => p.op === "fill" && p.fill === "#FFC000"),
+      "a successful capture deliberately contains no warning badge"
+    );
+    assert(cap._ctx.paintLog.some((p) => p.op === "getImageData"), "the normal ink validation still ran");
+
+    h.canvas.ctx.paintLog.length = 0;
+    const drawnBefore = snapApi(h).drawn;
+    draw(h, 1);
+    assertEqual(snapApi(h).drawn, drawnBefore + 1, "the next frame reused the captured picture");
+    assert(
+      !h.canvas.ctx.paintLog.some((p) => p.op === "fill" && p.fill === "#FFC000"),
+      "the cached picture is not painted over with the live-fallback badge"
+    );
 
     const blank = await boot({ ink: "none" });
     const { nodes: blankNodes } = vueGraph(blank, 1);

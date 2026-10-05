@@ -4,6 +4,40 @@ Version history for ANTs_ComfyUI_Frontend_Performance_Tracker. Newest first.
 The current behaviour is in `README.md`; the reasoning behind each release is in
 `memory.md`; the rules for changing the code are in `CLAUDE.md`.
 
+## What changed in v2.7.5
+
+- **The warning badge is a live-fallback indicator only.** A flat box shown while a
+  picture is not yet available gets the amber/black mark; a fully captured or
+  cached picture does not. The capture path no longer paints it, and `hv-warning-
+  fallback-only-2` changes the picture signature so old badge-bearing RAM/disk
+  entries miss and are rebuilt. Regression checks the live fallback, the offscreen
+  captured bitmap, and a later cached blit separately.
+
+- **The recent-metric windows are explicit in the tabs.** Timing and node-type rows
+  use a rolling 4-second window and naturally drop out after no activity; this is
+  aging, not a reset. Stalls headline rates use the same 4 seconds, while source
+  rows remain for 30 seconds after the last event and their source totals are
+  cumulative. The retention policy is unchanged; a regression proves the rate ages
+  out before the Stalls row does. The panel now says these windows where the user
+  sees the rows.
+
+- **Live report follow-up: no renderer-specific Governor removal was found.** The
+  in-page panel builds its Governor tab in either renderer mode. Its clean defaults
+  are normal per-source policies, rAF governor off, redraw coalescing off and
+  autopilot off, but `ants-governor-v1` can restore user-selected policies. The
+  separate-window page intentionally has only Node Rendering Settings, Status,
+  Timing, Nodes and Stalls; it does not include Governor. The active browser's
+  version, tab surface and stored Governor state still need checking.
+
+- **Remaining live symptoms are not diagnosed here.** Vue textarea values still
+  have no hard 2,000-character cut; they wrap and clip to their measured box, unlike
+  the separate canvas DOM-widget route's 2,000-character / 12-line caps. The latest
+  Nodes 2.0 truncation and odd captures still need a live report and paired image;
+  the painter reconstructs DOM into canvas and is not a browser screenshot.
+  No CPU-only Electron A/B or pixel comparison was run.
+
+- **Verification:** `node tests/run-tests.mjs` — **247 passed**; `python3 tests/test_init.py` — **9 passed**; `node tests/demo.mjs`, ES-module syntax checks, preview regeneration and `git diff --check` all passed. No real Electron A/B or live pixel comparison was run.
+
 ## What changed in v2.7.4
 
 - **Progress and errors now stay live over a held Nodes 2.0 picture.** The stand-in
@@ -16,12 +50,11 @@ The current behaviour is in `README.md`; the reasoning behind each release is in
   the Vue element back to the frontend. The separate Vue executing outline is not
   reconstructed by this change.
 
-- **Every stand-in gets the requested high-voltage badge.** An amber triangle with a
-  dark border and lightning bolt is drawn on the live fallback box immediately,
-  then baked into a picture only after the capture has passed its ink check — so a
-  decorative mark cannot make an otherwise blank capture look valid. It is included
-  before mipmaps and disk persistence. A badge-version token invalidates older RAM
-  and disk pictures so they cannot silently reappear without the mark.
+- **The high-voltage badge was corrected to live-fallback-only in v2.7.5.** The
+  amber triangle, dark border and lightning bolt identify a live fallback box; a
+  successfully captured or cached picture deliberately has no badge. The capture
+  path skips it, and the signature token invalidates older badge-bearing RAM/disk
+  entries so they miss and are rebuilt without the mark.
 
 - **Text limits are now explicit per pathway.** Ordinary Vue DOM text is capped at
   2,000 characters per string; same-length edits inside that prefix are hashed in
@@ -32,12 +65,13 @@ The current behaviour is in `README.md`; the reasoning behind each release is in
   textarea value beyond 2,000 characters that fits its enlarged box and is drawn
   through its tail sentinel.
 
-- **Tests: 246.** New coverage also proves that marks overlay a held picture without
-  capture/signature churn, the badge is live before capture and appears only after
-  the ink probe, and a badge alone cannot validate blank content. Both
-  `preview/boxes.html` and `preview/boxes.svg` were regenerated; the preview tool now
-  serializes the painter's path operations so the amber triangle, dark outline and
-  lightning bolt are visible there too.
+- **Tests at the initial v2.7.4 pass: 246.** New coverage also proved that marks
+  overlay a held picture without capture/signature churn and that a badge alone
+  cannot validate blank content. The v2.7.5 follow-up adds explicit assertions
+  that successful captures and cached blits never contain or receive the badge.
+  Both `preview/boxes.html` and `preview/boxes.svg` render the badge on live fallback
+  boxes; the preview tool serializes the painter's path operations so its amber
+  triangle, dark outline and lightning bolt remain visible.
 
 - **What is not claimed:** these are source/harness correctness results, not a live
   CPU-only Electron FPS or pixel-fidelity result. The supplied performance report

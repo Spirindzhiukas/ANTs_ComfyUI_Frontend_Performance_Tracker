@@ -4,12 +4,13 @@ A running record for whoever picks this up next (including me). `CLAUDE.md` is t
 rules for changing the code; `plan.md` is where it is going. This file is the past:
 what was built, what was rejected, and what the evidence was.
 
-Last updated at **v2.7.4**, 246 Node tests green. Commit `1e1253c` is pushed on
+Last updated at **v2.7.5**, after the badge/window follow-up; `node tests/run-tests.mjs`
+passes **247 tests** and `python3 tests/test_init.py` passes **9 tests**. The changes remain on
 `arena/01a1089b-ants-comfyui-frontend-performa`; draft PR #3 is open and not yet
-merged into `main`. The live Electron checks below remain open.
+merged into `main`. CPU-only Electron and live-browser checks remain open.
 
-`task_continuation.md` is the current handover: the code-level criteria that are
-closed, the checks still to run, and the user's two remaining live-page questions.
+`task_continuation.md` is the current handover: accepted code behavior, unresolved
+live symptoms, and the evidence needed to diagnose them without guessing.
 
 ---
 
@@ -17,8 +18,8 @@ closed, the checks still to run, and the user's two remaining live-page question
 
 | | |
 | --- | --- |
-| Version | 2.7.4 (`web/tracker.js` `VERSION`) |
-| Tests | 246 (`node tests/run-tests.mjs`), plus `tests/test_init.py` and `tests/demo.mjs` release checks |
+| Version | 2.7.5 (`web/tracker.js` `VERSION`) |
+| Tests | 247 Node (`node tests/run-tests.mjs`), 9 Python (`tests/test_init.py`); `tests/demo.mjs` passes |
 | Frontend | `web/tracker.js`, one ES module, no dependencies. The separate window is `web/window.html`, served at `/ants_optimizer/window`, not loaded as an extension. |
 | Backend | `__init__.py` — node `ANTs_Frontend_Optimizer` (old class key kept as an alias), nine best-effort routes (GPU, five thumbnail routes, the window page, `/ants_optimizer/ui`), and thumbnail read/write under ComfyUI's temp folder |
 | Panel | 10 tabs: Node Rendering Settings, Status, Timing, Nodes, Stalls, Governor, Load, Memory, GPU / VRAM, Testing |
@@ -41,9 +42,15 @@ something has to be drawn less or hit-tested less.
 
 The commit log is the full record; this is the "why", newest first.
 
+**v2.7.5 — badge only on live fallback boxes; explain short rolling metrics.** The badge request was explicitly reversed after v2.7.4: draw the amber/black warning only while the stand-in is a live flat fallback, never in or over a successfully captured/cached picture. `lodSnapWarningBadge` remains in `lodPaintNode` only when `!LOD.inCapture`; `lodSnapCaptureNode` no longer paints it. The changed `LOD_SNAP_BADGE_VERSION` in the signature makes older badge-bearing disk pictures miss and rebuild without the mark. Regression observes the live fallback, a successful capture without amber, and the next cached blit without an overlay. The generated box preview still shows the mark because it renders the live fallback painter.
+
+Timing and node-type rows use the 4-second rolling window; when the source stops, rows age out. Stalls headline rates also use 4 seconds, but per-source rows remain visible for 30 seconds after their last event, with source counters accumulated. No retention change was made: the panel now explains the windows; a test checks that the rate may be zero at 5 seconds while the row remains. The code registers Governor on the in-page panel in either renderer mode; the detached window intentionally has five tabs and excludes Governor. Clean defaults are policy `normal`, rAF off, coalescing off and autopilot off, but `ants-governor-v1` persists manual policies/settings, so live state still needs inspection.
+
+The latest Nodes 2.0 truncation/odd-capture report remains unresolved. The Vue form/textarea route still has no hard 2,000-character slice; it wraps/clips to its measured box. The separate canvas DOM-widget route keeps its 2,000-character and 12-line caps. Live report/screenshot evidence, CPU-only Electron A/B, pixel comparison and renderer-switch cache repopulation remain unverified.
+
 **v2.7.4 — live Vue state marks, the high-voltage badge, and route-specific text bounds.** Kept the Node 2.0 stand-in up through progress/error changes: `lodSnapLive` can permit state marks for the Vue blit path while video/link-drag remain live-element exceptions; `lodSnapSignature` leaves `progress` / `has_errors` out of the Vue signature; `lodSnapEnqueue` drops a pending capture while either is active; `lodSnapPaint` draws `lodSnapStateMarks` after blitting the held picture, from the current fields. Clearing state takes the overlay away on the next draw without capture churn. The classic canvas renderer is unchanged: running/erroring nodes remain live. Regression covers state arriving over one held picture, both marks painted, no invalidation/recapture, clear state, and the existing video/link-drag handback; the previous no-flicker lifecycle remains covered. The Vue root's separate executing outline is not reconstructed and should not be claimed as preserved by this pass.
 
-Added the classic amber/black warning triangle with bolt to every stand-in. `lodSnapWarningBadge` paints on the live fallback and the capture after the ink test but before mipmaps/disk persistence; `LOD_SNAP_BADGE_VERSION` is in the signature, so old memory/disk pictures are re-made. Its regression checks live-before-capture, ink-test ordering, and that the decorative badge cannot make a blank capture pass. The badge helper now explicitly restores the canvas style state as well as using `save`/`restore`, because the test context's no-op restore had leaked black `strokeStyle` into the next node draw (the first full-suite run exposed it; after the fix the full suite passes). The fake context now records `closePath`, and `tools/box-preview.mjs` serializes path fills/strokes as SVG, so regenerated HTML/SVG previews visibly include the triangle, outline and bolt instead of silently dropping the badge.
+The v2.7.4 pass first added the classic amber/black triangle to both live fallback boxes and stored pictures. That initial behavior was reversed in v2.7.5 per the user's latest instruction; see the entry above. The helper still explicitly restores canvas styles as well as using `save`/`restore`, because the fake context's no-op restore had leaked black `strokeStyle` into the next node draw. The harness records `closePath`, and the preview tool serializes path fills/strokes, so the generated HTML/SVG still show the badge on the live fallback box painter.
 
 Separated the three text routes, correcting a 2,000-character form-value cap that was introduced during implementation and did not match the user's explicit distinction: (1) ordinary Vue DOM leaves slice at `LOD_VUE_TEXT_CHARS = 2000`, with same-length middle edits hashed in the actual visible prefix; (2) Vue `<textarea>` / form values are not hard-sliced at 2,000 and are wrapped/clipped to the available box lines; (3) the classic canvas DOM-widget composite still hard-slices at `LOD_SNAP_TEXT_CHARS = 2000` and limits to 12 lines. Tests pin each distinction: ordinary Vue text's prefix/cut mark, a >2,000-character textarea whose tail fits after enlarging the box, the 12-line/two-thousand-character canvas path, and the existing middle-edit recapture. The generic wrapper no longer ellipsizes merely because the source string exceeds 2,000; callers decide clipping from their own character/line limits.
 
